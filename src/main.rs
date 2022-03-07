@@ -113,8 +113,7 @@ struct HashSeq {
 
 impl HashSeq {
     fn insert(&mut self, idx: usize, value: char) {
-        let topo = self.topo();
-        let mut order: TopoIter<'_> = topo.iter();
+        let mut order: TopoIter<'_> = self.topo.iter();
 
         if let Some(prev_idx) = idx.checked_sub(1) {
             for _ in 0..prev_idx {
@@ -131,6 +130,16 @@ impl HashSeq {
             lefts,
             rights,
         };
+        self.apply(node);
+    }
+
+    fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
+        for (i, e) in batch.into_iter().enumerate() {
+            self.insert(idx + i, e)
+        }
+    }
+
+    fn apply(&mut self, node: Node) {
         let id = node.hash();
         self.topo.insert(id);
         for l in node.lefts.iter() {
@@ -142,39 +151,16 @@ impl HashSeq {
         self.nodes.insert(id, node);
     }
 
-    fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
-        for (i, e) in batch.into_iter().enumerate() {
-            self.insert(idx + i, e)
-        }
-    }
-
     fn merge(&mut self, other: Self) {
-        self.nodes.extend(other.nodes);
-    }
-
-    fn topo(&self) -> TopoSort {
-        let mut topo = TopoSort::default();
-
-        for (id, node) in self.nodes.iter() {
-            topo.insert(*id);
-            for l in node.lefts.iter() {
-                topo.add_constraint(*l, *id);
-            }
-            for r in node.rights.iter() {
-                topo.add_constraint(*id, *r);
-            }
+        for node in other.nodes.into_values() {
+            self.apply(node);
         }
-        topo
     }
 
-    fn read<T>(&self) -> T
-    where
-        T: FromIterator<char>,
-    {
-        self.topo()
+    fn iter(&self) -> impl Iterator<Item = char> + '_ {
+        self.topo
             .iter()
             .map(|id| self.nodes.get(&id).unwrap().value)
-            .collect()
     }
 }
 
@@ -188,14 +174,14 @@ mod test {
         seq.insert(0, 'a');
         seq.insert(1, 'b');
         seq.insert(2, 'c');
-        assert_eq!(&seq.read::<String>(), "abc");
+        assert_eq!(&seq.iter().collect::<String>(), "abc");
     }
 
     #[test]
     fn test_insert_batch() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abc".chars());
-        assert_eq!(&seq.read::<String>(), "abc");
+        assert_eq!(&seq.iter().collect::<String>(), "abc");
     }
 
     #[test]
@@ -208,7 +194,10 @@ mod test {
 
         seq_a.merge(seq_b);
 
-        assert_eq!(&seq_a.read::<String>(), "we wrote this at the same time");
+        assert_eq!(
+            &seq_a.iter().collect::<String>(),
+            "we wrote this at the same time"
+        );
     }
 
     #[test]
@@ -221,7 +210,10 @@ mod test {
 
         seq_a.merge(seq_b);
 
-        assert_eq!(&seq_a.read::<String>(), "hello my name is zameenadavid");
+        assert_eq!(
+            &seq_a.iter().collect::<String>(),
+            "hello my name is zameenadavid"
+        );
     }
 }
 
@@ -231,5 +223,5 @@ fn main() {
     seq.insert(1, 'b');
     seq.insert(2, 'c');
     dbg!(&seq);
-    println!("{}", seq.read::<String>());
+    println!("{}", seq.iter().collect::<String>());
 }
