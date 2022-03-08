@@ -113,16 +113,24 @@ struct HashSeq {
 
 impl HashSeq {
     fn insert(&mut self, idx: usize, value: char) {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn insert(&mut self, idx: usize, value: char) {
         let mut order: TopoIter<'_> = self.topo.iter();
 
-        if let Some(prev_idx) = idx.checked_sub(1) {
+        let lefts = if let Some(prev_idx) = idx.checked_sub(1) {
             for _ in 0..prev_idx {
                 order.next();
             }
-        }
+            let lefts = BTreeSet::from_iter(order.free_stack.iter().copied());
+            order.next();
+            lefts
+        } else {
+            BTreeSet::default()
+        };
 
-        let lefts = BTreeSet::from_iter(order.free_stack.iter().copied());
-        order.next();
         let rights = BTreeSet::from_iter(order.free_stack.iter().copied());
 
         let node = Node {
@@ -133,7 +141,7 @@ impl HashSeq {
         self.apply(node);
     }
 
-    fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
+    pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
         for (i, e) in batch.into_iter().enumerate() {
             self.insert(idx + i, e)
         }
@@ -216,6 +224,31 @@ mod test {
             "hello my name is zameenadavid"
         );
     }
+
+    #[test]
+    fn test_insert_different_chars_at_front() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+
+        dbg!(&seq);
+
+        assert_eq!(&String::from_iter(seq.iter()), "ba");
+    }
+
+    #[test]
+    fn test_insert_same_char_at_front() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'a');
+
+        dbg!(&seq);
+
+        assert_eq!(&String::from_iter(seq.iter()), "aa");
+    }
+
     #[quickcheck]
     fn prop_vec_model(instructions: Vec<(u8, char)>) {
         let mut model = Vec::new();
