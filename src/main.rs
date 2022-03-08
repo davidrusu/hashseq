@@ -167,6 +167,7 @@ impl HashSeq {
 #[cfg(test)]
 mod test {
     use super::*;
+    use quickcheck_macros::quickcheck;
 
     #[test]
     fn test_insert_at_end() {
@@ -214,6 +215,19 @@ mod test {
             &seq_a.iter().collect::<String>(),
             "hello my name is zameenadavid"
         );
+    }
+    #[quickcheck]
+    fn prop_vec_model(instructions: Vec<(u8, char)>) {
+        let mut model = Vec::new();
+        let mut seq = HashSeq::default();
+
+        for (idx, elem) in instructions {
+            let idx = idx as usize;
+            model.insert(idx.min(model.len()), elem);
+            seq.insert(idx.min(seq.len()), elem);
+        }
+
+        assert_eq!(seq.iter().collect::<Vec<_>>(), model);
     }
 }
 

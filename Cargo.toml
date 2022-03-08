@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 blake3 = "1.0.0"
+quickcheck = "1"
+quickcheck_macros = "1"

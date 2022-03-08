@@ -58,6 +58,7 @@ struct Run<T> {
    lefts: Set<Hash>
    rights: Set<Hash>
 }
+```
 
 i.e. in the first example, a,b,c are sequential, they all have a common right hand (empty set), and their left hand is the previous element in the sequence.
 
