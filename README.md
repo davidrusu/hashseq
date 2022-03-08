@@ -1,6 +1,6 @@
 # HashSeq
 
-A Byzantine-Fault-Tolerant Sequence CRDT suitable for unpermissioned networks with unbounded number of collaborators.
+A Byzantine-Fault-Tolerant(BFT) Sequence CRDT suitable for unpermissioned networks with unbounded number of collaborators.
 
 # Design
 
@@ -26,25 +26,25 @@ a <- d -> b <- c
    \_____/
 ```
 
-We linearize these Hash Graphs by performing a _biased_ topological sort.
+We linearize these Hash Graphs by performing a biased topological sort.
 
-The bias is introduced to decide the canonical ordering when there are multiple linearizations that satisfy the left/right constraints.
+The bias is used to decide a canonical ordering in cases where multiple linearizations satisfy the left/right constraints.
 
 E.g.
 ```
-       b - c
-      /     \
-.. - a       f - ..
-      \     /
-       d - e
+            s - a - m
+           /         \
+h - i - ' '           ! - !
+           \         /
+            d - a - n
 
 ```
 
-both `abcdef`, `adedef`, `abdcef`, `adbec`, ... are valid orderings. We need a canonical ordering that preserves some semantic information, (i.e. no interleaving of concurrent runs)
+The above hash-graph can serialize to `hi samdan!!` or `hi dansam` or even any interleaving of sam/dan: `hi sdaamn`, `hi sdanam`, ... . We need a canonical ordering that preserves some semantic information, (i.e. no interleaving of concurrent runs)
 
-The choice we make is: when we notice a fork, we choose the branch whose starting element has the smaller hash, then to avoid interleaving of concurrent runs, our topological sort runs depth first rather than the traditional breadth first.
+The choice we make is: in a fork, we choose the branch whose starting element has the smaller hash, then to avoid interleaving of concurrent runs, our topological sort runs depth first rather than the traditional breadth first.
 
-So in the above example, the resulting sequence (assuming hash(b) < hash(d)) is: `abcdef`.
+So in the above example, assuming `hash(s)` < `hash(d)`, we'd get is: `hi samdan!!`.
 
 
 ## Optimizations:
@@ -52,30 +52,44 @@ So in the above example, the resulting sequence (assuming hash(b) < hash(d)) is:
 
 If we detect hash-chains, we can collabse them to just the first left hashes and the right hashes:
 
+```rust
+struct Run<T> {
+   run: Vec<T>
+   lefts: Set<Hash>
+   rights: Set<Hash>
+}
+
 i.e. in the first example, a,b,c are sequential, they all have a common right hand (empty set), and their left hand is the previous element in the sequence.
 
 So we could represent this as:
 
-```
-Run(abc)
+```rust
+
+// a <- b <- c == RUN("abc")
+
+Run {
+  run: "abc",
+  lefts: {},
+  rights: {}
+}
+
 ```
 
 Inserting 'd' splits the run:
 
 ```
-      __________________
-     /                   \*
-^ <- a <- d -> Run(bc) -> $
-     *\_______/
+a <- d -> RUN("bc")
+   \_____/
 ```
 
 And the fork example:
 
 ```
-       Run(bc)
-      /       \
-.. - a         f - ..
-      \       /
-       Run(de)
-
+           RUN("sam")
+          /          \
+RUN("hi ")            RUN("!!")
+          \          /
+           RUN("dan")
 ```
+
+This way we only store hashes at forks, the rest can be recomputed when necessary.
