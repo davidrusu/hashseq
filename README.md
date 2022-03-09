@@ -1,6 +1,6 @@
 # HashSeq
 
-A Byzantine-Fault-Tolerant(BFT) Sequence CRDT suitable for unpermissioned networks with unbounded number of collaborators.
+A Byzantine-Fault-Tolerant (BFT) Sequence CRDT suitable for unpermissioned networks with unbounded number of collaborators.
 
 ## Current Complexity:
 

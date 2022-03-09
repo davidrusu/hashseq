@@ -1,11 +1,19 @@
 [package]
 name = "hashseq"
+license = "MIT"
+authors = [ "David Rusu <davidrusu.me@gmail.com>" ]
+description = "A BFT Sequence CRDT suitable for unpermissioned networks with unbounded number of collaborators."
+keywords = [ "bft", "crdt", "distributed", "decentralized", "collaboration" ]
+homepage = "https://github.com/davidrusu/hashseq"
+repository = "https://github.com/davidrusu/hashseq"
+documentation = "https://docs.rs/hashseq"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-blake3 = "1.0.0"
+
+[dev-dependencies]
 quickcheck = "1"
 quickcheck_macros = "1"
