@@ -9,7 +9,7 @@ A Byzantine-Fault-Tolerant(BFT) Sequence CRDT suitable for unpermissioned networ
 | insert | O(n) | O(n)  |
 | remove | O(n) | O(1)  |
 
-We can likely improve these with some clever indexing strategies
+This is still a WIP, I think we can improve these substantially with some clever indexing strategies
 
 ## Design
 
