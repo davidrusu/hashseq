@@ -224,7 +224,7 @@ impl HashSeq {
         missing_deps
     }
 
-    fn is_faulty(&self, node: &Node) -> bool {
+    fn is_faulty_node(&self, node: &Node) -> bool {
         // Ensure there is no overlap between nodes on the left and nodes on the right
         let mut left_boundary = node.lefts.clone();
         let mut right_boundary = node.rights.clone();
@@ -255,7 +255,11 @@ impl HashSeq {
         false
     }
 
-    pub fn apply(&mut self, op: Op) -> Result<(), Node> {
+    fn is_faulty_remove(&self, remove: &Remove) -> bool {
+        !self.nodes.contains_key(&remove.node)
+    }
+
+    pub fn apply(&mut self, op: Op) -> Result<(), Op> {
         let deps = self.missing_dependencies(&op);
         if !deps.is_empty() {
             self.orphaned.insert(op);
@@ -270,8 +274,8 @@ impl HashSeq {
                     return Ok(()); // Already processed node.
                 }
 
-                if self.is_faulty(&node) {
-                    return Err(node);
+                if self.is_faulty_node(&node) {
+                    return Err(Op::Insert(node));
                 }
 
                 self.topo.insert(id);
@@ -302,6 +306,10 @@ impl HashSeq {
                     return Ok(());
                 }
 
+                if self.is_faulty_remove(&remove) {
+                    return Err(Op::Remove(remove));
+                }
+
                 self.topo.remove_and_propagate_constraints(remove.node);
 
                 let superseded_roots = BTreeSet::from_iter(
@@ -329,7 +337,7 @@ impl HashSeq {
         Ok(())
     }
 
-    pub fn merge(&mut self, other: Self) -> Result<(), Node> {
+    pub fn merge(&mut self, other: Self) -> Result<(), Op> {
         for node in other.nodes.into_values() {
             self.apply(Op::Insert(node))?;
         }
@@ -518,6 +526,23 @@ mod test {
         expected_seq.insert_batch(0, "ab".chars());
 
         assert_eq!(seq, expected_seq);
+    }
+
+    #[test]
+    fn test_faulty_remove() {
+        let mut seq = HashSeq::default();
+
+        // Attempting to remove node with id 0, with the empty DAG roots.
+        // This is faulty since the empty DAG roots should not have seen
+        // any nodes, let alone a node with id 0.
+        assert!(seq
+            .apply(Op::Remove(Remove {
+                node: 0,
+                roots: BTreeSet::new()
+            }))
+            .is_err());
+
+        assert_eq!(seq, HashSeq::default());
     }
 
     #[quickcheck]
