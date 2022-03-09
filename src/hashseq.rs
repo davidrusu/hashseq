@@ -5,7 +5,7 @@ use crate::topo_sort::{TopoIter, TopoSort};
 use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct Node {
+pub struct Insert {
     roots: BTreeSet<Id>,
     lefts: BTreeSet<Id>,
     rights: BTreeSet<Id>,
@@ -15,16 +15,16 @@ pub struct Node {
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Remove {
     roots: BTreeSet<Id>,
-    node: Id,
+    insert: Id,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Op {
-    Insert(Node),
+    Insert(Insert),
     Remove(Remove),
 }
 
-impl Node {
+impl Insert {
     fn hash(&self) -> Id {
         use std::hash::Hash;
         use std::hash::Hasher;
@@ -43,7 +43,7 @@ impl Remove {
         use std::hash::Hasher;
         let mut hasher = DefaultHasher::new();
         self.roots.hash(&mut hasher);
-        self.node.hash(&mut hasher);
+        self.insert.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -51,7 +51,7 @@ impl Remove {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HashSeq {
     topo: TopoSort,
-    nodes: BTreeMap<Id, Node>,
+    inserts: BTreeMap<Id, Insert>,
     removed: BTreeMap<Id, Remove>,
     roots: BTreeSet<Id>,
     orphaned: HashSet<Op>,
@@ -59,7 +59,7 @@ pub struct HashSeq {
 
 impl HashSeq {
     pub fn len(&self) -> usize {
-        self.nodes.len() - self.removed.len()
+        self.inserts.len() - self.removed.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -82,13 +82,13 @@ impl HashSeq {
 
         let rights = BTreeSet::from_iter(order.next_candidates());
 
-        let node = Node {
+        let insert = Insert {
             value,
             lefts,
             rights,
             roots: self.roots.clone(),
         };
-        self.apply(Op::Insert(node))
+        self.apply(Op::Insert(insert))
             .expect("ERR: We constructed a faulty op using public API");
     }
 
@@ -105,9 +105,9 @@ impl HashSeq {
             order.next();
         }
 
-        if let Some(node) = order.next() {
+        if let Some(insert) = order.next() {
             self.apply(Op::Remove(Remove {
-                node,
+                insert,
                 roots: self.roots.clone(),
             }))
             .expect("ERR: We constructed a faulty op using public API")
@@ -116,13 +116,13 @@ impl HashSeq {
 
     fn missing_dependencies(&self, op: &Op) -> BTreeSet<Id> {
         let dependencies = match op {
-            Op::Insert(Node { roots, .. }) | Op::Remove(Remove { roots, .. }) => roots,
+            Op::Insert(Insert { roots, .. }) | Op::Remove(Remove { roots, .. }) => roots,
         };
 
         let mut missing_deps = BTreeSet::new();
 
         for dep in dependencies.iter() {
-            if !self.nodes.contains_key(&dep) && !self.removed.contains_key(&dep) {
+            if !self.inserts.contains_key(&dep) && !self.removed.contains_key(&dep) {
                 missing_deps.insert(*dep);
             }
         }
@@ -130,30 +130,34 @@ impl HashSeq {
         missing_deps
     }
 
-    fn is_faulty_node(&self, node: &Node) -> bool {
-        // Ensure there is no overlap between nodes on the left and nodes on the right
-        let mut left_boundary = node.lefts.clone();
-        let mut right_boundary = node.rights.clone();
-        let mut nodes_on_left = BTreeSet::new();
-        let mut nodes_on_right = BTreeSet::new();
+    fn is_faulty_insert(&self, insert: &Insert) -> bool {
+        // Ensure there is no overlap between inserts on the left and inserts on the right
+        let mut left_boundary = insert.lefts.clone();
+        let mut right_boundary = insert.rights.clone();
+        let mut inserts_on_left = BTreeSet::new();
+        let mut inserts_on_right = BTreeSet::new();
         while !left_boundary.is_empty() || !right_boundary.is_empty() {
             for l in std::mem::take(&mut left_boundary) {
-                if let Some(l_node) = self.nodes.get(&l) {
-                    left_boundary.extend(l_node.lefts.clone());
-                    nodes_on_left.insert(l);
+                if let Some(l_insert) = self.inserts.get(&l) {
+                    left_boundary.extend(l_insert.lefts.clone());
+                    inserts_on_left.insert(l);
                 } else {
-                    return true; // refers to a node that we have not seen.
+                    return true; // refers to a insert that we have not seen.
                 }
             }
             for r in std::mem::take(&mut right_boundary) {
-                if let Some(r_node) = self.nodes.get(&r) {
-                    right_boundary.extend(r_node.rights.clone());
-                    nodes_on_right.insert(r);
+                if let Some(r_insert) = self.inserts.get(&r) {
+                    right_boundary.extend(r_insert.rights.clone());
+                    inserts_on_right.insert(r);
                 } else {
-                    return true; // refers to a node that we have not seen.
+                    return true; // refers to a left that we have not seen.
                 }
             }
-            if nodes_on_left.intersection(&nodes_on_right).next().is_some() {
+            if inserts_on_left
+                .intersection(&inserts_on_right)
+                .next()
+                .is_some()
+            {
                 return true; // left/right constraints are refer to overlapping sets
             }
         }
@@ -162,7 +166,7 @@ impl HashSeq {
     }
 
     fn is_faulty_remove(&self, remove: &Remove) -> bool {
-        !self.nodes.contains_key(&remove.node)
+        !self.inserts.contains_key(&remove.insert)
     }
 
     pub fn apply(&mut self, op: Op) -> Result<(), Op> {
@@ -173,29 +177,29 @@ impl HashSeq {
         }
 
         match op {
-            Op::Insert(node) => {
-                let id = node.hash();
+            Op::Insert(insert) => {
+                let id = insert.hash();
 
-                if self.nodes.contains_key(&id) {
-                    return Ok(()); // Already processed node.
+                if self.inserts.contains_key(&id) {
+                    return Ok(()); // Already processed insert.
                 }
 
-                if self.is_faulty_node(&node) {
-                    return Err(Op::Insert(node));
+                if self.is_faulty_insert(&insert) {
+                    return Err(Op::Insert(insert));
                 }
 
                 self.topo.insert(id);
-                for l in node.lefts.iter() {
+                for l in insert.lefts.iter() {
                     self.topo.add_constraint(*l, id);
                 }
-                for r in node.rights.iter() {
+                for r in insert.rights.iter() {
                     self.topo.add_constraint(id, *r);
                 }
 
                 let superseded_roots = BTreeSet::from_iter(
                     self.roots
                         .iter()
-                        .filter(|r| node.roots.contains(r))
+                        .filter(|r| insert.roots.contains(r))
                         .copied(),
                 );
 
@@ -203,7 +207,7 @@ impl HashSeq {
                     self.roots.remove(&r);
                 }
 
-                self.nodes.insert(id, node);
+                self.inserts.insert(id, insert);
                 self.roots.insert(id);
             }
             Op::Remove(remove) => {
@@ -216,7 +220,7 @@ impl HashSeq {
                     return Err(Op::Remove(remove));
                 }
 
-                self.topo.remove_and_propagate_constraints(remove.node);
+                self.topo.remove_and_propagate_constraints(remove.insert);
 
                 let superseded_roots = BTreeSet::from_iter(
                     self.roots
@@ -244,8 +248,8 @@ impl HashSeq {
     }
 
     pub fn merge(&mut self, other: Self) -> Result<(), Op> {
-        for node in other.nodes.into_values() {
-            self.apply(Op::Insert(node))?;
+        for insert in other.inserts.into_values() {
+            self.apply(Op::Insert(insert))?;
         }
         for rm in other.removed.into_values() {
             self.apply(Op::Remove(rm))?;
@@ -258,7 +262,7 @@ impl HashSeq {
             if self.removed.contains_key(&id) {
                 None
             } else {
-                self.nodes.get(&id).map(|n| n.value)
+                self.inserts.get(&id).map(|l| l.value)
             }
         })
     }
@@ -380,11 +384,11 @@ mod test {
     }
 
     #[test]
-    fn test_faulty_if_node_refers_to_non_existant_nodes() {
+    fn test_faulty_if_insert_refers_to_non_existant_inserts() {
         let mut seq = HashSeq::default();
 
         assert!(seq
-            .apply(Op::Insert(Node {
+            .apply(Op::Insert(Insert {
                 value: 'a',
                 lefts: BTreeSet::from_iter([0]),
                 rights: BTreeSet::default(),
@@ -395,7 +399,7 @@ mod test {
         assert_eq!(seq, HashSeq::default());
 
         assert!(seq
-            .apply(Op::Insert(Node {
+            .apply(Op::Insert(Insert {
                 value: 'a',
                 lefts: BTreeSet::default(),
                 rights: BTreeSet::from_iter([0]),
@@ -420,7 +424,7 @@ mod test {
         // engineer a faulty op where `b` is on our left and `a` is on our right.
 
         assert!(seq
-            .apply(Op::Insert(Node {
+            .apply(Op::Insert(Insert {
                 value: 'a',
                 lefts: BTreeSet::from_iter([b_id]),
                 rights: BTreeSet::from_iter([a_id]),
@@ -438,12 +442,12 @@ mod test {
     fn test_faulty_remove() {
         let mut seq = HashSeq::default();
 
-        // Attempting to remove node with id 0, with the empty DAG roots.
+        // Attempting to remove insert with id 0, with the empty DAG roots.
         // This is faulty since the empty DAG roots should not have seen
-        // any nodes, let alone a node with id 0.
+        // any inserts, let alone a insert with id 0.
         assert!(seq
             .apply(Op::Remove(Remove {
-                node: 0,
+                insert: 0,
                 roots: BTreeSet::new()
             }))
             .is_err());
