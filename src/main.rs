@@ -149,7 +149,6 @@ struct HashSeq {
     removed: BTreeMap<Id, Remove>,
     roots: BTreeSet<Id>,
     orphaned: HashSet<Op>,
-    // faulty: HashSet<Node>,
 }
 
 impl HashSeq {
@@ -183,7 +182,8 @@ impl HashSeq {
             rights,
             roots: self.roots.clone(),
         };
-        self.apply(Op::Insert(node));
+        self.apply(Op::Insert(node))
+            .expect("ERR: We constructed a faulty op using public API");
     }
 
     pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
@@ -204,6 +204,7 @@ impl HashSeq {
                 node,
                 roots: self.roots.clone(),
             }))
+            .expect("ERR: We constructed a faulty op using public API")
         }
     }
 
@@ -223,11 +224,42 @@ impl HashSeq {
         missing_deps
     }
 
-    pub fn apply(&mut self, op: Op) {
+    fn is_faulty(&self, node: &Node) -> bool {
+        // Ensure there is no overlap between nodes on the left and nodes on the right
+        let mut left_boundary = node.lefts.clone();
+        let mut right_boundary = node.rights.clone();
+        let mut nodes_on_left = BTreeSet::new();
+        let mut nodes_on_right = BTreeSet::new();
+        while !left_boundary.is_empty() || !right_boundary.is_empty() {
+            for l in std::mem::take(&mut left_boundary) {
+                if let Some(l_node) = self.nodes.get(&l) {
+                    left_boundary.extend(l_node.lefts.clone());
+                    nodes_on_left.insert(l);
+                } else {
+                    return true; // refers to a node that we have not seen.
+                }
+            }
+            for r in std::mem::take(&mut right_boundary) {
+                if let Some(r_node) = self.nodes.get(&r) {
+                    right_boundary.extend(r_node.rights.clone());
+                    nodes_on_right.insert(r);
+                } else {
+                    return true; // refers to a node that we have not seen.
+                }
+            }
+            if nodes_on_left.intersection(&nodes_on_right).next().is_some() {
+                return true; // left/right constraints are refer to overlapping sets
+            }
+        }
+
+        false
+    }
+
+    pub fn apply(&mut self, op: Op) -> Result<(), Node> {
         let deps = self.missing_dependencies(&op);
         if !deps.is_empty() {
             self.orphaned.insert(op);
-            return;
+            return Ok(());
         }
 
         match op {
@@ -235,7 +267,11 @@ impl HashSeq {
                 let id = node.hash();
 
                 if self.nodes.contains_key(&id) {
-                    return;
+                    return Ok(()); // Already processed node.
+                }
+
+                if self.is_faulty(&node) {
+                    return Err(node);
                 }
 
                 self.topo.insert(id);
@@ -263,8 +299,9 @@ impl HashSeq {
             Op::Remove(remove) => {
                 let id = remove.hash();
                 if self.removed.contains_key(&id) {
-                    return;
+                    return Ok(());
                 }
+
                 self.topo.remove_and_propagate_constraints(remove.node);
 
                 let superseded_roots = BTreeSet::from_iter(
@@ -286,17 +323,20 @@ impl HashSeq {
         let orphans = std::mem::take(&mut self.orphaned);
 
         for orphan in orphans {
-            self.apply(orphan);
+            self.apply(orphan)?;
         }
+
+        Ok(())
     }
 
-    pub fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: Self) -> Result<(), Node> {
         for node in other.nodes.into_values() {
-            self.apply(Op::Insert(node));
+            self.apply(Op::Insert(node))?;
         }
         for rm in other.removed.into_values() {
-            self.apply(Op::Remove(rm));
+            self.apply(Op::Remove(rm))?;
         }
+        Ok(())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
@@ -339,7 +379,7 @@ mod test {
         seq_a.insert_batch(0, "we wrote".chars());
         seq_b.insert_batch(0, "this together, ".chars());
 
-        seq_a.merge(seq_b);
+        seq_a.merge(seq_b).expect("Faulty merge");
 
         assert_eq!(&seq_a.iter().collect::<String>(), "this together, we wrote");
     }
@@ -352,7 +392,7 @@ mod test {
         seq_a.insert_batch(0, "hello my name is david".chars());
         seq_b.insert_batch(0, "hello my name is zameena".chars());
 
-        seq_a.merge(seq_b);
+        seq_a.merge(seq_b).expect("Faulty merge");
 
         assert_eq!(
             &seq_a.iter().collect::<String>(),
@@ -371,7 +411,7 @@ mod test {
         seq_b.insert_batch(0, "aza".chars());
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
-        seq_a.merge(seq_b);
+        seq_a.merge(seq_b).expect("Faulty merge");
         assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
     }
 
@@ -423,6 +463,61 @@ mod test {
 
         assert_eq!(&String::from_iter(seq.iter()), "");
         assert_eq!(seq.len(), 0);
+    }
+
+    #[test]
+    fn test_faulty_if_node_refers_to_non_existant_nodes() {
+        let mut seq = HashSeq::default();
+
+        assert!(seq
+            .apply(Op::Insert(Node {
+                value: 'a',
+                lefts: BTreeSet::from_iter([0]),
+                rights: BTreeSet::default(),
+                roots: BTreeSet::default(),
+            }))
+            .is_err());
+
+        assert_eq!(seq, HashSeq::default());
+
+        assert!(seq
+            .apply(Op::Insert(Node {
+                value: 'a',
+                lefts: BTreeSet::default(),
+                rights: BTreeSet::from_iter([0]),
+                roots: BTreeSet::default(),
+            }))
+            .is_err());
+
+        assert_eq!(seq, HashSeq::default());
+    }
+
+    #[test]
+    fn test_faulty_if_left_right_constraints_overlap() {
+        let mut seq = HashSeq::default();
+
+        seq.insert_batch(0, "ab".chars());
+
+        let mut topo_seq = seq.topo.iter();
+
+        let a_id = topo_seq.next().unwrap();
+        let b_id = topo_seq.next().unwrap();
+
+        // engineer a faulty op where `b` is on our left and `a` is on our right.
+
+        assert!(seq
+            .apply(Op::Insert(Node {
+                value: 'a',
+                lefts: BTreeSet::from_iter([b_id]),
+                rights: BTreeSet::from_iter([a_id]),
+                roots: BTreeSet::default(),
+            }))
+            .is_err());
+
+        let mut expected_seq = HashSeq::default();
+        expected_seq.insert_batch(0, "ab".chars());
+
+        assert_eq!(seq, expected_seq);
     }
 
     #[quickcheck]
