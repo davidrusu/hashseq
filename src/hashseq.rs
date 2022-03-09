@@ -153,16 +153,18 @@ impl HashSeq {
                     return true; // refers to a left that we have not seen.
                 }
             }
-            if inserts_on_left
-                .intersection(&inserts_on_right)
-                .next()
-                .is_some()
-            {
-                return true; // left/right constraints are refer to overlapping sets
-            }
         }
 
-        false
+        // TODO: if we're careful, we can move this into the above loop for an early out.
+        if inserts_on_left
+            .intersection(&inserts_on_right)
+            .next()
+            .is_some()
+        {
+            true // left/right constraints are refer to overlapping sets
+        } else {
+            false
+        }
     }
 
     fn is_faulty_remove(&self, remove: &Remove) -> bool {

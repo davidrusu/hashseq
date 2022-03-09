@@ -2,6 +2,15 @@
 
 A Byzantine-Fault-Tolerant(BFT) Sequence CRDT suitable for unpermissioned networks with unbounded number of collaborators.
 
+# Current Complexity:
+
+|   op   | time | space |
+|--------|------|-------|
+| insert | O(n) | O(n)  |
+| remove | O(n) | O(1)  |
+
+We can likely improve these with some clever indexing strategies
+
 # Design
 
 Each insert produces a Node holding a value, the hashes of the immediate nodes to the left, and the immediate nodes to the right:
