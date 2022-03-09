@@ -3,27 +3,50 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 type Id = u64;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct Node {
+    roots: BTreeSet<Id>,
     lefts: BTreeSet<Id>,
     rights: BTreeSet<Id>,
     value: char,
+}
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+struct Remove {
+    roots: BTreeSet<Id>,
+    node: Id,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+enum Op {
+    Insert(Node),
+    Remove(Remove),
 }
 
 impl Node {
     fn hash(&self) -> Id {
         use std::hash::Hash;
         use std::hash::Hasher;
-        // Hash an input incrementally.
         let mut hasher = DefaultHasher::new();
         self.lefts.hash(&mut hasher);
         self.rights.hash(&mut hasher);
+        self.roots.hash(&mut hasher);
         self.value.hash(&mut hasher);
         hasher.finish()
     }
 }
 
-#[derive(Debug, Default)]
+impl Remove {
+    fn hash(&self) -> Id {
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        let mut hasher = DefaultHasher::new();
+        self.roots.hash(&mut hasher);
+        self.node.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct TopoSort {
     after_constraints: BTreeMap<Id, BTreeSet<Id>>,
 }
@@ -38,6 +61,23 @@ impl TopoSort {
             .entry(after)
             .or_default()
             .insert(before);
+    }
+
+    fn remove_and_propagate_constraints(&mut self, node_to_delete: Id) {
+        let afters_to_propagate = self
+            .after_constraints
+            .entry(node_to_delete)
+            .or_default()
+            .clone();
+
+        for (_, afters) in self.after_constraints.iter_mut() {
+            if afters.contains(&node_to_delete) {
+                afters.extend(afters_to_propagate.clone());
+                afters.remove(&node_to_delete);
+            }
+        }
+
+        self.after_constraints.remove(&node_to_delete);
     }
 
     fn free_variables(&self) -> impl Iterator<Item = Id> + '_ {
@@ -60,7 +100,6 @@ pub struct TopoIter<'a> {
 
 impl<'a> TopoIter<'a> {
     fn new(topo: &'a TopoSort) -> Self {
-        println!("{:#?}", topo);
         let used = BTreeSet::new();
         let mut free_stack: Vec<Id> = topo.free_variables().collect();
         free_stack.sort();
@@ -103,18 +142,23 @@ impl<'a> Iterator for TopoIter<'a> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct HashSeq {
     topo: TopoSort,
     nodes: BTreeMap<Id, Node>,
-    // orphans: HashSet<Node>,
+    removed: BTreeMap<Id, Remove>,
+    roots: BTreeSet<Id>,
+    orphaned: HashSet<Op>,
     // faulty: HashSet<Node>,
 }
 
 impl HashSeq {
-    fn insert(&mut self, idx: usize, value: char) {
     fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.len() - self.removed.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {
@@ -137,8 +181,9 @@ impl HashSeq {
             value,
             lefts,
             rights,
+            roots: self.roots.clone(),
         };
-        self.apply(node);
+        self.apply(Op::Insert(node));
     }
 
     pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
@@ -147,28 +192,121 @@ impl HashSeq {
         }
     }
 
-    fn apply(&mut self, node: Node) {
-        let id = node.hash();
-        self.topo.insert(id);
-        for l in node.lefts.iter() {
-            self.topo.add_constraint(*l, id);
+    pub fn remove(&mut self, idx: usize) {
+        let mut order: TopoIter<'_> = self.topo.iter();
+
+        for _ in 0..idx {
+            order.next();
         }
-        for r in node.rights.iter() {
-            self.topo.add_constraint(id, *r);
+
+        if let Some(node) = order.next() {
+            self.apply(Op::Remove(Remove {
+                node,
+                roots: self.roots.clone(),
+            }))
         }
-        self.nodes.insert(id, node);
     }
 
-    fn merge(&mut self, other: Self) {
+    fn missing_dependencies(&self, op: &Op) -> BTreeSet<Id> {
+        let dependencies = match op {
+            Op::Insert(Node { roots, .. }) | Op::Remove(Remove { roots, .. }) => roots,
+        };
+
+        let mut missing_deps = BTreeSet::new();
+
+        for dep in dependencies.iter() {
+            if !self.nodes.contains_key(&dep) && !self.removed.contains_key(&dep) {
+                missing_deps.insert(*dep);
+            }
+        }
+
+        missing_deps
+    }
+
+    pub fn apply(&mut self, op: Op) {
+        let deps = self.missing_dependencies(&op);
+        if !deps.is_empty() {
+            self.orphaned.insert(op);
+            return;
+        }
+
+        match op {
+            Op::Insert(node) => {
+                let id = node.hash();
+
+                if self.nodes.contains_key(&id) {
+                    return;
+                }
+
+                self.topo.insert(id);
+                for l in node.lefts.iter() {
+                    self.topo.add_constraint(*l, id);
+                }
+                for r in node.rights.iter() {
+                    self.topo.add_constraint(id, *r);
+                }
+
+                let superseded_roots = BTreeSet::from_iter(
+                    self.roots
+                        .iter()
+                        .filter(|r| node.roots.contains(r))
+                        .copied(),
+                );
+
+                for r in superseded_roots {
+                    self.roots.remove(&r);
+                }
+
+                self.nodes.insert(id, node);
+                self.roots.insert(id);
+            }
+            Op::Remove(remove) => {
+                let id = remove.hash();
+                if self.removed.contains_key(&id) {
+                    return;
+                }
+                self.topo.remove_and_propagate_constraints(remove.node);
+
+                let superseded_roots = BTreeSet::from_iter(
+                    self.roots
+                        .iter()
+                        .filter(|r| remove.roots.contains(r))
+                        .copied(),
+                );
+
+                for r in superseded_roots {
+                    self.roots.remove(&r);
+                }
+
+                self.removed.insert(id, remove);
+                self.roots.insert(id);
+            }
+        }
+
+        let orphans = std::mem::take(&mut self.orphaned);
+
+        for orphan in orphans {
+            self.apply(orphan);
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
         for node in other.nodes.into_values() {
-            self.apply(node);
+            self.apply(Op::Insert(node));
+        }
+        for rm in other.removed.into_values() {
+            self.apply(Op::Remove(rm));
         }
     }
 
-    fn iter(&self) -> impl Iterator<Item = char> + '_ {
-        self.topo
-            .iter()
-            .map(|id| self.nodes.get(&id).unwrap().value)
+    pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
+        self.topo.iter().filter_map(|id| {
+            if self.removed.contains_key(&id) {
+                None
+            } else {
+                self.nodes.get(&id).map(|n| n.value)
+            }
+        })
     }
 }
 
@@ -198,15 +336,12 @@ mod test {
         let mut seq_a = HashSeq::default();
         let mut seq_b = HashSeq::default();
 
-        seq_a.insert_batch(0, "we wrote this ".chars());
-        seq_b.insert_batch(0, "at the same time".chars());
+        seq_a.insert_batch(0, "we wrote".chars());
+        seq_b.insert_batch(0, "this together, ".chars());
 
         seq_a.merge(seq_b);
 
-        assert_eq!(
-            &seq_a.iter().collect::<String>(),
-            "we wrote this at the same time"
-        );
+        assert_eq!(&seq_a.iter().collect::<String>(), "this together, we wrote");
     }
 
     #[test]
@@ -223,6 +358,21 @@ mod test {
             &seq_a.iter().collect::<String>(),
             "hello my name is zameenadavid"
         );
+    }
+
+    #[test]
+    fn test_common_prefix_isnt_duplicated_simple() {
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+
+        seq_a.insert_batch(0, "aba".chars());
+        assert_eq!(&seq_a.iter().collect::<String>(), "aba");
+
+        seq_b.insert_batch(0, "aza".chars());
+        assert_eq!(&seq_b.iter().collect::<String>(), "aza");
+
+        seq_a.merge(seq_b);
+        assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
     }
 
     #[test]
@@ -249,18 +399,59 @@ mod test {
         assert_eq!(&String::from_iter(seq.iter()), "aa");
     }
 
+    #[test]
+    fn test_insert_delete_then_reinsert() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.remove(0);
+        seq.insert(0, 'a');
+
+        dbg!(&seq);
+
+        assert_eq!(&String::from_iter(seq.iter()), "a");
+    }
+
+    #[test]
+    fn test_add_twice_then_remove_both() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'a');
+        seq.remove(0);
+        seq.remove(0);
+
+        assert_eq!(&String::from_iter(seq.iter()), "");
+        assert_eq!(seq.len(), 0);
+    }
+
     #[quickcheck]
-    fn prop_vec_model(instructions: Vec<(u8, char)>) {
+    fn prop_vec_model(instructions: Vec<(bool, u8, char)>) {
         let mut model = Vec::new();
         let mut seq = HashSeq::default();
 
-        for (idx, elem) in instructions {
+        for (insert_or_remove, idx, elem) in instructions {
             let idx = idx as usize;
-            model.insert(idx.min(model.len()), elem);
-            seq.insert(idx.min(seq.len()), elem);
+            match insert_or_remove {
+                true => {
+                    // insert
+                    model.insert(idx.min(model.len()), elem);
+                    seq.insert(idx.min(seq.len()), elem);
+                }
+                false => {
+                    // remove
+                    assert_eq!(seq.is_empty(), model.is_empty());
+                    if !seq.is_empty() {
+                        model.remove(idx.min(model.len() - 1));
+                        seq.remove(idx.min(seq.len() - 1));
+                    }
+                }
+            }
         }
 
         assert_eq!(seq.iter().collect::<Vec<_>>(), model);
+        assert_eq!(seq.len(), model.len());
+        assert_eq!(seq.is_empty(), model.is_empty());
     }
 }
 
