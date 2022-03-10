@@ -17,3 +17,12 @@ edition = "2021"
 [dev-dependencies]
 quickcheck = "1"
 quickcheck_macros = "1"
+criterion = "0.3"
+pprof = { version = "0.7.0", features = ["flamegraph"] }
+
+[profile.bench]
+debug = true
+
+[[bench]]
+name = "inserts"
+harness = false
