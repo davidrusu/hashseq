@@ -50,6 +50,7 @@ impl TopoSort {
 
 pub struct TopoIter<'a> {
     topo: &'a TopoSort,
+    inverted_dependencies: BTreeMap<Id, BTreeSet<Id>>,
     used: BTreeSet<Id>,
     free_stack: Vec<Id>,
 }
@@ -59,8 +60,20 @@ impl<'a> TopoIter<'a> {
         let used = BTreeSet::new();
         let mut free_stack: Vec<Id> = topo.free_variables().collect();
         free_stack.sort();
+
+        let mut inverted_dependencies: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();
+        for (after, befores) in topo.after_constraints.iter() {
+            for before in befores.iter() {
+                inverted_dependencies
+                    .entry(*before)
+                    .or_default()
+                    .insert(*after);
+            }
+        }
+
         Self {
             topo,
+            inverted_dependencies,
             used,
             free_stack,
         }
@@ -78,22 +91,16 @@ impl<'a> Iterator for TopoIter<'a> {
         if let Some(n) = self.free_stack.pop() {
             self.used.insert(n);
 
-            let mut newly_free = Vec::new();
-            for (after, befores) in self.topo.after_constraints.iter() {
-                if self.free_stack.contains(&after) {
-                    continue;
+            if let Some(afters) = self.inverted_dependencies.get(&n) {
+                let mut newly_free = Vec::new();
+                for after in afters.iter() {
+                    if self.topo.after_constraints[after].is_subset(&self.used) {
+                        newly_free.push(*after);
+                    }
                 }
-                if self.used.contains(&after) {
-                    continue;
-                }
-                if befores.is_subset(&self.used) {
-                    newly_free.push(after);
-                }
+                newly_free.sort();
+                self.free_stack.extend(newly_free);
             }
-
-            newly_free.sort();
-
-            self.free_stack.extend(newly_free);
 
             Some(n)
         } else {
