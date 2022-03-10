@@ -92,14 +92,12 @@ impl<'a> Iterator for TopoIter<'a> {
             self.used.insert(n);
 
             if let Some(afters) = self.inverted_dependencies.get(&n) {
-                let mut newly_free = Vec::new();
                 for after in afters.iter() {
                     if self.topo.after_constraints[after].is_subset(&self.used) {
-                        newly_free.push(*after);
+                        // its safe to push directly onto the free-stack since the afters are stored sorted (in a BTreeSet)
+                        self.free_stack.push(*after);
                     }
                 }
-                newly_free.sort();
-                self.free_stack.extend(newly_free);
             }
 
             Some(n)
