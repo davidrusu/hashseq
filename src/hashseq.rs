@@ -457,6 +457,49 @@ mod test {
         assert_eq!(seq, HashSeq::default());
     }
 
+    #[test]
+    fn test_cycle_resolution() {
+        let mut seq = HashSeq::default();
+        let a = Insert {
+            roots: Default::default(),
+            lefts: Default::default(),
+            rights: Default::default(),
+            value: 'a',
+        };
+
+        let b = Insert {
+            roots: Default::default(),
+            lefts: Default::default(),
+            rights: Default::default(),
+            value: 'b',
+        };
+
+        seq.apply(Op::Insert(a.clone())).unwrap();
+        seq.apply(Op::Insert(b.clone())).unwrap();
+
+        let a_c_b = Insert {
+            roots: BTreeSet::from_iter([a.hash(), b.hash()]),
+            lefts: BTreeSet::from_iter([a.hash()]),
+            rights: BTreeSet::from_iter([b.hash()]),
+            value: 'c',
+        };
+
+        let b_d_a = Insert {
+            roots: BTreeSet::from_iter([a.hash(), b.hash()]),
+            lefts: BTreeSet::from_iter([b.hash()]),
+            rights: BTreeSet::from_iter([a.hash()]),
+            value: 'd',
+        };
+
+        seq.apply(Op::Insert(a_c_b)).unwrap();
+
+        assert_eq!(&String::from_iter(seq.iter()), "acb");
+
+        seq.apply(Op::Insert(b_d_a)).unwrap();
+
+        assert_eq!(&String::from_iter(seq.iter()), "abcd");
+    }
+
     #[quickcheck]
     fn prop_vec_model(instructions: Vec<(bool, u8, char)>) {
         let mut model = Vec::new();

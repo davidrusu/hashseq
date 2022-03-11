@@ -50,7 +50,7 @@ impl TopoSort {
 
 pub struct TopoIter<'a> {
     topo: &'a TopoSort,
-    inverted_dependencies: BTreeMap<Id, BTreeSet<Id>>,
+    before_constraints: BTreeMap<Id, BTreeSet<Id>>,
     used: BTreeSet<Id>,
     free_stack: Vec<Id>,
 }
@@ -61,10 +61,10 @@ impl<'a> TopoIter<'a> {
         let mut free_stack: Vec<Id> = topo.free_variables().collect();
         free_stack.sort();
 
-        let mut inverted_dependencies: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();
+        let mut before_constraints: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();
         for (after, befores) in topo.after_constraints.iter() {
             for before in befores.iter() {
-                inverted_dependencies
+                before_constraints
                     .entry(*before)
                     .or_default()
                     .insert(*after);
@@ -73,7 +73,7 @@ impl<'a> TopoIter<'a> {
 
         Self {
             topo,
-            inverted_dependencies,
+            before_constraints,
             used,
             free_stack,
         }
@@ -91,7 +91,7 @@ impl<'a> Iterator for TopoIter<'a> {
         if let Some(n) = self.free_stack.pop() {
             self.used.insert(n);
 
-            if let Some(afters) = self.inverted_dependencies.get(&n) {
+            if let Some(afters) = self.before_constraints.get(&n) {
                 for after in afters.iter() {
                     if self.topo.after_constraints[after].is_subset(&self.used) {
                         // its safe to push directly onto the free-stack since the afters are stored sorted (in a BTreeSet)
