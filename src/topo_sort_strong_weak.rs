@@ -69,7 +69,49 @@ impl Topo {
         assert!(!self.edges.after.contains_key(&elem));
 
         match (left, right) {
-            (None, None) => self.edges.end(elem),
+            (None, None) => {
+                if let Some(id) = self.edges.first() {
+                    if id < elem {
+                        let mut current_left = id;
+                        loop {
+                            match self.edges.after(&current_left).unwrap() {
+                                Link::End => {
+                                    self.edges.weak(current_left, elem);
+                                    self.edges.end(elem);
+                                    break;
+                                }
+                                Link::Strong(strong) => {
+                                    self.edges.fork(current_left, strong, elem);
+                                    self.edges.end(elem);
+                                    break;
+                                }
+                                Link::Weak(weak) => {
+                                    if weak < elem {
+                                        current_left = weak;
+                                    } else {
+                                        self.edges.weak(current_left, elem);
+                                        self.edges.weak(elem, weak);
+                                        break;
+                                    }
+                                }
+                                Link::Fork { strong, weak } => {
+                                    if elem < weak {
+                                        self.edges.fork(current_left, strong, elem);
+                                        self.edges.weak(elem, weak);
+                                        break;
+                                    } else {
+                                        current_left = weak;
+                                    }
+                                }
+                            };
+                        }
+                    } else {
+                        self.edges.weak(elem, id);
+                    }
+                } else {
+                    self.edges.end(elem);
+                }
+            }
             (None, Some(right)) => {
                 let mut current_right = right;
                 loop {
@@ -217,7 +259,6 @@ impl<'a> Iterator for TopoIter<'a> {
     type Item = Id;
 
     fn next(&mut self) -> Option<Self::Item> {
-        dbg!(&self);
         if let Some(next) = self.boundary.pop() {
             let mut to_add_to_boundary = Vec::new();
             for link in self.topo.edges.after(&next) {
@@ -565,5 +606,31 @@ mod tests {
         assert_eq!(topo.edges.after(&3), Some(Link::Strong(1)));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3, 1]);
+    }
+
+    #[test]
+    fn test_concurrent_inserts() {
+        let mut topo = Topo::default();
+        topo.add(None, 0, None);
+        topo.add(None, 1, None);
+
+        assert_eq!(topo.edges.after(&0), Some(Link::Weak(1)));
+
+        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_concurrent_inserts_with_run() {
+        let mut topo = Topo::default();
+        topo.add(None, 0, None);
+        topo.add(Some(0), 1, None);
+        topo.add(None, 2, None);
+
+        assert_eq!(
+            topo.edges.after(&0),
+            Some(Link::Fork { strong: 1, weak: 2 })
+        );
+
+        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
     }
 }

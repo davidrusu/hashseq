@@ -1,14 +1,15 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::topo_sort::{TopoIter, TopoSort};
+// use crate::topo_sort::{TopoIter, TopoSort};
+use crate::topo_sort_strong_weak::{Topo, TopoIter};
 use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Insert {
     roots: BTreeSet<Id>,
-    lefts: BTreeSet<Id>,
-    rights: BTreeSet<Id>,
+    left: Option<Id>,
+    right: Option<Id>,
     value: char,
 }
 
@@ -29,8 +30,8 @@ impl Insert {
         use std::hash::Hash;
         use std::hash::Hasher;
         let mut hasher = DefaultHasher::new();
-        self.lefts.hash(&mut hasher);
-        self.rights.hash(&mut hasher);
+        self.left.hash(&mut hasher);
+        self.right.hash(&mut hasher);
         self.roots.hash(&mut hasher);
         self.value.hash(&mut hasher);
         hasher.finish()
@@ -50,9 +51,10 @@ impl Remove {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HashSeq {
-    topo: TopoSort,
+    topo: Topo,
     inserts: BTreeMap<Id, Insert>,
     removed: BTreeMap<Id, Remove>,
+    removed_inserts: BTreeSet<Id>,
     roots: BTreeSet<Id>,
     orphaned: HashSet<Op>,
 }
@@ -67,25 +69,26 @@ impl HashSeq {
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {
-        let mut order: TopoIter<'_> = self.topo.iter();
+        let mut order = self
+            .topo
+            .iter()
+            .filter(|id| !self.removed_inserts.contains(id));
 
-        let lefts = if let Some(prev_idx) = idx.checked_sub(1) {
+        let left = if let Some(prev_idx) = idx.checked_sub(1) {
             for _ in 0..prev_idx {
                 order.next();
             }
-            let lefts = BTreeSet::from_iter(order.next_candidates());
-            order.next();
-            lefts
+            order.next()
         } else {
-            BTreeSet::default()
+            None
         };
 
-        let rights = BTreeSet::from_iter(order.next_candidates());
+        let right = order.next();
 
         let insert = Insert {
             value,
-            lefts,
-            rights,
+            left,
+            right,
             roots: self.roots.clone(),
         };
         self.apply(Op::Insert(insert))
@@ -99,7 +102,10 @@ impl HashSeq {
     }
 
     pub fn remove(&mut self, idx: usize) {
-        let mut order: TopoIter<'_> = self.topo.iter();
+        let mut order = self
+            .topo
+            .iter()
+            .filter(|id| !self.removed_inserts.contains(id));
 
         for _ in 0..idx {
             order.next();
@@ -132,38 +138,25 @@ impl HashSeq {
 
     fn is_faulty_insert(&self, insert: &Insert) -> bool {
         // Ensure there is no overlap between inserts on the left and inserts on the right
-        let mut left_boundary = insert.lefts.clone();
-        let mut right_boundary = insert.rights.clone();
-        let mut inserts_on_left = BTreeSet::new();
-        let mut inserts_on_right = BTreeSet::new();
-        while !left_boundary.is_empty() || !right_boundary.is_empty() {
-            for l in std::mem::take(&mut left_boundary) {
-                if let Some(l_insert) = self.inserts.get(&l) {
-                    left_boundary.extend(l_insert.lefts.clone());
-                    inserts_on_left.insert(l);
-                } else {
-                    return true; // refers to a insert that we have not seen.
+        match (&insert.left, &insert.right) {
+            (Some(l), Some(r)) => {
+                let mut l_idx = None;
+                let mut r_idx = None;
+                for (idx, id) in self.topo.iter().enumerate() {
+                    if *l == id {
+                        l_idx = Some(idx);
+                    }
+                    if *r == id {
+                        r_idx = Some(idx);
+                    }
                 }
-            }
-            for r in std::mem::take(&mut right_boundary) {
-                if let Some(r_insert) = self.inserts.get(&r) {
-                    right_boundary.extend(r_insert.rights.clone());
-                    inserts_on_right.insert(r);
-                } else {
-                    return true; // refers to a left that we have not seen.
-                }
-            }
-        }
 
-        // TODO: if we're careful, we can move this into the above loop for an early out.
-        if inserts_on_left
-            .intersection(&inserts_on_right)
-            .next()
-            .is_some()
-        {
-            true // left/right constraints are refer to overlapping sets
-        } else {
-            false
+                match (l_idx, r_idx) {
+                    (Some(l_idx), Some(r_idx)) => l_idx > r_idx,
+                    _ => true,
+                }
+            }
+            _ => false,
         }
     }
 
@@ -190,13 +183,7 @@ impl HashSeq {
                     return Err(Op::Insert(insert));
                 }
 
-                self.topo.insert(id);
-                for l in insert.lefts.iter() {
-                    self.topo.add_constraint(*l, id);
-                }
-                for r in insert.rights.iter() {
-                    self.topo.add_constraint(id, *r);
-                }
+                self.topo.add(insert.left, id, insert.right);
 
                 let superseded_roots = BTreeSet::from_iter(
                     self.roots
@@ -222,8 +209,6 @@ impl HashSeq {
                     return Err(Op::Remove(remove));
                 }
 
-                self.topo.remove_and_propagate_constraints(remove.insert);
-
                 let superseded_roots = BTreeSet::from_iter(
                     self.roots
                         .iter()
@@ -235,6 +220,7 @@ impl HashSeq {
                     self.roots.remove(&r);
                 }
 
+                self.removed_inserts.insert(remove.insert);
                 self.removed.insert(id, remove);
                 self.roots.insert(id);
             }
@@ -261,7 +247,7 @@ impl HashSeq {
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
         self.topo.iter().filter_map(|id| {
-            if self.removed.contains_key(&id) {
+            if self.removed_inserts.contains(&id) {
                 None
             } else {
                 self.inserts.get(&id).map(|l| l.value)
@@ -296,12 +282,12 @@ mod test {
         let mut seq_a = HashSeq::default();
         let mut seq_b = HashSeq::default();
 
-        seq_a.insert_batch(0, "we wrote".chars());
-        seq_b.insert_batch(0, "this together, ".chars());
+        seq_a.insert_batch(0, "we wrote ".chars());
+        seq_b.insert_batch(0, "this together".chars());
 
         seq_a.merge(seq_b).expect("Faulty merge");
 
-        assert_eq!(&seq_a.iter().collect::<String>(), "this together, we wrote");
+        assert_eq!(&seq_a.iter().collect::<String>(), "we wrote this together");
     }
 
     #[test]
@@ -316,7 +302,7 @@ mod test {
 
         assert_eq!(
             &seq_a.iter().collect::<String>(),
-            "hello my name is zameenadavid"
+            "hello my name is davidzameena"
         );
     }
 
@@ -332,7 +318,7 @@ mod test {
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
         seq_a.merge(seq_b).expect("Faulty merge");
-        assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
+        assert_eq!(&seq_a.iter().collect::<String>(), "abaza");
     }
 
     #[test]
@@ -392,8 +378,8 @@ mod test {
         assert!(seq
             .apply(Op::Insert(Insert {
                 value: 'a',
-                lefts: BTreeSet::from_iter([0]),
-                rights: BTreeSet::default(),
+                left: Some(0),
+                right: None,
                 roots: BTreeSet::default(),
             }))
             .is_err());
@@ -403,8 +389,8 @@ mod test {
         assert!(seq
             .apply(Op::Insert(Insert {
                 value: 'a',
-                lefts: BTreeSet::default(),
-                rights: BTreeSet::from_iter([0]),
+                left: None,
+                right: Some(0),
                 roots: BTreeSet::default(),
             }))
             .is_err());
@@ -428,8 +414,8 @@ mod test {
         assert!(seq
             .apply(Op::Insert(Insert {
                 value: 'a',
-                lefts: BTreeSet::from_iter([b_id]),
-                rights: BTreeSet::from_iter([a_id]),
+                left: Some(b_id),
+                right: Some(a_id),
                 roots: BTreeSet::default(),
             }))
             .is_err());
@@ -462,15 +448,15 @@ mod test {
         let mut seq = HashSeq::default();
         let a = Insert {
             roots: Default::default(),
-            lefts: Default::default(),
-            rights: Default::default(),
+            left: None,
+            right: None,
             value: 'a',
         };
 
         let b = Insert {
             roots: Default::default(),
-            lefts: Default::default(),
-            rights: Default::default(),
+            left: None,
+            right: None,
             value: 'b',
         };
 
@@ -479,15 +465,15 @@ mod test {
 
         let a_c_b = Insert {
             roots: BTreeSet::from_iter([a.hash(), b.hash()]),
-            lefts: BTreeSet::from_iter([a.hash()]),
-            rights: BTreeSet::from_iter([b.hash()]),
+            left: Some(a.hash()),
+            right: Some(b.hash()),
             value: 'c',
         };
 
         let b_d_a = Insert {
             roots: BTreeSet::from_iter([a.hash(), b.hash()]),
-            lefts: BTreeSet::from_iter([b.hash()]),
-            rights: BTreeSet::from_iter([a.hash()]),
+            left: Some(b.hash()),
+            right: Some(a.hash()),
             value: 'd',
         };
 
