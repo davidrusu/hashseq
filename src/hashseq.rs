@@ -87,6 +87,10 @@ impl HashSeq {
         self.len() == 0
     }
 
+    pub fn orphans(&self) -> &HashSet<Op> {
+        &self.orphaned
+    }
+
     pub fn insert(&mut self, idx: usize, value: char) {
         let mut order = self
             .tree
@@ -177,17 +181,15 @@ impl HashSeq {
                     }
                 }
 
+                println!("{l_idx:?} < {r_idx:?}");
+
                 match (l_idx, r_idx) {
-                    (Some(l_idx), Some(r_idx)) => l_idx > r_idx,
+                    (Some(l_idx), Some(r_idx)) => l_idx >= r_idx,
                     _ => true,
                 }
             }
             _ => false,
         }
-    }
-
-    fn is_faulty_remove(&self, remove: &Remove) -> bool {
-        !self.inserts.contains_key(&remove.insert)
     }
 
     pub fn apply(&mut self, op: Op) -> Result<(), Op> {
@@ -229,10 +231,6 @@ impl HashSeq {
                 let id = remove.hash();
                 if self.removed.contains_key(&id) {
                     return Ok(());
-                }
-
-                if self.is_faulty_remove(&remove) {
-                    return Err(Op::Remove(remove));
                 }
 
                 let superseded_roots = Vec::from_iter(
@@ -354,8 +352,6 @@ mod test {
         seq.insert(0, 'a');
         seq.insert(0, 'b');
 
-        dbg!(&seq);
-
         assert_eq!(&String::from_iter(seq.iter()), "ba");
     }
 
@@ -365,8 +361,6 @@ mod test {
 
         seq.insert(0, 'a');
         seq.insert(0, 'a');
-
-        dbg!(&seq);
 
         assert_eq!(&String::from_iter(seq.iter()), "aa");
     }
@@ -378,8 +372,6 @@ mod test {
         seq.insert(0, 'a');
         seq.remove(0);
         seq.insert(0, 'a');
-
-        dbg!(&seq);
 
         assert_eq!(&String::from_iter(seq.iter()), "a");
     }
@@ -453,34 +445,45 @@ mod test {
     }
 
     #[test]
-    fn test_faulty_remove() {
+    fn test_out_of_order_remove_is_cached() {
         let mut seq = HashSeq::default();
 
-        // Attempting to remove insert with id 0, with the empty DAG roots.
-        // This is faulty since the empty DAG roots should not have seen
-        // any inserts, let alone a insert with id 0.
+        // Attempting to remove insert that doesn't yet exist.
+        // We expect the remove operation to be cached and applied
+        // once we see the insert.
+
+        let insert = Insert {
+            left: None,
+            value: 'a',
+            right: None,
+            extra_dependencies: BTreeSet::new(),
+        };
+
         assert!(seq
             .apply(Op::Remove(Remove {
-                insert: 0,
-                roots: BTreeSet::new()
+                insert: insert.hash(),
+                extra_dependencies: BTreeSet::new()
             }))
-            .is_err());
+            .is_ok());
 
-        assert_eq!(seq, HashSeq::default());
+        assert_eq!(seq.orphans().len(), 1);
+        assert!(seq.apply(Op::Insert(insert)).is_ok());
+        assert_eq!(seq.orphans().len(), 0);
+        assert_eq!(&String::from_iter(seq.iter()), "");
     }
 
     #[test]
     fn test_cycle_resolution() {
         let mut seq = HashSeq::default();
         let a = Insert {
-            roots: Default::default(),
+            extra_dependencies: Default::default(),
             left: None,
             right: None,
             value: 'a',
         };
 
         let b = Insert {
-            roots: Default::default(),
+            extra_dependencies: Default::default(),
             left: None,
             right: None,
             value: 'b',
@@ -490,14 +493,14 @@ mod test {
         seq.apply(Op::Insert(b.clone())).unwrap();
 
         let a_c_b = Insert {
-            roots: BTreeSet::from_iter([a.hash(), b.hash()]),
+            extra_dependencies: BTreeSet::from_iter([a.hash(), b.hash()]),
             left: Some(a.hash()),
             right: Some(b.hash()),
             value: 'c',
         };
 
         let b_d_a = Insert {
-            roots: BTreeSet::from_iter([a.hash(), b.hash()]),
+            extra_dependencies: BTreeSet::from_iter([a.hash(), b.hash()]),
             left: Some(b.hash()),
             right: Some(a.hash()),
             value: 'd',
@@ -507,9 +510,10 @@ mod test {
 
         assert_eq!(&String::from_iter(seq.iter()), "acb");
 
-        seq.apply(Op::Insert(b_d_a)).unwrap();
+        let b_d_a_insert = Op::Insert(b_d_a);
+        assert_eq!(seq.apply(b_d_a_insert.clone()), Err(b_d_a_insert));
 
-        assert_eq!(&String::from_iter(seq.iter()), "abcd");
+        assert_eq!(&String::from_iter(seq.iter()), "acb");
     }
 
     #[quickcheck]
