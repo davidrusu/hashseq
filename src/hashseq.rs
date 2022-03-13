@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 // use crate::topo_sort::{TopoIter, TopoSort};
-use crate::topo_sort_strong_weak::{Tree, TreeIter};
+use crate::topo_sort_strong_weak::Tree;
 use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -128,7 +128,7 @@ impl HashSeq {
         let mut missing_deps = BTreeSet::new();
 
         for dep in dependencies.iter() {
-            if !self.inserts.contains_key(&dep) && !self.removed.contains_key(&dep) {
+            if !self.inserts.contains_key(dep) && !self.removed.contains_key(dep) {
                 missing_deps.insert(*dep);
             }
         }
