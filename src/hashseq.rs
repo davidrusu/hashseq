@@ -390,30 +390,46 @@ mod test {
     }
 
     #[test]
-    fn test_faulty_if_insert_refers_to_non_existant_inserts() {
+    fn test_inserts_refering_to_out_of_order_inserts_are_cached() {
         let mut seq = HashSeq::default();
+
+        let insert = Insert {
+            value: 'b',
+            left: None,
+            right: None,
+            extra_dependencies: BTreeSet::default(),
+        };
 
         assert!(seq
             .apply(Op::Insert(Insert {
                 value: 'a',
-                left: Some(0),
+                left: Some(insert.hash()),
                 right: None,
                 extra_dependencies: BTreeSet::default(),
             }))
-            .is_err());
+            .is_ok());
 
-        assert_eq!(seq, HashSeq::default());
+        assert_eq!(seq.orphans().len(), 1);
+        assert_eq!(seq.len(), 0);
 
         assert!(seq
             .apply(Op::Insert(Insert {
                 value: 'a',
                 left: None,
-                right: Some(0),
+                right: Some(insert.hash()),
                 extra_dependencies: BTreeSet::default(),
             }))
-            .is_err());
+            .is_ok());
 
-        assert_eq!(seq, HashSeq::default());
+        assert_eq!(seq.orphans().len(), 2);
+        assert_eq!(seq.len(), 0);
+
+        assert!(seq.apply(Op::Insert(insert)).is_ok());
+
+        assert_eq!(seq.orphans().len(), 0);
+        assert_eq!(seq.len(), 3);
+
+        assert_eq!(&String::from_iter(seq.iter()), "aba");
     }
 
     #[test]
