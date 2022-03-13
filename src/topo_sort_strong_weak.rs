@@ -60,33 +60,26 @@ impl Tree {
     pub fn children(&self, v: &Id) -> Option<Link> {
         self.children.get(v).copied()
     }
-}
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Topo {
-    tree: Tree,
-}
-
-impl Topo {
     pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
         // println!("add {left:?} {node} {right:?}");
-        assert!(self.tree.children(&node).is_none()); // we are currently not idempotent
+        assert!(self.children(&node).is_none()); // we are currently not idempotent
 
         match (left, right) {
             (None, None) => {
-                if let Some(root) = self.tree.root() {
+                if let Some(root) = self.root() {
                     if root < node {
                         let mut parent = root;
                         loop {
-                            match self.tree.children(&parent).unwrap() {
+                            match self.children(&parent).unwrap() {
                                 Link::Leaf => {
-                                    self.tree.weak(parent, node);
-                                    self.tree.leaf(node);
+                                    self.weak(parent, node);
+                                    self.leaf(node);
                                     break;
                                 }
                                 Link::Strong(strong) => {
-                                    self.tree.fork(parent, strong, node);
-                                    self.tree.leaf(node);
+                                    self.fork(parent, strong, node);
+                                    self.leaf(node);
                                     break;
                                 }
                                 Link::Weak(weak) => {
@@ -94,8 +87,8 @@ impl Topo {
                                     if weak < node {
                                         parent = weak;
                                     } else {
-                                        self.tree.weak(parent, node);
-                                        self.tree.weak(node, weak);
+                                        self.weak(parent, node);
+                                        self.weak(node, weak);
                                         break;
                                     }
                                 }
@@ -103,31 +96,31 @@ impl Topo {
                                     if weak < node {
                                         parent = weak;
                                     } else {
-                                        self.tree.fork(parent, strong, node);
-                                        self.tree.weak(node, weak);
+                                        self.fork(parent, strong, node);
+                                        self.weak(node, weak);
                                         break;
                                     }
                                 }
                             };
                         }
                     } else {
-                        self.tree.weak(node, root);
+                        self.weak(node, root);
                     }
                 } else {
-                    self.tree.leaf(node);
+                    self.leaf(node);
                 }
             }
             (None, Some(right)) => {
                 let mut child = right;
 
                 loop {
-                    match self.tree.parent(&child) {
+                    match self.parent(&child) {
                         Some(parent) => {
                             assert_ne!(parent, node);
                             if node < parent {
                                 child = parent
                             } else {
-                                self.tree.weak(parent, node);
+                                self.weak(parent, node);
                                 break;
                             }
                         }
@@ -138,45 +131,45 @@ impl Topo {
                 }
 
                 if child == right {
-                    self.tree.strong(node, child);
+                    self.strong(node, child);
                 } else {
-                    self.tree.weak(node, child);
+                    self.weak(node, child);
                 }
             }
-            (Some(left), None) => match self.tree.children(&left).unwrap() {
+            (Some(left), None) => match self.children(&left).unwrap() {
                 // we can remove this children().unwrap() by treating None as
                 Link::Leaf => {
-                    self.tree.strong(left, node);
-                    self.tree.leaf(node);
+                    self.strong(left, node);
+                    self.leaf(node);
                 }
                 Link::Strong(next) => {
                     assert_ne!(next, node);
                     if node < next {
-                        self.tree.fork(left, node, next);
-                        self.tree.leaf(node); // and we could remove all these leaf inserts
+                        self.fork(left, node, next);
+                        self.leaf(node); // and we could remove all these leaf inserts
                     } else {
-                        self.tree.fork(left, next, node);
-                        self.tree.leaf(node);
+                        self.fork(left, next, node);
+                        self.leaf(node);
                     }
                 }
                 Link::Weak(next) => {
                     assert_ne!(next, node);
-                    self.tree.fork(left, node, next);
-                    self.tree.leaf(node);
+                    self.fork(left, node, next);
+                    self.leaf(node);
                 }
                 Link::Fork { strong, weak } => {
                     assert_ne!(strong, node);
                     assert_ne!(weak, node);
                     if node < strong {
-                        self.tree.fork(left, node, strong);
-                        self.tree.weak(strong, weak);
-                        self.tree.leaf(node);
+                        self.fork(left, node, strong);
+                        self.weak(strong, weak);
+                        self.leaf(node);
                     } else if node < weak {
-                        self.tree.fork(left, strong, node);
-                        self.tree.weak(node, weak);
+                        self.fork(left, strong, node);
+                        self.weak(node, weak);
                     } else {
-                        self.tree.weak(weak, node);
-                        self.tree.leaf(node);
+                        self.weak(weak, node);
+                        self.leaf(node);
                     }
                 }
             },
@@ -186,45 +179,56 @@ impl Topo {
                     assert_ne!(child, node);
                     assert_ne!(child, left);
 
-                    let parent = self.tree.parent(&child).unwrap();
+                    let parent = self.parent(&child).unwrap();
                     if parent == left || parent < node {
                         break;
                     }
                     child = parent
                 }
 
-                let child_parent = self.tree.parent(&child).unwrap();
+                let child_parent = self.parent(&child).unwrap();
 
-                match self.tree.children(&child_parent).unwrap() {
+                match self.children(&child_parent).unwrap() {
                     Link::Leaf => panic!("left does not have a link"),
                     Link::Strong(id) => {
                         assert_eq!(id, child);
                         if child_parent == left {
-                            self.tree.strong(child_parent, node);
+                            self.strong(child_parent, node);
                         } else {
-                            self.tree.weak(child_parent, node);
+                            self.weak(child_parent, node);
                         }
                     }
                     Link::Weak(id) => {
                         assert_eq!(id, child);
-                        self.tree.strong(child_parent, node);
+                        self.strong(child_parent, node);
                     }
                     Link::Fork { strong, weak } => {
                         if weak == child {
-                            self.tree.fork(child_parent, strong, node);
+                            self.fork(child_parent, strong, node);
                         } else {
                             assert_eq!(strong, child);
-                            self.tree.fork(child_parent, node, weak);
+                            self.fork(child_parent, node, weak);
                         }
                     }
                 }
                 if child == right {
-                    self.tree.strong(node, child);
+                    self.strong(node, child);
                 } else {
-                    self.tree.weak(node, child);
+                    self.weak(node, child);
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Topo {
+    tree: Tree,
+}
+
+impl Topo {
+    pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
+        self.tree.add(left, node, right);
     }
 
     pub fn iter(&self) -> TopoIter<'_> {
