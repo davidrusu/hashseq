@@ -181,8 +181,6 @@ impl HashSeq {
                     }
                 }
 
-                println!("{l_idx:?} < {r_idx:?}");
-
                 match (l_idx, r_idx) {
                     (Some(l_idx), Some(r_idx)) => l_idx >= r_idx,
                     _ => true,
