@@ -59,50 +59,56 @@ impl Tree {
     }
 
     pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
-        // println!("add {left:?} {node} {right:?}");
+        println!("add {left:?} {node} {right:?}");
         assert!(self.children(&node).is_none()); // we are currently not idempotent
 
         match (left, right) {
             (None, None) => {
-                if let Some(root) = self.root() {
-                    if root < node {
-                        let mut parent = root;
-                        loop {
-                            match self.children(&parent).unwrap() {
-                                Link::Leaf => {
+                if let Some(root) = dbg!(self.root()) {
+                    // if dbg!(root < node) {
+                    let mut parent = root;
+                    loop {
+                        dbg!(&parent);
+                        match dbg!(self.children(&parent).unwrap()) {
+                            Link::Leaf => {
+                                if parent < node {
                                     self.weak(parent, node);
                                     self.leaf(node);
+                                } else {
+                                    self.weak(node, parent);
+                                }
+                                break;
+                            }
+                            Link::Strong(strong) => {
+                                parent = strong;
+                                // self.fork(parent, strong, node);
+                                // self.leaf(node);
+                                // break;
+                            }
+                            Link::Weak(weak) => {
+                                assert_ne!(weak, node);
+                                if weak < node {
+                                    parent = weak;
+                                } else {
+                                    self.weak(parent, node);
+                                    self.weak(node, weak);
                                     break;
                                 }
-                                Link::Strong(strong) => {
+                            }
+                            Link::Fork { strong, weak } => {
+                                if weak < node {
+                                    parent = weak;
+                                } else {
                                     self.fork(parent, strong, node);
-                                    self.leaf(node);
+                                    self.weak(node, weak);
                                     break;
                                 }
-                                Link::Weak(weak) => {
-                                    assert_ne!(weak, node);
-                                    if weak < node {
-                                        parent = weak;
-                                    } else {
-                                        self.weak(parent, node);
-                                        self.weak(node, weak);
-                                        break;
-                                    }
-                                }
-                                Link::Fork { strong, weak } => {
-                                    if weak < node {
-                                        parent = weak;
-                                    } else {
-                                        self.fork(parent, strong, node);
-                                        self.weak(node, weak);
-                                        break;
-                                    }
-                                }
-                            };
-                        }
-                    } else {
-                        self.weak(node, root);
+                            }
+                        };
                     }
+                    // } else {
+                    //     self.weak(node, root);
+                    // }
                 } else {
                     self.leaf(node);
                 }
@@ -112,6 +118,14 @@ impl Tree {
 
                 while let Some(parent) = self.parent(&child) {
                     assert_ne!(parent, node);
+                    match self.children(&parent).unwrap() {
+                        Link::Leaf => panic!("unexpected leaf parent"),
+                        Link::Strong(strong) => {
+                            assert_eq!(strong, child);
+                        }
+                        Link::Weak(_) => todo!(),
+                        Link::Fork { strong, weak } => todo!(),
+                    }
                     if node < parent {
                         child = parent
                     } else {
@@ -579,6 +593,13 @@ mod tests {
         assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
 
         assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2]);
+
+        let mut tree_different_order = Tree::default();
+        tree_different_order.add(None, 2, None);
+        tree_different_order.add(None, 0, None);
+        tree_different_order.add(Some(0), 1, None);
+
+        assert_eq!(tree, tree_different_order);
     }
 
     #[test]
@@ -600,6 +621,48 @@ mod tests {
 
         tree.add(Some(0), 3, Some(2));
         assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 3, 2]);
+    }
+
+    #[test]
+    fn test_new_root_after_a_strong_link() {
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(None, 2, Some(0));
+        dbg!(&tree);
+        tree.add(None, 1, None);
+
+        dbg!(&tree);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![2, 0, 1]);
+
+        assert_eq!(tree.children(&2), Some(Link::Strong(0)));
+        assert_eq!(tree.children(&1), Some(Link::Leaf));
+        assert_eq!(tree.children(&0), Some(Link::Weak(1)));
+
+        let mut tree_different_order = Tree::default();
+        tree_different_order.add(None, 1, None);
+        tree_different_order.add(None, 0, None);
+        tree_different_order.add(None, 2, Some(0));
+
+        assert_eq!(tree, tree_different_order);
+    }
+
+    #[test]
+    fn test_concurrent_prepend_and_append_seperated_by_a_node() {
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(None, 2, Some(1));
+        tree.add(Some(0), 3, None);
+
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 2, 1, 3]);
+
+        let mut tree_reverse_order = Tree::default();
+        tree_reverse_order.add(None, 0, None);
+        tree_reverse_order.add(Some(0), 3, None);
+        tree_reverse_order.add(Some(0), 1, None);
+        tree_reverse_order.add(None, 2, Some(1));
+
+        assert_eq!(tree, tree_reverse_order);
     }
 
     #[ignore]

@@ -1,8 +1,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-// use crate::topo_sort::{TopoIter, TopoSort};
-use crate::topo_sort_strong_weak::Tree;
+use crate::topo_sort::Topo;
+// use crate::topo_sort_strong_weak::Tree;
 use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -68,9 +68,9 @@ impl Remove {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct HashSeq {
-    tree: Tree,
+    topo: Topo,
     inserts: BTreeMap<Id, Insert>,
     removed: BTreeMap<Id, Remove>,
     removed_inserts: BTreeSet<Id>,
@@ -93,7 +93,7 @@ impl HashSeq {
 
     pub fn insert(&mut self, idx: usize, value: char) {
         let mut order = self
-            .tree
+            .topo
             .iter()
             .filter(|id| !self.removed_inserts.contains(id));
 
@@ -136,7 +136,7 @@ impl HashSeq {
 
     pub fn remove(&mut self, idx: usize) {
         let mut order = self
-            .tree
+            .topo
             .iter()
             .filter(|id| !self.removed_inserts.contains(id));
 
@@ -172,7 +172,7 @@ impl HashSeq {
             (Some(l), Some(r)) => {
                 let mut l_idx = None;
                 let mut r_idx = None;
-                for (idx, id) in self.tree.iter().enumerate() {
+                for (idx, id) in self.topo.iter().enumerate() {
                     if *l == id {
                         l_idx = Some(idx);
                     }
@@ -209,7 +209,7 @@ impl HashSeq {
                     return Err(Op::Insert(insert));
                 }
 
-                self.tree.add(insert.left, id, insert.right);
+                self.topo.add(insert.left, id, insert.right);
 
                 let superseded_roots = Vec::from_iter(
                     self.roots
@@ -268,7 +268,7 @@ impl HashSeq {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
-        self.tree.iter().filter_map(|id| {
+        self.topo.iter().filter_map(|id| {
             if self.removed_inserts.contains(&id) {
                 None
             } else {
@@ -304,12 +304,12 @@ mod test {
         let mut seq_a = HashSeq::default();
         let mut seq_b = HashSeq::default();
 
-        seq_a.insert_batch(0, "we wrote ".chars());
-        seq_b.insert_batch(0, "this together".chars());
+        seq_a.insert_batch(0, "we wrote".chars());
+        seq_b.insert_batch(0, "this together ".chars());
 
         seq_a.merge(seq_b).expect("Faulty merge");
 
-        assert_eq!(&seq_a.iter().collect::<String>(), "we wrote this together");
+        assert_eq!(&seq_a.iter().collect::<String>(), "this together we wrote");
     }
 
     #[test]
@@ -324,7 +324,7 @@ mod test {
 
         assert_eq!(
             &seq_a.iter().collect::<String>(),
-            "hello my name is davidzameena"
+            "hello my name is zameenadavid"
         );
     }
 
@@ -340,7 +340,7 @@ mod test {
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
         seq_a.merge(seq_b).expect("Faulty merge");
-        assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
+        assert_eq!(&seq_a.iter().collect::<String>(), "abaza");
     }
 
     #[test]
@@ -436,7 +436,7 @@ mod test {
 
         seq.insert_batch(0, "ab".chars());
 
-        let mut tree_iter = seq.tree.iter();
+        let mut tree_iter = seq.topo.iter();
 
         let a_id = tree_iter.next().unwrap();
         let b_id = tree_iter.next().unwrap();
@@ -505,6 +505,7 @@ mod test {
 
         seq.apply(Op::Insert(a.clone())).unwrap();
         seq.apply(Op::Insert(b.clone())).unwrap();
+        assert_eq!(&String::from_iter(seq.iter()), "ba");
 
         let a_c_b = Insert {
             extra_dependencies: BTreeSet::from_iter([a.hash(), b.hash()]),
@@ -520,14 +521,109 @@ mod test {
             value: 'd',
         };
 
-        seq.apply(Op::Insert(a_c_b)).unwrap();
+        seq.apply(Op::Insert(b_d_a)).unwrap();
 
-        assert_eq!(&String::from_iter(seq.iter()), "acb");
+        assert_eq!(&String::from_iter(seq.iter()), "bda");
 
-        let b_d_a_insert = Op::Insert(b_d_a);
-        assert_eq!(seq.apply(b_d_a_insert.clone()), Err(b_d_a_insert));
+        let a_c_b_insert = Op::Insert(a_c_b);
+        assert_eq!(seq.apply(a_c_b_insert.clone()), Err(a_c_b_insert));
 
-        assert_eq!(&String::from_iter(seq.iter()), "acb");
+        assert_eq!(&String::from_iter(seq.iter()), "bda");
+    }
+
+    #[test]
+    fn test_prop_associative_qc1() {
+        // ([(true, 0, '\u{0}'), (true, 0, '\u{0}')], [], [(true, 0, '\u{3}')])
+
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+
+        seq_a.insert(0, 'a');
+        seq_a.insert(0, 'a');
+
+        seq_b.insert(0, 'b');
+
+        let mut ab = seq_a.clone();
+        ab.merge(seq_b.clone()).unwrap();
+
+        let mut ba = seq_b.clone();
+        ba.merge(seq_a.clone()).unwrap();
+
+        dbg!(&ab);
+        dbg!(&ba);
+
+        assert_eq!(ab, ba);
+    }
+
+    #[quickcheck]
+    fn prop_associative(
+        a: Vec<(bool, u8, char)>,
+        b: Vec<(bool, u8, char)>,
+        c: Vec<(bool, u8, char)>,
+    ) {
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+        let mut seq_c = HashSeq::default();
+
+        for (insert_or_remove, idx, elem) in a {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    seq_a.insert(idx.min(seq_a.len()), elem);
+                }
+                false => {
+                    // remove
+                    if !seq_a.is_empty() {
+                        seq_a.remove(idx.min(seq_a.len() - 1));
+                    }
+                }
+            }
+        }
+
+        for (insert_or_remove, idx, elem) in b {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    seq_b.insert(idx.min(seq_b.len()), elem);
+                }
+                false => {
+                    // remove
+                    if !seq_b.is_empty() {
+                        seq_b.remove(idx.min(seq_b.len() - 1));
+                    }
+                }
+            }
+        }
+
+        for (insert_or_remove, idx, elem) in c {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    seq_c.insert(idx.min(seq_c.len()), elem);
+                }
+                false => {
+                    // remove
+                    if !seq_c.is_empty() {
+                        seq_c.remove(idx.min(seq_c.len() - 1));
+                    }
+                }
+            }
+        }
+
+        // merge(merge(a, b), c) == merge(a, merge(b, c))
+
+        let mut ab_then_c = seq_a.clone();
+        ab_then_c.merge(seq_b.clone()).unwrap();
+        ab_then_c.merge(seq_c.clone()).unwrap();
+
+        let mut bc_then_a = seq_b.clone();
+        bc_then_a.merge(seq_c.clone()).unwrap();
+        bc_then_a.merge(seq_a.clone()).unwrap();
+
+        assert_eq!(ab_then_c, bc_then_a);
     }
 
     #[quickcheck]
