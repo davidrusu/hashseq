@@ -7,121 +7,128 @@ use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Link {
-    End,
+    Leaf,
     Strong(Id),
     Weak(Id),
     Fork { strong: Id, weak: Id },
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
-pub struct BiMap {
-    after: BTreeMap<Id, Link>,
-    before: BTreeMap<Id, Id>,
+pub struct Tree {
+    children: BTreeMap<Id, Link>,
+    parent: BTreeMap<Id, Id>,
 }
 
-impl BiMap {
-    pub fn end(&mut self, v: Id) {
-        self.after.insert(v, Link::End);
+impl Tree {
+    pub fn leaf(&mut self, v: Id) {
+        self.children.insert(v, Link::Leaf);
     }
 
     pub fn strong(&mut self, v: Id, next: Id) {
-        self.after.insert(v, Link::Strong(next));
-        self.before.insert(next, v);
+        self.children.insert(v, Link::Strong(next));
+        self.parent.insert(next, v);
     }
 
     pub fn weak(&mut self, v: Id, next: Id) {
-        self.after.insert(v, Link::Weak(next));
-        self.before.insert(next, v);
+        self.children.insert(v, Link::Weak(next));
+        self.parent.insert(next, v);
     }
 
     pub fn fork(&mut self, v: Id, strong: Id, weak: Id) {
-        self.after.insert(v, Link::Fork { strong, weak });
-        self.before.insert(strong, v);
-        self.before.insert(weak, v);
+        self.children.insert(v, Link::Fork { strong, weak });
+        self.parent.insert(strong, v);
+        self.parent.insert(weak, v);
     }
 
-    pub fn first(&self) -> Option<Id> {
-        let mut firsts = self.after.keys().filter(|v| !self.before.contains_key(v));
-        let first = firsts.next().copied();
+    pub fn root(&self) -> Option<Id> {
+        let mut roots = self
+            .children
+            .keys()
+            .filter(|v| !self.parent.contains_key(v));
 
-        assert_eq!(firsts.next(), None); // there should be only one
+        let root = roots.next().copied();
 
-        first
+        assert_eq!(roots.next(), None); // there should be only one
+
+        root
     }
 
-    pub fn before(&self, v: &Id) -> Option<Id> {
-        self.before.get(v).copied()
+    pub fn parent(&self, v: &Id) -> Option<Id> {
+        self.parent.get(v).copied()
     }
 
-    pub fn after(&self, v: &Id) -> Option<Link> {
-        self.after.get(v).copied()
+    pub fn children(&self, v: &Id) -> Option<Link> {
+        self.children.get(v).copied()
     }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Topo {
-    edges: BiMap,
+    tree: Tree,
 }
 
 impl Topo {
-    pub fn add(&mut self, left: Option<Id>, elem: Id, right: Option<Id>) {
-        println!("add {left:?} {elem} {right:?}");
-        assert!(!self.edges.after.contains_key(&elem));
+    pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
+        // println!("add {left:?} {node} {right:?}");
+        assert!(self.tree.children(&node).is_none()); // we are currently not idempotent
 
         match (left, right) {
             (None, None) => {
-                if let Some(id) = self.edges.first() {
-                    if id < elem {
-                        let mut current_left = id;
+                if let Some(root) = self.tree.root() {
+                    if root < node {
+                        let mut parent = root;
                         loop {
-                            match self.edges.after(&current_left).unwrap() {
-                                Link::End => {
-                                    self.edges.weak(current_left, elem);
-                                    self.edges.end(elem);
+                            match self.tree.children(&parent).unwrap() {
+                                Link::Leaf => {
+                                    self.tree.weak(parent, node);
+                                    self.tree.leaf(node);
                                     break;
                                 }
                                 Link::Strong(strong) => {
-                                    self.edges.fork(current_left, strong, elem);
-                                    self.edges.end(elem);
+                                    self.tree.fork(parent, strong, node);
+                                    self.tree.leaf(node);
                                     break;
                                 }
                                 Link::Weak(weak) => {
-                                    if weak < elem {
-                                        current_left = weak;
+                                    assert_ne!(weak, node);
+                                    if weak < node {
+                                        parent = weak;
                                     } else {
-                                        self.edges.weak(current_left, elem);
-                                        self.edges.weak(elem, weak);
+                                        self.tree.weak(parent, node);
+                                        self.tree.weak(node, weak);
                                         break;
                                     }
                                 }
                                 Link::Fork { strong, weak } => {
-                                    if elem < weak {
-                                        self.edges.fork(current_left, strong, elem);
-                                        self.edges.weak(elem, weak);
-                                        break;
+                                    if weak < node {
+                                        parent = weak;
                                     } else {
-                                        current_left = weak;
+                                        self.tree.fork(parent, strong, node);
+                                        self.tree.weak(node, weak);
+                                        break;
                                     }
                                 }
                             };
                         }
                     } else {
-                        self.edges.weak(elem, id);
+                        self.tree.weak(node, root);
                     }
                 } else {
-                    self.edges.end(elem);
+                    self.tree.leaf(node);
                 }
             }
             (None, Some(right)) => {
-                let mut current_right = right;
+                let mut child = right;
+
                 loop {
-                    match self.edges.before(&current_right) {
-                        Some(before) => {
-                            if before < elem {
-                                self.edges.weak(before, elem);
+                    match self.tree.parent(&child) {
+                        Some(parent) => {
+                            assert_ne!(parent, node);
+                            if node < parent {
+                                child = parent
+                            } else {
+                                self.tree.weak(parent, node);
                                 break;
-                            } else if elem < before {
-                                current_right = before
                             }
                         }
                         None => {
@@ -130,103 +137,91 @@ impl Topo {
                     }
                 }
 
-                if current_right == right {
-                    self.edges.strong(elem, current_right);
+                if child == right {
+                    self.tree.strong(node, child);
                 } else {
-                    self.edges.weak(elem, current_right);
+                    self.tree.weak(node, child);
                 }
             }
-            (Some(left), None) => match self.edges.after(&left).unwrap() {
-                Link::End => {
-                    self.edges.strong(left, elem);
-                    self.edges.end(elem);
+            (Some(left), None) => match self.tree.children(&left).unwrap() {
+                // we can remove this children().unwrap() by treating None as
+                Link::Leaf => {
+                    self.tree.strong(left, node);
+                    self.tree.leaf(node);
                 }
-                Link::Strong(next) => match elem.cmp(&next) {
-                    Ordering::Less => {
-                        self.edges.fork(left, elem, next);
-                        self.edges.end(elem);
+                Link::Strong(next) => {
+                    assert_ne!(next, node);
+                    if node < next {
+                        self.tree.fork(left, node, next);
+                        self.tree.leaf(node); // and we could remove all these leaf inserts
+                    } else {
+                        self.tree.fork(left, next, node);
+                        self.tree.leaf(node);
                     }
-                    Ordering::Equal => panic!("ids are equal"),
-                    Ordering::Greater => {
-                        self.edges.fork(left, next, elem);
-                        self.edges.end(elem);
-                    }
-                },
+                }
                 Link::Weak(next) => {
-                    self.edges.fork(left, elem, next);
-                    self.edges.end(elem);
+                    assert_ne!(next, node);
+                    self.tree.fork(left, node, next);
+                    self.tree.leaf(node);
                 }
                 Link::Fork { strong, weak } => {
-                    if elem < strong {
-                        self.edges.fork(left, elem, strong);
-                        self.edges.weak(strong, weak);
-                        self.edges.end(elem);
-                    } else if elem > strong && elem < weak {
-                        self.edges.fork(left, strong, elem);
-                        self.edges.weak(elem, weak);
-                    } else if elem > weak {
-                        self.edges.weak(weak, elem);
-                        self.edges.end(elem);
+                    assert_ne!(strong, node);
+                    assert_ne!(weak, node);
+                    if node < strong {
+                        self.tree.fork(left, node, strong);
+                        self.tree.weak(strong, weak);
+                        self.tree.leaf(node);
+                    } else if node < weak {
+                        self.tree.fork(left, strong, node);
+                        self.tree.weak(node, weak);
                     } else {
-                        panic!("Unhandled case");
+                        self.tree.weak(weak, node);
+                        self.tree.leaf(node);
                     }
                 }
             },
             (Some(left), Some(right)) => {
-                let mut current_right = right;
+                let mut child = right;
                 loop {
-                    match self.edges.before(&current_right) {
-                        Some(before) => {
-                            if before == left || before < elem {
-                                break;
-                            } else if elem < before {
-                                current_right = before
-                            }
-                        }
-                        None => panic!("Unhandled case"),
+                    assert_ne!(child, node);
+                    assert_ne!(child, left);
+
+                    let parent = self.tree.parent(&child).unwrap();
+                    if parent == left || parent < node {
+                        break;
                     }
+                    child = parent
                 }
 
-                let before_right = self.edges.before(&current_right).unwrap();
+                let child_parent = self.tree.parent(&child).unwrap();
 
-                match self.edges.after(&before_right).unwrap() {
-                    Link::End => panic!("left does not have a link"),
+                match self.tree.children(&child_parent).unwrap() {
+                    Link::Leaf => panic!("left does not have a link"),
                     Link::Strong(id) => {
-                        assert_eq!(id, current_right);
-                        if before_right == left {
-                            self.edges.strong(before_right, elem);
+                        assert_eq!(id, child);
+                        if child_parent == left {
+                            self.tree.strong(child_parent, node);
                         } else {
-                            self.edges.weak(before_right, elem);
-                        }
-                        if current_right == right {
-                            self.edges.strong(elem, current_right);
-                        } else {
-                            self.edges.weak(elem, current_right);
+                            self.tree.weak(child_parent, node);
                         }
                     }
                     Link::Weak(id) => {
-                        assert_eq!(id, current_right);
-                        self.edges.strong(before_right, elem);
-                        if current_right == right {
-                            self.edges.strong(elem, current_right);
-                        } else {
-                            self.edges.weak(elem, current_right);
-                        }
+                        assert_eq!(id, child);
+                        self.tree.strong(child_parent, node);
                     }
                     Link::Fork { strong, weak } => {
-                        if weak == current_right {
-                            self.edges.fork(before_right, strong, elem);
+                        if weak == child {
+                            self.tree.fork(child_parent, strong, node);
                         } else {
-                            assert_eq!(strong, current_right);
-                            self.edges.fork(before_right, elem, weak);
-                        }
-
-                        if current_right == right {
-                            self.edges.strong(elem, current_right);
-                        } else {
-                            self.edges.weak(elem, current_right);
+                            assert_eq!(strong, child);
+                            self.tree.fork(child_parent, node, weak);
                         }
                     }
+                }
+                if child == right {
+                    self.tree.strong(node, child);
+                } else {
+                    self.tree.weak(node, child);
                 }
             }
         }
@@ -246,7 +241,7 @@ pub struct TopoIter<'a> {
 
 impl<'a> TopoIter<'a> {
     pub fn new(topo: &'a Topo) -> Self {
-        let mut boundary = Vec::from_iter(topo.edges.first());
+        let boundary = Vec::from_iter(topo.tree.root());
         Self {
             topo,
             boundary,
@@ -261,9 +256,9 @@ impl<'a> Iterator for TopoIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.boundary.pop() {
             let mut to_add_to_boundary = Vec::new();
-            for link in self.topo.edges.after(&next) {
+            for link in self.topo.tree.children(&next) {
                 let afters = match link {
-                    Link::End => vec![],
+                    Link::Leaf => vec![],
                     Link::Strong(id) | Link::Weak(id) => vec![id],
                     Link::Fork { strong, weak } => vec![strong, weak],
                 };
@@ -272,7 +267,7 @@ impl<'a> Iterator for TopoIter<'a> {
                     let after_dependencies = self
                         .waiting
                         .entry(after)
-                        .or_insert_with(|| BTreeSet::from_iter(self.topo.edges.before(&after)));
+                        .or_insert_with(|| BTreeSet::from_iter(self.topo.tree.parent(&after)));
 
                     after_dependencies.remove(&next);
 
@@ -296,6 +291,8 @@ impl<'a> Iterator for TopoIter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use quickcheck_macros::quickcheck;
+
     use super::*;
 
     #[test]
@@ -430,7 +427,7 @@ mod tests {
         topo.add(Some(0), 2, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 2 })
         );
 
@@ -445,7 +442,7 @@ mod tests {
         topo.add(Some(0), 1, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 2 })
         );
 
@@ -461,10 +458,10 @@ mod tests {
         topo.add(Some(0), 1, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 2 })
         );
-        assert_eq!(topo.edges.after(&2), Some(Link::Weak(3)));
+        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
     }
@@ -477,18 +474,18 @@ mod tests {
         topo.add(Some(0), 3, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 3 })
         );
 
         topo.add(Some(0), 2, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 2 })
         );
 
-        assert_eq!(topo.edges.after(&2), Some(Link::Weak(3)));
+        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
     }
@@ -501,18 +498,18 @@ mod tests {
         topo.add(Some(0), 2, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 2 })
         );
 
         topo.add(Some(0), 3, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 2 })
         );
 
-        assert_eq!(topo.edges.after(&2), Some(Link::Weak(3)));
+        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
     }
@@ -523,9 +520,9 @@ mod tests {
         topo.add(None, 0, None);
         topo.add(None, 1, Some(0));
 
-        assert_eq!(topo.edges.after(&0), Some(Link::End));
-        assert_eq!(topo.edges.before(&0), Some(1));
-        assert_eq!(topo.edges.after(&1), Some(Link::Strong(0)));
+        assert_eq!(topo.tree.children(&0), Some(Link::Leaf));
+        assert_eq!(topo.tree.parent(&0), Some(1));
+        assert_eq!(topo.tree.children(&1), Some(Link::Strong(0)));
         assert_eq!(Vec::from_iter(topo.iter()), vec![1, 0]);
     }
 
@@ -536,12 +533,12 @@ mod tests {
         topo.add(None, 1, Some(0));
         topo.add(None, 2, Some(0));
 
-        assert_eq!(topo.edges.after(&0), Some(Link::End));
-        assert_eq!(topo.edges.before(&0), Some(2));
-        assert_eq!(topo.edges.after(&2), Some(Link::Strong(0)));
-        assert_eq!(topo.edges.before(&2), Some(1));
-        assert_eq!(topo.edges.after(&1), Some(Link::Weak(2)));
-        assert_eq!(topo.edges.before(&1), None);
+        assert_eq!(topo.tree.children(&0), Some(Link::Leaf));
+        assert_eq!(topo.tree.parent(&0), Some(2));
+        assert_eq!(topo.tree.children(&2), Some(Link::Strong(0)));
+        assert_eq!(topo.tree.parent(&2), Some(1));
+        assert_eq!(topo.tree.children(&1), Some(Link::Weak(2)));
+        assert_eq!(topo.tree.parent(&1), None);
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![1, 2, 0]);
     }
@@ -554,14 +551,14 @@ mod tests {
         topo.add(None, 3, Some(0));
         topo.add(None, 1, Some(0));
 
-        assert_eq!(topo.edges.after(&0), Some(Link::End));
-        assert_eq!(topo.edges.before(&0), Some(3));
-        assert_eq!(topo.edges.after(&3), Some(Link::Strong(0)));
-        assert_eq!(topo.edges.before(&3), Some(2));
-        assert_eq!(topo.edges.after(&2), Some(Link::Weak(3)));
-        assert_eq!(topo.edges.before(&2), Some(1));
-        assert_eq!(topo.edges.after(&1), Some(Link::Weak(2)));
-        assert_eq!(topo.edges.before(&1), None);
+        assert_eq!(topo.tree.children(&0), Some(Link::Leaf));
+        assert_eq!(topo.tree.parent(&0), Some(3));
+        assert_eq!(topo.tree.children(&3), Some(Link::Strong(0)));
+        assert_eq!(topo.tree.parent(&3), Some(2));
+        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
+        assert_eq!(topo.tree.parent(&2), Some(1));
+        assert_eq!(topo.tree.children(&1), Some(Link::Weak(2)));
+        assert_eq!(topo.tree.parent(&1), None);
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![1, 2, 3, 0]);
     }
@@ -572,15 +569,15 @@ mod tests {
         topo.add(None, 0, None);
         topo.add(Some(0), 1, None);
 
-        assert_eq!(topo.edges.after(&0), Some(Link::Strong(1)));
-        assert_eq!(topo.edges.before(&1), Some(0));
+        assert_eq!(topo.tree.children(&0), Some(Link::Strong(1)));
+        assert_eq!(topo.tree.parent(&1), Some(0));
 
         topo.add(Some(0), 2, Some(1));
 
-        assert_eq!(topo.edges.after(&0), Some(Link::Strong(2)));
-        assert_eq!(topo.edges.after(&2), Some(Link::Strong(1)));
-        assert_eq!(topo.edges.before(&1), Some(2));
-        assert_eq!(topo.edges.before(&2), Some(0));
+        assert_eq!(topo.tree.children(&0), Some(Link::Strong(2)));
+        assert_eq!(topo.tree.children(&2), Some(Link::Strong(1)));
+        assert_eq!(topo.tree.parent(&1), Some(2));
+        assert_eq!(topo.tree.parent(&2), Some(0));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 1]);
     }
@@ -591,19 +588,19 @@ mod tests {
         topo.add(None, 0, None);
         topo.add(Some(0), 1, None);
 
-        assert_eq!(topo.edges.after(&0), Some(Link::Strong(1)));
-        assert_eq!(topo.edges.before(&1), Some(0));
+        assert_eq!(topo.tree.children(&0), Some(Link::Strong(1)));
+        assert_eq!(topo.tree.parent(&1), Some(0));
 
         topo.add(Some(0), 2, Some(1));
 
-        assert_eq!(topo.edges.after(&0), Some(Link::Strong(2)));
-        assert_eq!(topo.edges.after(&2), Some(Link::Strong(1)));
+        assert_eq!(topo.tree.children(&0), Some(Link::Strong(2)));
+        assert_eq!(topo.tree.children(&2), Some(Link::Strong(1)));
 
         topo.add(Some(0), 3, Some(1));
 
-        assert_eq!(topo.edges.after(&0), Some(Link::Strong(2)));
-        assert_eq!(topo.edges.after(&2), Some(Link::Weak(3)));
-        assert_eq!(topo.edges.after(&3), Some(Link::Strong(1)));
+        assert_eq!(topo.tree.children(&0), Some(Link::Strong(2)));
+        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
+        assert_eq!(topo.tree.children(&3), Some(Link::Strong(1)));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3, 1]);
     }
@@ -614,7 +611,7 @@ mod tests {
         topo.add(None, 0, None);
         topo.add(None, 1, None);
 
-        assert_eq!(topo.edges.after(&0), Some(Link::Weak(1)));
+        assert_eq!(topo.tree.children(&0), Some(Link::Weak(1)));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1]);
     }
@@ -627,10 +624,42 @@ mod tests {
         topo.add(None, 2, None);
 
         assert_eq!(
-            topo.edges.after(&0),
+            topo.tree.children(&0),
             Some(Link::Fork { strong: 1, weak: 2 })
         );
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_triple_concurrent_roots() {
+        let mut topo = Topo::default();
+        topo.add(None, 0, None);
+        topo.add(None, 1, None);
+        topo.add(None, 2, None);
+
+        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_insert_at_weak_link() {
+        let mut topo = Topo::default();
+        topo.add(None, 0, None);
+        topo.add(None, 1, None);
+        topo.add(None, 2, None);
+
+        topo.add(Some(0), 3, Some(2));
+        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 3, 2]);
+    }
+
+    #[quickcheck]
+    fn prop_order_preservation_across_forks() {
+        // for nodes a, b
+        // if there exists sequence s \in S, a,b \in s with a < b in s
+        // then forall q \in S where a,b \in q, a < b in q
+
+        // that is, if node `a` comes before `b` in some sequence, `a` comes before `b` in all sequences.
+
+        assert!(false);
     }
 }
