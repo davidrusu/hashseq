@@ -7,7 +7,7 @@ use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Insert {
-    roots: BTreeSet<Id>,
+    extra_dependencies: BTreeSet<Id>,
     left: Option<Id>,
     right: Option<Id>,
     value: char,
@@ -15,7 +15,7 @@ pub struct Insert {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Remove {
-    roots: BTreeSet<Id>,
+    extra_dependencies: BTreeSet<Id>,
     insert: Id,
 }
 
@@ -25,6 +25,25 @@ pub enum Op {
     Remove(Remove),
 }
 
+impl Op {
+    fn dependencies(&self) -> Box<dyn Iterator<Item = Id> + '_> {
+        match &self {
+            Op::Insert(i) => Box::new(
+                i.extra_dependencies
+                    .iter()
+                    .chain(&i.left)
+                    .chain(&i.right)
+                    .copied(),
+            ),
+            Op::Remove(r) => Box::new(
+                std::iter::once(&r.insert)
+                    .chain(r.extra_dependencies.iter())
+                    .copied(),
+            ),
+        }
+    }
+}
+
 impl Insert {
     fn hash(&self) -> Id {
         use std::hash::Hash;
@@ -32,7 +51,7 @@ impl Insert {
         let mut hasher = DefaultHasher::new();
         self.left.hash(&mut hasher);
         self.right.hash(&mut hasher);
-        self.roots.hash(&mut hasher);
+        self.extra_dependencies.hash(&mut hasher);
         self.value.hash(&mut hasher);
         hasher.finish()
     }
@@ -43,7 +62,7 @@ impl Remove {
         use std::hash::Hash;
         use std::hash::Hasher;
         let mut hasher = DefaultHasher::new();
-        self.roots.hash(&mut hasher);
+        self.extra_dependencies.hash(&mut hasher);
         self.insert.hash(&mut hasher);
         hasher.finish()
     }
@@ -85,12 +104,22 @@ impl HashSeq {
 
         let right = order.next();
 
+        let mut extra_dependencies = self.roots.clone();
+
+        if let Some(l) = left.as_ref() {
+            extra_dependencies.remove(l); // left will already be seen a dependency.
+        }
+        if let Some(r) = right.as_ref() {
+            extra_dependencies.remove(r); //  right will already be seen a dependency.
+        }
+
         let insert = Insert {
             value,
             left,
             right,
-            roots: self.roots.clone(),
+            extra_dependencies,
         };
+
         self.apply(Op::Insert(insert))
             .expect("ERR: We constructed a faulty op using public API");
     }
@@ -112,28 +141,25 @@ impl HashSeq {
         }
 
         if let Some(insert) = order.next() {
+            let mut extra_dependencies = self.roots.clone();
+            extra_dependencies.remove(&insert); // insert will already be seen as a dependency;
+
             self.apply(Op::Remove(Remove {
                 insert,
-                roots: self.roots.clone(),
+                extra_dependencies,
             }))
             .expect("ERR: We constructed a faulty op using public API")
         }
     }
 
-    fn missing_dependencies(&self, op: &Op) -> BTreeSet<Id> {
-        let dependencies = match op {
-            Op::Insert(Insert { roots, .. }) | Op::Remove(Remove { roots, .. }) => roots,
-        };
-
-        let mut missing_deps = BTreeSet::new();
-
-        for dep in dependencies.iter() {
+    fn any_missing_dependencies(&self, deps: &BTreeSet<Id>) -> bool {
+        for dep in deps.iter() {
             if !self.inserts.contains_key(dep) && !self.removed.contains_key(dep) {
-                missing_deps.insert(*dep);
+                return true;
             }
         }
 
-        missing_deps
+        false
     }
 
     fn is_faulty_insert(&self, insert: &Insert) -> bool {
@@ -165,8 +191,8 @@ impl HashSeq {
     }
 
     pub fn apply(&mut self, op: Op) -> Result<(), Op> {
-        let deps = self.missing_dependencies(&op);
-        if !deps.is_empty() {
+        let op_dependencies = BTreeSet::from_iter(op.dependencies());
+        if self.any_missing_dependencies(&op_dependencies) {
             self.orphaned.insert(op);
             return Ok(());
         }
@@ -185,10 +211,10 @@ impl HashSeq {
 
                 self.tree.add(insert.left, id, insert.right);
 
-                let superseded_roots = BTreeSet::from_iter(
+                let superseded_roots = Vec::from_iter(
                     self.roots
                         .iter()
-                        .filter(|r| insert.roots.contains(r))
+                        .filter(|r| op_dependencies.contains(r))
                         .copied(),
                 );
 
@@ -209,10 +235,10 @@ impl HashSeq {
                     return Err(Op::Remove(remove));
                 }
 
-                let superseded_roots = BTreeSet::from_iter(
+                let superseded_roots = Vec::from_iter(
                     self.roots
                         .iter()
-                        .filter(|r| remove.roots.contains(r))
+                        .filter(|r| op_dependencies.contains(r))
                         .copied(),
                 );
 
@@ -318,7 +344,7 @@ mod test {
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
         seq_a.merge(seq_b).expect("Faulty merge");
-        assert_eq!(&seq_a.iter().collect::<String>(), "abaza");
+        assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
     }
 
     #[test]
@@ -380,7 +406,7 @@ mod test {
                 value: 'a',
                 left: Some(0),
                 right: None,
-                roots: BTreeSet::default(),
+                extra_dependencies: BTreeSet::default(),
             }))
             .is_err());
 
@@ -391,7 +417,7 @@ mod test {
                 value: 'a',
                 left: None,
                 right: Some(0),
-                roots: BTreeSet::default(),
+                extra_dependencies: BTreeSet::default(),
             }))
             .is_err());
 
@@ -416,7 +442,7 @@ mod test {
                 value: 'a',
                 left: Some(b_id),
                 right: Some(a_id),
-                roots: BTreeSet::default(),
+                extra_dependencies: BTreeSet::default(),
             }))
             .is_err());
 
