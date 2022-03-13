@@ -219,48 +219,37 @@ impl Tree {
             }
         }
     }
-}
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Topo {
-    tree: Tree,
-}
-
-impl Topo {
-    pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
-        self.tree.add(left, node, right);
-    }
-
-    pub fn iter(&self) -> TopoIter<'_> {
-        TopoIter::new(self)
+    pub fn iter(&self) -> TreeIter<'_> {
+        TreeIter::new(self)
     }
 }
 
 #[derive(Debug)]
-pub struct TopoIter<'a> {
-    topo: &'a Topo,
+pub struct TreeIter<'a> {
+    tree: &'a Tree,
     boundary: Vec<Id>,
     waiting: BTreeMap<Id, BTreeSet<Id>>,
 }
 
-impl<'a> TopoIter<'a> {
-    pub fn new(topo: &'a Topo) -> Self {
-        let boundary = Vec::from_iter(topo.tree.root());
+impl<'a> TreeIter<'a> {
+    pub fn new(tree: &'a Tree) -> Self {
+        let boundary = Vec::from_iter(tree.root());
         Self {
-            topo,
+            tree,
             boundary,
             waiting: Default::default(),
         }
     }
 }
 
-impl<'a> Iterator for TopoIter<'a> {
+impl<'a> Iterator for TreeIter<'a> {
     type Item = Id;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(next) = self.boundary.pop() {
             let mut to_add_to_boundary = Vec::new();
-            for link in self.topo.tree.children(&next) {
+            for link in self.tree.children(&next) {
                 let afters = match link {
                     Link::Leaf => vec![],
                     Link::Strong(id) | Link::Weak(id) => vec![id],
@@ -271,7 +260,7 @@ impl<'a> Iterator for TopoIter<'a> {
                     let after_dependencies = self
                         .waiting
                         .entry(after)
-                        .or_insert_with(|| BTreeSet::from_iter(self.topo.tree.parent(&after)));
+                        .or_insert_with(|| BTreeSet::from_iter(self.tree.parent(&after)));
 
                     after_dependencies.remove(&next);
 
@@ -281,8 +270,6 @@ impl<'a> Iterator for TopoIter<'a> {
                     }
                 }
             }
-
-            // to_add_to_boundary.sort();
 
             self.boundary.extend(to_add_to_boundary.into_iter().rev());
 
@@ -301,52 +288,50 @@ mod tests {
 
     #[test]
     fn test_single() {
-        let mut topo = Topo::default();
+        let mut tree = Tree::default();
 
-        topo.add(None, 0, None);
+        tree.add(None, 0, None);
 
-        dbg!(&topo);
-
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0]);
     }
 
     #[test]
     fn test_double() {
-        let mut topo = Topo::default();
+        let mut tree = Tree::default();
 
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1]);
 
-        let mut topo = Topo::default();
+        let mut tree = Tree::default();
 
-        topo.add(None, 1, None);
-        topo.add(Some(1), 0, None);
+        tree.add(None, 1, None);
+        tree.add(Some(1), 0, None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![1, 0]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![1, 0]);
     }
 
     #[test]
     fn test_fork() {
-        let mut topo = Topo::default();
+        let mut tree = Tree::default();
 
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
-        topo.add(Some(0), 2, None);
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(Some(0), 2, None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2]);
     }
 
     #[test]
     fn test_insert() {
-        let mut topo = Topo::default();
+        let mut tree = Tree::default();
 
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
-        topo.add(Some(0), 2, Some(1));
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(Some(0), 2, Some(1));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 1]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 2, 1]);
     }
 
     #[test]
@@ -359,20 +344,15 @@ mod tests {
 
         // linearizes to 01423
 
-        let mut topo = Topo::default();
+        let mut tree = Tree::default();
 
-        topo.add(None, 0, None);
-        dbg!(&topo);
-        topo.add(Some(0), 1, None);
-        dbg!(&topo);
-        topo.add(Some(1), 4, None);
-        dbg!(&topo);
-        topo.add(Some(0), 2, None);
-        dbg!(&topo);
-        topo.add(Some(2), 3, None);
-        dbg!(&topo);
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(Some(1), 4, None);
+        tree.add(Some(0), 2, None);
+        tree.add(Some(2), 3, None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 4, 2, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 4, 2, 3]);
     }
 
     #[test]
@@ -385,16 +365,16 @@ mod tests {
         //
         // linearizes to 0213
 
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 2, None);
-        topo.add(Some(0), 3, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 2, None);
+        tree.add(Some(0), 3, None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 2, 3]);
 
-        topo.add(Some(0), 1, Some(3));
+        tree.add(Some(0), 1, Some(3));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 1, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 2, 1, 3]);
     }
 
     #[test]
@@ -407,16 +387,16 @@ mod tests {
         //
         // linearizes to 0213
 
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 2, None);
-        topo.add(Some(0), 3, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 2, None);
+        tree.add(Some(0), 3, None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 2, 3]);
 
-        topo.add(Some(0), 1, Some(2));
+        tree.add(Some(0), 1, Some(2));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -425,235 +405,211 @@ mod tests {
         //  \ <---- weak
         //   c
 
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
-        topo.add(Some(0), 2, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(Some(0), 2, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 2 })
-        );
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2]);
     }
 
     #[test]
     fn test_adding_smaller_vertex_at_fork() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 2, None);
-        topo.add(Some(0), 1, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 2, None);
+        tree.add(Some(0), 1, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 2 })
-        );
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2]);
     }
 
     #[test]
     fn test_adding_smaller_vertex_at_full_fork() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 2, None);
-        topo.add(Some(0), 3, None);
-        topo.add(Some(0), 1, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 2, None);
+        tree.add(Some(0), 3, None);
+        tree.add(Some(0), 1, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 2 })
-        );
-        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
+        assert_eq!(tree.children(&2), Some(Link::Weak(3)));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn test_adding_middle_vertex_at_full_fork() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
-        topo.add(Some(0), 3, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(Some(0), 3, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 3 })
-        );
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 3 }));
 
-        topo.add(Some(0), 2, None);
+        tree.add(Some(0), 2, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 2 })
-        );
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
 
-        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
+        assert_eq!(tree.children(&2), Some(Link::Weak(3)));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn test_adding_bigger_vertex_at_full_fork() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
-        topo.add(Some(0), 2, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(Some(0), 2, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 2 })
-        );
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
 
-        topo.add(Some(0), 3, None);
+        tree.add(Some(0), 3, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 2 })
-        );
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
 
-        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
+        assert_eq!(tree.children(&2), Some(Link::Weak(3)));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn test_insert_before_root() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(None, 1, Some(0));
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(None, 1, Some(0));
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Leaf));
-        assert_eq!(topo.tree.parent(&0), Some(1));
-        assert_eq!(topo.tree.children(&1), Some(Link::Strong(0)));
-        assert_eq!(Vec::from_iter(topo.iter()), vec![1, 0]);
+        assert_eq!(tree.children(&0), Some(Link::Leaf));
+        assert_eq!(tree.parent(&0), Some(1));
+        assert_eq!(tree.children(&1), Some(Link::Strong(0)));
+        assert_eq!(Vec::from_iter(tree.iter()), vec![1, 0]);
     }
 
     #[test]
     fn test_insert_before_root_twice() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(None, 1, Some(0));
-        topo.add(None, 2, Some(0));
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(None, 1, Some(0));
+        tree.add(None, 2, Some(0));
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Leaf));
-        assert_eq!(topo.tree.parent(&0), Some(2));
-        assert_eq!(topo.tree.children(&2), Some(Link::Strong(0)));
-        assert_eq!(topo.tree.parent(&2), Some(1));
-        assert_eq!(topo.tree.children(&1), Some(Link::Weak(2)));
-        assert_eq!(topo.tree.parent(&1), None);
+        assert_eq!(tree.children(&0), Some(Link::Leaf));
+        assert_eq!(tree.parent(&0), Some(2));
+        assert_eq!(tree.children(&2), Some(Link::Strong(0)));
+        assert_eq!(tree.parent(&2), Some(1));
+        assert_eq!(tree.children(&1), Some(Link::Weak(2)));
+        assert_eq!(tree.parent(&1), None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![1, 2, 0]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![1, 2, 0]);
     }
 
     #[test]
     fn test_insert_before_root_out_of_order() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(None, 2, Some(0));
-        topo.add(None, 3, Some(0));
-        topo.add(None, 1, Some(0));
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(None, 2, Some(0));
+        tree.add(None, 3, Some(0));
+        tree.add(None, 1, Some(0));
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Leaf));
-        assert_eq!(topo.tree.parent(&0), Some(3));
-        assert_eq!(topo.tree.children(&3), Some(Link::Strong(0)));
-        assert_eq!(topo.tree.parent(&3), Some(2));
-        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
-        assert_eq!(topo.tree.parent(&2), Some(1));
-        assert_eq!(topo.tree.children(&1), Some(Link::Weak(2)));
-        assert_eq!(topo.tree.parent(&1), None);
+        assert_eq!(tree.children(&0), Some(Link::Leaf));
+        assert_eq!(tree.parent(&0), Some(3));
+        assert_eq!(tree.children(&3), Some(Link::Strong(0)));
+        assert_eq!(tree.parent(&3), Some(2));
+        assert_eq!(tree.children(&2), Some(Link::Weak(3)));
+        assert_eq!(tree.parent(&2), Some(1));
+        assert_eq!(tree.children(&1), Some(Link::Weak(2)));
+        assert_eq!(tree.parent(&1), None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![1, 2, 3, 0]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![1, 2, 3, 0]);
     }
 
     #[test]
     fn test_insert_at_strong_link() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Strong(1)));
-        assert_eq!(topo.tree.parent(&1), Some(0));
+        assert_eq!(tree.children(&0), Some(Link::Strong(1)));
+        assert_eq!(tree.parent(&1), Some(0));
 
-        topo.add(Some(0), 2, Some(1));
+        tree.add(Some(0), 2, Some(1));
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Strong(2)));
-        assert_eq!(topo.tree.children(&2), Some(Link::Strong(1)));
-        assert_eq!(topo.tree.parent(&1), Some(2));
-        assert_eq!(topo.tree.parent(&2), Some(0));
+        assert_eq!(tree.children(&0), Some(Link::Strong(2)));
+        assert_eq!(tree.children(&2), Some(Link::Strong(1)));
+        assert_eq!(tree.parent(&1), Some(2));
+        assert_eq!(tree.parent(&2), Some(0));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 1]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 2, 1]);
     }
 
     #[test]
     fn test_insert_at_strong_link_twice() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Strong(1)));
-        assert_eq!(topo.tree.parent(&1), Some(0));
+        assert_eq!(tree.children(&0), Some(Link::Strong(1)));
+        assert_eq!(tree.parent(&1), Some(0));
 
-        topo.add(Some(0), 2, Some(1));
+        tree.add(Some(0), 2, Some(1));
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Strong(2)));
-        assert_eq!(topo.tree.children(&2), Some(Link::Strong(1)));
+        assert_eq!(tree.children(&0), Some(Link::Strong(2)));
+        assert_eq!(tree.children(&2), Some(Link::Strong(1)));
 
-        topo.add(Some(0), 3, Some(1));
+        tree.add(Some(0), 3, Some(1));
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Strong(2)));
-        assert_eq!(topo.tree.children(&2), Some(Link::Weak(3)));
-        assert_eq!(topo.tree.children(&3), Some(Link::Strong(1)));
+        assert_eq!(tree.children(&0), Some(Link::Strong(2)));
+        assert_eq!(tree.children(&2), Some(Link::Weak(3)));
+        assert_eq!(tree.children(&3), Some(Link::Strong(1)));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3, 1]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 2, 3, 1]);
     }
 
     #[test]
     fn test_concurrent_inserts() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(None, 1, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(None, 1, None);
 
-        assert_eq!(topo.tree.children(&0), Some(Link::Weak(1)));
+        assert_eq!(tree.children(&0), Some(Link::Weak(1)));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1]);
     }
 
     #[test]
     fn test_concurrent_inserts_with_run() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
-        topo.add(None, 2, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(Some(0), 1, None);
+        tree.add(None, 2, None);
 
-        assert_eq!(
-            topo.tree.children(&0),
-            Some(Link::Fork { strong: 1, weak: 2 })
-        );
+        assert_eq!(tree.children(&0), Some(Link::Fork { strong: 1, weak: 2 }));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2]);
     }
 
     #[test]
     fn test_triple_concurrent_roots() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(None, 1, None);
-        topo.add(None, 2, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(None, 1, None);
+        tree.add(None, 2, None);
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 2]);
     }
 
     #[test]
     fn test_insert_at_weak_link() {
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(None, 1, None);
-        topo.add(None, 2, None);
+        let mut tree = Tree::default();
+        tree.add(None, 0, None);
+        tree.add(None, 1, None);
+        tree.add(None, 2, None);
 
-        topo.add(Some(0), 3, Some(2));
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 3, 2]);
+        tree.add(Some(0), 3, Some(2));
+        assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 3, 2]);
     }
 
     #[quickcheck]

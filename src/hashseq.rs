@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 // use crate::topo_sort::{TopoIter, TopoSort};
-use crate::topo_sort_strong_weak::{Topo, TopoIter};
+use crate::topo_sort_strong_weak::{Tree, TreeIter};
 use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -51,7 +51,7 @@ impl Remove {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HashSeq {
-    topo: Topo,
+    tree: Tree,
     inserts: BTreeMap<Id, Insert>,
     removed: BTreeMap<Id, Remove>,
     removed_inserts: BTreeSet<Id>,
@@ -70,7 +70,7 @@ impl HashSeq {
 
     pub fn insert(&mut self, idx: usize, value: char) {
         let mut order = self
-            .topo
+            .tree
             .iter()
             .filter(|id| !self.removed_inserts.contains(id));
 
@@ -103,7 +103,7 @@ impl HashSeq {
 
     pub fn remove(&mut self, idx: usize) {
         let mut order = self
-            .topo
+            .tree
             .iter()
             .filter(|id| !self.removed_inserts.contains(id));
 
@@ -142,7 +142,7 @@ impl HashSeq {
             (Some(l), Some(r)) => {
                 let mut l_idx = None;
                 let mut r_idx = None;
-                for (idx, id) in self.topo.iter().enumerate() {
+                for (idx, id) in self.tree.iter().enumerate() {
                     if *l == id {
                         l_idx = Some(idx);
                     }
@@ -183,7 +183,7 @@ impl HashSeq {
                     return Err(Op::Insert(insert));
                 }
 
-                self.topo.add(insert.left, id, insert.right);
+                self.tree.add(insert.left, id, insert.right);
 
                 let superseded_roots = BTreeSet::from_iter(
                     self.roots
@@ -246,7 +246,7 @@ impl HashSeq {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
-        self.topo.iter().filter_map(|id| {
+        self.tree.iter().filter_map(|id| {
             if self.removed_inserts.contains(&id) {
                 None
             } else {
@@ -404,10 +404,10 @@ mod test {
 
         seq.insert_batch(0, "ab".chars());
 
-        let mut topo_seq = seq.topo.iter();
+        let mut tree_iter = seq.tree.iter();
 
-        let a_id = topo_seq.next().unwrap();
-        let b_id = topo_seq.next().unwrap();
+        let a_id = tree_iter.next().unwrap();
+        let b_id = tree_iter.next().unwrap();
 
         // engineer a faulty op where `b` is on our left and `a` is on our right.
 
