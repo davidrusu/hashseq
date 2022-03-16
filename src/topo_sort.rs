@@ -19,6 +19,9 @@ impl Topo {
             }
             seen.insert(n);
             boundary.extend(self.after(n).into_iter().filter(|a| !seen.contains(a)));
+            if n != a {
+                boundary.extend(self.before(n).into_iter().filter(|a| !seen.contains(a)));
+            }
         }
 
         false
