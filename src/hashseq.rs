@@ -97,7 +97,7 @@ impl HashSeq {
             .iter()
             .filter(|id| !self.removed_inserts.contains(id));
 
-        let left = if let Some(prev_idx) = idx.checked_sub(1) {
+        let mut left = if let Some(prev_idx) = idx.checked_sub(1) {
             for _ in 0..prev_idx {
                 order.next();
             }
@@ -106,7 +106,17 @@ impl HashSeq {
             None
         };
 
-        let right = order.next();
+        let mut right = order.next();
+
+        if let Some(l) = left {
+            if let Some(r) = right {
+                if self.topo.before(r).contains(&l) {
+                    right = None;
+                } else {
+                    left = None;
+                }
+            }
+        }
 
         let mut extra_dependencies = self.roots.clone();
 
@@ -304,12 +314,12 @@ mod test {
         let mut seq_a = HashSeq::default();
         let mut seq_b = HashSeq::default();
 
-        seq_a.insert_batch(0, "we wrote".chars());
-        seq_b.insert_batch(0, "this together ".chars());
+        seq_a.insert_batch(0, "we wrote ".chars());
+        seq_b.insert_batch(0, "this together".chars());
 
         seq_a.merge(seq_b).expect("Faulty merge");
 
-        assert_eq!(&seq_a.iter().collect::<String>(), "this together we wrote");
+        assert_eq!(&seq_a.iter().collect::<String>(), "we wrote this together");
     }
 
     #[test]
@@ -624,6 +634,69 @@ mod test {
         bc_then_a.merge(seq_a.clone()).unwrap();
 
         assert_eq!(ab_then_c, bc_then_a);
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc1() {
+        let mut model = Vec::new();
+        let mut seq = HashSeq::default();
+
+        for (insert_or_remove, idx, elem) in [(true, 0, 'b'), (true, 0, 'b'), (true, 1, 'a')] {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    model.insert(idx.min(model.len()), elem);
+                    seq.insert(idx.min(seq.len()), elem);
+                }
+                false => {
+                    // remove
+                    assert_eq!(seq.is_empty(), model.is_empty());
+                    if !seq.is_empty() {
+                        model.remove(idx.min(model.len() - 1));
+                        seq.remove(idx.min(seq.len() - 1));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(seq.iter().collect::<Vec<_>>(), model);
+        assert_eq!(seq.len(), model.len());
+        assert_eq!(seq.is_empty(), model.is_empty());
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc2() {
+        let mut model = Vec::new();
+        let mut seq = HashSeq::default();
+
+        for (insert_or_remove, idx, elem) in [
+            (true, 0, 'b'),
+            (true, 0, 'b'),
+            (true, 1, 'b'),
+            (true, 2, 'a'),
+        ] {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    model.insert(idx.min(model.len()), elem);
+                    seq.insert(idx.min(seq.len()), elem);
+                }
+                false => {
+                    // remove
+                    assert_eq!(seq.is_empty(), model.is_empty());
+                    if !seq.is_empty() {
+                        model.remove(idx.min(model.len() - 1));
+                        seq.remove(idx.min(seq.len() - 1));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(seq.iter().collect::<Vec<_>>(), model);
+        assert_eq!(seq.len(), model.len());
+        assert_eq!(seq.is_empty(), model.is_empty());
     }
 
     #[quickcheck]

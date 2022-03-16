@@ -1,21 +1,44 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::Id;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Topo {
+    roots: BTreeSet<Id>,
     before: BTreeMap<Id, BTreeSet<Id>>,
     after: BTreeMap<Id, BTreeSet<Id>>,
 }
 
 impl Topo {
-    pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
-        self.insert(node);
-        if let Some(left) = left {
-            self.add_constraint(left, node);
+    pub fn is_causally_before(&self, a: Id, b: Id) -> bool {
+        let mut seen = BTreeSet::new();
+        let mut boundary = VecDeque::from_iter(self.after(a));
+        while let Some(n) = boundary.pop_front() {
+            if n == b {
+                return true;
+            }
+            seen.insert(n);
+            boundary.extend(self.after(n).into_iter().filter(|a| !seen.contains(a)));
         }
+
+        false
+    }
+
+    pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
+        if left.is_none() && right.is_none() {
+            self.roots.insert(node);
+        }
+
+        assert!(!(left.is_some() && right.is_some()));
+
+        self.insert(node);
+
+        if let Some(left) = left {
+            self.after.entry(left).or_default().insert(node);
+        }
+
         if let Some(right) = right {
-            self.add_constraint(node, right);
+            self.before.entry(right).or_default().insert(node);
         }
     }
 
@@ -29,11 +52,8 @@ impl Topo {
         self.after.entry(before).or_default().insert(after);
     }
 
-    fn roots(&self) -> impl Iterator<Item = Id> + '_ {
-        self.before
-            .iter()
-            .filter(|(_, befores)| befores.is_empty())
-            .map(|(n, _)| *n)
+    fn roots(&self) -> &BTreeSet<Id> {
+        &self.roots
     }
 
     pub fn after(&self, id: Id) -> BTreeSet<Id> {
@@ -54,24 +74,26 @@ pub struct TopoIter<'a> {
     topo: &'a Topo,
     used: BTreeSet<Id>,
     free_stack: Vec<Id>,
+    waiting_stack: Vec<(Id, BTreeSet<Id>)>,
 }
 
 impl<'a> TopoIter<'a> {
     fn new(topo: &'a Topo) -> Self {
         let used = BTreeSet::new();
-        let mut free_stack: Vec<Id> = topo.roots().collect();
-        free_stack.sort();
-        free_stack.reverse();
+        let free_stack = Vec::new();
+        let waiting_stack = topo
+            .roots()
+            .into_iter()
+            .map(|r| (*r, topo.before(*r)))
+            .rev()
+            .collect();
 
         Self {
             topo,
             used,
             free_stack,
+            waiting_stack,
         }
-    }
-
-    pub fn next_candidates(&self) -> impl Iterator<Item = Id> + '_ {
-        self.free_stack.iter().copied()
     }
 }
 
@@ -80,20 +102,29 @@ impl<'a> Iterator for TopoIter<'a> {
 
     fn next(&mut self) -> Option<Id> {
         if let Some(n) = self.free_stack.pop() {
-            self.used.insert(n);
+            for after in self.topo.after(n).into_iter().rev() {
+                self.waiting_stack.push((after, self.topo.before(after)));
+            }
 
-            if let Some(afters) = self.topo.after.get(&n) {
-                for after in afters.iter().rev() {
-                    if self.topo.before[after].is_subset(&self.used) {
-                        // its safe to push directly onto the free-stack since the afters are stored sorted (in a BTreeSet)
-                        self.free_stack.push(*after);
-                    }
-                }
+            for (_, deps) in self.waiting_stack.iter_mut() {
+                deps.remove(&n);
             }
 
             Some(n)
         } else {
-            None
+            if let Some((ready, deps)) = self.waiting_stack.pop() {
+                if deps.is_empty() {
+                    self.free_stack.push(ready);
+                } else {
+                    self.waiting_stack.push((ready, deps.clone()));
+                    for dep in deps.into_iter().rev() {
+                        self.waiting_stack.push((dep, self.topo.before(dep)));
+                    }
+                }
+                self.next()
+            } else {
+                None
+            }
         }
     }
 }
@@ -147,7 +178,12 @@ mod tests {
 
         topo.add(None, 0, None);
         topo.add(Some(0), 1, None);
-        topo.add(Some(0), 2, Some(1));
+        topo.add(None, 2, Some(1));
+
+        let mut iter = topo.iter();
+        assert_eq!(dbg!(&mut iter).next(), Some(0));
+        assert_eq!(dbg!(&mut iter).next(), Some(2));
+        assert_eq!(dbg!(&mut iter).next(), Some(1));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 1]);
     }
@@ -178,7 +214,7 @@ mod tests {
         //   2
         //  /
         // 0 - 3
-        //  \ /
+        //    /
         //   1
         //
         // linearizes to 0213
@@ -187,11 +223,17 @@ mod tests {
         topo.add(None, 0, None);
         topo.add(Some(0), 2, None);
         topo.add(Some(0), 3, None);
+        dbg!(&topo);
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3]);
 
-        topo.add(Some(0), 1, Some(3));
+        topo.add(None, 1, Some(3));
+        dbg!(&topo);
 
+        let mut iter = topo.iter();
+        assert_eq!(iter.next(), Some(0));
+        // dbg!(&iter);
+        //assert_eq!(iter.next(), Some(2));
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 1, 3]);
     }
 
@@ -200,7 +242,7 @@ mod tests {
         //   3
         //  /
         // 0 - 2
-        //  \ /
+        //    /
         //   1
         //
         // linearizes to 0213
@@ -212,27 +254,9 @@ mod tests {
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3]);
 
-        topo.add(Some(0), 1, Some(2));
+        topo.add(None, 1, Some(2));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn test_adding_larger_vertex_at_fork() {
-        // a == b
-        //  \ <---- weak
-        //   c
-
-        let mut topo = Topo::default();
-        topo.add(None, 0, None);
-        topo.add(Some(0), 1, None);
-        topo.add(Some(0), 2, None);
-
-        assert_eq!(topo.after(0), BTreeSet::from_iter([1, 2]));
-        assert_eq!(topo.before(1), BTreeSet::from_iter([0]));
-        assert_eq!(topo.before(2), BTreeSet::from_iter([0]));
-
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2]);
     }
 
     #[test]
@@ -302,9 +326,7 @@ mod tests {
         tree.add(None, 1, Some(0));
 
         assert_eq!(tree.after(0), BTreeSet::from_iter([]));
-        assert_eq!(tree.after(1), BTreeSet::from_iter([0]));
         assert_eq!(tree.before(0), BTreeSet::from_iter([1]));
-        assert_eq!(tree.before(1), BTreeSet::from_iter([]));
 
         assert_eq!(Vec::from_iter(tree.iter()), vec![1, 0]);
     }
@@ -318,10 +340,6 @@ mod tests {
 
         assert_eq!(topo.after(0), BTreeSet::from_iter([]));
         assert_eq!(topo.before(0), BTreeSet::from_iter([1, 2]));
-        assert_eq!(topo.after(1), BTreeSet::from_iter([0]));
-        assert_eq!(topo.after(2), BTreeSet::from_iter([0]));
-        assert_eq!(topo.before(1), BTreeSet::from_iter([]));
-        assert_eq!(topo.before(2), BTreeSet::from_iter([]));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![1, 2, 0]);
     }
@@ -336,9 +354,6 @@ mod tests {
 
         assert_eq!(topo.after(0), BTreeSet::from_iter([]));
         assert_eq!(topo.before(0), BTreeSet::from_iter([1, 2, 3]));
-        assert_eq!(topo.after(1), BTreeSet::from_iter([0]));
-        assert_eq!(topo.after(2), BTreeSet::from_iter([0]));
-        assert_eq!(topo.after(3), BTreeSet::from_iter([0]));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![1, 2, 3, 0]);
     }
@@ -348,15 +363,7 @@ mod tests {
         let mut topo = Topo::default();
         topo.add(None, 0, None);
         topo.add(Some(0), 1, None);
-
-        assert_eq!(topo.after(0), BTreeSet::from_iter([1]));
-        assert_eq!(topo.before(1), BTreeSet::from_iter([0]));
-
-        topo.add(Some(0), 2, Some(1));
-
-        assert_eq!(topo.after(0), BTreeSet::from_iter([1, 2]));
-        assert_eq!(topo.before(1), BTreeSet::from_iter([0, 2]));
-        assert_eq!(topo.before(2), BTreeSet::from_iter([0]));
+        topo.add(None, 2, Some(1));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 1]);
     }
@@ -367,21 +374,9 @@ mod tests {
         topo.add(None, 0, None);
         topo.add(Some(0), 1, None);
 
-        assert_eq!(topo.after(0), BTreeSet::from_iter([1]));
-        assert_eq!(topo.before(1), BTreeSet::from_iter([0]));
+        topo.add(None, 2, Some(1));
 
-        topo.add(Some(0), 2, Some(1));
-
-        assert_eq!(topo.after(0), BTreeSet::from_iter([1, 2]));
-        assert_eq!(topo.before(1), BTreeSet::from_iter([0, 2]));
-        assert_eq!(topo.before(2), BTreeSet::from_iter([0]));
-
-        topo.add(Some(0), 3, Some(1));
-
-        assert_eq!(topo.after(0), BTreeSet::from_iter([1, 2, 3]));
-        assert_eq!(topo.before(1), BTreeSet::from_iter([0, 2, 3]));
-        assert_eq!(topo.before(2), BTreeSet::from_iter([0]));
-        assert_eq!(topo.before(3), BTreeSet::from_iter([0]));
+        topo.add(None, 3, Some(1));
 
         assert_eq!(Vec::from_iter(topo.iter()), vec![0, 2, 3, 1]);
     }
@@ -425,13 +420,13 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_at_weak_link() {
+    fn test_prepend_to_larger_branch() {
         let mut tree = Topo::default();
         tree.add(None, 0, None);
         tree.add(None, 1, None);
         tree.add(None, 2, None);
 
-        tree.add(Some(0), 3, Some(2));
+        tree.add(None, 3, Some(2));
         assert_eq!(Vec::from_iter(tree.iter()), vec![0, 1, 3, 2]);
     }
 
@@ -445,11 +440,6 @@ mod tests {
 
         dbg!(&tree);
         assert_eq!(Vec::from_iter(tree.iter()), vec![2, 0, 1]);
-
-        assert_eq!(tree.after(2), BTreeSet::from_iter([0]));
-        assert_eq!(tree.after(1), BTreeSet::from_iter([]));
-        assert_eq!(tree.after(0), BTreeSet::from_iter([]));
-        assert_eq!(tree.before(0), BTreeSet::from_iter([2]));
 
         let mut tree_different_order = Topo::default();
         tree_different_order.add(None, 1, None);
