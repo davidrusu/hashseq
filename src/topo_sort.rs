@@ -27,21 +27,34 @@ impl Topo {
         false
     }
 
+    pub fn add_root(&mut self, node: Id) {
+        self.insert(node);
+        self.roots.insert(node);
+    }
+
+    pub fn add_after(&mut self, left: Id, node: Id) {
+        self.insert(node); // is this necessary?
+        self.after.entry(left).or_default().insert(node);
+    }
+
+    pub fn add_before(&mut self, right: Id, node: Id) {
+        self.insert(node); // is this necessary?
+        self.before.entry(right).or_default().insert(node);
+    }
+
     pub fn add(&mut self, left: Option<Id>, node: Id, right: Option<Id>) {
         if left.is_none() && right.is_none() {
-            self.roots.insert(node);
+            self.add_root(node);
         }
 
         assert!(!(left.is_some() && right.is_some()));
 
-        self.insert(node);
-
         if let Some(left) = left {
-            self.after.entry(left).or_default().insert(node);
+            self.add_after(left, node);
         }
 
         if let Some(right) = right {
-            self.before.entry(right).or_default().insert(node);
+            self.add_before(right, node);
         }
     }
 
