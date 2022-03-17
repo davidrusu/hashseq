@@ -521,6 +521,82 @@ mod test {
     }
 
     #[quickcheck]
+    fn prop_reflexive(ops: Vec<(bool, u8, char)>) {
+        let mut seq = HashSeq::default();
+
+        for (insert_or_remove, idx, elem) in ops {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    seq.insert(idx.min(seq.len()), elem);
+                }
+                false => {
+                    // remove
+                    if !seq.is_empty() {
+                        seq.remove(idx.min(seq.len() - 1));
+                    }
+                }
+            }
+        }
+
+        // merge(a, a) == a
+
+        let mut merge_self = seq.clone();
+        merge_self.merge(seq.clone()).unwrap();
+
+        assert_eq!(merge_self, seq);
+    }
+
+    #[quickcheck]
+    fn prop_commutative(a: Vec<(bool, u8, char)>, b: Vec<(bool, u8, char)>) {
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+
+        for (insert_or_remove, idx, elem) in a {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    seq_a.insert(idx.min(seq_a.len()), elem);
+                }
+                false => {
+                    // remove
+                    if !seq_a.is_empty() {
+                        seq_a.remove(idx.min(seq_a.len() - 1));
+                    }
+                }
+            }
+        }
+
+        for (insert_or_remove, idx, elem) in b {
+            let idx = idx as usize;
+            match insert_or_remove {
+                true => {
+                    // insert
+                    seq_b.insert(idx.min(seq_b.len()), elem);
+                }
+                false => {
+                    // remove
+                    if !seq_b.is_empty() {
+                        seq_b.remove(idx.min(seq_b.len() - 1));
+                    }
+                }
+            }
+        }
+
+        // merge(a, b) == merge(b, a)
+
+        let mut merge_a_b = seq_a.clone();
+        merge_a_b.merge(seq_b.clone()).unwrap();
+
+        let mut merge_b_a = seq_b.clone();
+        merge_b_a.merge(seq_a.clone()).unwrap();
+
+        assert_eq!(merge_a_b, merge_b_a);
+    }
+
+    #[quickcheck]
     fn prop_associative(
         a: Vec<(bool, u8, char)>,
         b: Vec<(bool, u8, char)>,
@@ -589,6 +665,8 @@ mod test {
         bc_then_a.merge(seq_a.clone()).unwrap();
 
         assert_eq!(ab_then_c, bc_then_a);
+
+        // TODO: once insert returns an Op, check that we are op associative as well.
     }
 
     #[test]
