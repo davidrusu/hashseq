@@ -6,21 +6,11 @@ use crate::topo_sort::Topo;
 use crate::Id;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct Insert {
-    left: Option<Id>,
-    right: Option<Id>,
-    value: char,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct Remove {
-    insert: Id,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Op {
-    Insert(Insert),
-    Remove(Remove),
+    InsertRoot(char),
+    InsertAfter(Id, char),
+    InsertBefore(Id, char),
+    Remove(Id),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,19 +22,8 @@ pub struct HashNode {
 impl Op {
     fn dependency(&self) -> Option<Id> {
         match &self {
-            Op::Insert(Insert {
-                left: None,
-                right: None,
-                ..
-            }) => None,
-            Op::Insert(Insert {
-                left: Some(dep), ..
-            }) => Some(*dep),
-            Op::Insert(Insert {
-                right: Some(dep), ..
-            }) => Some(*dep),
-            Op::Remove(r) => Some(r.insert),
-            _ => panic!("bad insert"),
+            Op::InsertRoot(_) => None,
+            Op::InsertAfter(dep, _) | Op::InsertBefore(dep, _) | Op::Remove(dep) => Some(*dep),
         }
     }
 }
@@ -96,7 +75,7 @@ impl HashSeq {
             .iter()
             .filter(|id| !self.removed_inserts.contains(id));
 
-        let mut left = if let Some(prev_idx) = idx.checked_sub(1) {
+        let left = if let Some(prev_idx) = idx.checked_sub(1) {
             for _ in 0..prev_idx {
                 order.next();
             }
@@ -105,26 +84,26 @@ impl HashSeq {
             None
         };
 
-        let mut right = order.next();
+        let right = order.next();
 
-        if let (Some(l), Some(r)) = (left, right) {
-            if self.topo.is_causally_before(l, r) {
-                left = None
-            } else {
-                right = None
+        let op = match (left, right) {
+            (Some(l), Some(r)) => {
+                if self.topo.is_causally_before(l, r) {
+                    Op::InsertBefore(r, value)
+                } else {
+                    Op::InsertAfter(l, value)
+                }
             }
-        }
+            (Some(l), None) => Op::InsertAfter(l, value),
+            (None, Some(r)) => Op::InsertBefore(r, value),
+            (None, None) => Op::InsertRoot(value),
+        };
 
         let mut extra_dependencies = self.roots.clone();
 
-        if let Some(l) = left.as_ref() {
-            extra_dependencies.remove(l); // left will already be seen a dependency.
+        if let Some(dep) = op.dependency() {
+            extra_dependencies.remove(&dep); // the op dependency will already be seen, no need to duplicated it in the extra dependencie.
         }
-        if let Some(r) = right.as_ref() {
-            extra_dependencies.remove(r); //  right will already be seen a dependency.
-        }
-
-        let op = Op::Insert(Insert { value, left, right });
 
         let node = HashNode {
             extra_dependencies,
@@ -157,7 +136,7 @@ impl HashSeq {
 
             let node = HashNode {
                 extra_dependencies,
-                op: Op::Remove(Remove { insert }),
+                op: Op::Remove(insert),
             };
 
             self.apply(node)
@@ -175,33 +154,9 @@ impl HashSeq {
         false
     }
 
-    fn is_faulty_insert(&self, insert: &Insert) -> bool {
-        // Ensure there is no overlap between inserts on the left and inserts on the right
-        match (&insert.left, &insert.right) {
-            (Some(l), Some(r)) => {
-                let mut l_idx = None;
-                let mut r_idx = None;
-                for (idx, id) in self.topo.iter().enumerate() {
-                    if *l == id {
-                        l_idx = Some(idx);
-                    }
-                    if *r == id {
-                        r_idx = Some(idx);
-                    }
-                }
-
-                match (l_idx, r_idx) {
-                    (Some(l_idx), Some(r_idx)) => l_idx >= r_idx,
-                    _ => true,
-                }
-            }
-            _ => false,
-        }
-    }
-
     pub fn apply(&mut self, node: HashNode) -> Result<(), Op> {
         let id = node.id();
-        println!("apply({:?} = {:?})", node, id);
+        // println!("apply({:?} = {:?})", node, id);
 
         let dependencies = BTreeSet::from_iter(node.dependencies());
         if self.any_missing_dependencies(&dependencies) {
@@ -214,16 +169,12 @@ impl HashSeq {
         }
 
         match &node.op {
-            Op::Insert(insert) => {
-                if self.is_faulty_insert(&insert) {
-                    // TAI: is a faulty insert possible?
-                    return Err(Op::Insert(insert.clone()));
-                }
-
-                self.topo.add(insert.left, id, insert.right);
-            }
-            Op::Remove(remove) => {
-                self.removed_inserts.insert(remove.insert);
+            Op::InsertRoot(_) => self.topo.add_root(id),
+            Op::InsertAfter(node, _) => self.topo.add_after(*node, id),
+            Op::InsertBefore(node, _) => self.topo.add_before(*node, id),
+            Op::Remove(node) => {
+                // TODO: if self.nodes.get(node) is not an insert op, then drop this remove
+                self.removed_inserts.insert(*node);
             }
         }
 
@@ -266,11 +217,11 @@ impl HashSeq {
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
         self.topo
             .iter()
-            .filter(|id| !self.removed_inserts.contains(&id))
+            .filter(|id| !self.removed_inserts.contains(id))
             .filter_map(|id| self.nodes.get(&id))
             .filter_map(|node| match &node.op {
-                Op::Insert(insert) => Some(insert.value),
-                _ => None,
+                Op::InsertRoot(v) | Op::InsertAfter(_, v) | Op::InsertBefore(_, v) => Some(*v),
+                Op::Remove(_) => None,
             })
     }
 }
@@ -321,7 +272,7 @@ mod test {
 
         assert_eq!(
             &seq_a.iter().collect::<String>(),
-            "hello my name is davidzameena"
+            "hello my name is zameenadavid"
         );
     }
 
@@ -337,7 +288,7 @@ mod test {
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
         seq_a.merge(seq_b).expect("Faulty merge");
-        assert_eq!(&seq_a.iter().collect::<String>(), "abaza");
+        assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
     }
 
     #[test]
@@ -389,21 +340,13 @@ mod test {
         let mut seq = HashSeq::default();
 
         let insert = HashNode {
-            op: Op::Insert(Insert {
-                value: 'b',
-                left: None,
-                right: None,
-            }),
+            op: Op::InsertRoot('b'),
             extra_dependencies: BTreeSet::default(),
         };
 
         assert!(seq
             .apply(HashNode {
-                op: Op::Insert(Insert {
-                    value: 'a',
-                    left: Some(insert.id()),
-                    right: None,
-                }),
+                op: Op::InsertAfter(insert.id(), 'a'),
                 extra_dependencies: BTreeSet::default(),
             })
             .is_ok());
@@ -413,11 +356,7 @@ mod test {
 
         assert!(seq
             .apply(HashNode {
-                op: Op::Insert(Insert {
-                    value: 'a',
-                    left: None,
-                    right: Some(insert.id()),
-                }),
+                op: Op::InsertBefore(insert.id(), 'a'),
                 extra_dependencies: BTreeSet::default(),
             })
             .is_ok());
@@ -434,36 +373,6 @@ mod test {
     }
 
     #[test]
-    fn test_faulty_if_left_right_constraints_overlap() {
-        let mut seq = HashSeq::default();
-
-        seq.insert_batch(0, "ab".chars());
-
-        let mut tree_iter = seq.topo.iter();
-
-        let a_id = tree_iter.next().unwrap();
-        let b_id = tree_iter.next().unwrap();
-
-        // engineer a faulty op where `b` is on our left and `a` is on our right.
-
-        assert!(seq
-            .apply(HashNode {
-                op: Op::Insert(Insert {
-                    value: 'a',
-                    left: Some(b_id),
-                    right: Some(a_id),
-                }),
-                extra_dependencies: BTreeSet::default(),
-            })
-            .is_err());
-
-        let mut expected_seq = HashSeq::default();
-        expected_seq.insert_batch(0, "ab".chars());
-
-        assert_eq!(seq, expected_seq);
-    }
-
-    #[test]
     fn test_out_of_order_remove_is_cached() {
         let mut seq = HashSeq::default();
 
@@ -472,19 +381,13 @@ mod test {
         // once we see the insert.
 
         let insert = HashNode {
-            op: Op::Insert(Insert {
-                left: None,
-                value: 'a',
-                right: None,
-            }),
+            op: Op::InsertRoot('a'),
             extra_dependencies: BTreeSet::new(),
         };
 
         assert!(seq
             .apply(HashNode {
-                op: Op::Remove(Remove {
-                    insert: insert.id(),
-                }),
+                op: Op::Remove(insert.id()),
                 extra_dependencies: BTreeSet::new()
             })
             .is_ok());
