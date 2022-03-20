@@ -6,44 +6,35 @@ A Byzantine-Fault-Tolerant (BFT) Sequence CRDT suitable for unpermissioned netwo
 
 ## Merge Semantics
 
-### concurrent inserts are not interleaved:
+### Concurrent Inserts are not interleaved:
 
 | Site 1 | Site 2  |
 |--------|---------|
 |  hello | goodbye |
-|------------------|
-|   hellogoodbye   |
-
-
-
-site 2 inserts
-
-   goodbye
 
 On merge we see:
 
-   hellogoodbye
-
-or
-
-   goodbyehello
+`hellogoodbye` OR `goodbyehello`
 
 
-### Shared prefix's are not duplicated:
+### Common Prefix is Deduplicated:
 
-Site 1 inserts:
-
-    hello earth
-
-Site 2 inserts:
-
-    hello mars
-
+| Site 1 | Site 2  |
+|--------|---------|
+|  hello earth | hello mars |
 
 On merge we see:
 
-    hello earthmars OR hello marsearth
+`hello earthmars` OR `hello marsearth`
 
+(i.e. hello is not duplicated even though Site 1 and Site 2 both inserted it.)
+
+### Stable Ordering
+let _S_,_R_ be HashSeq instances on Site 1, Site 2 respectively.
+
+Both _S_ and _R_ form a montonic sub-sequence of _Q_ = merge(_S_, _R_).
+
+Stated differently, for sequence elements _a_,_b_ ∈ _S_, if _a_ comes before _b_ in _S_, and _a_,_b_ ∈ _R_, then _a_ comes before _b_ in _R_.
 
 ## Current Complexity:
 
