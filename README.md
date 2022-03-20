@@ -4,6 +4,47 @@
 
 A Byzantine-Fault-Tolerant (BFT) Sequence CRDT suitable for unpermissioned networks with unbounded number of collaborators.
 
+## Merge Semantics
+
+### concurrent inserts are not interleaved:
+
+| Site 1 | Site 2  |
+|--------|---------|
+|  hello | goodbye |
+|------------------|
+|   hellogoodbye   |
+
+
+
+site 2 inserts
+
+   goodbye
+
+On merge we see:
+
+   hellogoodbye
+
+or
+
+   goodbyehello
+
+
+### Shared prefix's are not duplicated:
+
+Site 1 inserts:
+
+    hello earth
+
+Site 2 inserts:
+
+    hello mars
+
+
+On merge we see:
+
+    hello earthmars OR hello marsearth
+
+
 ## Current Complexity:
 
 |   op   | time | space |
