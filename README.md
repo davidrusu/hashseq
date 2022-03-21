@@ -47,8 +47,51 @@ This is still a WIP, I think we can improve these substantially with some clever
 
 ## Design
 
-Each insert produces a Node holding a value, the hashes of the immediate nodes to the left, and the immediate nodes to the right:
 
+Each edit produces a HashNode containing an Op and some extra dependencies:
+
+```rust
+pub enum Op {
+    InsertRoot(char),
+    InsertAfter(Id, char),
+    InsertBefore(Id, char),
+    Remove(Id),
+}
+
+pub struct HashNode {
+    extra_dependenciess: BTreeSet<Id>,
+    op: Op,
+}
+
+impl HashNode {
+    fn id(&self) -> Id;
+}
+```
+
+* `InsertRoot` is used when the HashSeq is empty.
+* `InsertAfter(id, char) is used to constrain this `HashNode` to appear after the node with id `id`.
+* `InsertBefore(id, char)` is used to constrain this HashNode to appear before the node with id `id`.
+* `Remove(id)` is used to removing the node with id `id`.
+
+#### Example 1. Writing "hello" by appending end
+
+```
+InsertRoot('h')       -- id = 0x0
+InsertAfter(0x0, 'e') -- id = 0x1
+InsertAfter(0x1, 'l') -- id = 0x2
+InsertAfter(0x2, 'l') -- id = 0x3
+InsertAfter(0x3, 'o') -- id = 0x4
+
+  h <- e <- l <- l <- o
+
+-- "hello"
+```
+
+
+
+
+Each insert produces a Node holding a value, the hashes of the immediate nodes to the left, and the immediate nodes to the right:
+s
 ```
 struct Node<V> {
    value: V,
