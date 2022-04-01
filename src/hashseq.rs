@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::topo_sort::Topo;
 // use crate::topo_sort_strong_weak::Tree;
-use crate::Id;
+use crate::{Id, Cursor};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Op {
@@ -15,12 +15,12 @@ pub enum Op {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HashNode {
-    extra_dependencies: BTreeSet<Id>,
-    op: Op,
+    pub extra_dependencies: BTreeSet<Id>,
+    pub op: Op,
 }
 
 impl Op {
-    fn dependency(&self) -> Option<Id> {
+    pub fn dependency(&self) -> Option<Id> {
         match &self {
             Op::InsertRoot(_) => None,
             Op::InsertAfter(dep, _) | Op::InsertBefore(dep, _) | Op::Remove(dep) => Some(*dep),
@@ -29,14 +29,14 @@ impl Op {
 }
 
 impl HashNode {
-    fn dependencies(&self) -> impl Iterator<Item = Id> + '_ {
+    pub fn dependencies(&self) -> impl Iterator<Item = Id> + '_ {
         self.extra_dependencies
             .iter()
             .copied()
             .chain(self.op.dependency())
     }
 
-    fn id(&self) -> Id {
+    pub fn id(&self) -> Id {
         use std::hash::Hash;
         use std::hash::Hasher;
         let mut hasher = DefaultHasher::new();
@@ -47,11 +47,11 @@ impl HashNode {
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct HashSeq {
-    topo: Topo,
-    nodes: BTreeMap<Id, HashNode>,
-    removed_inserts: BTreeSet<Id>,
-    roots: BTreeSet<Id>,
-    orphaned: HashSet<HashNode>,
+    pub(crate) topo: Topo,
+    pub(crate) nodes: BTreeMap<Id, HashNode>,
+    pub(crate) removed_inserts: BTreeSet<Id>,
+    pub(crate) roots: BTreeSet<Id>,
+    pub(crate) orphaned: HashSet<HashNode>,
 }
 
 impl HashSeq {
@@ -67,6 +67,10 @@ impl HashSeq {
 
     pub fn orphans(&self) -> &HashSet<HashNode> {
         &self.orphaned
+    }
+
+    pub fn cursor(self) -> Cursor {
+	Cursor::from(self)
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {

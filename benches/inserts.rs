@@ -24,8 +24,7 @@ fn insert_middle(n: usize) {
 }
 
 fn append_growth(c: &mut Criterion) {
-    for n in [1, 10, 100, 1000] {
-        let guard = pprof::ProfilerGuard::new(100).unwrap();
+    for n in [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000] {
 
         c.bench_function(&format!("append {n}"), |b| {
             b.iter(|| append(black_box(n)));

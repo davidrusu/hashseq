@@ -38,12 +38,15 @@ Stated differently, for sequence elements _a_,_b_ ∈ _S_, if _a_ comes before _
 
 ## Current Complexity:
 
+Assuming you are using the Cursor interface:
+
 |   op   | time | space |
 |--------|------|-------|
-| insert | O(n) | O(n)  |
-| remove | O(n) | O(1)  |
+| insert | O(1) | O(1)  |
+| remove | O(n) | O(n)  |
+| seek   | O(n) | O(n)  |
 
-This is still a WIP, I think we can improve these substantially with some clever indexing strategies
+These are still WIP, we should be able to get `remove` and `seek` down to O(log(n)) once we have a secondary position index into the ordering tree.
 
 ## Design
 
