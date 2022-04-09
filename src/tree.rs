@@ -77,10 +77,7 @@ impl Tree {
                 if self.root != self.leaf_idx {
                     self.nodes.remove(self.root);
                 }
-                self.root = self.nodes.insert(NodeWithMeta {
-                    node: Node::Two(left, value, right),
-                    size: self.nodes[left].size + 1 + self.nodes[right].size,
-                })
+                self.root = self.two_node(left, value, right);
             }
             None => (),
         }
@@ -130,14 +127,8 @@ impl Tree {
                     match self.insert_rec(idx, value, prefix_len, l) {
                         Some((cl, cv, cr)) => {
                             self.nodes.remove(root);
-                            let nl = self.nodes.insert(NodeWithMeta {
-                                node: Node::Two(cl, cv, cr),
-                                size: self.nodes[cl].size + 1 + self.nodes[cr].size,
-                            });
-                            let nr = self.nodes.insert(NodeWithMeta {
-                                node: Node::Two(m, rv, r),
-                                size: self.nodes[m].size + 1 + self.nodes[r].size,
-                            });
+                            let nl = self.two_node(cl, cv, cr);
+                            let nr = self.two_node(m, rv, r);
                             Some((nl, lv, nr))
                         }
                         None => {
@@ -149,14 +140,8 @@ impl Tree {
                     match self.insert_rec(idx, value, left_bound + 1, m) {
                         Some((cl, cv, cr)) => {
                             self.nodes.remove(root);
-                            let nl = self.nodes.insert(NodeWithMeta {
-                                node: Node::Two(l, lv, cl),
-                                size: self.nodes[l].size + 1 + self.nodes[cl].size,
-                            });
-                            let nr = self.nodes.insert(NodeWithMeta {
-                                node: Node::Two(cr, rv, r),
-                                size: self.nodes[cr].size + 1 + self.nodes[r].size,
-                            });
+                            let nl = self.two_node(l, lv, cl);
+                            let nr = self.two_node(cr, rv, r);
                             Some((nl, cv, nr))
                         }
                         None => {
@@ -168,14 +153,8 @@ impl Tree {
                     match self.insert_rec(idx, value, mid_bound + 1, r) {
                         Some((cl, cv, cr)) => {
                             self.nodes.remove(root);
-                            let nl = self.nodes.insert(NodeWithMeta {
-                                node: Node::Two(l, lv, m),
-                                size: self.nodes[l].size + 1 + self.nodes[m].size,
-                            });
-                            let nr = self.nodes.insert(NodeWithMeta {
-                                node: Node::Two(cl, cv, cr),
-                                size: self.nodes[cl].size + 1 + self.nodes[cr].size,
-                            });
+                            let nl = self.two_node(l, lv, m);
+                            let nr = self.two_node(cl, cv, cr);
                             Some((nl, rv, nr))
                         }
                         None => {
