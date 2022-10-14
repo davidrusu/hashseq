@@ -97,8 +97,10 @@ impl<'a> Iterator for TopoIter<'a> {
 
     fn next(&mut self) -> Option<Id> {
         if let Some(n) = self.free_stack.pop() {
-            for after in self.topo.after(n).into_iter().rev() {
-                self.waiting_stack.push((after, self.topo.before(after)));
+            if let Some(afters) = self.topo.after.get(&n) {
+                for after in afters.iter().rev().copied() {
+                    self.waiting_stack.push((after, self.topo.before(after)));
+                }
             }
 
             for (_, deps) in self.waiting_stack.iter_mut() {
