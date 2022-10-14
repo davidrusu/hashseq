@@ -456,6 +456,17 @@ mod tests {
         assert_eq!(topo, topo_reverse_order);
     }
 
+    #[test]
+    fn test_multiple_after_dependencies() {
+        let mut topo = Topo::default();
+        topo.add_root(0);
+        topo.add_root(1);
+        topo.add_after(0, 2);
+        topo.add_after(1, 2);
+
+        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2])
+    }
+
     #[ignore]
     #[quickcheck]
     fn prop_order_preservation_across_forks() {
