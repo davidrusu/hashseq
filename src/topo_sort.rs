@@ -68,7 +68,7 @@ impl Topo {
 pub struct TopoIter<'a> {
     topo: &'a Topo,
     free_stack: Vec<&'a Id>,
-    waiting_stack: Vec<(&'a Id, BTreeSet<&'a Id>)>,
+    waiting_stack: Vec<(&'a Id, Vec<&'a Id>)>,
 }
 
 impl<'a> TopoIter<'a> {
@@ -89,9 +89,9 @@ impl<'a> TopoIter<'a> {
     }
 
     fn push_waiting(&mut self, n: &'a Id) {
-        let mut deps = BTreeSet::new();
+        let mut deps = Vec::new();
         if let Some(befores) = self.topo.before.get(&n) {
-            deps.extend(befores.iter())
+            deps.extend(befores)
         }
         self.waiting_stack.push((n, deps));
     }
@@ -113,7 +113,7 @@ impl<'a> Iterator for TopoIter<'a> {
             if deps.is_empty() {
                 self.free_stack.push(n)
             } else {
-                self.waiting_stack.push((n, BTreeSet::new()));
+                self.waiting_stack.push((n, Vec::new()));
                 for dep in deps.into_iter().rev() {
                     self.push_waiting(dep);
                 }
