@@ -67,28 +67,33 @@ impl Topo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopoIter<'a> {
     topo: &'a Topo,
-    used: BTreeSet<Id>,
-    free_stack: Vec<Id>,
-    waiting_stack: Vec<(Id, BTreeSet<Id>)>,
+    free_stack: Vec<&'a Id>,
+    waiting_stack: Vec<(&'a Id, BTreeSet<&'a Id>)>,
 }
 
 impl<'a> TopoIter<'a> {
     fn new(topo: &'a Topo) -> Self {
-        let used = BTreeSet::new();
         let free_stack = Vec::new();
-        let waiting_stack = topo
-            .roots()
-            .iter()
-            .map(|r| (*r, topo.before(*r)))
-            .rev()
-            .collect();
 
-        Self {
+        let mut iter = Self {
             topo,
-            used,
             free_stack,
-            waiting_stack,
+            waiting_stack: Vec::new(),
+        };
+
+        for root in topo.roots().iter().rev() {
+            iter.push_waiting(root);
         }
+
+        iter
+    }
+
+    fn push_waiting(&mut self, n: &'a Id) {
+        let mut deps = BTreeSet::new();
+        if let Some(befores) = self.topo.before.get(&n) {
+            deps.extend(befores.iter())
+        }
+        self.waiting_stack.push((n, deps));
     }
 }
 
@@ -98,25 +103,22 @@ impl<'a> Iterator for TopoIter<'a> {
     fn next(&mut self) -> Option<Id> {
         if let Some(n) = self.free_stack.pop() {
             if let Some(afters) = self.topo.after.get(&n) {
-                for after in afters.iter().rev().copied() {
-                    self.waiting_stack.push((after, self.topo.before(after)));
+                for after in afters.iter().rev() {
+                    self.push_waiting(after);
                 }
             }
 
-            for (_, deps) in self.waiting_stack.iter_mut() {
-                deps.remove(&n);
-            }
-
-            Some(n)
-        } else if let Some((ready, deps)) = self.waiting_stack.pop() {
+            Some(*n)
+        } else if let Some((n, deps)) = self.waiting_stack.pop() {
             if deps.is_empty() {
-                self.free_stack.push(ready);
+                self.free_stack.push(n)
             } else {
-                self.waiting_stack.push((ready, deps.clone()));
+                self.waiting_stack.push((n, BTreeSet::new()));
                 for dep in deps.into_iter().rev() {
-                    self.waiting_stack.push((dep, self.topo.before(dep)));
+                    self.push_waiting(dep);
                 }
             }
+
             self.next()
         } else {
             None
@@ -454,17 +456,6 @@ mod tests {
         topo_reverse_order.add_before(1, 2);
 
         assert_eq!(topo, topo_reverse_order);
-    }
-
-    #[test]
-    fn test_multiple_after_dependencies() {
-        let mut topo = Topo::default();
-        topo.add_root(0);
-        topo.add_root(1);
-        topo.add_after(0, 2);
-        topo.add_after(1, 2);
-
-        assert_eq!(Vec::from_iter(topo.iter()), vec![0, 1, 2])
     }
 
     #[ignore]
