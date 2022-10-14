@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::Id;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Topo {
     roots: BTreeSet<Id>,
-    before: BTreeMap<Id, BTreeSet<Id>>,
-    after: BTreeMap<Id, BTreeSet<Id>>,
+    before: HashMap<Id, BTreeSet<Id>>,
+    after: HashMap<Id, BTreeSet<Id>>,
 }
 
 impl Topo {
