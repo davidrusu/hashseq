@@ -8,4 +8,4 @@ pub mod cursor;
 pub use self::cursor::Cursor;
 pub use self::hashseq::{HashNode, HashSeq};
 
-type Id = u64;
+type Id = [u8; 32];
