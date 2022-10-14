@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::topo_sort::Topo;
 // use crate::topo_sort_strong_weak::Tree;
-use crate::{Id, Cursor};
+use crate::{Cursor, Id};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Op {
@@ -70,7 +70,7 @@ impl HashSeq {
     }
 
     pub fn cursor(self) -> Cursor {
-	Cursor::from(self)
+        Cursor::from(self)
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {
@@ -113,8 +113,7 @@ impl HashSeq {
             op,
         };
 
-        self.apply(node)
-            .expect("ERR: We constructed a faulty op using public API");
+        self.apply(node);
     }
 
     pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
@@ -142,8 +141,7 @@ impl HashSeq {
                 op: Op::Remove(insert),
             };
 
-            self.apply(node)
-                .expect("ERR: We constructed a faulty op using public API")
+            self.apply(node);
         }
     }
 
@@ -157,18 +155,18 @@ impl HashSeq {
         false
     }
 
-    pub fn apply(&mut self, node: HashNode) -> Result<(), Op> {
+    pub fn apply(&mut self, node: HashNode) {
         let id = node.id();
         // println!("apply({:?} = {:?})", node, id);
+
+        if self.nodes.contains_key(&id) {
+            return; // Already processed this node
+        }
 
         let dependencies = BTreeSet::from_iter(node.dependencies());
         if self.any_missing_dependencies(&dependencies) {
             self.orphaned.insert(node);
-            return Ok(());
-        }
-
-        if self.nodes.contains_key(&id) {
-            return Ok(()); // Already processed this node
+            return;
         }
 
         match &node.op {
@@ -199,22 +197,18 @@ impl HashSeq {
         let orphans = std::mem::take(&mut self.orphaned);
 
         for orphan in orphans {
-            self.apply(orphan)?;
+            self.apply(orphan);
         }
-
-        Ok(())
     }
 
-    pub fn merge(&mut self, other: Self) -> Result<(), Op> {
+    pub fn merge(&mut self, other: Self) {
         for node in other.nodes.into_values() {
-            self.apply(node)?;
+            self.apply(node);
         }
 
         for orphan in other.orphaned {
-            self.apply(orphan)?;
+            self.apply(orphan);
         }
-
-        Ok(())
     }
 
     pub fn iter_ids(&self) -> impl Iterator<Item = Id> + '_ {
@@ -262,7 +256,7 @@ mod test {
         seq_a.insert_batch(0, "we wrote".chars());
         seq_b.insert_batch(0, "this together ".chars());
 
-        seq_a.merge(seq_b).expect("Faulty merge");
+        seq_a.merge(seq_b);
 
         assert_eq!(&seq_a.iter().collect::<String>(), "this together we wrote");
     }
@@ -275,7 +269,7 @@ mod test {
         seq_a.insert_batch(0, "hello my name is david".chars());
         seq_b.insert_batch(0, "hello my name is zameena".chars());
 
-        seq_a.merge(seq_b).expect("Faulty merge");
+        seq_a.merge(seq_b);
 
         assert_eq!(
             &seq_a.iter().collect::<String>(),
@@ -294,7 +288,7 @@ mod test {
         seq_b.insert_batch(0, "aza".chars());
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
-        seq_a.merge(seq_b).expect("Faulty merge");
+        seq_a.merge(seq_b);
         assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
     }
 
@@ -351,27 +345,23 @@ mod test {
             extra_dependencies: BTreeSet::default(),
         };
 
-        assert!(seq
-            .apply(HashNode {
-                op: Op::InsertAfter(insert.id(), 'a'),
-                extra_dependencies: BTreeSet::default(),
-            })
-            .is_ok());
+        seq.apply(HashNode {
+            op: Op::InsertAfter(insert.id(), 'a'),
+            extra_dependencies: BTreeSet::default(),
+        });
 
         assert_eq!(seq.orphans().len(), 1);
         assert_eq!(seq.len(), 0);
 
-        assert!(seq
-            .apply(HashNode {
-                op: Op::InsertBefore(insert.id(), 'a'),
-                extra_dependencies: BTreeSet::default(),
-            })
-            .is_ok());
+        seq.apply(HashNode {
+            op: Op::InsertBefore(insert.id(), 'a'),
+            extra_dependencies: BTreeSet::default(),
+        });
 
         assert_eq!(seq.orphans().len(), 2);
         assert_eq!(seq.len(), 0);
 
-        assert!(seq.apply(insert).is_ok());
+        seq.apply(insert);
 
         assert_eq!(seq.orphans().len(), 0);
         assert_eq!(seq.len(), 3);
@@ -392,15 +382,13 @@ mod test {
             extra_dependencies: BTreeSet::new(),
         };
 
-        assert!(seq
-            .apply(HashNode {
-                op: Op::Remove(insert.id()),
-                extra_dependencies: BTreeSet::new()
-            })
-            .is_ok());
+        seq.apply(HashNode {
+            op: Op::Remove(insert.id()),
+            extra_dependencies: BTreeSet::new(),
+        });
 
         assert_eq!(seq.orphans().len(), 1);
-        assert!(seq.apply(insert).is_ok());
+        seq.apply(insert);
         assert_eq!(seq.orphans().len(), 0);
         assert_eq!(&String::from_iter(seq.iter()), "");
     }
@@ -418,10 +406,10 @@ mod test {
         seq_b.insert(0, 'b');
 
         let mut ab = seq_a.clone();
-        ab.merge(seq_b.clone()).unwrap();
+        ab.merge(seq_b.clone());
 
         let mut ba = seq_b.clone();
-        ba.merge(seq_a.clone()).unwrap();
+        ba.merge(seq_a.clone());
 
         dbg!(&ab);
         dbg!(&ba);
@@ -452,7 +440,7 @@ mod test {
         // merge(a, a) == a
 
         let mut merge_self = seq.clone();
-        merge_self.merge(seq.clone()).unwrap();
+        merge_self.merge(seq.clone());
 
         assert_eq!(merge_self, seq);
     }
@@ -497,10 +485,10 @@ mod test {
         // merge(a, b) == merge(b, a)
 
         let mut merge_a_b = seq_a.clone();
-        merge_a_b.merge(seq_b.clone()).unwrap();
+        merge_a_b.merge(seq_b.clone());
 
         let mut merge_b_a = seq_b.clone();
-        merge_b_a.merge(seq_a.clone()).unwrap();
+        merge_b_a.merge(seq_a.clone());
 
         assert_eq!(merge_a_b, merge_b_a);
     }
@@ -566,12 +554,12 @@ mod test {
         // merge(merge(a, b), c) == merge(a, merge(b, c))
 
         let mut ab_then_c = seq_a.clone();
-        ab_then_c.merge(seq_b.clone()).unwrap();
-        ab_then_c.merge(seq_c.clone()).unwrap();
+        ab_then_c.merge(seq_b.clone());
+        ab_then_c.merge(seq_c.clone());
 
         let mut bc_then_a = seq_b.clone();
-        bc_then_a.merge(seq_c.clone()).unwrap();
-        bc_then_a.merge(seq_a.clone()).unwrap();
+        bc_then_a.merge(seq_c.clone());
+        bc_then_a.merge(seq_a.clone());
 
         assert_eq!(ab_then_c, bc_then_a);
 
@@ -759,21 +747,17 @@ mod test {
         }
 
         let mut merged = seq_a.clone();
-        merged.merge(seq_b.clone()).unwrap();
+        merged.merge(seq_b.clone());
 
         for r in removed {
-            seq_a
-                .apply(HashNode {
-                    op: Op::Remove(r),
-                    extra_dependencies: BTreeSet::new(),
-                })
-                .unwrap();
-            seq_b
-                .apply(HashNode {
-                    op: Op::Remove(r),
-                    extra_dependencies: BTreeSet::new(),
-                })
-                .unwrap();
+            seq_a.apply(HashNode {
+                op: Op::Remove(r),
+                extra_dependencies: BTreeSet::new(),
+            });
+            seq_b.apply(HashNode {
+                op: Op::Remove(r),
+                extra_dependencies: BTreeSet::new(),
+            });
         }
         let mut iter_a = seq_a.iter_ids();
         let mut iter_b = seq_b.iter_ids();
