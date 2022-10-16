@@ -74,7 +74,7 @@ impl Topo {
 
 #[derive(Debug, Default, Clone)]
 pub struct Marker {
-    pub(crate) waiting_stack: Vec<(Id, BTreeSet<Id>)>,
+    pub(crate) waiting_stack: Vec<(Id, Vec<Id>)>,
 }
 
 impl Marker {
@@ -85,7 +85,10 @@ impl Marker {
     pub(crate) fn insert_dependency(&mut self, id: &Id, dep: Id) {
         for (n, deps) in self.waiting_stack.iter_mut() {
             if n == id {
-                deps.insert(dep);
+                match deps.binary_search_by(|d| d.cmp(&dep).reverse()) {
+                    Ok(_) => (), // id is already a dependency
+                    Err(idx) => deps.insert(idx, dep),
+                }
                 break;
             }
         }
@@ -95,7 +98,7 @@ impl Marker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopoIter<'a, 'b> {
     topo: &'a Topo,
-    waiting_stack: Vec<(&'a Id, BTreeSet<&'a Id>)>,
+    waiting_stack: Vec<(&'a Id, Vec<&'a Id>)>,
     removed: &'b HashSet<Id>,
 }
 
@@ -117,11 +120,11 @@ impl<'a, 'b> TopoIter<'a, 'b> {
     pub fn restore(topo: &'a Topo, removed: &'b HashSet<Id>, marker: &Marker) -> Self {
         let waiting_stack = Vec::from_iter(marker.waiting_stack.iter().map(|(id, deps)| {
             let (id, _) = topo.before.get_key_value(id).expect("Invalid marker");
-            let mut dep_ref = BTreeSet::new();
+            let mut dep_ref = Vec::with_capacity(deps.len());
 
             for dep in deps {
                 let (dep_id, _) = topo.before.get_key_value(dep).expect("Invalid dep");
-                dep_ref.insert(dep_id);
+                dep_ref.push(dep_id);
             }
 
             (id, dep_ref)
@@ -137,15 +140,15 @@ impl<'a, 'b> TopoIter<'a, 'b> {
         let waiting_stack = Vec::from_iter(
             self.waiting_stack
                 .iter()
-                .map(|(id, deps)| (**id, BTreeSet::from_iter(deps.iter().map(|id| **id)))),
+                .map(|(id, deps)| (**id, Vec::from_iter(deps.iter().map(|id| **id)))),
         );
         self.next().map(|id| (id, Marker { waiting_stack }))
     }
 
     fn push_waiting(&mut self, n: &'a Id) {
-        let mut deps = BTreeSet::new();
+        let mut deps = Vec::new();
         let befores = &self.topo.before[n];
-        deps.extend(befores.iter());
+        deps.extend(befores.iter().rev());
         self.waiting_stack.push((n, deps));
     }
 }
@@ -173,7 +176,7 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
         } else {
             // This node has dependencies that need to be
             // released ahead of itself.
-            let dep = deps.pop_first().expect("There should be at least one dep");
+            let dep = deps.pop().expect("There should be at least one dep");
             self.push_waiting(dep);
 
             self.next()
