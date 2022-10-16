@@ -129,9 +129,8 @@ impl<'a, 'b> TopoIter<'a, 'b> {
 
     fn push_waiting(&mut self, n: &'a Id) {
         let mut deps = BTreeSet::new();
-        if let Some(befores) = self.topo.before.get(n) {
-            deps.extend(befores.iter())
-        }
+        let befores = &self.topo.before[n];
+        deps.extend(befores.iter());
         self.waiting_stack.push((n, deps));
     }
 }
@@ -140,9 +139,10 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
     type Item = Id;
 
     fn next(&mut self) -> Option<Id> {
-        let (n, mut deps) = self.waiting_stack.pop()?;
+        let (_, deps) = self.waiting_stack.last_mut()?;
 
         if deps.is_empty() {
+            let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
             // This node is free to be released, but first
             // queue up any nodes who come after this one
             if let Some(afters) = self.topo.after.get(n) {
@@ -159,7 +159,6 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
             // This node has dependencies that need to be
             // released ahead of itself.
             let dep = deps.pop_first().expect("There should be at least one dep");
-            self.waiting_stack.push((n, deps));
             self.push_waiting(dep);
 
             self.next()

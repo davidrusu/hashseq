@@ -17,12 +17,12 @@ serde = { version = "1", features = ["derive"] }
 tiny-keccak = { version = "2.0.2", features = ["sha3"] }
 serde_json = "1.0.86"
 indicatif = "0.17.1"
+pprof = { version = "0.7.0", features = ["flamegraph"] }
 
 [dev-dependencies]
 quickcheck = "1"
 quickcheck_macros = "1"
 criterion = "0.3"
-pprof = { version = "0.7.0", features = ["flamegraph"] }
 
 [profile.bench]
 debug = true
