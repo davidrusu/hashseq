@@ -144,10 +144,10 @@ impl HashSeq {
 
         if let Some(mut marker) = marker {
             if was_insert_before {
-                let right = right.unwrap();
+                let right = right.expect("Right should be defined if we are inserting before");
                 marker.insert_dependency(&right, node_id);
             } else {
-                marker.waiting_stack.push((node_id, Default::default()));
+                marker.push_next(node_id);
             }
 
             self.markers.insert(idx, marker);

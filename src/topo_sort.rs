@@ -78,6 +78,10 @@ pub struct Marker {
 }
 
 impl Marker {
+    pub(crate) fn push_next(&mut self, id: Id) {
+        self.waiting_stack.push((id, Default::default()))
+    }
+
     pub(crate) fn insert_dependency(&mut self, id: &Id, dep: Id) {
         for (n, deps) in self.waiting_stack.iter_mut() {
             if n == id {
