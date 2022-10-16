@@ -142,13 +142,17 @@ impl HashSeq {
 
     pub fn remove(&mut self, idx: usize) {
         let id_to_remove = {
-            let mut order = self.iter_ids();
+            if let Some(marker) = self.markers.get(&idx).cloned() {
+                marker.current
+            } else {
+                let mut order = self.iter_ids();
 
-            for _ in 0..idx {
-                order.next();
+                for _ in 0..idx {
+                    order.next();
+                }
+
+                order.next()
             }
-
-            order.next()
         };
 
         if let Some(id) = id_to_remove {

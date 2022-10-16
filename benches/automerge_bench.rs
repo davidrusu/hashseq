@@ -82,7 +82,7 @@ fn automerge_bench(c: &mut Criterion) {
 
     let guard = pprof::ProfilerGuard::new(100).unwrap();
 
-    let n = 10000;
+    let n = 20000;
 
     c.bench_function("load automerge trace", |b| {
         b.iter(|| {
