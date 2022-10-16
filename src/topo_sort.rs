@@ -97,25 +97,28 @@ impl<'a> Iterator for TopoIter<'a> {
     type Item = Id;
 
     fn next(&mut self) -> Option<Id> {
-        if let Some((n, deps)) = self.waiting_stack.pop() {
-            if deps.is_empty() {
-                if let Some(afters) = self.topo.after.get(n) {
-                    for after in afters.iter().rev() {
-                        self.push_waiting(after);
-                    }
-                }
-                Some(*n)
-            } else {
-                self.waiting_stack.push((n, Vec::new()));
+        let (n, deps) = self.waiting_stack.pop()?;
 
-                for dep in deps.into_iter().rev() {
-                    self.push_waiting(dep);
+        if deps.is_empty() {
+            // This node is free to be released, but first
+            // queue up any nodes who come after this one
+            if let Some(afters) = self.topo.after.get(n) {
+                for after in afters.iter().rev() {
+                    self.push_waiting(after);
                 }
-
-                self.next()
             }
+
+            Some(*n)
         } else {
-            None
+            // This node has dependencies that need to be
+            // released before it.
+            self.waiting_stack.push((n, Vec::new()));
+
+            for dep in deps.into_iter().rev() {
+                self.push_waiting(dep);
+            }
+
+            self.next()
         }
     }
 }
