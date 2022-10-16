@@ -10,16 +10,16 @@ pub struct Topo {
 }
 
 impl Topo {
-    pub fn is_causally_before(&self, a: Id, b: Id) -> bool {
+    pub fn is_causally_before(&self, a: &Id, b: &Id) -> bool {
         let mut seen = BTreeSet::new();
-        let mut boundary = VecDeque::from_iter(self.after(a));
+        let mut boundary = VecDeque::from_iter(self.after(*a));
         while let Some(n) = boundary.pop_front() {
-            if n == b {
+            if &n == b {
                 return true;
             }
             seen.insert(n);
             boundary.extend(self.after(n).into_iter().filter(|a| !seen.contains(a)));
-            if n != a {
+            if &n != a {
                 boundary.extend(self.before(n).into_iter().filter(|a| !seen.contains(a)));
             }
         }

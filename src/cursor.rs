@@ -1,9 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{
-    hashseq::{HashNode, Op},
-    HashSeq, Id,
-};
+use crate::{HashNode, HashSeq, Id, Op};
 
 pub struct Cursor {
     hashseq: HashSeq,
@@ -59,7 +56,7 @@ impl Cursor {
     fn do_insert(&mut self, value: char) -> Id {
         let op = match (self.left, self.right) {
             (Some(l), Some(r)) => {
-                if self.hashseq.topo.is_causally_before(l, r) {
+                if self.hashseq.topo.is_causally_before(&l, &r) {
                     Op::InsertBefore(r, value)
                 } else {
                     Op::InsertAfter(l, value)

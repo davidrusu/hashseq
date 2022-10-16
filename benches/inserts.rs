@@ -27,7 +27,7 @@ fn append_growth(c: &mut Criterion) {
     for n in [1, 10, 100, 1000] {
         let guard = pprof::ProfilerGuard::new(100).unwrap();
 
-        c.bench_function(&format!("append {n}"), |b| {
+        c.bench_function(&format!("index-append-{n}"), |b| {
             b.iter(|| append(black_box(n)));
         });
 

@@ -1,17 +1,44 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use crate::topo_sort::Topo;
 // use crate::topo_sort_strong_weak::Tree;
-use crate::{Cursor, Id};
+use crate::{Cursor, HashNode, Id, Op};
 
-#[derive(Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Marker {
+    current: Option<Id>,
+    next: Option<Id>,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct HashSeq {
     pub(crate) topo: Topo,
     pub(crate) nodes: BTreeMap<Id, HashNode>,
     pub(crate) removed_inserts: BTreeSet<Id>,
     pub(crate) roots: BTreeSet<Id>,
     pub(crate) orphaned: HashSet<HashNode>,
+    pub(crate) markers: BTreeMap<usize, Marker>,
 }
+
+impl PartialEq for HashSeq {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            &self.topo,
+            &self.nodes,
+            &self.removed_inserts,
+            &self.roots,
+            &self.orphaned,
+        ) == (
+            &other.topo,
+            &other.nodes,
+            &other.removed_inserts,
+            &other.roots,
+            &other.orphaned,
+        )
+    }
+}
+
+impl Eq for HashSeq {}
 
 impl HashSeq {
     pub fn len(&self) -> usize {
@@ -32,39 +59,69 @@ impl HashSeq {
         Cursor::from(self)
     }
 
-    pub fn insert(&mut self, idx: usize, value: char) {
-        let op = {
-            let mut order = self.iter_ids();
-
-            let left = if let Some(prev_idx) = idx.checked_sub(1) {
-                for _ in 0..prev_idx {
-                    order.next();
-                }
-                order.next()
-            } else {
-                None
-            };
-
-            let right = order.next();
-
-            match (left, right) {
-                (Some(l), Some(r)) => {
-                    if self.topo.is_causally_before(l, r) {
-                        Op::InsertBefore(r, value)
-                    } else {
-                        Op::InsertAfter(l, value)
-                    }
-                }
-                (Some(l), None) => Op::InsertAfter(l, value),
-                (None, Some(r)) => Op::InsertBefore(r, value),
-                (None, None) => Op::InsertRoot(value),
+    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {
+        if let Some(prev_idx) = idx.checked_sub(1) {
+            if let Some(marker) = self.markers.get(&prev_idx).cloned() {
+                return (marker.current, marker.next);
             }
+        }
+
+        let mut order = self.iter_ids();
+
+        let left = if let Some(prev_idx) = idx.checked_sub(1) {
+            for _ in 0..prev_idx {
+                order.next();
+            }
+            order.next()
+        } else {
+            None
+        };
+
+        let right = order.next();
+
+        (left, right)
+    }
+
+    fn invalidate_markers_after(&mut self, idx: usize) {
+        self.markers.split_off(&(idx + 1));
+    }
+
+    fn update_marker(&mut self, idx: usize, id: Id, next: Option<Id>) {
+        self.invalidate_markers_after(idx);
+        if let Some(prev_idx) = idx.checked_sub(1) {
+            if let Some(prev_marker) = self.markers.get_mut(&prev_idx) {
+                prev_marker.next = Some(id);
+            }
+        }
+        self.markers.insert(
+            idx,
+            Marker {
+                current: Some(id),
+                next,
+            },
+        );
+    }
+
+    pub fn insert(&mut self, idx: usize, value: char) {
+        let (left, right) = self.neighbours(idx);
+        let op = match &(left, right) {
+            (Some(l), Some(r)) => {
+                if self.topo.is_causally_before(l, r) {
+                    Op::InsertBefore(*r, value)
+                } else {
+                    Op::InsertAfter(*l, value)
+                }
+            }
+            (Some(l), None) => Op::InsertAfter(*l, value),
+            (None, Some(r)) => Op::InsertBefore(*r, value),
+            (None, None) => Op::InsertRoot(value),
         };
 
         let mut extra_dependencies = self.roots.clone();
 
         if let Some(dep) = op.dependency() {
-            extra_dependencies.remove(&dep); // the op dependency will already be seen, no need to duplicated it in the extra dependencie.
+            // the op dependency will already be seen, no need to duplicated it in the extra dependencie.
+            extra_dependencies.remove(&dep);
         }
 
         let node = HashNode {
@@ -72,7 +129,9 @@ impl HashSeq {
             op,
         };
 
-        self.apply(node);
+        let node_id = node.id();
+        self.apply_without_invalidate(node);
+        self.update_marker(idx, node_id, right);
     }
 
     pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
@@ -100,7 +159,9 @@ impl HashSeq {
                 op: Op::Remove(insert),
             };
 
-            self.apply(node);
+            self.apply_without_invalidate(node);
+            self.invalidate_markers_after(idx);
+            self.markers.remove(&idx);
         }
     }
 
@@ -115,6 +176,11 @@ impl HashSeq {
     }
 
     pub fn apply(&mut self, node: HashNode) {
+        self.apply_without_invalidate(node);
+        self.markers.clear();
+    }
+
+    pub fn apply_without_invalidate(&mut self, node: HashNode) {
         let id = node.id();
         // println!("apply({:?} = {:?})", node, id);
 
@@ -632,6 +698,18 @@ mod test {
         }
 
         assert_eq!(seq.iter().collect::<String>(), "aaadaa");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc5() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'a');
+        seq.remove(0);
+        seq.insert(1, 'b');
+
+        assert_eq!(String::from_iter(seq.iter()), "ab");
     }
 
     #[quickcheck]

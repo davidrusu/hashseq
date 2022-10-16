@@ -7,7 +7,7 @@ pub mod cursor;
 pub mod hash_node;
 
 pub use self::cursor::Cursor;
-pub use self::hash_node::HashNode;
+pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::HashSeq;
 
 type Id = [u8; 32];
