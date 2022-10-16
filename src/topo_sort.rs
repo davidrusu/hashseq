@@ -67,7 +67,6 @@ impl Topo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopoIter<'a> {
     topo: &'a Topo,
-    ready: Option<&'a Id>,
     waiting_stack: Vec<(&'a Id, Vec<&'a Id>)>,
 }
 
@@ -75,7 +74,6 @@ impl<'a> TopoIter<'a> {
     fn new(topo: &'a Topo) -> Self {
         let mut iter = Self {
             topo,
-            ready: None,
             waiting_stack: Vec::new(),
         };
 
@@ -99,25 +97,23 @@ impl<'a> Iterator for TopoIter<'a> {
     type Item = Id;
 
     fn next(&mut self) -> Option<Id> {
-        if let Some(n) = self.ready.take() {
-            if let Some(afters) = self.topo.after.get(n) {
-                for after in afters.iter().rev() {
-                    self.push_waiting(after);
-                }
-            }
-
-            Some(*n)
-        } else if let Some((n, deps)) = self.waiting_stack.pop() {
+        if let Some((n, deps)) = self.waiting_stack.pop() {
             if deps.is_empty() {
-                self.ready = Some(n)
+                if let Some(afters) = self.topo.after.get(n) {
+                    for after in afters.iter().rev() {
+                        self.push_waiting(after);
+                    }
+                }
+                Some(*n)
             } else {
                 self.waiting_stack.push((n, Vec::new()));
+
                 for dep in deps.into_iter().rev() {
                     self.push_waiting(dep);
                 }
-            }
 
-            self.next()
+                self.next()
+            }
         } else {
             None
         }
