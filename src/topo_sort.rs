@@ -68,7 +68,7 @@ impl Topo {
         removed: &'b HashSet<Id>,
         marker: &Marker,
     ) -> TopoIter<'a, 'b> {
-        TopoIter::restore(&self, removed, marker)
+        TopoIter::restore(self, removed, marker)
     }
 }
 

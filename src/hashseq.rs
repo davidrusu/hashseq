@@ -70,7 +70,7 @@ impl HashSeq {
         if (idx - start_idx) > self.marker_spacing() {
             // we'll insert a marker at the midpoint between the index and the start_idx
 
-            let mid_idx = (start_idx + (idx - start_idx) / 2);
+            let mid_idx = start_idx + (idx - start_idx) / 2;
             for _ in start_idx..mid_idx {
                 order.next();
             }
@@ -79,8 +79,8 @@ impl HashSeq {
         }
 
         let left = if let Some(prev_idx) = idx.checked_sub(1) && prev_idx >= start_idx {
-            for i in start_idx..prev_idx {
-                let v = order.next();
+            for _ in start_idx..prev_idx {
+                order.next();
             }
             order.next()
         } else {
@@ -192,7 +192,7 @@ impl HashSeq {
             if (idx - start_idx) > self.marker_spacing() {
                 // we'll insert a marker at the midpoint between the index and the start_idx
 
-                let mid_idx = (start_idx + (idx - start_idx) / 2);
+                let mid_idx = start_idx + (idx - start_idx) / 2;
                 for _ in start_idx..mid_idx {
                     order.next();
                 }
@@ -200,8 +200,8 @@ impl HashSeq {
                 start_idx = mid_idx + 1;
             }
 
-            for i in start_idx..idx {
-                let v = order.next();
+            for _ in start_idx..idx {
+                order.next();
             }
 
             let v = order.marker();
@@ -865,7 +865,7 @@ mod test {
                     // remove
                     if !seq_a.is_empty() {
                         let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(seq_a.iter_ids().skip(idx).next().unwrap());
+                        removed.insert(seq_a.iter_ids().nth(idx).unwrap());
                         seq_a.remove(idx);
                     }
                 }
@@ -883,7 +883,7 @@ mod test {
                     // remove
                     if !seq_b.is_empty() {
                         let idx = idx.min(seq_b.len() - 1);
-                        removed.insert(seq_b.iter_ids().skip(idx).next().unwrap());
+                        removed.insert(seq_b.iter_ids().nth(idx).unwrap());
                         seq_b.remove(idx);
                     }
                 }

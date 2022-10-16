@@ -3,7 +3,6 @@ use std::{fs::File, io};
 use ::hashseq::HashSeq;
 use indicatif::ProgressBar;
 use serde::Deserialize;
-use serde_json;
 
 #[derive(Deserialize)]
 #[serde(untagged)]

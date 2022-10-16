@@ -7,8 +7,8 @@ use std::{
 use criterion::{criterion_group, criterion_main, Criterion};
 use hashseq::HashSeq;
 use serde::Deserialize;
-use serde_json;
 
+#[allow(unused)]
 #[derive(Deserialize)]
 enum AutomergeAction {
     #[serde(rename = "set")]
@@ -21,6 +21,7 @@ enum AutomergeAction {
     MakeMap,
 }
 
+#[allow(unused)]
 #[derive(Deserialize)]
 struct AutomergeOp {
     action: AutomergeAction,
@@ -31,6 +32,7 @@ struct AutomergeOp {
     pred: Vec<String>,
 }
 
+#[allow(unused)]
 #[derive(Deserialize)]
 struct AutomergeEvent {
     actor: String,
@@ -43,6 +45,7 @@ struct AutomergeEvent {
     ops: Vec<AutomergeOp>,
 }
 
+#[allow(unused)]
 fn load_automerge_events() -> Vec<AutomergeEvent> {
     // It's assumed you have https://github.com/automerge/automerge-perf
     // cloned next to this repository and `edit-history/paper.json.gz` decompressed
@@ -98,7 +101,7 @@ fn automerge_bench(c: &mut Criterion) {
     });
 
     if let Ok(report) = guard.report().build() {
-        let file = std::fs::File::create(&format!("automerge-index-fg.svg")).unwrap();
+        let file = std::fs::File::create("automerge-index-fg.svg").unwrap();
         report.flamegraph(file).unwrap();
     };
 }
