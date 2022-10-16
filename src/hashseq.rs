@@ -87,10 +87,12 @@ impl HashSeq {
             None
         };
 
-        let right_marker = order.marker();
-        let right = right_marker.as_ref().map(|m| m.id);
+        let (right, marker) = match order.marker() {
+            Some((id, m)) => (Some(id), Some(m)),
+            None => (None, None),
+        };
 
-        if let Some((idx, marker)) = extra_markers_to_insert {
+        if let Some((idx, (_, marker))) = extra_markers_to_insert {
             self.markers.insert(idx, marker);
         }
 
@@ -100,7 +102,7 @@ impl HashSeq {
             self.cache_miss += 1;
         }
 
-        (left, right, right_marker)
+        (left, right, marker)
     }
 
     fn invalidate_markers_after(&mut self, idx: usize) {
@@ -140,8 +142,6 @@ impl HashSeq {
         self.invalidate_markers_after(idx);
 
         if let Some(mut marker) = marker {
-            marker.id = node_id;
-
             if was_insert_before {
                 let right = right.unwrap();
                 for (n, deps) in marker.waiting_stack.iter_mut() {
@@ -215,23 +215,23 @@ impl HashSeq {
             v
         };
 
-        if let Some((idx, marker)) = extra_markers_to_insert {
+        if let Some((idx, (_, marker))) = extra_markers_to_insert {
             self.markers.insert(idx, marker);
         }
 
-        if let Some(marker) = id_to_remove {
+        if let Some((id, marker)) = id_to_remove {
             let mut extra_dependencies = self.roots.clone();
-            extra_dependencies.remove(&marker.id); // insert will already be seen as a dependency;
+            extra_dependencies.remove(&id); // insert will already be seen as a dependency;
 
             let node = HashNode {
                 extra_dependencies,
-                op: Op::Remove(marker.id),
+                op: Op::Remove(id),
             };
 
             self.apply_without_invalidate(node);
             self.invalidate_markers_after(idx);
             let mut order = self.iter_ids_from(&marker);
-            if let Some(next_marker) = order.marker() {
+            if let Some((_, next_marker)) = order.marker() {
                 self.markers.insert(idx, next_marker);
             } else {
                 self.markers.remove(&idx);

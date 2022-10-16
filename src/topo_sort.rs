@@ -74,7 +74,6 @@ impl Topo {
 
 #[derive(Debug, Default, Clone)]
 pub struct Marker {
-    pub(crate) id: Id,
     pub(crate) waiting_stack: Vec<(Id, BTreeSet<Id>)>,
 }
 
@@ -119,13 +118,13 @@ impl<'a, 'b> TopoIter<'a, 'b> {
         }
     }
 
-    pub fn marker(&mut self) -> Option<Marker> {
+    pub fn marker(&mut self) -> Option<(Id, Marker)> {
         let waiting_stack = Vec::from_iter(
             self.waiting_stack
                 .iter()
                 .map(|(id, deps)| (**id, BTreeSet::from_iter(deps.iter().map(|id| **id)))),
         );
-        self.next().map(|id| Marker { id, waiting_stack })
+        self.next().map(|id| (id, Marker { waiting_stack }))
     }
 
     fn push_waiting(&mut self, n: &'a Id) {
