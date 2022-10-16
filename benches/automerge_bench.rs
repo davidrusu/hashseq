@@ -74,22 +74,18 @@ fn load_automerge_trace() -> Vec<Trace> {
 }
 
 fn automerge_bench(c: &mut Criterion) {
-    // c.bench_function("load automerge events", |b| {
-    //     b.iter(load_automerge_events);
-    // });
-
     let trace = load_automerge_trace();
 
     let guard = pprof::ProfilerGuard::new(100).unwrap();
 
-    let n = 20000;
-
-    c.bench_function("load automerge trace", |b| {
+    let mut group = c.benchmark_group("automerge");
+    group.sample_size(5);
+    group.bench_function("load automerge trace", |b| {
         b.iter(|| {
             let mut seq = HashSeq::default();
 
-            for (i, event) in trace.iter().enumerate().take(n) {
-                if i % 1000 == 0 {
+            for (i, event) in trace.iter().enumerate() {
+                if i % 10000 == 0 {
                     println!("Processing {i}'th event");
                 }
 
@@ -102,7 +98,7 @@ fn automerge_bench(c: &mut Criterion) {
     });
 
     if let Ok(report) = guard.report().build() {
-        let file = std::fs::File::create(&format!("automerge-index-{n}-fg.svg")).unwrap();
+        let file = std::fs::File::create(&format!("automerge-index-fg.svg")).unwrap();
         report.flamegraph(file).unwrap();
     };
 }

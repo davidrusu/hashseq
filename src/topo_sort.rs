@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::Id;
 
@@ -59,22 +59,38 @@ impl Topo {
         self.before.get(&id).cloned().unwrap_or_default()
     }
 
-    pub fn iter(&self) -> TopoIter<'_> {
-        TopoIter::new(self)
+    pub fn iter<'a, 'b>(&'a self, removed: &'b HashSet<Id>) -> TopoIter<'a, 'b> {
+        TopoIter::new(self, removed)
+    }
+
+    pub(crate) fn iter_from<'a, 'b>(
+        &'a self,
+        removed: &'b HashSet<Id>,
+        marker: &Marker,
+    ) -> TopoIter<'a, 'b> {
+        TopoIter::restore(&self, removed, marker)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TopoIter<'a> {
-    topo: &'a Topo,
-    waiting_stack: Vec<(&'a Id, Vec<&'a Id>)>,
+#[derive(Debug, Default, Clone)]
+pub struct Marker {
+    pub(crate) id: Id,
+    pub(crate) waiting_stack: Vec<(Id, BTreeSet<Id>)>,
 }
 
-impl<'a> TopoIter<'a> {
-    fn new(topo: &'a Topo) -> Self {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopoIter<'a, 'b> {
+    topo: &'a Topo,
+    waiting_stack: Vec<(&'a Id, BTreeSet<&'a Id>)>,
+    removed: &'b HashSet<Id>,
+}
+
+impl<'a, 'b> TopoIter<'a, 'b> {
+    fn new(topo: &'a Topo, removed: &'b HashSet<Id>) -> Self {
         let mut iter = Self {
             topo,
             waiting_stack: Vec::new(),
+            removed,
         };
 
         for root in topo.roots().iter().rev() {
@@ -84,20 +100,48 @@ impl<'a> TopoIter<'a> {
         iter
     }
 
+    pub fn restore(topo: &'a Topo, removed: &'b HashSet<Id>, marker: &Marker) -> Self {
+        let waiting_stack = Vec::from_iter(marker.waiting_stack.iter().map(|(id, deps)| {
+            let (id, _) = topo.before.get_key_value(id).expect("Invalid marker");
+            let mut dep_ref = BTreeSet::new();
+
+            for dep in deps {
+                let (dep_id, _) = topo.before.get_key_value(dep).expect("Invalid dep");
+                dep_ref.insert(dep_id);
+            }
+
+            (id, dep_ref)
+        }));
+        Self {
+            topo,
+            waiting_stack,
+            removed,
+        }
+    }
+
+    pub fn marker(&mut self) -> Option<Marker> {
+        let waiting_stack = Vec::from_iter(
+            self.waiting_stack
+                .iter()
+                .map(|(id, deps)| (**id, BTreeSet::from_iter(deps.iter().map(|id| **id)))),
+        );
+        self.next().map(|id| Marker { id, waiting_stack })
+    }
+
     fn push_waiting(&mut self, n: &'a Id) {
-        let mut deps = Vec::new();
+        let mut deps = BTreeSet::new();
         if let Some(befores) = self.topo.before.get(n) {
-            deps.extend(befores)
+            deps.extend(befores.iter())
         }
         self.waiting_stack.push((n, deps));
     }
 }
 
-impl<'a> Iterator for TopoIter<'a> {
+impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
     type Item = Id;
 
     fn next(&mut self) -> Option<Id> {
-        let (n, deps) = self.waiting_stack.pop()?;
+        let (n, mut deps) = self.waiting_stack.pop()?;
 
         if deps.is_empty() {
             // This node is free to be released, but first
@@ -107,16 +151,17 @@ impl<'a> Iterator for TopoIter<'a> {
                     self.push_waiting(after);
                 }
             }
-
-            Some(*n)
+            if self.removed.contains(n) {
+                self.next()
+            } else {
+                Some(*n)
+            }
         } else {
             // This node has dependencies that need to be
-            // released before it.
-            self.waiting_stack.push((n, Vec::new()));
-
-            for dep in deps.into_iter().rev() {
-                self.push_waiting(dep);
-            }
+            // released ahead of itself.
+            let dep = deps.pop_first().expect("There should be at least one dep");
+            self.waiting_stack.push((n, deps));
+            self.push_waiting(dep);
 
             self.next()
         }
@@ -130,7 +175,8 @@ mod tests {
     use super::*;
 
     fn n(n: u8) -> Id {
-        [n; 32]
+        // [n; 32]
+        n.into()
     }
 
     #[test]
@@ -139,7 +185,7 @@ mod tests {
 
         topo.add_root(n(0));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0)]);
+        assert_eq!(Vec::from_iter(topo.iter(&Default::default())), vec![n(0)]);
     }
 
     #[test]
@@ -149,14 +195,20 @@ mod tests {
         topo.add_root(n(0));
         topo.add_after(n(0), n(1));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1)]
+        );
 
         let mut topo = Topo::default();
 
         topo.add_root(n(1));
         topo.add_after(n(1), n(0));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(1), n(0)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(1), n(0)]
+        );
     }
 
     #[test]
@@ -167,7 +219,10 @@ mod tests {
         topo.add_after(n(0), n(1));
         topo.add_after(n(0), n(2));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2)]
+        );
     }
 
     #[test]
@@ -178,12 +233,16 @@ mod tests {
         topo.add_after(n(0), n(1));
         topo.add_before(n(1), n(2));
 
-        let mut iter = topo.iter();
+        let removed = Default::default();
+        let mut iter = topo.iter(&removed);
         assert_eq!(iter.next(), Some(n(0)));
         assert_eq!(iter.next(), Some(n(2)));
         assert_eq!(iter.next(), Some(n(1)));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(2), n(1)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(2), n(1)]
+        );
     }
 
     #[test]
@@ -205,7 +264,7 @@ mod tests {
         topo.add_after(n(2), n(3));
 
         assert_eq!(
-            Vec::from_iter(topo.iter()),
+            Vec::from_iter(topo.iter(&Default::default())),
             vec![n(0), n(1), n(4), n(2), n(3)]
         );
     }
@@ -225,13 +284,20 @@ mod tests {
         topo.add_after(n(0), n(2));
         topo.add_after(n(0), n(3));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(2), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(2), n(3)]
+        );
 
         topo.add_before(n(3), n(1));
 
-        let mut iter = topo.iter();
+        let removed = Default::default();
+        let mut iter = topo.iter(&removed);
         assert_eq!(iter.next(), Some(n(0)));
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(2), n(1), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(2), n(1), n(3)]
+        );
     }
 
     #[test]
@@ -249,11 +315,17 @@ mod tests {
         topo.add_after(n(0), n(2));
         topo.add_after(n(0), n(3));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(2), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(2), n(3)]
+        );
 
         topo.add_before(n(2), n(1));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2), n(3)]
+        );
     }
 
     #[test]
@@ -265,7 +337,10 @@ mod tests {
 
         assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2)]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2)]
+        );
     }
 
     #[test]
@@ -281,7 +356,10 @@ mod tests {
         assert_eq!(topo.after(n(2)), BTreeSet::from_iter([]));
         assert_eq!(topo.after(n(3)), BTreeSet::from_iter([]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2), n(3)]
+        );
     }
 
     #[test]
@@ -297,7 +375,10 @@ mod tests {
 
         assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2), n(3)]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2), n(3)]
+        );
     }
 
     #[test]
@@ -313,7 +394,10 @@ mod tests {
 
         assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2), n(3)]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2), n(3)]
+        );
     }
 
     #[test]
@@ -325,7 +409,10 @@ mod tests {
         assert_eq!(topo.after(n(0)), BTreeSet::from_iter([]));
         assert_eq!(topo.before(n(0)), BTreeSet::from_iter([n(1)]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(1), n(0)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(1), n(0)]
+        );
     }
 
     #[test]
@@ -338,7 +425,10 @@ mod tests {
         assert_eq!(topo.after(n(0)), BTreeSet::from_iter([]));
         assert_eq!(topo.before(n(0)), BTreeSet::from_iter([n(1), n(2)]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(1), n(2), n(0)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(1), n(2), n(0)]
+        );
     }
 
     #[test]
@@ -352,7 +442,10 @@ mod tests {
         assert_eq!(topo.after(n(0)), BTreeSet::from_iter([]));
         assert_eq!(topo.before(n(0)), BTreeSet::from_iter([n(1), n(2), n(3)]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(1), n(2), n(3), n(0)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(1), n(2), n(3), n(0)]
+        );
     }
 
     #[test]
@@ -362,7 +455,10 @@ mod tests {
         topo.add_after(n(0), n(1));
         topo.add_before(n(1), n(2));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(2), n(1)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(2), n(1)]
+        );
     }
 
     #[test]
@@ -373,7 +469,10 @@ mod tests {
         topo.add_before(n(1), n(2));
         topo.add_before(n(1), n(3));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(2), n(3), n(1)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(2), n(3), n(1)]
+        );
     }
 
     #[test]
@@ -383,7 +482,10 @@ mod tests {
         topo.add_root(n(0));
         topo.add_root(n(1));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1)]
+        );
     }
 
     #[test]
@@ -395,7 +497,10 @@ mod tests {
 
         assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1)]));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2)]
+        );
 
         let mut topo_different_order = Topo::default();
         topo_different_order.add_root(n(2));
@@ -413,7 +518,10 @@ mod tests {
         topo.add_root(n(1));
         topo.add_root(n(2));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(2)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(2)]
+        );
     }
 
     #[test]
@@ -423,7 +531,10 @@ mod tests {
         topo.add_root(n(1));
         topo.add_root(n(2));
         topo.add_before(n(2), n(3));
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(1), n(3), n(2)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(1), n(3), n(2)]
+        );
     }
 
     #[test]
@@ -433,7 +544,10 @@ mod tests {
         topo.add_before(n(0), n(2));
         topo.add_root(n(1));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(2), n(0), n(1)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(2), n(0), n(1)]
+        );
 
         let mut topo_different_order = Topo::default();
         topo_different_order.add_root(n(1));
@@ -451,7 +565,10 @@ mod tests {
         topo.add_before(n(1), n(2));
         topo.add_after(n(0), n(3));
 
-        assert_eq!(Vec::from_iter(topo.iter()), vec![n(0), n(2), n(1), n(3)]);
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![n(0), n(2), n(1), n(3)]
+        );
 
         let mut topo_reverse_order = Topo::default();
         topo_reverse_order.add_root(n(0));

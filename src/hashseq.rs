@@ -1,14 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::topo_sort::Topo;
+use crate::topo_sort::{Marker, Topo, TopoIter};
 // use crate::topo_sort_strong_weak::Tree;
 use crate::{Cursor, HashNode, Id, Op};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Marker {
-    current: Option<Id>,
-    next: Option<Id>,
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
@@ -17,7 +11,9 @@ pub struct HashSeq {
     pub(crate) removed_inserts: HashSet<Id>,
     pub(crate) roots: BTreeSet<Id>,
     pub(crate) orphaned: HashSet<HashNode>,
-    pub(crate) markers: BTreeMap<usize, Marker>,
+    pub markers: BTreeMap<usize, Marker>,
+    pub cache_hit: u64,
+    pub cache_miss: u64,
 }
 
 impl PartialEq for HashSeq {
@@ -59,51 +55,60 @@ impl HashSeq {
         Cursor::from(self)
     }
 
-    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {
-        if let Some(prev_idx) = idx.checked_sub(1) {
-            if let Some(marker) = self.markers.get(&prev_idx).cloned() {
-                return (marker.current, marker.next);
+    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>, Option<Marker>) {
+        let (mut start_idx, mut order) =
+            if let Some((start_idx, marker)) = self.markers.range(..idx).rev().next() {
+                (*start_idx, self.iter_ids_from(marker))
+            } else {
+                (0, self.iter_ids())
+            };
+
+        let original_start_idx = start_idx;
+
+        let mut extra_markers_to_insert = None;
+
+        if (idx - start_idx) > self.marker_spacing() {
+            // we'll insert a marker at the midpoint between the index and the start_idx
+
+            let mid_idx = (start_idx + (idx - start_idx) / 2);
+            for _ in start_idx..mid_idx {
+                order.next();
             }
+            extra_markers_to_insert = order.marker().map(|m| (mid_idx, m));
+            start_idx = mid_idx + 1;
         }
 
-        let mut order = self.iter_ids();
-
-        let left = if let Some(prev_idx) = idx.checked_sub(1) {
-            for _ in 0..prev_idx {
-                order.next();
+        let left = if let Some(prev_idx) = idx.checked_sub(1) && prev_idx >= start_idx {
+            for i in start_idx..prev_idx {
+                let v = order.next();
             }
             order.next()
         } else {
             None
         };
 
-        let right = order.next();
+        let right_marker = order.marker();
+        let right = right_marker.as_ref().map(|m| m.id);
 
-        (left, right)
+        if let Some((idx, marker)) = extra_markers_to_insert {
+            self.markers.insert(idx, marker);
+        }
+
+        if (idx - original_start_idx) <= self.marker_spacing() {
+            self.cache_hit += 1;
+        } else {
+            self.cache_miss += 1;
+        }
+
+        (left, right, right_marker)
     }
 
     fn invalidate_markers_after(&mut self, idx: usize) {
         self.markers.split_off(&(idx + 1));
     }
 
-    fn update_marker(&mut self, idx: usize, id: Id, next: Option<Id>) {
-        self.invalidate_markers_after(idx);
-        if let Some(prev_idx) = idx.checked_sub(1) {
-            if let Some(prev_marker) = self.markers.get_mut(&prev_idx) {
-                prev_marker.next = Some(id);
-            }
-        }
-        self.markers.insert(
-            idx,
-            Marker {
-                current: Some(id),
-                next,
-            },
-        );
-    }
-
     pub fn insert(&mut self, idx: usize, value: char) {
-        let (left, right) = self.neighbours(idx);
+        let (left, right, marker) = self.neighbours(idx);
         let op = match &(left, right) {
             (Some(l), Some(r)) => {
                 if self.topo.is_causally_before(l, r) {
@@ -129,9 +134,28 @@ impl HashSeq {
             op,
         };
 
+        let was_insert_before = matches!(node.op, Op::InsertBefore(_, _));
         let node_id = node.id();
         self.apply_without_invalidate(node);
-        self.update_marker(idx, node_id, right);
+        self.invalidate_markers_after(idx);
+
+        if let Some(mut marker) = marker {
+            marker.id = node_id;
+
+            if was_insert_before {
+                let right = right.unwrap();
+                for (n, deps) in marker.waiting_stack.iter_mut() {
+                    if n == &right {
+                        deps.insert(node_id);
+                        break;
+                    }
+                }
+            } else {
+                marker.waiting_stack.push((node_id, BTreeSet::new()));
+            }
+
+            self.markers.insert(idx, marker);
+        }
     }
 
     pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
@@ -140,33 +164,78 @@ impl HashSeq {
         }
     }
 
-    pub fn remove(&mut self, idx: usize) {
-        let id_to_remove = {
-            if let Some(marker) = self.markers.get(&idx).cloned() {
-                marker.current
-            } else {
-                let mut order = self.iter_ids();
+    fn lg_len(&self) -> usize {
+        let l = self.len();
+        if l < 2 {
+            1
+        } else {
+            self.len().ilog2() as usize
+        }
+    }
 
-                for _ in 0..idx {
+    fn marker_spacing(&self) -> usize {
+        self.len() / self.lg_len()
+    }
+
+    pub fn remove(&mut self, idx: usize) {
+        let mut extra_markers_to_insert = None;
+        let id_to_remove = {
+            let (mut start_idx, mut order) =
+                if let Some((start_idx, marker)) = self.markers.range(..=idx).rev().next() {
+                    (*start_idx, self.iter_ids_from(marker))
+                } else {
+                    (0, self.iter_ids())
+                };
+
+            let original_start_idx = start_idx;
+
+            if (idx - start_idx) > self.marker_spacing() {
+                // we'll insert a marker at the midpoint between the index and the start_idx
+
+                let mid_idx = (start_idx + (idx - start_idx) / 2);
+                for _ in start_idx..mid_idx {
                     order.next();
                 }
-
-                order.next()
+                extra_markers_to_insert = order.marker().map(|m| (mid_idx, m));
+                start_idx = mid_idx + 1;
             }
+
+            for i in start_idx..idx {
+                let v = order.next();
+            }
+
+            let v = order.marker();
+
+            if (idx - original_start_idx) <= self.marker_spacing() {
+                self.cache_hit += 1;
+            } else {
+                self.cache_miss += 1;
+            }
+
+            v
         };
 
-        if let Some(id) = id_to_remove {
+        if let Some((idx, marker)) = extra_markers_to_insert {
+            self.markers.insert(idx, marker);
+        }
+
+        if let Some(marker) = id_to_remove {
             let mut extra_dependencies = self.roots.clone();
-            extra_dependencies.remove(&id); // insert will already be seen as a dependency;
+            extra_dependencies.remove(&marker.id); // insert will already be seen as a dependency;
 
             let node = HashNode {
                 extra_dependencies,
-                op: Op::Remove(id),
+                op: Op::Remove(marker.id),
             };
 
             self.apply_without_invalidate(node);
             self.invalidate_markers_after(idx);
-            self.markers.remove(&idx);
+            let mut order = self.iter_ids_from(&marker);
+            if let Some(next_marker) = order.marker() {
+                self.markers.insert(idx, next_marker);
+            } else {
+                self.markers.remove(&idx);
+            }
         }
     }
 
@@ -187,7 +256,6 @@ impl HashSeq {
 
     pub fn apply_without_invalidate(&mut self, node: HashNode) {
         let id = node.id();
-        // println!("apply({:?} = {:?})", node, id);
 
         if self.nodes.contains_key(&id) {
             return; // Already processed this node
@@ -241,10 +309,12 @@ impl HashSeq {
         }
     }
 
-    pub fn iter_ids(&self) -> impl Iterator<Item = Id> + '_ {
-        self.topo
-            .iter()
-            .filter(|id| !self.removed_inserts.contains(id))
+    pub fn iter_ids(&self) -> TopoIter<'_, '_> {
+        self.topo.iter(&self.removed_inserts)
+    }
+
+    fn iter_ids_from(&self, marker: &Marker) -> TopoIter<'_, '_> {
+        self.topo.iter_from(&self.removed_inserts, marker)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
@@ -268,7 +338,8 @@ mod test {
         seq.insert(0, 'a');
         seq.insert(1, 'b');
         seq.insert(2, 'c');
-        assert_eq!(&seq.iter().collect::<String>(), "abc");
+
+        assert_eq!(seq.iter().collect::<String>(), "abc");
     }
 
     #[test]
@@ -441,9 +512,6 @@ mod test {
         let mut ba = seq_b.clone();
         ba.merge(seq_a.clone());
 
-        dbg!(&ab);
-        dbg!(&ba);
-
         assert_eq!(ab, ba);
     }
 
@@ -598,65 +666,25 @@ mod test {
 
     #[test]
     fn test_prop_vec_model_qc1() {
-        let mut model = Vec::new();
         let mut seq = HashSeq::default();
 
-        for (insert_or_remove, idx, elem) in [(true, 0, 'b'), (true, 0, 'b'), (true, 1, 'a')] {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    model.insert(idx.min(model.len()), elem);
-                    seq.insert(idx.min(seq.len()), elem);
-                }
-                false => {
-                    // remove
-                    assert_eq!(seq.is_empty(), model.is_empty());
-                    if !seq.is_empty() {
-                        model.remove(idx.min(model.len() - 1));
-                        seq.remove(idx.min(seq.len() - 1));
-                    }
-                }
-            }
-        }
+        seq.insert(0, 'c');
+        seq.insert(0, 'b');
+        seq.insert(1, 'a');
 
-        assert_eq!(seq.iter().collect::<Vec<_>>(), model);
-        assert_eq!(seq.len(), model.len());
-        assert_eq!(seq.is_empty(), model.is_empty());
+        assert_eq!(String::from_iter(seq.iter()), "bac");
     }
 
     #[test]
     fn test_prop_vec_model_qc2() {
-        let mut model = Vec::new();
         let mut seq = HashSeq::default();
 
-        for (insert_or_remove, idx, elem) in [
-            (true, 0, 'b'),
-            (true, 0, 'b'),
-            (true, 1, 'b'),
-            (true, 2, 'a'),
-        ] {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    model.insert(idx.min(model.len()), elem);
-                    seq.insert(idx.min(seq.len()), elem);
-                }
-                false => {
-                    // remove
-                    assert_eq!(seq.is_empty(), model.is_empty());
-                    if !seq.is_empty() {
-                        model.remove(idx.min(model.len() - 1));
-                        seq.remove(idx.min(seq.len() - 1));
-                    }
-                }
-            }
-        }
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        seq.insert(1, 'c');
+        seq.insert(2, 'd');
 
-        assert_eq!(seq.iter().collect::<Vec<_>>(), model);
-        assert_eq!(seq.len(), model.len());
-        assert_eq!(seq.is_empty(), model.is_empty());
+        assert_eq!(String::from_iter(dbg!(&seq).iter()), "bcda");
     }
 
     #[test]
@@ -715,6 +743,80 @@ mod test {
         seq.insert(1, 'b');
 
         assert_eq!(String::from_iter(seq.iter()), "ab");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc6() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(1, 'b');
+        seq.insert(0, 'c');
+        seq.remove(2);
+
+        assert_eq!(String::from_iter(seq.iter()), "ca");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc7() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        seq.remove(1);
+
+        assert_eq!(String::from_iter(seq.iter()), "b");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc8() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        seq.insert(1, 'c');
+        seq.remove(0);
+        seq.insert(2, 'd');
+
+        assert_eq!(String::from_iter(seq.iter()), "cad");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc9() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(1, 'a');
+        seq.insert(1, 'b');
+        seq.insert(1, 'a');
+        seq.remove(2);
+
+        assert_eq!(String::from_iter(seq.iter()), "aaa");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc10() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        seq.insert(1, 'c');
+        seq.remove(2);
+
+        assert_eq!(String::from_iter(seq.iter()), "bc");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc11() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        seq.insert(0, 'c');
+        seq.insert(0, 'd');
+        seq.remove(3);
+
+        assert_eq!(String::from_iter(seq.iter()), "dcb");
     }
 
     #[quickcheck]

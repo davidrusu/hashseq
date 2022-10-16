@@ -1,13 +1,62 @@
-use ::hashseq::HashSeq;
+use std::{fs::File, io};
 
-fn main() {
+use ::hashseq::HashSeq;
+use indicatif::ProgressBar;
+use serde::Deserialize;
+use serde_json;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Trace {
+    Insert(usize, usize, char),
+    Delete(usize, usize),
+}
+
+fn load_automerge_trace() -> Vec<Trace> {
+    let file = File::open("../automerge-perf/edit-by-index/trace.json")
+        .expect("Failed to find trace file");
+
+    serde_json::from_reader(io::BufReader::new(file)).expect("Failed to parse trace")
+}
+
+fn automerge_trace() -> HashSeq {
+    let trace = load_automerge_trace();
+
     let mut seq = HashSeq::default();
 
-    seq.insert(0, 'a');
-    seq.insert(1, 'b');
-    seq.insert(2, 'c');
+    let progress = ProgressBar::new(trace.len() as u64);
+    for (i, event) in trace.iter().enumerate() {
+        if i % 1000 == 0 {
+            let idx = match event {
+                Trace::Insert(idx, _, _) => idx,
+                Trace::Delete(idx, _) => idx,
+            };
+            let doc = String::from_iter(seq.iter());
+            println!(
+                "\033c{}",
+                &doc[idx.saturating_sub(5000)..(idx + 1000).min(doc.len())]
+            );
+            println!(
+                "markers={} hit={} miss={}",
+                seq.markers.len(),
+                seq.cache_hit,
+                seq.cache_miss
+            )
+        }
+        progress.inc(1);
 
-    let result: String = seq.iter().collect();
-    assert_eq!(result, "abc");
-    println!("result of inserting 'a', 'b', 'c': {}", result);
+        match event {
+            Trace::Insert(idx, _, c) => seq.insert(*idx, *c),
+            Trace::Delete(idx, _) => seq.remove(*idx),
+        }
+    }
+
+    seq
+}
+
+fn main() {
+    let seq = automerge_trace();
+
+    let doc = String::from_iter(seq.iter());
+    println!("{doc}");
 }

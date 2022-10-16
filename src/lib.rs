@@ -1,3 +1,7 @@
+#![feature(map_first_last)]
+#![feature(let_chains)]
+#![feature(int_log)]
+
 pub mod hashseq;
 // pub mod topo_after_and_before;
 pub mod topo_sort;
@@ -10,4 +14,5 @@ pub use self::cursor::Cursor;
 pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::HashSeq;
 
-type Id = [u8; 32];
+// type Id = [u8; 32];
+type Id = u64;
