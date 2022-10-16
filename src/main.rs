@@ -23,6 +23,8 @@ fn automerge_trace() -> HashSeq {
 
     let mut seq = HashSeq::default();
 
+    let guard = pprof::ProfilerGuard::new(100).unwrap();
+
     let progress = ProgressBar::new(trace.len() as u64);
     for (i, event) in trace.iter().enumerate() {
         if i % 1000 == 0 {
@@ -49,6 +51,11 @@ fn automerge_trace() -> HashSeq {
             Trace::Delete(idx, _) => seq.remove(*idx),
         }
     }
+
+    if let Ok(report) = guard.report().build() {
+        let file = std::fs::File::create("automerge-index-fg.svg").unwrap();
+        report.flamegraph(file).unwrap();
+    };
 
     seq
 }

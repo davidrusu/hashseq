@@ -82,7 +82,7 @@ fn automerge_bench(c: &mut Criterion) {
     let guard = pprof::ProfilerGuard::new(100).unwrap();
 
     let mut group = c.benchmark_group("automerge");
-    group.sample_size(5);
+    group.sample_size(10);
     group.bench_function("load automerge trace", |b| {
         b.iter(|| {
             let mut seq = HashSeq::default();

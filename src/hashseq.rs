@@ -55,52 +55,53 @@ impl HashSeq {
         Cursor::from(self)
     }
 
-    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>, Option<Marker>) {
+    fn iter_from(&mut self, idx: usize) -> TopoIter<'_, '_> {
         let (mut start_idx, mut order) =
-            if let Some((start_idx, marker)) = self.markers.range(..idx).rev().next() {
-                (*start_idx, self.iter_ids_from(marker))
+            if let Some((start_idx, marker)) = self.markers.range(..=idx).rev().next() {
+                let order = self.topo.iter_from(&self.removed_inserts, marker);
+                (*start_idx, order)
             } else {
-                (0, self.iter_ids())
+                let order = self.topo.iter(&self.removed_inserts);
+                (0, order)
             };
 
-        let original_start_idx = start_idx;
-
-        let mut extra_markers_to_insert = None;
-
-        if (idx - start_idx) > self.marker_spacing() {
+        let diff = idx - start_idx;
+        if diff > self.marker_spacing() {
             // we'll insert a marker at the midpoint between the index and the start_idx
 
-            let mid_idx = start_idx + (idx - start_idx) / 2;
-            for _ in start_idx..mid_idx {
+            let next_marker_idx = start_idx + diff / 2;
+            for _ in start_idx..next_marker_idx {
                 order.next();
             }
-            extra_markers_to_insert = order.marker().map(|m| (mid_idx, m));
-            start_idx = mid_idx + 1;
+
+            let (_, marker) = order.marker().expect("We should have a marker here");
+            self.markers.insert(next_marker_idx, marker);
+            start_idx = next_marker_idx + 1;
+
+            self.cache_miss += 1;
+        } else {
+            self.cache_hit += 1;
         }
 
-        let left = if let Some(prev_idx) = idx.checked_sub(1) && prev_idx >= start_idx {
-            for _ in start_idx..prev_idx {
-                order.next();
-            }
-            order.next()
+        for _ in start_idx..idx {
+            order.next();
+        }
+
+        order
+    }
+
+    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>, Option<Marker>) {
+        let (left, mut order) = if let Some(prev_idx) = idx.checked_sub(1) {
+            let mut order = self.iter_from(prev_idx);
+            (order.next(), order)
         } else {
-            None
+            (None, self.iter_from(idx))
         };
 
         let (right, marker) = match order.marker() {
             Some((id, m)) => (Some(id), Some(m)),
             None => (None, None),
         };
-
-        if let Some((idx, (_, marker))) = extra_markers_to_insert {
-            self.markers.insert(idx, marker);
-        }
-
-        if (idx - original_start_idx) <= self.marker_spacing() {
-            self.cache_hit += 1;
-        } else {
-            self.cache_miss += 1;
-        }
 
         (left, right, marker)
     }
@@ -164,7 +165,7 @@ impl HashSeq {
         }
     }
 
-    fn lg_len(&self) -> usize {
+    fn log_len(&self) -> usize {
         let l = self.len();
         if l < 2 {
             1
@@ -174,52 +175,12 @@ impl HashSeq {
     }
 
     fn marker_spacing(&self) -> usize {
-        self.len() / self.lg_len()
+        self.log_len()
+        // dbg!(self.len() / self.log_len())
     }
 
     pub fn remove(&mut self, idx: usize) {
-        let mut extra_markers_to_insert = None;
-        let id_to_remove = {
-            let (mut start_idx, mut order) =
-                if let Some((start_idx, marker)) = self.markers.range(..=idx).rev().next() {
-                    (*start_idx, self.iter_ids_from(marker))
-                } else {
-                    (0, self.iter_ids())
-                };
-
-            let original_start_idx = start_idx;
-
-            if (idx - start_idx) > self.marker_spacing() {
-                // we'll insert a marker at the midpoint between the index and the start_idx
-
-                let mid_idx = start_idx + (idx - start_idx) / 2;
-                for _ in start_idx..mid_idx {
-                    order.next();
-                }
-                extra_markers_to_insert = order.marker().map(|m| (mid_idx, m));
-                start_idx = mid_idx + 1;
-            }
-
-            for _ in start_idx..idx {
-                order.next();
-            }
-
-            let v = order.marker();
-
-            if (idx - original_start_idx) <= self.marker_spacing() {
-                self.cache_hit += 1;
-            } else {
-                self.cache_miss += 1;
-            }
-
-            v
-        };
-
-        if let Some((idx, (_, marker))) = extra_markers_to_insert {
-            self.markers.insert(idx, marker);
-        }
-
-        if let Some((id, marker)) = id_to_remove {
+        if let Some((id, marker)) = self.iter_from(idx).marker() {
             let mut extra_dependencies = self.roots.clone();
             extra_dependencies.remove(&id); // insert will already be seen as a dependency;
 
@@ -230,9 +191,9 @@ impl HashSeq {
 
             self.apply_without_invalidate(node);
             self.invalidate_markers_after(idx);
-            let mut order = self.iter_ids_from(&marker);
-            if let Some((_, next_marker)) = order.marker() {
-                self.markers.insert(idx, next_marker);
+            let replacement_marker = self.topo.iter_from(&self.removed_inserts, &marker).marker();
+            if let Some((_, marker)) = replacement_marker {
+                self.markers.insert(idx, marker);
             } else {
                 self.markers.remove(&idx);
             }
@@ -311,10 +272,6 @@ impl HashSeq {
 
     pub fn iter_ids(&self) -> TopoIter<'_, '_> {
         self.topo.iter(&self.removed_inserts)
-    }
-
-    fn iter_ids_from(&self, marker: &Marker) -> TopoIter<'_, '_> {
-        self.topo.iter_from(&self.removed_inserts, marker)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
