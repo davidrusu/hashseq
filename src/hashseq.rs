@@ -14,7 +14,7 @@ pub(crate) struct Marker {
 pub struct HashSeq {
     pub(crate) topo: Topo,
     pub(crate) nodes: BTreeMap<Id, HashNode>,
-    pub(crate) removed_inserts: BTreeSet<Id>,
+    pub(crate) removed_inserts: HashSet<Id>,
     pub(crate) roots: BTreeSet<Id>,
     pub(crate) orphaned: HashSet<HashNode>,
     pub(crate) markers: BTreeMap<usize, Marker>,
@@ -141,22 +141,23 @@ impl HashSeq {
     }
 
     pub fn remove(&mut self, idx: usize) {
-        let mut order = self
-            .topo
-            .iter()
-            .filter(|id| !self.removed_inserts.contains(id));
+        let id_to_remove = {
+            let mut order = self.iter_ids();
 
-        for _ in 0..idx {
-            order.next();
-        }
+            for _ in 0..idx {
+                order.next();
+            }
 
-        if let Some(insert) = order.next() {
+            order.next()
+        };
+
+        if let Some(id) = id_to_remove {
             let mut extra_dependencies = self.roots.clone();
-            extra_dependencies.remove(&insert); // insert will already be seen as a dependency;
+            extra_dependencies.remove(&id); // insert will already be seen as a dependency;
 
             let node = HashNode {
                 extra_dependencies,
-                op: Op::Remove(insert),
+                op: Op::Remove(id),
             };
 
             self.apply_without_invalidate(node);
