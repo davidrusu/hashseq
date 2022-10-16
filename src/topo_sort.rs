@@ -77,6 +77,17 @@ pub struct Marker {
     pub(crate) waiting_stack: Vec<(Id, BTreeSet<Id>)>,
 }
 
+impl Marker {
+    pub(crate) fn insert_dependency(&mut self, id: &Id, dep: Id) {
+        for (n, deps) in self.waiting_stack.iter_mut() {
+            if n == id {
+                deps.insert(dep);
+                break;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopoIter<'a, 'b> {
     topo: &'a Topo,

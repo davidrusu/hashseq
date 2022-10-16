@@ -145,14 +145,9 @@ impl HashSeq {
         if let Some(mut marker) = marker {
             if was_insert_before {
                 let right = right.unwrap();
-                for (n, deps) in marker.waiting_stack.iter_mut() {
-                    if n == &right {
-                        deps.insert(node_id);
-                        break;
-                    }
-                }
+                marker.insert_dependency(&right, node_id);
             } else {
-                marker.waiting_stack.push((node_id, BTreeSet::new()));
+                marker.waiting_stack.push((node_id, Default::default()));
             }
 
             self.markers.insert(idx, marker);
