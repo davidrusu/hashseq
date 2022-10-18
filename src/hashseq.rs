@@ -6,9 +6,9 @@ use crate::{Cursor, HashNode, Id, Op};
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
-    pub(crate) topo: Topo,
-    pub(crate) nodes: BTreeMap<Id, HashNode>,
-    pub(crate) removed_inserts: HashSet<Id>,
+    pub topo: Topo,
+    pub nodes: BTreeMap<Id, HashNode>,
+    pub removed_inserts: HashSet<Id>,
     pub(crate) roots: BTreeSet<Id>,
     pub(crate) orphaned: HashSet<HashNode>,
     pub markers: BTreeMap<usize, Marker>,

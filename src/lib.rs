@@ -15,4 +15,4 @@ pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::HashSeq;
 
 // type Id = [u8; 32];
-type Id = u64;
+pub type Id = u64;

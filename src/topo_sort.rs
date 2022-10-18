@@ -4,9 +4,9 @@ use crate::Id;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Topo {
-    roots: BTreeSet<Id>,
-    before: HashMap<Id, BTreeSet<Id>>,
-    after: HashMap<Id, BTreeSet<Id>>,
+    pub roots: BTreeSet<Id>,
+    pub before: HashMap<Id, BTreeSet<Id>>,
+    pub after: HashMap<Id, BTreeSet<Id>>,
 }
 
 impl Topo {
