@@ -1,4 +1,7 @@
-use std::{fs::File, io};
+use std::{
+    fs::File,
+    io::{self, Write},
+};
 
 use ::hashseq::HashSeq;
 use indicatif::ProgressBar;
@@ -64,5 +67,7 @@ fn main() {
     let seq = automerge_trace();
 
     let doc = String::from_iter(seq.iter());
-    println!("{doc}");
+
+    let mut file = std::fs::File::create("automerge.latex").unwrap();
+    write!(file, "{}", doc);
 }
