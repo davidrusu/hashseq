@@ -167,7 +167,7 @@ mod bezier {
                 _ => (event::Status::Ignored, Some(Message::Tick)),
             };
 
-            let k = 0.1;
+            let k = 0.2;
             let h_spacing = 10.0;
             let v_spacing = 48.0;
 
@@ -316,7 +316,7 @@ mod bezier {
                     }
                 }
 
-                if net_change < 1.0 + (self.seq.nodes.len() * 10) as f32 {
+                if i > 5 || net_change < 1.0 + self.seq.nodes.len() as f32 * 0.5 {
                     break;
                 }
             }
@@ -356,7 +356,9 @@ mod bezier {
                     let string = String::from_iter(self.seq.iter());
                     let before_cursor = String::from_iter(string.chars().take(state.cursor));
                     let after_cursor = String::from_iter(string.chars().skip(state.cursor));
-                    frame.fill_text(Text::from(format!("{}|{}", before_cursor, after_cursor)));
+                    let mut text = Text::from(format!("{}|{}", before_cursor, after_cursor));
+                    text.size = 32.0;
+                    frame.fill_text(text);
 
                     for (id, afters) in self.seq.topo.after.iter() {
                         if !state.node_pos.contains_key(id) {

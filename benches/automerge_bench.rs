@@ -79,6 +79,7 @@ fn load_automerge_trace() -> Vec<Trace> {
 fn automerge_bench(c: &mut Criterion) {
     let trace = load_automerge_trace();
 
+    #[cfg(not(target_os = "macos"))]
     let guard = pprof::ProfilerGuard::new(100).unwrap();
 
     let mut group = c.benchmark_group("automerge");
@@ -100,6 +101,7 @@ fn automerge_bench(c: &mut Criterion) {
         });
     });
 
+    #[cfg(not(target_os = "macos"))]
     if let Ok(report) = guard.report().build() {
         let file = std::fs::File::create("automerge-index-fg.svg").unwrap();
         report.flamegraph(file).unwrap();

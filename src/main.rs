@@ -26,6 +26,7 @@ fn automerge_trace() -> HashSeq {
 
     let mut seq = HashSeq::default();
 
+    #[cfg(not(target_os = "macos"))]
     let guard = pprof::ProfilerGuard::new(100).unwrap();
 
     let progress = ProgressBar::new(trace.len() as u64);
@@ -55,6 +56,7 @@ fn automerge_trace() -> HashSeq {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     if let Ok(report) = guard.report().build() {
         let file = std::fs::File::create("automerge-index-fg.svg").unwrap();
         report.flamegraph(file).unwrap();
