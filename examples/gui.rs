@@ -1,5 +1,5 @@
 use hashseq::HashSeq;
-use iced::widget::{button, column, text};
+use iced::widget::{button, checkbox, column, row, text};
 use iced::{Alignment, Element, Length, Point, Rectangle, Sandbox, Settings, Theme};
 
 pub fn main() -> iced::Result {
@@ -12,16 +12,22 @@ pub fn main() -> iced::Result {
 #[derive(Default)]
 struct Demo {
     seq_seq: usize, // sequence number of which seq we are on.
-    seq: HashSeq,
-    bezier: bezier::State,
+    seq_a: HashSeq,
+    seq_a_viz: hashseq_viz::State,
+    seq_b: HashSeq,
+    seq_b_viz: hashseq_viz::State,
+    show_dependencies: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Message {
     Clear,
-    Insert(usize, char),
-    Remove(usize),
-    Tick,
+    SeqA(hashseq_viz::Msg),
+    SeqB(hashseq_viz::Msg),
+    MergeAtoB,
+    MergeBtoA,
+    Sync,
+    ShowDependencies(bool),
 }
 
 impl Sandbox for Demo {
@@ -36,25 +42,55 @@ impl Sandbox for Demo {
     }
 
     fn update(&mut self, message: Message) {
-        match message {
+        match dbg!(message) {
             Message::Clear => {
-                self.bezier = bezier::State::default();
-                self.seq = HashSeq::default();
+                self.seq_a_viz = hashseq_viz::State::default();
+                self.seq_a = HashSeq::default();
+                self.seq_b_viz = hashseq_viz::State::default();
+                self.seq_b = HashSeq::default();
                 self.seq_seq += 1;
-                self.bezier.request_redraw()
+                self.seq_a_viz.request_redraw();
+                self.seq_b_viz.request_redraw();
             }
-            Message::Insert(idx, c) => {
-                println!("Handled insert");
-                self.seq.insert(idx, c);
-                println!("Seq: {}", String::from_iter(self.seq.iter()));
-                self.bezier.request_redraw();
+            Message::SeqA(hashseq_viz::Msg::Insert(idx, c)) => {
+                self.seq_a.insert(idx, c);
+                self.seq_a_viz.request_redraw();
             }
-            Message::Remove(idx) => {
-                self.seq.remove(idx);
-                self.bezier.request_redraw()
+            Message::SeqA(hashseq_viz::Msg::Remove(idx)) => {
+                self.seq_a.remove(idx);
+                self.seq_a_viz.request_redraw();
             }
-            Message::Tick => {
-                self.bezier.request_redraw();
+            Message::SeqB(hashseq_viz::Msg::Insert(idx, c)) => {
+                self.seq_b.insert(idx, c);
+                self.seq_b_viz.request_redraw();
+            }
+            Message::SeqB(hashseq_viz::Msg::Remove(idx)) => {
+                self.seq_b.remove(idx);
+                self.seq_b_viz.request_redraw();
+            }
+            Message::SeqA(hashseq_viz::Msg::Tick) => {
+                self.seq_a_viz.request_redraw();
+            }
+            Message::SeqB(hashseq_viz::Msg::Tick) => {
+                self.seq_b_viz.request_redraw();
+            }
+            Message::MergeAtoB => {
+                self.seq_b.merge(self.seq_a.clone());
+                self.seq_b_viz.request_redraw();
+            }
+            Message::MergeBtoA => {
+                self.seq_a.merge(self.seq_b.clone());
+                self.seq_a_viz.request_redraw();
+            }
+            Message::Sync => {
+                let seq_a = self.seq_a.clone();
+                self.seq_a.merge(self.seq_b.clone());
+                self.seq_b.merge(seq_a);
+                self.seq_a_viz.request_redraw();
+                self.seq_b_viz.request_redraw();
+            }
+            Message::ShowDependencies(v) => {
+                self.show_dependencies = v;
             }
         }
     }
@@ -62,8 +98,27 @@ impl Sandbox for Demo {
     fn view(&self) -> Element<Message> {
         column![
             text("HashSeq Demo").width(Length::Shrink).size(36),
-            self.bezier.view(self.seq_seq, &self.seq),
-            button("Clear").padding(8).on_press(Message::Clear),
+            self.seq_a_viz
+                .view(self.seq_seq, &self.seq_a, self.show_dependencies)
+                .map(Message::SeqA),
+            row![
+                button("merge down").padding(8).on_press(Message::MergeAtoB),
+                button("sync").padding(8).on_press(Message::Sync),
+                button("merge up").padding(8).on_press(Message::MergeBtoA)
+            ]
+            .spacing(20),
+            self.seq_b_viz
+                .view(self.seq_seq, &self.seq_b, self.show_dependencies)
+                .map(Message::SeqB),
+            row![
+                button("Clear").padding(8).on_press(Message::Clear),
+                checkbox(
+                    "Show dependencies",
+                    self.show_dependencies,
+                    Message::ShowDependencies
+                ),
+            ]
+            .spacing(20),
         ]
         .padding(20)
         .spacing(20)
@@ -72,7 +127,7 @@ impl Sandbox for Demo {
     }
 }
 
-mod bezier {
+mod hashseq_viz {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
@@ -82,17 +137,30 @@ mod bezier {
     use iced::widget::canvas::{self, Canvas, Cursor, Fill, Frame, Geometry, Path, Stroke, Text};
     use iced::{mouse, Color, Size, Vector};
 
+    #[derive(Debug, Clone, Copy)]
+    pub enum Msg {
+        Insert(usize, char),
+        Remove(usize),
+        Tick,
+    }
+
     #[derive(Default)]
     pub struct State {
         cache: canvas::Cache,
     }
 
     impl State {
-        pub fn view<'a>(&'a self, seq_seq: usize, seq: &'a HashSeq) -> Element<'a, Message> {
+        pub fn view<'a>(
+            &'a self,
+            seq_seq: usize,
+            seq: &'a HashSeq,
+            show_dependencies: bool,
+        ) -> Element<'a, Msg> {
             Canvas::new(HashSeqDemo {
                 seq_seq,
                 state: self,
                 seq,
+                show_dependencies,
             })
             .width(Length::Fill)
             .height(Length::Fill)
@@ -108,6 +176,7 @@ mod bezier {
         seq_seq: usize,
         seq: &'a HashSeq,
         state: &'a State,
+        show_dependencies: bool,
     }
 
     #[derive(Default)]
@@ -117,7 +186,7 @@ mod bezier {
         node_pos: BTreeMap<Id, Point>,
     }
 
-    impl<'a> canvas::Program<Message> for HashSeqDemo<'a> {
+    impl<'a> canvas::Program<Msg> for HashSeqDemo<'a> {
         type State = ProgramState;
 
         fn update(
@@ -125,8 +194,11 @@ mod bezier {
             state: &mut Self::State,
             event: Event,
             bounds: Rectangle,
-            _cursor: Cursor,
-        ) -> (event::Status, Option<Message>) {
+            cursor: Cursor,
+        ) -> (event::Status, Option<Msg>) {
+            if cursor.position_in(&bounds).is_none() {
+                return (event::Status::Ignored, None);
+            }
             if self.seq_seq != state.seq_seq {
                 *state = Self::State::default();
                 state.seq_seq = self.seq_seq;
@@ -139,36 +211,36 @@ mod bezier {
                             ..
                         } => {
                             state.cursor = state.cursor.saturating_sub(1);
-                            Some(Message::Remove(state.cursor))
+                            Some(Msg::Remove(state.cursor))
                         }
                         iced::keyboard::Event::KeyPressed {
                             key_code: KeyCode::Left,
                             ..
                         } => {
                             state.cursor = state.cursor.saturating_sub(1);
-                            Some(Message::Tick)
+                            Some(Msg::Tick)
                         }
                         iced::keyboard::Event::KeyPressed {
                             key_code: KeyCode::Right,
                             ..
                         } => {
                             state.cursor = (state.cursor + 1).min(self.seq.len());
-                            Some(Message::Tick)
+                            Some(Msg::Tick)
                         }
                         iced::keyboard::Event::CharacterReceived(c) if !c.is_control() => {
                             let insert_idx = state.cursor;
                             state.cursor += 1;
-                            Some(Message::Insert(insert_idx, c))
+                            Some(Msg::Insert(insert_idx, c))
                         }
                         _ => None,
                     };
                     (event::Status::Captured, msg)
                 }
-                _ => (event::Status::Ignored, Some(Message::Tick)),
+                _ => (event::Status::Ignored, Some(Msg::Tick)),
             };
 
             let k = 0.2;
-            let h_spacing = 10.0;
+            let h_spacing = 20.0;
             let v_spacing = 48.0;
 
             let pos_in_set =
@@ -392,17 +464,39 @@ mod bezier {
                             );
                         }
                     }
-
                     for (id, pos) in state.node_pos.iter() {
                         let r = 2.0;
 
-                        match &self.seq.nodes[id].op {
+                        let node = &self.seq.nodes[id];
+
+                        if self.show_dependencies {
+                            for dep in node.extra_dependencies.iter() {
+                                let dep_from = state.node_pos[dep].clone();
+                                let mid = Point {
+                                    x: (pos.x + dep_from.x) / 2.0,
+                                    y: (pos.y + dep_from.y) / 2.0 - 20.0,
+                                };
+                                let curve = Path::new(|p| {
+                                    p.move_to(dep_from);
+                                    p.quadratic_curve_to(mid, *pos);
+                                });
+
+                                frame.stroke(
+                                    &curve,
+                                    Stroke::default()
+                                        .with_width(1.0)
+                                        .with_color(Color::from_rgba(0.0, 0.0, 0.0, 0.5)),
+                                );
+                            }
+                        }
+
+                        match &node.op {
                             hashseq::Op::InsertRoot(c)
                             | hashseq::Op::InsertAfter(_, c)
                             | hashseq::Op::InsertBefore(_, c) => {
                                 let mut char = Text::from(format!("{c}"));
                                 char.position = *pos;
-                                char.size = 12.0;
+                                char.size = 24.0;
                                 char.position.y += 2.0;
                                 char.position.x -= char.size / 4.0;
                                 frame.fill_text(char);
