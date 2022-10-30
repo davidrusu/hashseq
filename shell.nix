@@ -6,9 +6,20 @@ let
   ruststable = (nixpkgs.latest.rustChannels.stable.rust.override {
     extensions = [ "rust-src" "rust-analysis" ];}
   );
+  rustnightly = (nixpkgs.latest.rustChannels.nightly.rust.override {
+    extensions = [ "rust-src" "rust-analysis" ];}
+  );
 in
   with nixpkgs;
   stdenv.mkDerivation {
     name = "rust";
-    buildInputs = [ rustup ruststable];
+    buildInputs = [
+      rustup
+      rustnightly
+
+      # examples/gui
+      pkg-config
+      fontconfig
+      expat
+    ];
   }

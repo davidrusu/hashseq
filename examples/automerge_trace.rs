@@ -58,8 +58,11 @@ fn automerge_trace() -> HashSeq {
 
     #[cfg(not(target_os = "macos"))]
     if let Ok(report) = guard.report().build() {
-        let file = std::fs::File::create("automerge-index-fg.svg").unwrap();
-        report.flamegraph(file).unwrap();
+        let file =
+            File::create("automerge-index-fg.svg").expect("Failed to create flamgegraph file");
+        report
+            .flamegraph(file)
+            .expect("Failed to generate flamegraph");
     };
 
     seq
@@ -70,6 +73,6 @@ fn main() {
 
     let doc = String::from_iter(seq.iter());
 
-    let mut file = std::fs::File::create("automerge.latex").unwrap();
-    write!(file, "{}", doc);
+    let mut file = File::create("automerge.latex").expect("Failed to create output file");
+    write!(file, "{}", doc).expect("Failed to write final document");
 }

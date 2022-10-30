@@ -271,14 +271,10 @@ mod hashseq_viz {
                 i += 1;
                 let mut net_change = 0.0;
                 for (id, node) in self.seq.nodes.iter() {
-                    let pos = state
-                        .node_pos
-                        .entry(*id)
-                        .or_insert_with(|| Point {
-                            x: rand::random::<f32>() * bounds.width,
-                            y: rand::random::<f32>() * bounds.height,
-                        })
-                        .clone();
+                    let pos = *state.node_pos.entry(*id).or_insert_with(|| Point {
+                        x: rand::random::<f32>() * bounds.width,
+                        y: rand::random::<f32>() * bounds.height,
+                    });
                     let target_pos = match node.op {
                         hashseq::Op::InsertRoot(_) => {
                             match pos_in_set(*id, self.seq.topo.roots.clone(), &state.node_pos) {
@@ -393,7 +389,7 @@ mod hashseq_viz {
                 }
             }
 
-            if state.node_pos.len() > 0 {
+            if !state.node_pos.is_empty() {
                 // Recenter things
                 let mut avg_pos = Point::ORIGIN;
                 for (_, pos) in state.node_pos.iter() {
@@ -436,12 +432,12 @@ mod hashseq_viz {
                         if !state.node_pos.contains_key(id) {
                             continue;
                         }
-                        let from = state.node_pos[id].clone();
+                        let from = state.node_pos[id];
                         for after in afters.iter() {
                             if !state.node_pos.contains_key(after) {
                                 continue;
                             }
-                            let to = state.node_pos[after].clone();
+                            let to = state.node_pos[after];
                             frame.stroke(
                                 &Path::line(from, to),
                                 Stroke::default().with_color(Color::from_rgb(0.0, 1.0, 0.0)),
@@ -452,12 +448,12 @@ mod hashseq_viz {
                         if !state.node_pos.contains_key(id) {
                             continue;
                         }
-                        let from = state.node_pos[id].clone();
+                        let from = state.node_pos[id];
                         for before in befores.iter() {
                             if !state.node_pos.contains_key(before) {
                                 continue;
                             }
-                            let to = state.node_pos[before].clone();
+                            let to = state.node_pos[before];
                             frame.stroke(
                                 &Path::line(from, to),
                                 Stroke::default().with_color(Color::from_rgb(1.0, 0.0, 0.0)),
@@ -471,7 +467,7 @@ mod hashseq_viz {
 
                         if self.show_dependencies {
                             for dep in node.extra_dependencies.iter() {
-                                let dep_from = state.node_pos[dep].clone();
+                                let dep_from = state.node_pos[dep];
                                 let mid = Point {
                                     x: (pos.x + dep_from.x) / 2.0,
                                     y: (pos.y + dep_from.y) / 2.0 - 20.0,
@@ -518,7 +514,7 @@ mod hashseq_viz {
                                     Stroke::default().with_color(Color::BLACK),
                                 );
 
-                                let to = state.node_pos[target].clone();
+                                let to = state.node_pos[target];
                                 frame.stroke(
                                     &Path::line(*pos, to),
                                     Stroke::default().with_color(Color::BLACK),
