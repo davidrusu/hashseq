@@ -308,12 +308,12 @@ mod hashseq_viz {
                         hashseq::Op::InsertBefore(parent, _) => {
                             let w = 0.9;
                             if let Some(p) = state.node_pos.get(&parent) {
+                                let befores = self.seq.topo.before(parent);
                                 let default_target = Point {
-                                    x: p.x + h_spacing,
-                                    y: p.y + v_spacing,
+                                    x: p.x - h_spacing,
+                                    y: p.y + v_spacing * befores.len() as f32,
                                 };
-                                match pos_in_set(*id, self.seq.topo.before(parent), &state.node_pos)
-                                {
+                                match pos_in_set(*id, befores, &state.node_pos) {
                                     None => default_target,
                                     Some(target) => Point {
                                         x: target.x * w + default_target.x * (1.0 - w),
