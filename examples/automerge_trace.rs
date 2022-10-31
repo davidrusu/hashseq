@@ -59,7 +59,7 @@ fn automerge_trace() -> HashSeq {
     #[cfg(not(target_os = "macos"))]
     if let Ok(report) = guard.report().build() {
         let file =
-            File::create("automerge-index-fg.svg").expect("Failed to create flamgegraph file");
+            File::create("automerge-trace-fg.svg").expect("Failed to create flamegraph file");
         report
             .flamegraph(file)
             .expect("Failed to generate flamegraph");

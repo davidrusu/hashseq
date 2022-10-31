@@ -63,7 +63,7 @@ impl Topo {
         TopoIter::new(self, removed)
     }
 
-    pub(crate) fn iter_from<'a, 'b>(
+    pub fn iter_from<'a, 'b>(
         &'a self,
         removed: &'b HashSet<Id>,
         marker: &Marker,

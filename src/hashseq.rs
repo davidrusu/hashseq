@@ -111,18 +111,30 @@ impl HashSeq {
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {
+        self.insert_batch(idx, [value]);
+    }
+
+    pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
+        let mut batch = batch.into_iter();
+
+        let first_elem = if let Some(value) = batch.next() {
+            value
+        } else {
+            return;
+        };
+
         let (left, right, marker) = self.neighbours(idx);
         let op = match &(left, right) {
             (Some(l), Some(r)) => {
                 if self.topo.is_causally_before(l, r) {
-                    Op::InsertBefore(*r, value)
+                    Op::InsertBefore(*r, first_elem)
                 } else {
-                    Op::InsertAfter(*l, value)
+                    Op::InsertAfter(*l, first_elem)
                 }
             }
-            (Some(l), None) => Op::InsertAfter(*l, value),
-            (None, Some(r)) => Op::InsertBefore(*r, value),
-            (None, None) => Op::InsertRoot(value),
+            (Some(l), None) => Op::InsertAfter(*l, first_elem),
+            (None, Some(r)) => Op::InsertBefore(*r, first_elem),
+            (None, None) => Op::InsertRoot(first_elem),
         };
 
         let mut extra_dependencies = self.roots.clone();
@@ -138,25 +150,32 @@ impl HashSeq {
         };
 
         let was_insert_before = matches!(node.op, Op::InsertBefore(_, _));
-        let node_id = node.id();
+        let first_node_id = node.id();
         self.apply_without_invalidate(node);
         self.invalidate_markers_after(idx);
 
         if let Some(mut marker) = marker {
             if was_insert_before {
                 let right = right.expect("Right should be defined if we are inserting before");
-                marker.insert_dependency(&right, node_id);
+                marker.insert_dependency(&right, first_node_id);
             } else {
-                marker.push_next(node_id);
+                marker.push_next(first_node_id);
             }
 
             self.markers.insert(idx, marker);
         }
-    }
 
-    pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
-        for (i, e) in batch.into_iter().enumerate() {
-            self.insert(idx + i, e)
+        // All remaining elements will be chained after the first node
+        let mut last_id = first_node_id;
+        for e in batch {
+            let node = HashNode {
+                extra_dependencies: BTreeSet::new(),
+                op: Op::InsertAfter(last_id, e),
+            };
+
+            last_id = node.id();
+
+            self.apply_without_invalidate(node);
         }
     }
 
@@ -192,6 +211,12 @@ impl HashSeq {
             } else {
                 self.markers.remove(&idx);
             }
+        }
+    }
+
+    pub fn remove_batch(&mut self, idx: usize, amount: usize) {
+        for _ in 0..amount {
+            self.remove(idx);
         }
     }
 
