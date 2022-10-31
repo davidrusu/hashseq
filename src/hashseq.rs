@@ -190,29 +190,41 @@ impl HashSeq {
     }
 
     pub fn remove(&mut self, idx: usize) {
-        if let Some((id, marker)) = self.iter_from(idx).marker() {
-            let mut extra_dependencies = self.roots.clone();
-            extra_dependencies.remove(&id); // insert will already be seen as a dependency;
-
-            let node = HashNode {
-                extra_dependencies,
-                op: Op::Remove(BTreeSet::from_iter([id])),
-            };
-
-            self.apply_without_invalidate(node);
-            self.invalidate_markers_after(idx);
-            let replacement_marker = self.topo.iter_from(&self.removed_inserts, &marker).marker();
-            if let Some((_, marker)) = replacement_marker {
-                self.markers.insert(idx, marker);
-            } else {
-                self.markers.remove(&idx);
-            }
-        }
+        self.remove_batch(idx, 1);
     }
 
     pub fn remove_batch(&mut self, idx: usize, amount: usize) {
-        for _ in 0..amount {
-            self.remove(idx);
+        if amount == 0 {
+            // Nothing to remove
+            return;
+        }
+
+        let mut iter = self.iter_from(idx);
+        let (id, marker) = if let Some(m) = iter.marker() {
+            m
+        } else {
+            // We reached the end of the sequence when iterating
+            return;
+        };
+
+        let mut to_remove = BTreeSet::from_iter([id]);
+        to_remove.extend(iter.take(amount - 1)); // amount is at least 1 by our check above
+        let op = Op::Remove(to_remove);
+
+        let extra_dependencies =
+            BTreeSet::from_iter(self.roots.difference(&op.dependencies()).cloned());
+
+        let node = HashNode {
+            extra_dependencies,
+            op,
+        };
+
+        self.apply_without_invalidate(node);
+        self.invalidate_markers_after(idx);
+        if idx < self.len() {
+            self.markers.insert(idx, marker);
+        } else {
+            self.markers.remove(&idx);
         }
     }
 
@@ -790,6 +802,20 @@ mod test {
         seq.remove(3);
 
         assert_eq!(String::from_iter(seq.iter()), "dcb");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc12() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'a');
+        seq.remove(0);
+        seq.remove(0);
+        seq.insert(0, 'a');
+        seq.remove(0);
+
+        assert_eq!(String::from_iter(seq.iter()), "");
     }
 
     #[quickcheck]
