@@ -160,7 +160,11 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
         loop {
             let (_, deps) = self.waiting_stack.last_mut()?;
 
-            if deps.is_empty() {
+            if let Some(dep) = deps.pop() {
+                // This node has dependencies that need to be
+                // released ahead of itself.
+                self.push_waiting(dep);
+            } else {
                 let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
@@ -172,11 +176,6 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
                 if !self.removed.contains(n) {
                     return Some(*n);
                 }
-            } else {
-                // This node has dependencies that need to be
-                // released ahead of itself.
-                let dep = deps.pop().expect("There should be at least one dep");
-                self.push_waiting(dep);
             }
         }
     }

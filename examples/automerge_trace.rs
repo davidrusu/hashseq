@@ -31,7 +31,7 @@ fn automerge_trace() -> HashSeq {
 
     let progress = ProgressBar::new(trace.len() as u64);
     for (i, event) in trace.iter().enumerate() {
-        if i % 1000 == 0 {
+        if i % 10000 == 0 {
             let idx = match event {
                 Trace::Insert(idx, _, _) => idx,
                 Trace::Delete(idx, _) => idx,
