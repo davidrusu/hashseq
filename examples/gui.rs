@@ -275,7 +275,7 @@ mod hashseq_viz {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let target_pos = match node.op {
+                    let target_pos = match &node.op {
                         hashseq::Op::InsertRoot(_) => {
                             match pos_in_set(*id, self.seq.topo.roots.clone(), &state.node_pos) {
                                 Some(p) => p,
@@ -284,12 +284,12 @@ mod hashseq_viz {
                         }
                         hashseq::Op::InsertAfter(parent, _) => {
                             let w = 0.5;
-                            if let Some(p) = state.node_pos.get(&parent) {
+                            if let Some(p) = state.node_pos.get(parent) {
                                 let default_target = Point {
                                     x: p.x + h_spacing,
                                     y: p.y,
                                 };
-                                match pos_in_set(*id, self.seq.topo.after(parent), &state.node_pos)
+                                match pos_in_set(*id, self.seq.topo.after(*parent), &state.node_pos)
                                 {
                                     None => default_target,
                                     Some(target) => Point {
@@ -303,8 +303,8 @@ mod hashseq_viz {
                         }
                         hashseq::Op::InsertBefore(parent, _) => {
                             let w = 0.9;
-                            if let Some(p) = state.node_pos.get(&parent) {
-                                let befores = self.seq.topo.before(parent);
+                            if let Some(p) = state.node_pos.get(parent) {
+                                let befores = self.seq.topo.before(*parent);
                                 let default_target = Point {
                                     x: p.x - h_spacing,
                                     y: p.y + v_spacing * befores.len() as f32,
@@ -320,14 +320,18 @@ mod hashseq_viz {
                                 pos
                             }
                         }
-                        hashseq::Op::Remove(target) => {
-                            if let Some(p) = state.node_pos.get(&target) {
-                                Point {
-                                    x: p.x,
-                                    y: p.y - 5.0,
-                                }
-                            } else {
-                                pos
+                        hashseq::Op::Remove(targets) => {
+                            assert!(!targets.is_empty());
+                            let p: Vector = targets
+                                .iter()
+                                .filter_map(|t| state.node_pos.get(t))
+                                .map(|p| Vector::new(p.x, p.y))
+                                .reduce(|accum, p| accum + p)
+                                .unwrap_or_default();
+
+                            Point {
+                                x: p.x,
+                                y: p.y - 5.0,
                             }
                         }
                     };
@@ -499,7 +503,7 @@ mod hashseq_viz {
                                 char.position.x -= char.size / 4.0;
                                 frame.fill_text(char);
                             }
-                            hashseq::Op::Remove(target) => {
+                            hashseq::Op::Remove(targets) => {
                                 let x_r = 2.0;
                                 frame.stroke(
                                     &Path::line(
@@ -516,11 +520,13 @@ mod hashseq_viz {
                                     Stroke::default().with_color(Color::BLACK),
                                 );
 
-                                let to = state.node_pos[target];
-                                frame.stroke(
-                                    &Path::line(*pos, to),
-                                    Stroke::default().with_color(Color::BLACK),
-                                );
+                                for target in targets.iter() {
+                                    let to = state.node_pos[target];
+                                    frame.stroke(
+                                        &Path::line(*pos, to),
+                                        Stroke::default().with_color(Color::BLACK),
+                                    );
+                                }
                             }
                         }
 

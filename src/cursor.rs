@@ -67,11 +67,8 @@ impl Cursor {
             (None, None) => Op::InsertRoot(value),
         };
 
-        let mut extra_dependencies = self.hashseq.roots.clone();
-
-        if let Some(dep) = op.dependency() {
-            extra_dependencies.remove(&dep); // the op dependency will already be seen, no need to duplicated it in the extra dependencie.
-        }
+        let extra_dependencies =
+            BTreeSet::from_iter(self.hashseq.roots.difference(&op.dependencies()).cloned());
 
         let node = HashNode {
             extra_dependencies,
@@ -113,7 +110,7 @@ impl Cursor {
 
             let node = HashNode {
                 extra_dependencies,
-                op: Op::Remove(left),
+                op: Op::Remove(BTreeSet::from_iter([left])),
             };
 
             self.hashseq.apply(node);

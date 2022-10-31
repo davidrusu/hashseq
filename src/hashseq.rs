@@ -137,12 +137,8 @@ impl HashSeq {
             (None, None) => Op::InsertRoot(first_elem),
         };
 
-        let mut extra_dependencies = self.roots.clone();
-
-        if let Some(dep) = op.dependency() {
-            // the op dependency will already be seen, no need to duplicated it in the extra dependencie.
-            extra_dependencies.remove(&dep);
-        }
+        let extra_dependencies =
+            BTreeSet::from_iter(self.roots.difference(&op.dependencies()).cloned());
 
         let node = HashNode {
             extra_dependencies,
@@ -200,7 +196,7 @@ impl HashSeq {
 
             let node = HashNode {
                 extra_dependencies,
-                op: Op::Remove(id),
+                op: Op::Remove(BTreeSet::from_iter([id])),
             };
 
             self.apply_without_invalidate(node);
@@ -252,9 +248,9 @@ impl HashSeq {
             Op::InsertRoot(_) => self.topo.add_root(id),
             Op::InsertAfter(node, _) => self.topo.add_after(*node, id),
             Op::InsertBefore(node, _) => self.topo.add_before(*node, id),
-            Op::Remove(node) => {
+            Op::Remove(nodes) => {
                 // TODO: if self.nodes.get(node) is not an insert op, then drop this remove
-                self.removed_inserts.insert(*node);
+                self.removed_inserts.extend(nodes);
             }
         }
 
@@ -461,7 +457,7 @@ mod test {
         };
 
         seq.apply(HashNode {
-            op: Op::Remove(insert.id()),
+            op: Op::Remove(BTreeSet::from_iter([insert.id()])),
             extra_dependencies: BTreeSet::new(),
         });
 
@@ -872,11 +868,11 @@ mod test {
 
         for r in removed {
             seq_a.apply(HashNode {
-                op: Op::Remove(r),
+                op: Op::Remove(BTreeSet::from_iter([r])),
                 extra_dependencies: BTreeSet::new(),
             });
             seq_b.apply(HashNode {
-                op: Op::Remove(r),
+                op: Op::Remove(BTreeSet::from_iter([r])),
                 extra_dependencies: BTreeSet::new(),
             });
         }

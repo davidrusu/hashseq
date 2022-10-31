@@ -7,7 +7,7 @@ pub enum Op {
     InsertRoot(char),
     InsertAfter(Id, char),
     InsertBefore(Id, char),
-    Remove(Id),
+    Remove(BTreeSet<Id>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -17,10 +17,11 @@ pub struct HashNode {
 }
 
 impl Op {
-    pub fn dependency(&self) -> Option<Id> {
+    pub fn dependencies(&self) -> BTreeSet<Id> {
         match &self {
-            Op::InsertRoot(_) => None,
-            Op::InsertAfter(dep, _) | Op::InsertBefore(dep, _) | Op::Remove(dep) => Some(*dep),
+            Op::InsertRoot(_) => BTreeSet::new(),
+            Op::InsertAfter(dep, _) | Op::InsertBefore(dep, _) => BTreeSet::from_iter([*dep]),
+            Op::Remove(deps) => deps.clone(),
         }
     }
 
@@ -56,7 +57,7 @@ impl HashNode {
         self.extra_dependencies
             .iter()
             .copied()
-            .chain(self.op.dependency())
+            .chain(self.op.dependencies())
     }
 
     pub fn id(&self) -> Id {
