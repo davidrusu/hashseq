@@ -157,29 +157,27 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
     type Item = Id;
 
     fn next(&mut self) -> Option<Id> {
-        let (_, deps) = self.waiting_stack.last_mut()?;
+        loop {
+            let (_, deps) = self.waiting_stack.last_mut()?;
 
-        if deps.is_empty() {
-            let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
-            // This node is free to be released, but first
-            // queue up any nodes who come after this one
-            if let Some(afters) = self.topo.after.get(n) {
-                for after in afters.iter().rev() {
-                    self.push_waiting(after);
+            if deps.is_empty() {
+                let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
+                // This node is free to be released, but first
+                // queue up any nodes who come after this one
+                if let Some(afters) = self.topo.after.get(n) {
+                    for after in afters.iter().rev() {
+                        self.push_waiting(after);
+                    }
                 }
-            }
-            if self.removed.contains(n) {
-                self.next()
+                if !self.removed.contains(n) {
+                    return Some(*n);
+                }
             } else {
-                Some(*n)
+                // This node has dependencies that need to be
+                // released ahead of itself.
+                let dep = deps.pop().expect("There should be at least one dep");
+                self.push_waiting(dep);
             }
-        } else {
-            // This node has dependencies that need to be
-            // released ahead of itself.
-            let dep = deps.pop().expect("There should be at least one dep");
-            self.push_waiting(dep);
-
-            self.next()
         }
     }
 }
