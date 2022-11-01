@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::Id;
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub enum Op {
     InsertRoot(char),
     InsertAfter(Id, char),
@@ -10,7 +12,7 @@ pub enum Op {
     Remove(BTreeSet<Id>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HashNode {
     pub extra_dependencies: BTreeSet<Id>,
     pub op: Op,

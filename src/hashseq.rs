@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use crate::topo_sort::{Marker, Topo, TopoIter};
 // use crate::topo_sort_strong_weak::Tree;
 use crate::{Cursor, HashNode, Id, Op};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct HashSeq {
     pub topo: Topo,
     pub nodes: BTreeMap<Id, HashNode>,
@@ -816,6 +817,18 @@ mod test {
         seq.remove(0);
 
         assert_eq!(String::from_iter(seq.iter()), "");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc13() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(1, 'a');
+        seq.insert(1, 'a');
+        seq.insert(1, 'b');
+
+        assert_eq!(String::from_iter(seq.iter()), "abaa");
     }
 
     #[quickcheck]

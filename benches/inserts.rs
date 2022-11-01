@@ -11,9 +11,7 @@ fn prepend(n: usize) {
 
 fn append(n: usize) {
     let mut seq = HashSeq::default();
-    for _ in 0..n {
-        seq.insert(seq.len(), 'a');
-    }
+    seq.insert_batch(0, std::iter::repeat('a').take(n));
 }
 
 fn insert_middle(n: usize) {
@@ -23,50 +21,55 @@ fn insert_middle(n: usize) {
     }
 }
 
+fn insert_random(n: usize) {
+    let mut seq = HashSeq::default();
+    for _ in 0..n {
+        let p = if seq.is_empty() {
+            0
+        } else {
+            rand::random::<usize>() % seq.len()
+        };
+        seq.insert(p, 'a');
+    }
+}
+
 fn append_growth(c: &mut Criterion) {
     for n in [1, 10, 100, 1000] {
-        let guard = pprof::ProfilerGuard::new(100).unwrap();
-
         c.bench_function(&format!("index-append-{n}"), |b| {
             b.iter(|| append(black_box(n)));
         });
-
-        if let Ok(report) = guard.report().build() {
-            let file = std::fs::File::create(&format!("append-{n}-fg.svg")).unwrap();
-            report.flamegraph(file).unwrap();
-        };
     }
 }
 
 fn prepend_growth(c: &mut Criterion) {
     for n in [1, 10, 100, 1000] {
-        let guard = pprof::ProfilerGuard::new(100).unwrap();
-
         c.bench_function(&format!("prepend {n}"), |b| {
             b.iter(|| prepend(black_box(n)));
         });
-
-        if let Ok(report) = guard.report().build() {
-            let file = std::fs::File::create(&format!("prepend-{n}-fg.svg")).unwrap();
-            report.flamegraph(file).unwrap();
-        };
     }
 }
 
 fn insert_middle_growth(c: &mut Criterion) {
     for n in [1, 10, 100, 1000] {
-        let guard = pprof::ProfilerGuard::new(100).unwrap();
-
         c.bench_function(&format!("insert-middle {n}"), |b| {
             b.iter(|| insert_middle(black_box(n)));
         });
-
-        if let Ok(report) = guard.report().build() {
-            let file = std::fs::File::create(&format!("insert-middle-{n}-fg.svg")).unwrap();
-            report.flamegraph(file).unwrap();
-        };
     }
 }
 
-criterion_group!(benches, append_growth, prepend_growth, insert_middle_growth);
+fn insert_random_growth(c: &mut Criterion) {
+    for n in [1, 10, 100, 1000, 10000] {
+        c.bench_function(&format!("insert-random {n}"), |b| {
+            b.iter(|| insert_random(black_box(n)));
+        });
+    }
+}
+
+criterion_group!(
+    benches,
+    append_growth,
+    prepend_growth,
+    insert_middle_growth,
+    insert_random_growth
+);
 criterion_main!(benches);

@@ -1,4 +1,3 @@
-#![feature(map_first_last)]
 #![feature(let_chains)]
 #![feature(int_log)]
 

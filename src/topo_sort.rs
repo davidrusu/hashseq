@@ -1,8 +1,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::Id;
 
-#[derive(Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Topo {
     pub roots: BTreeSet<Id>,
     pub before: HashMap<Id, BTreeSet<Id>>,
@@ -17,6 +19,7 @@ impl Topo {
             if &n == b {
                 return true;
             }
+
             seen.insert(n);
             boundary.extend(self.after(n).into_iter().filter(|a| !seen.contains(a)));
             if &n != a {
@@ -72,7 +75,7 @@ impl Topo {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Marker {
     pub(crate) waiting_stack: Vec<(Id, Vec<Id>)>,
 }
@@ -142,13 +145,13 @@ impl<'a, 'b> TopoIter<'a, 'b> {
                 .iter()
                 .map(|(id, deps)| (**id, Vec::from_iter(deps.iter().map(|id| **id)))),
         );
-        self.next().map(|id| (id, Marker { waiting_stack }))
+        let marker = Marker { waiting_stack };
+        let id = self.next()?;
+        Some((id, marker))
     }
 
     fn push_waiting(&mut self, n: &'a Id) {
-        let mut deps = Vec::new();
-        let befores = &self.topo.before[n];
-        deps.extend(befores.iter().rev());
+        let deps = Vec::from_iter(self.topo.before[n].iter().rev());
         self.waiting_stack.push((n, deps));
     }
 }
