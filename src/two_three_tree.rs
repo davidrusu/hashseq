@@ -14,6 +14,10 @@ enum Node {
 }
 
 impl Node {
+    fn is_leaf(&self) -> bool {
+        matches!(self, Node::Leaf(_))
+    }
+
     fn count(&self) -> usize {
         match self {
             Node::Leaf(_) => 1,
@@ -45,6 +49,39 @@ impl Node {
                     right.insert(idx - left.count(), value)
                 }
                 *count += 1;
+            }
+            Node::Three {
+                count,
+                left,
+                middle,
+                right,
+            } => todo!(),
+        }
+    }
+
+    fn remove(&mut self, idx: usize) {
+        assert!(idx < self.count());
+
+        match self {
+            Node::Leaf(_) => panic!("Parent should have removed us"),
+            Node::Two { count, left, right } => {
+                if idx < left.count() {
+                    if left.is_leaf() {
+                        let n = std::mem::replace(right, Box::new(Node::Leaf('a')));
+                        *self = *n;
+                    } else {
+                        left.remove(idx);
+                        *count -= 1;
+                    }
+                } else {
+                    if right.is_leaf() {
+                        let n = std::mem::replace(left, Box::new(Node::Leaf('a')));
+                        *self = *n;
+                    } else {
+                        right.remove(idx - left.count());
+                        *count -= 1;
+                    }
+                }
             }
             Node::Three {
                 count,
@@ -122,6 +159,19 @@ impl Tree {
         }
     }
 
+    fn remove(&mut self, idx: usize) {
+        assert!(idx <= self.len());
+        match &mut self.root {
+            Some(Node::Leaf(_)) => {
+                self.root = None;
+            }
+            Some(r) => {
+                r.remove(idx);
+            }
+            None => (),
+        }
+    }
+
     fn iter(&self) -> Box<dyn Iterator<Item = char>> {
         match &self.root {
             None => Box::new(std::iter::empty()),
@@ -176,6 +226,17 @@ mod test {
         assert_eq!(String::from_iter(seq.iter()), "abc");
     }
 
+    #[test]
+    fn test_insert_twice_than_remove() {
+        let mut seq = Tree::default();
+
+        seq.insert(0, 'a');
+        seq.insert(1, 'b');
+        seq.remove(1);
+
+        assert_eq!(String::from_iter(seq.iter()), "a");
+    }
+
     #[quickcheck]
     fn prop_vec_model(instructions: Vec<(bool, u8, char)>) {
         let mut model = Vec::new();
@@ -191,12 +252,11 @@ mod test {
                 }
                 false => {
                     // remove
-                    // TODO:
-                    // assert_eq!(seq.is_empty(), model.is_empty());
-                    // if !seq.is_empty() {
-                    //     model.remove(idx.min(model.len() - 1));
-                    //     seq.remove(idx.min(seq.len() - 1));
-                    // }
+                    assert_eq!(seq.is_empty(), model.is_empty());
+                    if !seq.is_empty() {
+                        model.remove(idx.min(model.len() - 1));
+                        seq.remove(idx.min(seq.len() - 1));
+                    }
                 }
             }
         }
