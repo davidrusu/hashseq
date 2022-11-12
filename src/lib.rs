@@ -1,5 +1,4 @@
 #![feature(let_chains)]
-#![feature(int_log)]
 
 pub mod hashseq;
 // pub mod topo_after_and_before;
