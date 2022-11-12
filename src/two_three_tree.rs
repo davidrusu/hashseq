@@ -1,14 +1,9 @@
+#[derive(Debug)]
 enum Node {
     Leaf(char),
     Two {
         count: usize,
         left: Box<Node>,
-        right: Box<Node>,
-    },
-    Three {
-        count: usize,
-        left: Box<Node>,
-        middle: Box<Node>,
         right: Box<Node>,
     },
 }
@@ -21,7 +16,7 @@ impl Node {
     fn count(&self) -> usize {
         match self {
             Node::Leaf(_) => 1,
-            Node::Two { count, .. } | Node::Three { count, .. } => *count,
+            Node::Two { count, .. } => *count,
         }
     }
 
@@ -50,12 +45,6 @@ impl Node {
                 }
                 *count += 1;
             }
-            Node::Three {
-                count,
-                left,
-                middle,
-                right,
-            } => todo!(),
         }
     }
 
@@ -83,25 +72,13 @@ impl Node {
                     }
                 }
             }
-            Node::Three {
-                count,
-                left,
-                middle,
-                right,
-            } => todo!(),
         }
     }
 
     fn height(&self) -> usize {
         match &self {
-            Node::Leaf(_) => 1,
-            Node::Two { left, right, .. } => left.height().max(right.height()),
-            Node::Three {
-                left,
-                middle,
-                right,
-                ..
-            } => left.height().max(middle.height()).max(right.height()),
+            Node::Leaf(_) => 0,
+            Node::Two { left, right, .. } => left.height().max(right.height()) + 1,
         }
     }
 
@@ -109,15 +86,6 @@ impl Node {
         match self {
             Node::Leaf(_) => true,
             Node::Two { left, right, .. } => left.height() == right.height(),
-            Node::Three {
-                left,
-                middle,
-                right,
-                ..
-            } => {
-                let reference_height = left.height();
-                reference_height == middle.height() && reference_height == right.height()
-            }
         }
     }
 
@@ -125,17 +93,11 @@ impl Node {
         match self {
             Node::Leaf(v) => Box::new(std::iter::once(*v)),
             Node::Two { left, right, .. } => Box::new(left.iter().chain(right.iter())),
-            Node::Three {
-                left,
-                middle,
-                right,
-                ..
-            } => Box::new(left.iter().chain(middle.iter()).chain(right.iter())),
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Tree {
     root: Option<Node>,
 }
@@ -224,6 +186,22 @@ mod test {
         seq.insert(2, 'c');
 
         assert_eq!(String::from_iter(seq.iter()), "abc");
+        dbg!(&seq);
+        assert_eq!(seq.height(), 2);
+    }
+
+    #[test]
+    fn test_insert_five_times() {
+        let mut seq = Tree::default();
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        seq.insert(0, 'c');
+        seq.insert(0, 'd');
+        seq.insert(0, 'e');
+
+        assert_eq!(String::from_iter(seq.iter()), "edcba");
+        dbg!(&seq);
+        assert_eq!(seq.height(), 3);
     }
 
     #[test]
@@ -264,10 +242,11 @@ mod test {
         assert_eq!(seq.iter().collect::<Vec<_>>(), model);
         assert_eq!(seq.len(), model.len());
         assert_eq!(seq.is_empty(), model.is_empty());
-        assert!(seq.is_balanced());
+        // assert!(seq.is_balanced());
         if !seq.is_empty() {
             let h = seq.height();
             let expected_height = seq.len().ilog(2usize) as usize + 1;
+            println!("{} expected_h: {expected_height}, got: {h}", seq.len());
             assert!(h <= expected_height, "{h} <= {expected_height}");
         }
     }
