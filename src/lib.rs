@@ -7,6 +7,7 @@ pub mod topo_sort;
 pub mod cursor;
 // pub mod tree;
 pub mod hash_node;
+pub mod two_three_tree;
 
 pub use self::cursor::Cursor;
 pub use self::hash_node::{HashNode, Op};
