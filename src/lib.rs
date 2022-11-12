@@ -9,6 +9,8 @@ pub mod cursor;
 pub mod hash_node;
 // pub mod two_three_tree;
 
+pub mod skip_list;
+
 pub use self::cursor::Cursor;
 pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::HashSeq;
