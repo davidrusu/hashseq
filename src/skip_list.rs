@@ -1,7 +1,5 @@
 use std::{cell::RefCell, rc::Rc};
 
-use crate::Id;
-
 struct Node {
     value: char,
     prev: Box<Option<Rc<RefCell<Node>>>>,
@@ -43,7 +41,7 @@ impl SkipList {
     fn insert(&mut self, idx: usize, value: char) {
         assert!(idx <= self.len());
 
-        let mut node = Rc::new(RefCell::new(Node::new(value)));
+        let node = Rc::new(RefCell::new(Node::new(value)));
 
         if idx == 0 {
             if let Some(head) = self.root.clone() {
@@ -85,10 +83,14 @@ impl SkipList {
         prev.borrow_mut().next = next_next;
     }
 
-    fn iter(&self) -> SkipListIter {
+    fn iter_nodes(&self) -> SkipListIter {
         SkipListIter {
             node: self.root.clone(),
         }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = char> {
+        self.iter_nodes().map(|n| n.borrow().value)
     }
 }
 
@@ -97,16 +99,16 @@ struct SkipListIter {
 }
 
 impl Iterator for SkipListIter {
-    type Item = char;
+    type Item = Rc<RefCell<Node>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &self.node {
             Some(n) => {
-                let v = n.borrow().value;
+                let current = n.clone();
                 let next = n.borrow().next.clone();
                 self.node = *next;
 
-                Some(v)
+                Some(current)
             }
             None => None,
         }
