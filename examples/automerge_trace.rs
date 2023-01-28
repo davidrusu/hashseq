@@ -67,5 +67,5 @@ fn main() {
     );
 
     let mut file = File::create("automerge.latex").expect("Failed to create output file");
-    write!(file, "{}", doc).expect("Failed to write final document");
+    write!(file, "{doc}").expect("Failed to write final document");
 }

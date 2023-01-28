@@ -428,7 +428,7 @@ mod hashseq_viz {
                     let string = String::from_iter(self.seq.iter());
                     let before_cursor = String::from_iter(string.chars().take(state.cursor));
                     let after_cursor = String::from_iter(string.chars().skip(state.cursor));
-                    let mut text = Text::from(format!("{}|{}", before_cursor, after_cursor));
+                    let mut text = Text::from(format!("{before_cursor}|{after_cursor}"));
                     text.size = 32.0;
                     frame.fill_text(text);
 
