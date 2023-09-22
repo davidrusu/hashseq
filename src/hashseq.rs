@@ -58,7 +58,7 @@ impl HashSeq {
 
     fn iter_from(&mut self, idx: usize) -> TopoIter<'_, '_> {
         let (mut start_idx, mut order) =
-            if let Some((start_idx, marker)) = self.markers.range(..=idx).rev().next() {
+            if let Some((start_idx, marker)) = self.markers.range(..=idx).next_back() {
                 let order = self.topo.iter_from(&self.removed_inserts, marker);
                 (*start_idx, order)
             } else {

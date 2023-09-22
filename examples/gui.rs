@@ -245,7 +245,7 @@ mod hashseq_viz {
 
             let pos_in_set =
                 |id: Id, set: BTreeSet<Id>, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
-                    let before_id = set.range(..id).rev().next().cloned();
+                    let before_id = set.range(..id).next_back().cloned();
                     let after_id = set.range(id..).nth(1).cloned();
                     let before_pos = before_id.and_then(|id| nodes.get(&id)).cloned();
                     let after_pos = after_id.and_then(|id| nodes.get(&id)).cloned();
