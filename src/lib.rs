@@ -1,6 +1,3 @@
-#![feature(let_chains)]
-#![feature(int_log)]
-
 pub mod hashseq;
 // pub mod topo_after_and_before;
 pub mod topo_sort;
@@ -8,6 +5,11 @@ pub mod topo_sort;
 pub mod cursor;
 // pub mod tree;
 pub mod hash_node;
+// pub mod two_three_tree;
+
+// pub mod skip_list;
+// mod positional_list;
+// mod poslist;
 
 pub use self::cursor::Cursor;
 pub use self::hash_node::{HashNode, Op};

@@ -245,7 +245,7 @@ mod hashseq_viz {
 
             let pos_in_set =
                 |id: Id, set: BTreeSet<Id>, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
-                    let before_id = set.range(..id).rev().next().cloned();
+                    let before_id = set.range(..id).next_back().cloned();
                     let after_id = set.range(id..).nth(1).cloned();
                     let before_pos = before_id.and_then(|id| nodes.get(&id)).cloned();
                     let after_pos = after_id.and_then(|id| nodes.get(&id)).cloned();
@@ -277,7 +277,7 @@ mod hashseq_viz {
                     });
                     let target_pos = match &node.op {
                         hashseq::Op::InsertRoot(_) => {
-                            match pos_in_set(*id, self.seq.topo.roots.clone(), &state.node_pos) {
+                            match pos_in_set(*id, self.seq.topo.roots().clone(), &state.node_pos) {
                                 Some(p) => p,
                                 None => pos,
                             }
@@ -428,7 +428,7 @@ mod hashseq_viz {
                     let string = String::from_iter(self.seq.iter());
                     let before_cursor = String::from_iter(string.chars().take(state.cursor));
                     let after_cursor = String::from_iter(string.chars().skip(state.cursor));
-                    let mut text = Text::from(format!("{}|{}", before_cursor, after_cursor));
+                    let mut text = Text::from(format!("{before_cursor}|{after_cursor}"));
                     text.size = 32.0;
                     frame.fill_text(text);
 
@@ -534,28 +534,6 @@ mod hashseq_viz {
                             &Path::rectangle(*pos - Vector::new(r * 0.5, r * 0.5), Size::new(r, r)),
                             Fill::from(Color::BLACK),
                         );
-                    }
-
-                    // Render all markers in the hashseq
-
-                    for (idx, marker) in self.seq.markers.iter() {
-                        let marker_node = self
-                            .seq
-                            .topo
-                            .iter_from(&self.seq.removed_inserts, marker)
-                            .next()
-                            .expect("Marker without next value");
-
-                        if let Some(node_pos) = state.node_pos.get(&marker_node) {
-                            let mut marker_t = Text::from(format!("{idx}"));
-                            marker_t.size = 24.0;
-                            marker_t.position = *node_pos;
-                            marker_t.position.y -= 26.0;
-                            marker_t.position.x -= marker_t.size / 4.0;
-                            frame.fill_text(marker_t);
-                        } else {
-                            println!("Warning: missing node position for {marker_node}")
-                        }
                     }
                 });
                 stack.push(content);
