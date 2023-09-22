@@ -4,6 +4,7 @@ struct Node {
     value: char,
     prev: Box<Option<Rc<RefCell<Node>>>>,
     next: Box<Option<Rc<RefCell<Node>>>>,
+    removed: bool,
 }
 
 impl Node {
@@ -12,7 +13,14 @@ impl Node {
             value,
             prev: Box::new(None),
             next: Box::new(None),
+            removed: false,
         }
+    }
+
+    fn mark_removed(&mut self) {
+        self.prev = Box::new(None);
+        self.next = Box::new(None);
+        self.removed = true;
     }
 }
 
@@ -23,15 +31,7 @@ struct SkipList {
 
 impl SkipList {
     fn len(&self) -> usize {
-        let mut len = 0;
-        let mut curr = self.root.clone();
-
-        while let Some(n) = curr {
-            len += 1;
-            curr = *(n.borrow().next.clone());
-        }
-
-        len
+        self.iter_nodes().count()
     }
 
     fn is_empty(&self) -> bool {
@@ -54,33 +54,30 @@ impl SkipList {
             return;
         }
 
-        let mut prev = self.root.clone().unwrap();
-        for _ in 0..idx - 1 {
-            let new_prev = prev.borrow().next.clone().unwrap();
-            prev = new_prev;
-        }
+        let prev = self.iter_nodes().nth(idx - 1).unwrap();
 
         node.borrow_mut().next = prev.borrow().next.clone();
         node.borrow_mut().prev = Box::new(Some(prev.clone()));
         prev.borrow_mut().next = Box::new(Some(node));
     }
 
-    fn remove(&mut self, idx: usize) {
-        if idx == 0 {
-            let new_root = self.root.as_ref().unwrap().borrow().next.clone();
-            self.root = *new_root;
-            return;
-        }
+    fn remove(&mut self, idx: usize) -> Rc<RefCell<Node>> {
+        let removed_node = if idx == 0 {
+            let removed_node = self.root.clone().unwrap();
+            self.root = *(removed_node.borrow().next.clone());
 
-        let mut prev = self.root.clone().unwrap();
-        for _ in 0..idx - 1 {
-            let new_prev = prev.borrow().next.clone().unwrap();
-            prev = new_prev;
-        }
+            removed_node
+        } else {
+            let prev = self.iter_nodes().nth(idx - 1).unwrap();
+            let removed_node = prev.borrow().next.clone().unwrap();
+            let next_next = removed_node.borrow().next.clone();
+            prev.borrow_mut().next = next_next;
 
-        let next_next = prev.borrow().next.clone().unwrap().borrow().next.clone();
+            removed_node
+        };
 
-        prev.borrow_mut().next = next_next;
+        removed_node.borrow_mut().mark_removed();
+        removed_node
     }
 
     fn iter_nodes(&self) -> SkipListIter {

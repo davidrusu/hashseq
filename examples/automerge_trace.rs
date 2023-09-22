@@ -62,8 +62,8 @@ fn main() {
     let seq_bytes = bincode::serialize(&seq).unwrap().len();
 
     println!(
-        "doc: {doc_bytes}, seq: {seq_bytes}, overhead: {}",
-        seq_bytes - doc_bytes
+        "doc: {doc_bytes}, seq: {seq_bytes}, overhead: {:.2}x",
+        seq_bytes as f64 / doc_bytes as f64
     );
 
     let mut file = File::create("automerge.latex").expect("Failed to create output file");
