@@ -58,13 +58,13 @@ fn main() {
 
     let doc = String::from_iter(seq.iter());
 
-    let doc_bytes = doc.as_bytes().len();
-    let seq_bytes = bincode::serialize(&seq).unwrap().len();
+    // let doc_bytes = doc.as_bytes().len();
+    // let seq_bytes = bincode::serialize(&seq).unwrap().len();
 
-    println!(
-        "doc: {doc_bytes}, seq: {seq_bytes}, overhead: {:.2}x",
-        seq_bytes as f64 / doc_bytes as f64
-    );
+    // println!(
+    //     "doc: {doc_bytes}, seq: {seq_bytes}, overhead: {:.2}x",
+    //     seq_bytes as f64 / doc_bytes as f64
+    // );
 
     let mut file = File::create("automerge.latex").expect("Failed to create output file");
     write!(file, "{doc}").expect("Failed to write final document");

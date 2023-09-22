@@ -535,28 +535,6 @@ mod hashseq_viz {
                             Fill::from(Color::BLACK),
                         );
                     }
-
-                    // Render all markers in the hashseq
-
-                    for (idx, marker) in self.seq.markers.iter() {
-                        let marker_node = self
-                            .seq
-                            .topo
-                            .iter_from(&self.seq.removed_inserts, marker)
-                            .next()
-                            .expect("Marker without next value");
-
-                        if let Some(node_pos) = state.node_pos.get(&marker_node) {
-                            let mut marker_t = Text::from(format!("{idx}"));
-                            marker_t.size = 24.0;
-                            marker_t.position = *node_pos;
-                            marker_t.position.y -= 26.0;
-                            marker_t.position.x -= marker_t.size / 4.0;
-                            frame.fill_text(marker_t);
-                        } else {
-                            println!("Warning: missing node position for {marker_node}")
-                        }
-                    }
                 });
                 stack.push(content);
             }

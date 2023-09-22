@@ -1,20 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::topo_sort::{Marker, Topo, TopoIter};
+use associative_positional_list::AssociativePositionalList;
+
+use crate::topo_sort::{Topo, TopoIter};
 // use crate::topo_sort_strong_weak::Tree;
 use crate::{Cursor, HashNode, Id, Op};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub struct HashSeq {
     pub topo: Topo,
     pub nodes: BTreeMap<Id, HashNode>,
     pub removed_inserts: HashSet<Id>,
     pub(crate) roots: BTreeSet<Id>,
     pub(crate) orphaned: HashSet<HashNode>,
-    pub markers: BTreeMap<usize, Marker>,
-    pub cache_hit: u64,
-    pub cache_miss: u64,
+    index: AssociativePositionalList<Id>,
 }
 
 impl PartialEq for HashSeq {
@@ -57,41 +56,16 @@ impl HashSeq {
     }
 
     fn iter_from(&mut self, idx: usize) -> TopoIter<'_, '_> {
-        let (mut start_idx, mut order) =
-            if let Some((start_idx, marker)) = self.markers.range(..=idx).next_back() {
-                let order = self.topo.iter_from(&self.removed_inserts, marker);
-                (*start_idx, order)
-            } else {
-                let order = self.topo.iter(&self.removed_inserts);
-                (0, order)
-            };
+        let mut order = self.topo.iter(&self.removed_inserts);
 
-        let diff = idx - start_idx;
-        if diff > self.marker_spacing() {
-            // we'll insert a marker at the midpoint between the index and the start_idx
-
-            let next_marker_idx = start_idx + diff / 2;
-            for _ in start_idx..next_marker_idx {
-                order.next();
-            }
-
-            let (_, marker) = order.marker().expect("We should have a marker here");
-            self.markers.insert(next_marker_idx, marker);
-            start_idx = next_marker_idx + 1;
-
-            self.cache_miss += 1;
-        } else {
-            self.cache_hit += 1;
-        }
-
-        for _ in start_idx..idx {
+        for _ in 0..idx {
             order.next();
         }
 
         order
     }
 
-    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>, Option<Marker>) {
+    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {
         let (left, mut order) = if let Some(prev_idx) = idx.checked_sub(1) {
             let mut order = self.iter_from(prev_idx);
             (order.next(), order)
@@ -99,16 +73,9 @@ impl HashSeq {
             (None, self.iter_from(idx))
         };
 
-        let (right, marker) = match order.marker() {
-            Some((id, m)) => (Some(id), Some(m)),
-            None => (None, None),
-        };
+        let right = order.next();
 
-        (left, right, marker)
-    }
-
-    fn invalidate_markers_after(&mut self, idx: usize) {
-        self.markers.split_off(&(idx + 1));
+        (left, right)
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {
@@ -124,7 +91,7 @@ impl HashSeq {
             return;
         };
 
-        let (left, right, marker) = self.neighbours(idx);
+        let (left, right) = self.neighbours(idx);
         let op = match &(left, right) {
             (Some(l), Some(r)) => {
                 if self.topo.is_causally_before(l, r) {
@@ -146,21 +113,8 @@ impl HashSeq {
             op,
         };
 
-        let was_insert_before = matches!(node.op, Op::InsertBefore(_, _));
         let first_node_id = node.id();
-        self.apply_without_invalidate(node);
-        self.invalidate_markers_after(idx);
-
-        if let Some(mut marker) = marker {
-            if was_insert_before {
-                let right = right.expect("Right should be defined if we are inserting before");
-                marker.insert_dependency(&right, first_node_id);
-            } else {
-                marker.push_next(first_node_id);
-            }
-
-            self.markers.insert(idx, marker);
-        }
+        self.apply(node);
 
         // All remaining elements will be chained after the first node
         let mut last_id = first_node_id;
@@ -172,22 +126,8 @@ impl HashSeq {
 
             last_id = node.id();
 
-            self.apply_without_invalidate(node);
+            self.apply(node);
         }
-    }
-
-    fn log_len(&self) -> usize {
-        let l = self.len();
-        if l < 2 {
-            1
-        } else {
-            self.len().ilog2() as usize
-        }
-    }
-
-    fn marker_spacing(&self) -> usize {
-        self.log_len()
-        // dbg!(self.len() / self.log_len())
     }
 
     pub fn remove(&mut self, idx: usize) {
@@ -201,7 +141,7 @@ impl HashSeq {
         }
 
         let mut iter = self.iter_from(idx);
-        let (id, marker) = if let Some(m) = iter.marker() {
+        let id = if let Some(m) = iter.next() {
             m
         } else {
             // We reached the end of the sequence when iterating
@@ -220,13 +160,7 @@ impl HashSeq {
             op,
         };
 
-        self.apply_without_invalidate(node);
-        self.invalidate_markers_after(idx);
-        if idx < self.len() {
-            self.markers.insert(idx, marker);
-        } else {
-            self.markers.remove(&idx);
-        }
+        self.apply(node);
     }
 
     fn any_missing_dependencies(&self, deps: &BTreeSet<Id>) -> bool {
@@ -240,11 +174,6 @@ impl HashSeq {
     }
 
     pub fn apply(&mut self, node: HashNode) {
-        self.apply_without_invalidate(node);
-        self.markers.clear();
-    }
-
-    pub fn apply_without_invalidate(&mut self, node: HashNode) {
         let id = node.id();
 
         if self.nodes.contains_key(&id) {
