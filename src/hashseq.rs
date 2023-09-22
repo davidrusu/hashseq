@@ -38,13 +38,11 @@ impl Eq for HashSeq {}
 
 impl HashSeq {
     pub fn len(&self) -> usize {
-        // nodes contains both insert and remove Ops, so nodes.len() counts both the remove ops and the removed inserts.
-        // We subtract out 2 * removed_inserts.len() to account for both the remove op and the insert op that was removed
-        self.nodes.len() - self.removed_inserts.len() * 2
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.index.is_empty()
     }
 
     pub fn orphans(&self) -> &HashSet<HashNode> {
@@ -55,25 +53,12 @@ impl HashSeq {
         Cursor::from(self)
     }
 
-    fn iter_from(&mut self, idx: usize) -> TopoIter<'_, '_> {
-        let mut order = self.topo.iter(&self.removed_inserts);
-
-        for _ in 0..idx {
-            order.next();
-        }
-
-        order
-    }
-
     fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {
-        let (left, mut order) = if let Some(prev_idx) = idx.checked_sub(1) {
-            let mut order = self.iter_from(prev_idx);
-            (order.next(), order)
-        } else {
-            (None, self.iter_from(idx))
-        };
+        let left = idx
+            .checked_sub(1)
+            .and_then(|prev_idx| self.index.get(prev_idx).copied());
 
-        let right = order.next();
+        let right = self.index.get(idx).copied();
 
         (left, right)
     }
@@ -92,16 +77,16 @@ impl HashSeq {
         };
 
         let (left, right) = self.neighbours(idx);
-        let op = match &(left, right) {
+        let op = match (left, right) {
             (Some(l), Some(r)) => {
-                if self.topo.is_causally_before(l, r) {
-                    Op::InsertBefore(*r, first_elem)
+                if self.topo.is_causally_before(&l, &r) {
+                    Op::InsertBefore(r, first_elem)
                 } else {
-                    Op::InsertAfter(*l, first_elem)
+                    Op::InsertAfter(l, first_elem)
                 }
             }
-            (Some(l), None) => Op::InsertAfter(*l, first_elem),
-            (None, Some(r)) => Op::InsertBefore(*r, first_elem),
+            (Some(l), None) => Op::InsertAfter(l, first_elem),
+            (None, Some(r)) => Op::InsertBefore(r, first_elem),
             (None, None) => Op::InsertRoot(first_elem),
         };
 
@@ -140,16 +125,14 @@ impl HashSeq {
             return;
         }
 
-        let mut iter = self.iter_from(idx);
-        let id = if let Some(m) = iter.next() {
-            m
-        } else {
-            // We reached the end of the sequence when iterating
-            return;
-        };
-
-        let mut to_remove = BTreeSet::from_iter([id]);
-        to_remove.extend(iter.take(amount - 1)); // amount is at least 1 by our check above
+        let mut to_remove = BTreeSet::new();
+        for pos in idx..(idx + amount) {
+            if let Some(id) = self.index.get(pos) {
+                to_remove.insert(*id);
+            } else {
+                break;
+            }
+        }
         let op = Op::Remove(to_remove);
 
         let extra_dependencies =
@@ -187,11 +170,83 @@ impl HashSeq {
         }
 
         match &node.op {
-            Op::InsertRoot(_) => self.topo.add_root(id),
-            Op::InsertAfter(node, _) => self.topo.add_after(*node, id),
-            Op::InsertBefore(node, _) => self.topo.add_before(*node, id),
+            Op::InsertRoot(_) => {
+                let position = if let Some(next_root) = self
+                    .topo
+                    .roots()
+                    .range(id..)
+                    .find(|id| !self.removed_inserts.contains(id))
+                {
+                    // new root is inserted just before the next root
+                    self.index.find(next_root).unwrap()
+                } else {
+                    // new root is inserted at end of list
+                    self.len()
+                };
+                self.index.insert(position, id);
+
+                self.topo.add_root(id);
+            }
+            Op::InsertAfter(node, _) => {
+                let position = if let Some(next_node) = self
+                    .topo
+                    .after(*node)
+                    .range(id..)
+                    .find(|id| !self.removed_inserts.contains(id))
+                {
+                    // new node is inserted just before the other node after our anchor node that is
+                    // bigger than the new node
+                    Some(self.index.find(next_node).unwrap())
+                } else {
+                    // otherwise the new node is inserted after our anchor node
+                    self.index.find(node).map(|p| p + 1)
+                };
+                self.topo.add_after(*node, id);
+
+                let position = if let Some(position) = position {
+                    position
+                } else {
+                    // fall back to iterating over the entire sequence if the anchor node has been removed
+                    let (position, _) =
+                        self.iter_ids().enumerate().find(|(_, i)| i == &id).unwrap();
+                    position
+                };
+                self.index.insert(position, id);
+            }
+            Op::InsertBefore(node, _) => {
+                let position = if let Some(next_node) = self
+                    .topo
+                    .before(*node)
+                    .range(id..)
+                    .find(|id| !self.removed_inserts.contains(id))
+                {
+                    // new node is inserted just before the other node before our anchor node that is
+                    // bigger than the new node
+                    Some(self.index.find(next_node).unwrap())
+                } else {
+                    // otherwise the new node is inserted before our anchor node
+                    self.index.find(node)
+                };
+
+                self.topo.add_before(*node, id);
+
+                let position = if let Some(position) = position {
+                    position
+                } else {
+                    // fall back to iterating over the entire sequence if the anchor node has been removed
+                    let (position, _) =
+                        self.iter_ids().enumerate().find(|(_, i)| i == &id).unwrap();
+                    position
+                };
+                self.index.insert(position, id);
+            }
             Op::Remove(nodes) => {
                 // TODO: if self.nodes.get(node) is not an insert op, then drop this remove
+                for n in nodes {
+                    if let Some(p) = self.index.find(n) {
+                        self.index.remove(p);
+                    }
+                }
                 self.removed_inserts.extend(nodes);
             }
         }
@@ -289,7 +344,7 @@ mod test {
 
         assert_eq!(
             &seq_a.iter().collect::<String>(),
-            "hello my name is davidzameena"
+            "hello my name is zameenadavid"
         );
     }
 
@@ -305,7 +360,7 @@ mod test {
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
         seq_a.merge(seq_b);
-        assert_eq!(&seq_a.iter().collect::<String>(), "abaza");
+        assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
     }
 
     #[test]
@@ -428,6 +483,30 @@ mod test {
         ba.merge(seq_a.clone());
 
         assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn test_prop_commutative_qc1() {
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+
+        seq_a.insert(0, 'a');
+        seq_a.remove(0);
+        assert_eq!(String::from_iter(seq_a.iter()), "");
+
+        seq_b.insert(0, 'a');
+        seq_b.insert(0, 'b');
+        assert_eq!(String::from_iter(seq_b.iter()), "ba");
+
+        // merge(a, b) == merge(b, a)
+
+        let mut merge_a_b = seq_a.clone();
+        merge_a_b.merge(seq_b.clone());
+
+        let mut merge_b_a = seq_b.clone();
+        merge_b_a.merge(seq_a.clone());
+
+        assert_eq!(merge_a_b, merge_b_a);
     }
 
     #[quickcheck]
@@ -758,6 +837,31 @@ mod test {
         seq.insert(1, 'b');
 
         assert_eq!(String::from_iter(seq.iter()), "abaa");
+    }
+
+    #[test]
+    fn test_insert_remove_and_reinsert() {
+        let mut seq = HashSeq::default();
+        seq.insert(0, 'b');
+        seq.remove(0);
+        seq.insert(0, 'b');
+        assert_eq!(String::from_iter(seq.iter()), "b");
+    }
+
+    #[test]
+    fn test_removing_an_element_twice() {
+        let mut seq = HashSeq::default();
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        let removed = seq.iter_ids().nth(1).unwrap();
+        seq.remove(1);
+
+        seq.apply(HashNode {
+            op: Op::Remove(BTreeSet::from_iter([removed])),
+            extra_dependencies: BTreeSet::new(),
+        });
+
+        assert_eq!(String::from_iter(seq.iter()), "b");
     }
 
     #[quickcheck]

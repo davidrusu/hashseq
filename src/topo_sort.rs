@@ -6,7 +6,7 @@ use crate::Id;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Topo {
-    pub roots: BTreeSet<Id>,
+    roots: BTreeSet<Id>,
     pub before: HashMap<Id, BTreeSet<Id>>,
     pub after: HashMap<Id, BTreeSet<Id>>,
 }
@@ -50,7 +50,7 @@ impl Topo {
         self.after.entry(n).or_default();
     }
 
-    fn roots(&self) -> &BTreeSet<Id> {
+    pub fn roots(&self) -> &BTreeSet<Id> {
         &self.roots
     }
 

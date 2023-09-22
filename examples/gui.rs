@@ -277,7 +277,7 @@ mod hashseq_viz {
                     });
                     let target_pos = match &node.op {
                         hashseq::Op::InsertRoot(_) => {
-                            match pos_in_set(*id, self.seq.topo.roots.clone(), &state.node_pos) {
+                            match pos_in_set(*id, self.seq.topo.roots().clone(), &state.node_pos) {
                                 Some(p) => p,
                                 None => pos,
                             }
