@@ -18,19 +18,7 @@ pub struct HashSeq {
 
 impl PartialEq for HashSeq {
     fn eq(&self, other: &Self) -> bool {
-        (
-            &self.topo,
-            &self.nodes,
-            &self.removed_inserts,
-            &self.roots,
-            &self.orphaned,
-        ) == (
-            &other.topo,
-            &other.nodes,
-            &other.removed_inserts,
-            &other.roots,
-            &other.orphaned,
-        )
+        (&self.roots, &self.orphaned) == (&other.roots, &other.orphaned)
     }
 }
 
