@@ -3,8 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use associative_positional_list::AssociativePositionalList;
 
 use crate::topo_sort::{Topo, TopoIter};
-// use crate::topo_sort_strong_weak::Tree;
-use crate::{Cursor, HashNode, Id, Op};
+use crate::{HashNode, Id, Op};
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
@@ -18,19 +17,7 @@ pub struct HashSeq {
 
 impl PartialEq for HashSeq {
     fn eq(&self, other: &Self) -> bool {
-        (
-            &self.topo,
-            &self.nodes,
-            &self.removed_inserts,
-            &self.roots,
-            &self.orphaned,
-        ) == (
-            &other.topo,
-            &other.nodes,
-            &other.removed_inserts,
-            &other.roots,
-            &other.orphaned,
-        )
+        (&self.roots, &self.orphaned) == (&other.roots, &other.orphaned)
     }
 }
 
@@ -47,10 +34,6 @@ impl HashSeq {
 
     pub fn orphans(&self) -> &HashSet<HashNode> {
         &self.orphaned
-    }
-
-    pub fn cursor(self) -> Cursor {
-        Cursor::from(self)
     }
 
     fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {
@@ -156,6 +139,87 @@ impl HashSeq {
         false
     }
 
+    fn insert_root(&mut self, root_id: Id) {
+        let position = if let Some(next_root) = self
+            .topo
+            .roots()
+            .range(root_id..)
+            .find(|id| !self.removed_inserts.contains(id))
+        {
+            // new root is inserted just before the next biggest root
+            self.index.find(next_root).unwrap()
+        } else {
+            // otherwise if there is no bigger root, the new root is
+            // inserted at end of list
+            self.len()
+        };
+
+        self.index.insert(position, root_id);
+        self.topo.add_root(root_id);
+    }
+
+    fn insert_after_anchor(&mut self, id: Id, anchor: Id) {
+        let position = if let Some(next_node) = self
+            .topo
+            .after(anchor)
+            .range(id..)
+            .find(|id| !self.removed_inserts.contains(id))
+        {
+            // new node is inserted just before the other node after our anchor node that is
+            // bigger than the new node
+            Some(self.index.find(next_node).unwrap())
+        } else {
+            // otherwise the new node is inserted after our anchor node (unless it has been removed)
+            self.index.find(&anchor).map(|p| p + 1)
+        };
+
+        self.topo.add_after(anchor, id);
+
+        let position = position.unwrap_or_else(|| {
+            // fall back to iterating over the entire sequence if the anchor node has been removed
+            let (position, _) = self.iter_ids().enumerate().find(|(_, n)| n == &id).unwrap();
+            position
+        });
+        self.index.insert(position, id);
+    }
+
+    fn remove_nodes(&mut self, nodes: &BTreeSet<Id>) {
+        // TODO: if self.nodes.get(node) is not an insert op, then drop this remove.
+        //       Are you sure? looks like we would mark this op as an orphan if we hadn't
+        //       seen a node yet.
+        for n in nodes {
+            if let Some(p) = self.index.find(n) {
+                self.index.remove(p);
+            }
+        }
+        self.removed_inserts.extend(nodes);
+    }
+
+    fn insert_before_anchor(&mut self, id: Id, anchor: Id) {
+        let position = if let Some(next_node) = self
+            .topo
+            .before(anchor)
+            .range(id..)
+            .find(|id| !self.removed_inserts.contains(id))
+        {
+            // new node is inserted just before the other node before our anchor node that is
+            // bigger than the new node
+            Some(self.index.find(next_node).unwrap())
+        } else {
+            // otherwise the new node is inserted before our anchor node
+            self.index.find(&anchor)
+        };
+
+        self.topo.add_before(anchor, id);
+
+        let position = position.unwrap_or_else(|| {
+            // fall back to iterating over the entire sequence if the anchor node has been removed
+            let (position, _) = self.iter_ids().enumerate().find(|(_, n)| n == &id).unwrap();
+            position
+        });
+        self.index.insert(position, id);
+    }
+
     pub fn apply(&mut self, node: HashNode) {
         let id = node.id();
 
@@ -170,85 +234,10 @@ impl HashSeq {
         }
 
         match &node.op {
-            Op::InsertRoot(_) => {
-                let position = if let Some(next_root) = self
-                    .topo
-                    .roots()
-                    .range(id..)
-                    .find(|id| !self.removed_inserts.contains(id))
-                {
-                    // new root is inserted just before the next root
-                    self.index.find(next_root).unwrap()
-                } else {
-                    // new root is inserted at end of list
-                    self.len()
-                };
-                self.index.insert(position, id);
-
-                self.topo.add_root(id);
-            }
-            Op::InsertAfter(node, _) => {
-                let position = if let Some(next_node) = self
-                    .topo
-                    .after(*node)
-                    .range(id..)
-                    .find(|id| !self.removed_inserts.contains(id))
-                {
-                    // new node is inserted just before the other node after our anchor node that is
-                    // bigger than the new node
-                    Some(self.index.find(next_node).unwrap())
-                } else {
-                    // otherwise the new node is inserted after our anchor node
-                    self.index.find(node).map(|p| p + 1)
-                };
-                self.topo.add_after(*node, id);
-
-                let position = if let Some(position) = position {
-                    position
-                } else {
-                    // fall back to iterating over the entire sequence if the anchor node has been removed
-                    let (position, _) =
-                        self.iter_ids().enumerate().find(|(_, i)| i == &id).unwrap();
-                    position
-                };
-                self.index.insert(position, id);
-            }
-            Op::InsertBefore(node, _) => {
-                let position = if let Some(next_node) = self
-                    .topo
-                    .before(*node)
-                    .range(id..)
-                    .find(|id| !self.removed_inserts.contains(id))
-                {
-                    // new node is inserted just before the other node before our anchor node that is
-                    // bigger than the new node
-                    Some(self.index.find(next_node).unwrap())
-                } else {
-                    // otherwise the new node is inserted before our anchor node
-                    self.index.find(node)
-                };
-
-                self.topo.add_before(*node, id);
-
-                let position = if let Some(position) = position {
-                    position
-                } else {
-                    // fall back to iterating over the entire sequence if the anchor node has been removed
-                    let (position, _) =
-                        self.iter_ids().enumerate().find(|(_, i)| i == &id).unwrap();
-                    position
-                };
-                self.index.insert(position, id);
-            }
-            Op::Remove(nodes) => {
-                // TODO: if self.nodes.get(node) is not an insert op, then drop this remove
-                for n in nodes {
-                    if let Some(p) = self.index.find(n) {
-                        self.index.remove(p);
-                    }
-                }
-                self.removed_inserts.extend(nodes);
-            }
+            Op::InsertRoot(_) => self.insert_root(id),
+            Op::InsertAfter(anchor, _) => self.insert_after_anchor(id, *anchor),
+            Op::InsertBefore(anchor, _) => self.insert_before_anchor(id, *anchor),
+            Op::Remove(nodes) => self.remove_nodes(nodes),
         }
 
         self.nodes.insert(id, node);
