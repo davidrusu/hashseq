@@ -382,15 +382,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cpp_demangle"
-version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eeaa953eaad386a53111e47172c2fedba671e5684c8dd601a5f474f4f118710f"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -571,9 +562,9 @@ dependencies = [
 
 [[package]]
 name = "debugid"
-version = "0.7.3"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6ee87af31d84ef885378aebca32be3d682b0e0dc119d5b4860a2c5bb5046730"
+checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
  "uuid",
 ]
@@ -1647,19 +1638,6 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3790c00a0150112de0f4cd161e3d7fc4b2d8a5542ffc35f099a2562aecb35c"
-dependencies = [
- "bitflags 1.3.2",
- "cc",
- "cfg-if",
- "libc",
- "memoffset 0.6.5",
-]
-
-[[package]]
-name = "nix"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fa52e972a9a719cecb6864fb88568781eb706bac2cd1d4f04a648542dbf78069"
@@ -1681,6 +1659,17 @@ dependencies = [
  "cfg-if",
  "libc",
  "memoffset 0.6.5",
+]
+
+[[package]]
+name = "nix"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "598beaf3cc6fdd9a5dfb1630c2800c7acd31df7aaf0f565796fba2b53ca1af1b"
+dependencies = [
+ "bitflags 1.3.2",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -2014,9 +2003,9 @@ checksum = "d220334a184db82b31b83f5ff093e3315280fb2b6bbc032022b2304a509aab7a"
 
 [[package]]
 name = "pprof"
-version = "0.7.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c090facb9ab04a4fb15fe27f8861059f195dd0847e6f1042016244e129eddeb2"
+checksum = "978385d59daf9269189d052ca8a84c1acfd0715c0599a5d5188d4acc078ca46a"
 dependencies = [
  "backtrace",
  "cfg-if",
@@ -2024,7 +2013,7 @@ dependencies = [
  "inferno",
  "libc",
  "log",
- "nix 0.23.2",
+ "nix 0.26.4",
  "once_cell",
  "parking_lot 0.12.1",
  "smallvec",
@@ -2496,9 +2485,9 @@ checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
 
 [[package]]
 name = "symbolic-common"
-version = "8.8.0"
+version = "12.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f551f902d5642e58039aee6a9021a61037926af96e071816361644983966f540"
+checksum = "fac08504d60cf5bdffeb8a6a028f1a4868a5da1098bb19eb46239440039163fb"
 dependencies = [
  "debugid",
  "memmap2",
@@ -2508,11 +2497,10 @@ dependencies = [
 
 [[package]]
 name = "symbolic-demangle"
-version = "8.8.0"
+version = "12.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4564ca7b4e6eb14105aa8bbbce26e080f6b5d9c4373e67167ab31f7b86443750"
+checksum = "8b212728d4f6c527c1d50d6169e715f6e02d849811843c13e366d8ca6d0cf5c4"
 dependencies = [
- "cpp_demangle",
  "rustc-demangle",
  "symbolic-common",
 ]
@@ -2689,9 +2677,9 @@ checksum = "c0edd1e5b14653f783770bce4a4dabb4a5108a5370a5f5d8cfe8710c361f6c8b"
 
 [[package]]
 name = "uuid"
-version = "0.8.2"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc5cf98d8186244414c848017f0e2676b3fcb46807f6668a97dfe67359a3c4b7"
+checksum = "79daa5ed5740825c40b389c5e50312b9c86df53fccd33f281df655642b43869d"
 
 [[package]]
 name = "vec_map"
