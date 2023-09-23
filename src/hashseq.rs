@@ -3,8 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use associative_positional_list::AssociativePositionalList;
 
 use crate::topo_sort::{Topo, TopoIter};
-// use crate::topo_sort_strong_weak::Tree;
-use crate::{Cursor, HashNode, Id, Op};
+use crate::{HashNode, Id, Op};
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
@@ -35,10 +34,6 @@ impl HashSeq {
 
     pub fn orphans(&self) -> &HashSet<HashNode> {
         &self.orphaned
-    }
-
-    pub fn cursor(self) -> Cursor {
-        Cursor::from(self)
     }
 
     fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {

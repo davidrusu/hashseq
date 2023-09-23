@@ -38,10 +38,6 @@ debug = true
 name = "inserts"
 harness = false
 
-# [[bench]]
-# name = "cursor_inserts"
-# harness = false
-
 [[bench]]
 name = "automerge_bench"
 harness = false
