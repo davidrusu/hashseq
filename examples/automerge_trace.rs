@@ -26,7 +26,7 @@ fn automerge_trace(n: usize) -> HashSeq {
 
     let mut seq = HashSeq::default();
 
-    let guard = pprof::ProfilerGuard::new(100).unwrap();
+    let guard = pprof::ProfilerGuard::new(500).unwrap();
 
     let progress = ProgressBar::new((trace.len() * n) as u64);
     for _ in 0..n {
@@ -52,7 +52,7 @@ fn automerge_trace(n: usize) -> HashSeq {
 }
 
 fn main() {
-    let seq = automerge_trace(1);
+    let seq = automerge_trace(10);
 
     let doc = String::from_iter(seq.iter());
 

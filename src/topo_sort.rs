@@ -35,14 +35,14 @@ impl Topo {
         self.roots.insert(node);
     }
 
-    pub fn add_after(&mut self, left: Id, node: Id) {
+    pub fn add_after(&mut self, anchor: Id, node: Id) {
         self.insert(node); // is this necessary?
-        self.after.entry(left).or_default().insert(node);
+        self.after.entry(anchor).or_default().insert(node);
     }
 
-    pub fn add_before(&mut self, right: Id, node: Id) {
+    pub fn add_before(&mut self, anchor: Id, node: Id) {
         self.insert(node); // is this necessary?
-        self.before.entry(right).or_default().insert(node);
+        self.before.entry(anchor).or_default().insert(node);
     }
 
     fn insert(&mut self, n: Id) {

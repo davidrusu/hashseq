@@ -51,9 +51,9 @@ impl HashSeq {
     }
 
     pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
-        let mut batch = batch.into_iter();
+        let mut batch = batch.into_iter().enumerate();
 
-        let first_elem = if let Some(value) = batch.next() {
+        let first_elem = if let Some((_, value)) = batch.next() {
             value
         } else {
             return;
@@ -82,11 +82,11 @@ impl HashSeq {
         };
 
         let first_node_id = node.id();
-        self.apply(node);
+        self.apply_with_known_position(node, idx);
 
         // All remaining elements will be chained after the first node
         let mut last_id = first_node_id;
-        for e in batch {
+        for (i, e) in batch {
             let node = HashNode {
                 extra_dependencies: BTreeSet::new(),
                 op: Op::InsertAfter(last_id, e),
@@ -94,7 +94,7 @@ impl HashSeq {
 
             last_id = node.id();
 
-            self.apply(node);
+            self.apply_with_known_position(node, idx + i);
         }
     }
 
@@ -153,9 +153,12 @@ impl HashSeq {
             // inserted at end of list
             self.len()
         };
+        self.insert_root_with_known_position(root_id, position);
+    }
 
-        self.index.insert(position, root_id);
-        self.topo.add_root(root_id);
+    fn insert_root_with_known_position(&mut self, id: Id, position: usize) {
+        self.index.insert(position, id);
+        self.topo.add_root(id);
     }
 
     fn insert_after_anchor(&mut self, id: Id, anchor: Id) {
@@ -180,6 +183,11 @@ impl HashSeq {
             let (position, _) = self.iter_ids().enumerate().find(|(_, n)| n == &id).unwrap();
             position
         });
+        self.insert_after_anchor_with_known_position(id, anchor, position);
+    }
+
+    fn insert_after_anchor_with_known_position(&mut self, id: Id, anchor: Id, position: usize) {
+        self.topo.add_after(anchor, id);
         self.index.insert(position, id);
     }
 
@@ -218,6 +226,57 @@ impl HashSeq {
             position
         });
         self.index.insert(position, id);
+    }
+
+    fn insert_before_anchor_with_known_position(&mut self, id: Id, anchor: Id, position: usize) {
+        self.topo.add_before(anchor, id);
+        self.index.insert(position, id);
+    }
+
+    pub fn apply_with_known_position(&mut self, node: HashNode, position: usize) {
+        let id = node.id();
+
+        if self.nodes.contains_key(&id) {
+            return; // Already processed this node
+        }
+
+        let dependencies = BTreeSet::from_iter(node.dependencies());
+        if self.any_missing_dependencies(&dependencies) {
+            self.orphaned.insert(node);
+            return;
+        }
+
+        match &node.op {
+            Op::InsertRoot(_) => self.insert_root_with_known_position(id, position),
+            Op::InsertAfter(anchor, _) => {
+                self.insert_after_anchor_with_known_position(id, *anchor, position)
+            }
+            Op::InsertBefore(anchor, _) => {
+                self.insert_before_anchor_with_known_position(id, *anchor, position)
+            }
+            Op::Remove(nodes) => self.remove_nodes(nodes),
+        }
+
+        self.nodes.insert(id, node);
+
+        let superseded_roots = Vec::from_iter(
+            self.roots
+                .iter()
+                .filter(|r| dependencies.contains(*r))
+                .copied(),
+        );
+
+        for r in superseded_roots {
+            self.roots.remove(&r);
+        }
+
+        self.roots.insert(id);
+
+        let orphans = std::mem::take(&mut self.orphaned);
+
+        for orphan in orphans {
+            self.apply(orphan);
+        }
     }
 
     pub fn apply(&mut self, node: HashNode) {
