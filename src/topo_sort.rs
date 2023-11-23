@@ -6,8 +6,11 @@ use crate::Id;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Topo {
+    // roots designate the independent causal trees.
     roots: BTreeSet<Id>,
+    // given anchor node `x`, before[x] holds all nodes that should appear immediately to the left of `x`
     pub before: HashMap<Id, BTreeSet<Id>>,
+    // given anchor node `x`, after[x] holds all nodes that should appear immediately to the right of `x`
     pub after: HashMap<Id, BTreeSet<Id>>,
 }
 
