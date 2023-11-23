@@ -183,11 +183,10 @@ impl HashSeq {
             let (position, _) = self.iter_ids().enumerate().find(|(_, n)| n == &id).unwrap();
             position
         });
-        self.insert_after_anchor_with_known_position(id, anchor, position);
+        self.update_position_index(id, position);
     }
 
-    fn insert_after_anchor_with_known_position(&mut self, id: Id, anchor: Id, position: usize) {
-        self.topo.add_after(anchor, id);
+    fn update_position_index(&mut self, id: Id, position: usize) {
         self.index.insert(position, id);
     }
 
@@ -225,12 +224,7 @@ impl HashSeq {
             let (position, _) = self.iter_ids().enumerate().find(|(_, n)| n == &id).unwrap();
             position
         });
-        self.index.insert(position, id);
-    }
-
-    fn insert_before_anchor_with_known_position(&mut self, id: Id, anchor: Id, position: usize) {
-        self.topo.add_before(anchor, id);
-        self.index.insert(position, id);
+        self.update_position_index(id, position);
     }
 
     pub fn apply_with_known_position(&mut self, node: HashNode, position: usize) {
@@ -249,10 +243,12 @@ impl HashSeq {
         match &node.op {
             Op::InsertRoot(_) => self.insert_root_with_known_position(id, position),
             Op::InsertAfter(anchor, _) => {
-                self.insert_after_anchor_with_known_position(id, *anchor, position)
+                self.topo.add_after(*anchor, id);
+                self.update_position_index(id, position)
             }
             Op::InsertBefore(anchor, _) => {
-                self.insert_before_anchor_with_known_position(id, *anchor, position)
+                self.topo.add_before(*anchor, id);
+                self.update_position_index(id, position)
             }
             Op::Remove(nodes) => self.remove_nodes(nodes),
         }
@@ -381,7 +377,7 @@ mod test {
     }
 
     #[test]
-    fn test_common_prefix_isnt_duplicated() {
+    fn test_common_prefix_is_deduplicated() {
         let mut seq_a = HashSeq::default();
         let mut seq_b = HashSeq::default();
 
@@ -397,7 +393,7 @@ mod test {
     }
 
     #[test]
-    fn test_common_prefix_isnt_duplicated_simple() {
+    fn test_common_prefix_is_deduplicated_simple() {
         let mut seq_a = HashSeq::default();
         let mut seq_b = HashSeq::default();
 

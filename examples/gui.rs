@@ -437,12 +437,12 @@ mod hashseq_viz {
                             text.size = 32.0;
                             frame.fill_text(text);
 
-                            for (id, afters) in self.seq.topo.after.iter() {
+                            for (id, span) in self.seq.topo.spans.iter() {
                                 if !state.node_pos.contains_key(id) {
                                     continue;
                                 }
                                 let from = state.node_pos[id];
-                                for after in afters.iter() {
+                                for after in span.after.iter() {
                                     if !state.node_pos.contains_key(after) {
                                         continue;
                                     }
@@ -454,12 +454,12 @@ mod hashseq_viz {
                                     );
                                 }
                             }
-                            for (id, befores) in self.seq.topo.before.iter() {
+                            for (id, span) in self.seq.topo.spans.iter() {
                                 if !state.node_pos.contains_key(id) {
                                     continue;
                                 }
                                 let from = state.node_pos[id];
-                                for before in befores.iter() {
+                                for before in span.before.iter() {
                                     if !state.node_pos.contains_key(before) {
                                         continue;
                                     }
