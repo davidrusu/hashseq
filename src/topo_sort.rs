@@ -6,17 +6,87 @@ use crate::Id;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct SpanNode {
-    span: Id,
+    span: Vec<Id>,
     pub after: BTreeSet<Id>,
     pub before: BTreeSet<Id>,
 }
 
 impl SpanNode {
-    fn new(span: Id) -> Self {
+    fn new(span: Vec<Id>) -> Self {
+        debug_assert!(!span.is_empty());
         Self {
             span,
             after: Default::default(),
             before: Default::default(),
+        }
+    }
+
+    fn id(&self) -> Id {
+        self.span[0]
+    }
+
+    fn can_add_before(&self, node: Id) -> bool {
+        self.span[0] == node
+    }
+
+    fn can_extend_from(&self, node: Id) -> bool {
+        self.after.is_empty() && self.is_last(node)
+    }
+
+    fn is_last(&self, node: Id) -> bool {
+        self.span[self.span.len() - 1] == node
+    }
+
+    // Splits this span in place after the given node; returns the span that was split off
+    fn split_after(&mut self, node: Id) -> SpanNode {
+        // first find the position of the node
+        let p = self.span.iter().position(|n| n == &node).unwrap();
+        let new_span = self.span.split_off(p + 1);
+
+        let mut new_node = SpanNode::new(new_span);
+        // the after's are moved to the span that was split off
+        new_node.after = std::mem::take(&mut self.after);
+        self.after.insert(new_node.id());
+
+        new_node
+    }
+
+    // Splits this span in place before the given node; returns the span that was split off
+    fn split_before(&mut self, node: Id) -> SpanNode {
+        // first find the position of the node
+        let p = self.span.iter().position(|n| n == &node).unwrap();
+        let new_span = self.span.split_off(p);
+
+        let mut new_node = SpanNode::new(new_span);
+        // the after's are moved to the span that was split off
+        new_node.after = std::mem::take(&mut self.after);
+        self.after.insert(new_node.id());
+
+        new_node
+    }
+
+    fn add_after(&mut self, node: Id) {
+        self.after.insert(node);
+    }
+
+    fn add_before(&mut self, node: Id) {
+        self.before.insert(node);
+    }
+
+    fn after_of(&self, node: Id) -> BTreeSet<Id> {
+        if self.is_last(node) {
+            self.after.clone()
+        } else {
+            let after = self.span.iter().skip_while(|n| n != &&node).nth(1).unwrap();
+            BTreeSet::from_iter([*after])
+        }
+    }
+
+    fn before_of(&self, node: Id) -> BTreeSet<Id> {
+        if node == self.span[0] {
+            self.before.clone()
+        } else {
+            BTreeSet::new()
         }
     }
 }
@@ -49,39 +119,69 @@ impl Topo {
     }
 
     pub fn add_root(&mut self, node: Id) {
-        assert!(!self.spans.contains_key(&node));
+        debug_assert!(!self.spans.contains_key(&node));
 
         self.roots.insert(node);
-        self.spans.insert(node, SpanNode::new(node));
+        self.spans.insert(node, SpanNode::new(vec![node]));
         self.index.insert(node, node);
     }
 
     pub fn add_after(&mut self, anchor: Id, node: Id) {
-        assert!(!self.spans.contains_key(&node));
-        assert!(self.spans.contains_key(&anchor));
+        debug_assert!(!self.index.contains_key(&node));
+        debug_assert!(self.index.contains_key(&anchor));
 
         let span_id = self.index[&anchor];
+        let span = self.spans.get_mut(&span_id).unwrap();
 
-        assert_eq!(span_id, anchor); // initial impl.
+        if span.can_extend_from(anchor) {
+            span.span.push(node);
+            self.index.insert(node, span_id);
+        } else if span.is_last(anchor) {
+            // add to the afters
+            span.add_after(node);
+            self.spans.insert(node, SpanNode::new(vec![node]));
+            self.index.insert(node, node);
+        } else {
+            // need to split the span since we have a fork
+            let new_span = span.split_after(anchor);
+            // re-index the new span
+            for id in new_span.span.iter() {
+                self.index.insert(*id, new_span.id());
+            }
 
-        let span = self.spans.get_mut(&anchor).unwrap();
-        span.after.insert(node);
-        self.spans.insert(node, SpanNode::new(node));
-        self.index.insert(node, node);
+            span.add_after(node);
+
+            self.spans.insert(new_span.id(), new_span);
+            self.spans.insert(node, SpanNode::new(vec![node]));
+            self.index.insert(node, node);
+        }
     }
 
     pub fn add_before(&mut self, anchor: Id, node: Id) {
-        assert!(!self.spans.contains_key(&node));
-        assert!(self.spans.contains_key(&anchor));
+        debug_assert!(!self.index.contains_key(&node));
+        debug_assert!(self.index.contains_key(&anchor));
 
         let span_id = self.index[&anchor];
+        let span = self.spans.get_mut(&span_id).unwrap();
 
-        assert_eq!(span_id, anchor); // initial impl.
+        if span.can_add_before(anchor) {
+            span.add_before(node);
+            self.spans.insert(node, SpanNode::new(vec![node]));
+            self.index.insert(node, node);
+        } else {
+            // need to split the span since we have a fork
+            let mut new_span = span.split_before(anchor);
+            // re-index the new span
+            for id in new_span.span.iter() {
+                self.index.insert(*id, new_span.id());
+            }
 
-        let span = self.spans.get_mut(&anchor).unwrap();
-        span.before.insert(node);
-        self.spans.insert(node, SpanNode::new(node));
-        self.index.insert(node, node);
+            new_span.add_before(node);
+
+            self.spans.insert(new_span.id(), new_span);
+            self.spans.insert(node, SpanNode::new(vec![node]));
+            self.index.insert(node, node);
+        }
     }
 
     pub fn roots(&self) -> &BTreeSet<Id> {
@@ -89,11 +189,13 @@ impl Topo {
     }
 
     pub fn after(&self, id: Id) -> BTreeSet<Id> {
-        self.spans[&id].after.clone()
+        let span_id = self.index[&id];
+        self.spans[&span_id].after_of(id)
     }
 
     pub fn before(&self, id: Id) -> BTreeSet<Id> {
-        self.spans[&id].before.clone()
+        let span_id = self.index[&id];
+        self.spans[&span_id].before_of(id)
     }
 
     pub fn iter<'a, 'b>(&'a self, removed: &'b HashSet<Id>) -> TopoIter<'a, 'b> {
@@ -144,8 +246,15 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
                 let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
-                for after in self.topo.spans[n].after.iter().rev() {
-                    self.push_waiting(after);
+                if let Some(span) = self.topo.spans.get(n) {
+                    for after in span.after.iter().rev() {
+                        self.push_waiting(after);
+                    }
+                    for s in span.span.iter().rev() {
+                        if s != n {
+                            self.waiting_stack.push((s, Vec::new()));
+                        }
+                    }
                 }
                 if !self.removed.contains(n) {
                     return Some(*n);
@@ -182,10 +291,11 @@ mod tests {
         topo.add_root(n(0));
         topo.add_after(n(0), n(1));
 
-        assert_eq!(
-            Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1)]
-        );
+        let removed = Default::default();
+        let mut iter = topo.iter(&removed);
+        assert_eq!(iter.next(), Some(n(0)));
+        assert_eq!(iter.next(), Some(n(1)));
+        assert_eq!(iter.next(), None);
 
         let mut topo = Topo::default();
 
