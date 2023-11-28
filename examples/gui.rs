@@ -134,8 +134,8 @@ mod hashseq_viz {
     use hashseq::Id;
     use iced::keyboard::KeyCode;
     use iced::widget::canvas::event::{self, Event};
-    use iced::widget::canvas::{self, Canvas, Cursor, Fill, Frame, Geometry, Path, Stroke, Text};
-    use iced::{mouse, Color, Size, Vector};
+    use iced::widget::canvas::{self, Canvas, Fill, Frame, Geometry, Path, Stroke, Text};
+    use iced::{mouse, Color, Renderer, Size, Vector};
 
     #[derive(Debug, Clone, Copy)]
     pub enum Msg {
@@ -194,9 +194,9 @@ mod hashseq_viz {
             state: &mut Self::State,
             event: Event,
             bounds: Rectangle,
-            cursor: Cursor,
+            cursor: mouse::Cursor,
         ) -> (event::Status, Option<Msg>) {
-            if cursor.position_in(&bounds).is_none() {
+            if cursor.position_in(bounds).is_none() {
                 return (event::Status::Ignored, None);
             }
             if self.seq_seq != state.seq_seq {
@@ -418,124 +418,134 @@ mod hashseq_viz {
         fn draw(
             &self,
             state: &Self::State,
+            renderer: &Renderer,
             _theme: &Theme,
             bounds: Rectangle,
-            _cursor: Cursor,
+            _cursor: mouse::Cursor,
         ) -> Vec<Geometry> {
             let mut stack = Vec::new();
             if self.seq_seq == state.seq_seq {
-                let content = self.state.cache.draw(bounds.size(), |frame: &mut Frame| {
-                    let string = String::from_iter(self.seq.iter());
-                    let before_cursor = String::from_iter(string.chars().take(state.cursor));
-                    let after_cursor = String::from_iter(string.chars().skip(state.cursor));
-                    let mut text = Text::from(format!("{before_cursor}|{after_cursor}"));
-                    text.size = 32.0;
-                    frame.fill_text(text);
+                let content =
+                    self.state
+                        .cache
+                        .draw(renderer, bounds.size(), |frame: &mut Frame| {
+                            let string = String::from_iter(self.seq.iter());
+                            let before_cursor =
+                                String::from_iter(string.chars().take(state.cursor));
+                            let after_cursor = String::from_iter(string.chars().skip(state.cursor));
+                            let mut text = Text::from(format!("{before_cursor}|{after_cursor}"));
+                            text.size = 32.0;
+                            frame.fill_text(text);
 
-                    for (id, afters) in self.seq.topo.after.iter() {
-                        if !state.node_pos.contains_key(id) {
-                            continue;
-                        }
-                        let from = state.node_pos[id];
-                        for after in afters.iter() {
-                            if !state.node_pos.contains_key(after) {
-                                continue;
-                            }
-                            let to = state.node_pos[after];
-                            frame.stroke(
-                                &Path::line(from, to),
-                                Stroke::default().with_color(Color::from_rgb(0.0, 1.0, 0.0)),
-                            );
-                        }
-                    }
-                    for (id, befores) in self.seq.topo.before.iter() {
-                        if !state.node_pos.contains_key(id) {
-                            continue;
-                        }
-                        let from = state.node_pos[id];
-                        for before in befores.iter() {
-                            if !state.node_pos.contains_key(before) {
-                                continue;
-                            }
-                            let to = state.node_pos[before];
-                            frame.stroke(
-                                &Path::line(from, to),
-                                Stroke::default().with_color(Color::from_rgb(1.0, 0.0, 0.0)),
-                            );
-                        }
-                    }
-
-                    // Render all nodes in the hash-seq
-                    for (id, pos) in state.node_pos.iter() {
-                        let r = 2.0;
-
-                        let node = &self.seq.nodes[id];
-
-                        if self.show_dependencies {
-                            for dep in node.extra_dependencies.iter() {
-                                let dep_from = state.node_pos[dep];
-                                let mid = Point {
-                                    x: (pos.x + dep_from.x) / 2.0,
-                                    y: (pos.y + dep_from.y) / 2.0 - 20.0,
-                                };
-                                let curve = Path::new(|p| {
-                                    p.move_to(dep_from);
-                                    p.quadratic_curve_to(mid, *pos);
-                                });
-
-                                frame.stroke(
-                                    &curve,
-                                    Stroke::default()
-                                        .with_width(1.0)
-                                        .with_color(Color::from_rgba(0.0, 0.0, 0.0, 0.5)),
-                                );
-                            }
-                        }
-
-                        match &node.op {
-                            hashseq::Op::InsertRoot(c)
-                            | hashseq::Op::InsertAfter(_, c)
-                            | hashseq::Op::InsertBefore(_, c) => {
-                                let mut char = Text::from(format!("{c}"));
-                                char.position = *pos;
-                                char.size = 24.0;
-                                char.position.y += 2.0;
-                                char.position.x -= char.size / 4.0;
-                                frame.fill_text(char);
-                            }
-                            hashseq::Op::Remove(targets) => {
-                                let x_r = 2.0;
-                                frame.stroke(
-                                    &Path::line(
-                                        *pos + Vector::new(-x_r, -x_r),
-                                        *pos + Vector::new(x_r, x_r),
-                                    ),
-                                    Stroke::default().with_color(Color::BLACK),
-                                );
-                                frame.stroke(
-                                    &Path::line(
-                                        *pos + Vector::new(x_r, -x_r),
-                                        *pos + Vector::new(-x_r, x_r),
-                                    ),
-                                    Stroke::default().with_color(Color::BLACK),
-                                );
-
-                                for target in targets.iter() {
-                                    let to = state.node_pos[target];
+                            for (id, span) in self.seq.topo.spans.iter() {
+                                if !state.node_pos.contains_key(id) {
+                                    continue;
+                                }
+                                let from = state.node_pos[id];
+                                for after in span.after.iter() {
+                                    if !state.node_pos.contains_key(after) {
+                                        continue;
+                                    }
+                                    let to = state.node_pos[after];
                                     frame.stroke(
-                                        &Path::line(*pos, to),
-                                        Stroke::default().with_color(Color::BLACK),
+                                        &Path::line(from, to),
+                                        Stroke::default()
+                                            .with_color(Color::from_rgb(0.0, 1.0, 0.0)),
                                     );
                                 }
                             }
-                        }
+                            for (id, span) in self.seq.topo.spans.iter() {
+                                if !state.node_pos.contains_key(id) {
+                                    continue;
+                                }
+                                let from = state.node_pos[id];
+                                for before in span.before.iter() {
+                                    if !state.node_pos.contains_key(before) {
+                                        continue;
+                                    }
+                                    let to = state.node_pos[before];
+                                    frame.stroke(
+                                        &Path::line(from, to),
+                                        Stroke::default()
+                                            .with_color(Color::from_rgb(1.0, 0.0, 0.0)),
+                                    );
+                                }
+                            }
 
-                        frame.fill(
-                            &Path::rectangle(*pos - Vector::new(r * 0.5, r * 0.5), Size::new(r, r)),
-                            Fill::from(Color::BLACK),
-                        );
-                    }
-                });
+                            // Render all nodes in the hash-seq
+                            for (id, pos) in state.node_pos.iter() {
+                                let r = 2.0;
+
+                                let node = &self.seq.nodes[id];
+
+                                if self.show_dependencies {
+                                    for dep in node.extra_dependencies.iter() {
+                                        let dep_from = state.node_pos[dep];
+                                        let mid = Point {
+                                            x: (pos.x + dep_from.x) / 2.0,
+                                            y: (pos.y + dep_from.y) / 2.0 - 20.0,
+                                        };
+                                        let curve = Path::new(|p| {
+                                            p.move_to(dep_from);
+                                            p.quadratic_curve_to(mid, *pos);
+                                        });
+
+                                        frame.stroke(
+                                            &curve,
+                                            Stroke::default()
+                                                .with_width(1.0)
+                                                .with_color(Color::from_rgba(0.0, 0.0, 0.0, 0.5)),
+                                        );
+                                    }
+                                }
+
+                                match &node.op {
+                                    hashseq::Op::InsertRoot(c)
+                                    | hashseq::Op::InsertAfter(_, c)
+                                    | hashseq::Op::InsertBefore(_, c) => {
+                                        let mut char = Text::from(format!("{c}"));
+                                        char.position = *pos;
+                                        char.size = 24.0;
+                                        char.position.y += 2.0;
+                                        char.position.x -= char.size / 4.0;
+                                        frame.fill_text(char);
+                                    }
+                                    hashseq::Op::Remove(targets) => {
+                                        let x_r = 2.0;
+                                        frame.stroke(
+                                            &Path::line(
+                                                *pos + Vector::new(-x_r, -x_r),
+                                                *pos + Vector::new(x_r, x_r),
+                                            ),
+                                            Stroke::default().with_color(Color::BLACK),
+                                        );
+                                        frame.stroke(
+                                            &Path::line(
+                                                *pos + Vector::new(x_r, -x_r),
+                                                *pos + Vector::new(-x_r, x_r),
+                                            ),
+                                            Stroke::default().with_color(Color::BLACK),
+                                        );
+
+                                        for target in targets.iter() {
+                                            let to = state.node_pos[target];
+                                            frame.stroke(
+                                                &Path::line(*pos, to),
+                                                Stroke::default().with_color(Color::BLACK),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                frame.fill(
+                                    &Path::rectangle(
+                                        *pos - Vector::new(r * 0.5, r * 0.5),
+                                        Size::new(r, r),
+                                    ),
+                                    Fill::from(Color::BLACK),
+                                );
+                            }
+                        });
                 stack.push(content);
             }
 
@@ -546,9 +556,9 @@ mod hashseq_viz {
             &self,
             _state: &Self::State,
             bounds: Rectangle,
-            cursor: Cursor,
+            cursor: mouse::Cursor,
         ) -> mouse::Interaction {
-            if cursor.is_over(&bounds) {
+            if cursor.is_over(bounds) {
                 mouse::Interaction::Crosshair
             } else {
                 mouse::Interaction::default()
