@@ -1,0 +1,12 @@
+Positional Bloom Tree
+
+- O(log(N)) lookups / inserts / deletes
+
+
+
+
+         [root bloom filter]
+           /            \
+[left bloom filter] [right bloom filter]
+     \\\|||///          \\\||||///
+      abcdefg            hijklmno
