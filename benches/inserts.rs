@@ -11,7 +11,7 @@ fn prepend(n: usize) {
 
 fn append(n: usize) {
     let mut seq = HashSeq::default();
-    seq.insert_batch(0, std::iter::repeat('a').take(n));
+    seq.insert_batch(0, std::iter::repeat_n('a', n));
 }
 
 fn insert_middle(n: usize) {

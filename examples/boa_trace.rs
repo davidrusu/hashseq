@@ -27,12 +27,11 @@ fn main() {
     // Since the file uses const declarations, we need to make them global
     // by wrapping them or evaluating them differently
     let wrapped_js = format!(
-        "{}
+        "{js_content}
         // Make variables accessible globally
         globalThis.edits = edits;
         globalThis.finalText = finalText;
-        ",
-        js_content
+        "
     );
 
     // Evaluate the JavaScript code
@@ -155,7 +154,7 @@ fn main() {
     }
 
     let trace_elapsed = trace_start.elapsed();
-    println!("Trace applied in: {:?}", trace_elapsed);
+    println!("Trace applied in: {trace_elapsed:?}");
     println!(
         "Average: {:.0} edits/sec",
         trace.len() as f64 / trace_elapsed.as_secs_f64()
@@ -182,7 +181,7 @@ fn main() {
 
         for (i, (c1, c2)) in chars1.iter().zip(chars2.iter()).enumerate() {
             if c1 != c2 {
-                println!("First difference at position {}: '{}' vs '{}'", i, c1, c2);
+                println!("First difference at position {i}: '{c1}' vs '{c2}'");
                 break;
             }
         }

@@ -46,11 +46,11 @@ fn main() {
     let start_time = Instant::now();
     let length = 100_000;
 
-    println!("Generating random trace of {} operations...", length);
+    println!("Generating random trace of {length} operations...");
     let gen_start = Instant::now();
     let (expected_content, trace) = random_trace(length);
     let gen_elapsed = gen_start.elapsed();
-    println!("Trace generated in: {:?}", gen_elapsed);
+    println!("Trace generated in: {gen_elapsed:?}");
     println!(
         "Expected final string length: {} characters",
         expected_content.len()
@@ -74,7 +74,7 @@ fn main() {
     }
 
     let trace_elapsed = trace_start.elapsed();
-    println!("Trace applied in: {:?}", trace_elapsed);
+    println!("Trace applied in: {trace_elapsed:?}");
     println!(
         "Average: {:.0} edits/sec",
         trace.len() as f64 / trace_elapsed.as_secs_f64()
@@ -94,7 +94,7 @@ fn main() {
         // Find the first difference
         for (i, (c1, c2)) in expected_content.chars().zip(result.chars()).enumerate() {
             if c1 != c2 {
-                println!("First difference at position {}: '{}' vs '{}'", i, c1, c2);
+                println!("First difference at position {i}: '{c1}' vs '{c2}'");
                 break;
             }
         }
