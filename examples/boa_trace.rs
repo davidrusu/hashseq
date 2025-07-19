@@ -168,28 +168,28 @@ fn main() {
 
     // Memory usage analysis
     println!("\nMemory usage:");
-    let final_text_bytes = reconstructed_text.as_bytes().len();
-    println!("Final text: {} bytes", final_text_bytes);
+    let final_text_bytes = reconstructed_text.len();
+    println!("Final text: {final_text_bytes} bytes");
     
     // Direct memory size of the HashSeq structure
     let seq_size = std::mem::size_of_val(&seq);
-    println!("HashSeq struct size: {} bytes", seq_size);
+    println!("HashSeq struct size: {seq_size} bytes");
     
     // Estimate memory usage based on internal data structures
     let nodes_count = seq.nodes.len();
     let removed_count = seq.removed_inserts.len();
-    println!("Nodes in HashSeq: {}", nodes_count);
-    println!("Removed inserts: {}", removed_count);
+    println!("Nodes in HashSeq: {nodes_count}");
+    println!("Removed inserts: {removed_count}");
     
     // Rough estimation: each node might use ~48-64 bytes (Id + HashNode + overhead)
     // This is a conservative estimate for heap-allocated data
     let estimated_node_size = 56; // bytes per node
     let estimated_memory = nodes_count * estimated_node_size + removed_count * 8; // 8 bytes per Id
-    println!("Estimated memory usage: {} bytes", estimated_memory);
+    println!("Estimated memory usage: {estimated_memory} bytes");
     
     // Calculate overhead
     let overhead_ratio = estimated_memory as f64 / final_text_bytes as f64;
-    println!("Memory overhead: {:.2}x the final text size", overhead_ratio);
+    println!("Memory overhead: {overhead_ratio:.2}x the final text size");
     println!("Overhead per character: {:.2} bytes", estimated_memory as f64 / reconstructed_text.len() as f64);
 
     println!("\nResults:");
