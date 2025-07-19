@@ -271,8 +271,9 @@ mod tests {
     use super::*;
 
     fn n(n: u8) -> Id {
-        // [n; 32]
-        n.into()
+        let mut id = [0u8; 32];
+        id[0] = n;
+        id
     }
 
     #[test]

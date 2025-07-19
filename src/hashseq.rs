@@ -144,7 +144,7 @@ impl HashSeq {
             .topo
             .roots()
             .range(root_id..)
-            .find(|id| !self.removed_inserts.contains(id))
+            .find(|id| !self.removed_inserts.contains(*id))
         {
             // new root is inserted just before the next biggest root
             self.index.find(next_root).unwrap()
@@ -166,7 +166,7 @@ impl HashSeq {
             .topo
             .after(anchor)
             .range(id..)
-            .find(|id| !self.removed_inserts.contains(id))
+            .find(|id| !self.removed_inserts.contains(*id))
         {
             // new node is inserted just before the other node after our anchor node that is
             // bigger than the new node
@@ -207,7 +207,7 @@ impl HashSeq {
             .topo
             .before(anchor)
             .range(id..)
-            .find(|id| !self.removed_inserts.contains(id))
+            .find(|id| !self.removed_inserts.contains(*id))
         {
             // new node is inserted just before the other node before our anchor node that is
             // bigger than the new node
