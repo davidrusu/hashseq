@@ -27,7 +27,7 @@ impl Op {
         }
     }
 
-    #[cfg(feature = "crypto-hash")]
+    #[cfg(feature = "sha3-hash")]
     pub fn hash_update(&self, sha: &mut tiny_keccak::Sha3) {
         use tiny_keccak::Hasher;
         match self {
@@ -94,7 +94,7 @@ impl HashNode {
     }
 
     pub fn id(&self) -> Id {
-        #[cfg(feature = "crypto-hash")]
+        #[cfg(feature = "sha3-hash")]
         {
             use tiny_keccak::Hasher;
             let mut sha3 = tiny_keccak::Sha3::v256();
@@ -147,7 +147,7 @@ impl HashNode {
         }
     }
 
-    #[cfg(feature = "crypto-hash")]
+    #[cfg(feature = "sha3-hash")]
     pub fn hash_update(&self, sha: &mut tiny_keccak::Sha3) {
         use tiny_keccak::Hasher;
         

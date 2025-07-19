@@ -23,7 +23,7 @@ bitmaps = "3.2.1"
 [features]
 default = ["fast-hash"]
 fast-hash = []
-crypto-hash = []
+sha3-hash = []
 blake3-hash = []
 
 [dev-dependencies]
