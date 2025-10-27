@@ -95,7 +95,7 @@ impl Sandbox for Demo {
         }
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         column![
             text("HashSeq Demo").width(Length::Shrink).size(36),
             self.seq_a_viz
@@ -240,15 +240,67 @@ mod hashseq_viz {
             };
 
             let k = 0.2;
-            let h_spacing = 20.0;
+            let h_spacing = 40.0;
             let v_spacing = 48.0;
+
+            // Helper to get position of any node, including characters inside runs
+            let get_node_pos = |id: &Id, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
+                if let Some(pos) = nodes.get(id) {
+                    return Some(*pos);
+                }
+                // Check if this ID is inside a run
+                if let Some(hashseq::NodeLocation::InRun { run_id, .. }) =
+                    self.seq.id_to_location.get(id)
+                {
+                    return nodes.get(run_id).copied();
+                }
+                None
+            };
+
+            // Helper to get the right edge of a node (for InsertAfter positioning)
+            let get_node_right_edge = |id: &Id, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
+                if let Some(run) = self.seq.runs.get(id) {
+                    // For runs, return the right edge
+                    if let Some(center) = nodes.get(id) {
+                        let text_size = 24.0;
+                        let char_width = text_size * 0.6;
+                        let padding = 8.0;
+                        let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
+                        return Some(Point {
+                            x: center.x + width / 2.0,
+                            y: center.y,
+                        });
+                    }
+                }
+                // For individual nodes or if inside a run, use center position
+                get_node_pos(id, nodes)
+            };
+
+            // Helper to get the left edge of a node (for InsertBefore positioning)
+            let get_node_left_edge = |id: &Id, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
+                if let Some(run) = self.seq.runs.get(id) {
+                    // For runs, return the left edge
+                    if let Some(center) = nodes.get(id) {
+                        let text_size = 24.0;
+                        let char_width = text_size * 0.6;
+                        let padding = 8.0;
+                        let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
+                        return Some(Point {
+                            x: center.x - width / 2.0,
+                            y: center.y,
+                        });
+                    }
+                }
+                // For individual nodes or if inside a run, use center position
+                get_node_pos(id, nodes)
+            };
 
             let pos_in_set =
                 |id: Id, set: BTreeSet<Id>, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
                     let before_id = set.range(..id).next_back().cloned();
                     let after_id = set.range(id..).nth(1).cloned();
-                    let before_pos = before_id.and_then(|id| nodes.get(&id)).cloned();
-                    let after_pos = after_id.and_then(|id| nodes.get(&id)).cloned();
+                    let before_pos = before_id.and_then(|id| get_node_pos(&id, nodes));
+                    let after_pos = after_id.and_then(|id| get_node_pos(&id, nodes));
 
                     match (before_pos, after_pos) {
                         (None, None) => None,
@@ -270,7 +322,9 @@ mod hashseq_viz {
             loop {
                 i += 1;
                 let mut net_change = 0.0;
-                for (id, node) in self.seq.nodes.iter() {
+
+                // Process individual nodes
+                for (id, node) in self.seq.individual_nodes.iter() {
                     let pos = *state.node_pos.entry(*id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
@@ -284,7 +338,7 @@ mod hashseq_viz {
                         }
                         hashseq::Op::InsertAfter(parent, _) => {
                             let w = 0.5;
-                            if let Some(p) = state.node_pos.get(parent) {
+                            if let Some(p) = get_node_right_edge(parent, &state.node_pos) {
                                 let default_target = Point {
                                     x: p.x + h_spacing,
                                     y: p.y,
@@ -303,7 +357,7 @@ mod hashseq_viz {
                         }
                         hashseq::Op::InsertBefore(parent, _) => {
                             let w = 0.9;
-                            if let Some(p) = state.node_pos.get(parent) {
+                            if let Some(p) = get_node_left_edge(parent, &state.node_pos) {
                                 let befores = self.seq.topo.before(*parent);
                                 let default_target = Point {
                                     x: p.x - h_spacing,
@@ -324,7 +378,7 @@ mod hashseq_viz {
                             assert!(!targets.is_empty());
                             let p: Vector = targets
                                 .iter()
-                                .filter_map(|t| state.node_pos.get(t))
+                                .filter_map(|t| get_node_pos(t, &state.node_pos))
                                 .map(|p| Vector::new(p.x, p.y))
                                 .reduce(|accum, p| accum + p)
                                 .unwrap_or_default();
@@ -348,47 +402,99 @@ mod hashseq_viz {
                     pos.y += push.y;
                 }
 
-                for a_id in self.seq.nodes.keys() {
-                    for b_id in self.seq.nodes.keys() {
-                        if a_id == b_id {
-                            continue;
+                // Process runs - position each run as a single entity
+                for (run_id, run) in self.seq.runs.iter() {
+                    let pos = *state.node_pos.entry(*run_id).or_insert_with(|| Point {
+                        x: rand::random::<f32>() * bounds.width,
+                        y: rand::random::<f32>() * bounds.height,
+                    });
+
+                    let left_pos = get_node_left_edge(run_id, &state.node_pos).unwrap_or(pos);
+
+                    // Determine target position based on run structure
+                    let target_pos = {
+                        // Has left dependencies
+                        let parent = run.insert_after;
+                        if let Some(p) = get_node_right_edge(&parent, &state.node_pos) {
+                            Point {
+                                x: p.x + h_spacing,
+                                y: p.y,
+                            }
+                        } else {
+                            left_pos
                         }
+                    };
 
-                        let a = state.node_pos[a_id];
-                        let b = state.node_pos[b_id];
+                    let delta = Vector::<f32> {
+                        x: target_pos.x - left_pos.x,
+                        y: target_pos.y - left_pos.y,
+                    };
 
-                        // are they too close together?
-
-                        let dx = b.x - a.x;
-                        let dy = b.y - a.y;
-                        let d_sq = (dx * dx + dy * dy).max(1.0);
-                        let min_d_sq = 36.0;
-                        let rk = 0.01;
-                        if d_sq < min_d_sq {
-                            let d = d_sq.sqrt();
-                            let min_d = min_d_sq.sqrt();
-                            let delta = min_d - d;
-                            let nx = dx / d;
-                            let ny = dy / d;
-                            let rx = rand::random::<f32>() - 0.5;
-                            let ry = rand::random::<f32>() - 0.5;
-                            let fx = nx * delta * k + rx * rk;
-                            let fy = ny * delta * k + ry * rk;
-
-                            let f_net = (fx * fx + fy * fy).sqrt();
-                            net_change += f_net * 2.0;
-
-                            let a = state.node_pos.entry(*a_id).or_default();
-                            a.x -= fx;
-                            a.y -= fy;
-                            let b = state.node_pos.entry(*b_id).or_default();
-                            b.x += fx;
-                            b.y += fy;
-                        }
-                    }
+                    let push = delta * k;
+                    net_change += (push.x.powf(2.0) + push.y.powf(2.0)).sqrt();
+                    let pos = state.node_pos.entry(*run_id).or_default();
+                    pos.x += push.x;
+                    pos.y += push.y;
                 }
 
-                if i > 5 || net_change < 1.0 + self.seq.nodes.len() as f32 * 0.5 {
+                //     // Collision detection for all nodes (individual nodes + run IDs)
+                //     let mut all_node_ids: Vec<_> = self.seq.individual_nodes.keys().cloned().collect();
+                //     all_node_ids.extend(self.seq.runs.keys().cloned());
+
+                //     // Helper to get the radius/half-width of a node
+                //     let get_node_radius = |id: &Id| -> f32 {
+                //         if let Some(run) = self.seq.runs.get(id) {
+                //             // For runs, use half the text width plus padding
+                //             let text_size = 24.0;
+                //             let char_width = text_size * 0.6;
+                //             let padding = 8.0;
+                //             let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
+                //             width / 2.0
+                //         } else {
+                //             // For individual nodes, use a small radius
+                //             6.0
+                //         }
+                //     };
+
+                //     for (i, a_id) in all_node_ids.iter().enumerate() {
+                //         for b_id in all_node_ids.iter().skip(i + 1) {
+                //             let a = state.node_pos[a_id];
+                //             let b = state.node_pos[b_id];
+
+                //             // Calculate minimum distance based on both node sizes
+                //             let a_radius = get_node_radius(a_id);
+                //             let b_radius = get_node_radius(b_id);
+                //             let min_d = a_radius + b_radius + 4.0; // Add 4.0 for extra spacing
+
+                //             let dx = b.x - a.x;
+                //             let dy = b.y - a.y;
+                //             let d_sq = (dx * dx + dy * dy).max(1.0);
+                //             let min_d_sq = min_d * min_d;
+                //             let rk = 0.01;
+                //             if d_sq < min_d_sq {
+                //                 let d = d_sq.sqrt();
+                //                 let delta = min_d - d;
+                //                 let nx = dx / d;
+                //                 let ny = dy / d;
+                //                 let rx = rand::random::<f32>() - 0.5;
+                //                 let ry = rand::random::<f32>() - 0.5;
+                //                 let fx = nx * delta * k + rx * rk;
+                //                 let fy = ny * delta * k + ry * rk;
+
+                //                 let f_net = (fx * fx + fy * fy).sqrt();
+                //                 net_change += f_net * 2.0;
+
+                //                 let a = state.node_pos.entry(*a_id).or_default();
+                //                 a.x -= fx;
+                //                 a.y -= fy;
+                //                 let b = state.node_pos.entry(*b_id).or_default();
+                //                 b.x += fx;
+                //                 b.y += fy;
+                //             }
+                //         }
+                //     }
+
+                if i > 10 || net_change < 1e-4 {
                     break;
                 }
             }
@@ -429,6 +535,20 @@ mod hashseq_viz {
                     self.state
                         .cache
                         .draw(renderer, bounds.size(), |frame: &mut Frame| {
+                            // Helper to get position of any node, including characters inside runs
+                            let get_node_pos = |id: &Id| -> Option<Point> {
+                                if let Some(pos) = state.node_pos.get(id) {
+                                    return Some(*pos);
+                                }
+                                // Check if this ID is inside a run
+                                if let Some(hashseq::NodeLocation::InRun { .. }) =
+                                    self.seq.id_to_location.get(id)
+                                {
+                                    // TODO: determine position of char inside the run.
+                                }
+                                None
+                            };
+
                             let string = String::from_iter(self.seq.iter());
                             let before_cursor =
                                 String::from_iter(string.chars().take(state.cursor));
@@ -438,15 +558,13 @@ mod hashseq_viz {
                             frame.fill_text(text);
 
                             for (id, span) in self.seq.topo.spans.iter() {
-                                if !state.node_pos.contains_key(id) {
+                                let Some(from) = get_node_pos(id) else {
                                     continue;
-                                }
-                                let from = state.node_pos[id];
+                                };
                                 for after in span.after.iter() {
-                                    if !state.node_pos.contains_key(after) {
+                                    let Some(to) = get_node_pos(after) else {
                                         continue;
-                                    }
-                                    let to = state.node_pos[after];
+                                    };
                                     frame.stroke(
                                         &Path::line(from, to),
                                         Stroke::default()
@@ -455,15 +573,13 @@ mod hashseq_viz {
                                 }
                             }
                             for (id, span) in self.seq.topo.spans.iter() {
-                                if !state.node_pos.contains_key(id) {
+                                let Some(from) = get_node_pos(id) else {
                                     continue;
-                                }
-                                let from = state.node_pos[id];
+                                };
                                 for before in span.before.iter() {
-                                    if !state.node_pos.contains_key(before) {
+                                    let Some(to) = get_node_pos(before) else {
                                         continue;
-                                    }
-                                    let to = state.node_pos[before];
+                                    };
                                     frame.stroke(
                                         &Path::line(from, to),
                                         Stroke::default()
@@ -472,78 +588,114 @@ mod hashseq_viz {
                                 }
                             }
 
-                            // Render all nodes in the hash-seq
+                            // Render all nodes (both individual and runs)
                             for (id, pos) in state.node_pos.iter() {
-                                let r = 2.0;
+                                // Check if this ID corresponds to a run
+                                if let Some(run) = self.seq.runs.get(id) {
+                                    // Render run as a single node with full text
+                                    let text_size = 24.0;
+                                    let char_width = text_size * 0.6; // Approximate character width
+                                    let padding = 8.0;
+                                    let width =
+                                        run.run.chars().count() as f32 * char_width + padding * 2.0;
+                                    let height = text_size + padding * 2.0;
 
-                                let node = &self.seq.nodes[id];
+                                    // Draw rectangle background
+                                    let rect_pos = Point {
+                                        x: pos.x - width / 2.0,
+                                        y: pos.y - height / 2.0,
+                                    };
 
-                                if self.show_dependencies {
-                                    for dep in node.extra_dependencies.iter() {
-                                        let dep_from = state.node_pos[dep];
-                                        let mid = Point {
-                                            x: (pos.x + dep_from.x) / 2.0,
-                                            y: (pos.y + dep_from.y) / 2.0 - 20.0,
-                                        };
-                                        let curve = Path::new(|p| {
-                                            p.move_to(dep_from);
-                                            p.quadratic_curve_to(mid, *pos);
-                                        });
+                                    frame.fill(
+                                        &Path::rectangle(rect_pos, Size::new(width, height)),
+                                        Fill::from(Color::from_rgb(0.0, 0.5, 1.0)),
+                                    );
 
-                                        frame.stroke(
-                                            &curve,
-                                            Stroke::default()
-                                                .with_width(1.0)
-                                                .with_color(Color::from_rgba(0.0, 0.0, 0.0, 0.5)),
-                                        );
-                                    }
-                                }
+                                    // Draw text centered
+                                    let mut text = Text::from(run.run.clone());
+                                    text.position = Point {
+                                        x: pos.x
+                                            - (run.run.chars().count() as f32 * char_width) / 2.0,
+                                        y: pos.y - text_size / 2.0 + 2.0,
+                                    };
+                                    text.size = text_size;
+                                    text.color = Color::WHITE;
+                                    frame.fill_text(text);
+                                } else if let Some(node) = self.seq.individual_nodes.get(id) {
+                                    // Render individual node
+                                    let r = 2.0;
 
-                                match &node.op {
-                                    hashseq::Op::InsertRoot(c)
-                                    | hashseq::Op::InsertAfter(_, c)
-                                    | hashseq::Op::InsertBefore(_, c) => {
-                                        let mut char = Text::from(format!("{c}"));
-                                        char.position = *pos;
-                                        char.size = 24.0;
-                                        char.position.y += 2.0;
-                                        char.position.x -= char.size / 4.0;
-                                        frame.fill_text(char);
-                                    }
-                                    hashseq::Op::Remove(targets) => {
-                                        let x_r = 2.0;
-                                        frame.stroke(
-                                            &Path::line(
-                                                *pos + Vector::new(-x_r, -x_r),
-                                                *pos + Vector::new(x_r, x_r),
-                                            ),
-                                            Stroke::default().with_color(Color::BLACK),
-                                        );
-                                        frame.stroke(
-                                            &Path::line(
-                                                *pos + Vector::new(x_r, -x_r),
-                                                *pos + Vector::new(-x_r, x_r),
-                                            ),
-                                            Stroke::default().with_color(Color::BLACK),
-                                        );
+                                    // Render dependencies for individual nodes
+                                    if self.show_dependencies {
+                                        for dep in node.extra_dependencies.iter() {
+                                            if let Some(dep_from) = get_node_pos(dep) {
+                                                let mid = Point {
+                                                    x: (pos.x + dep_from.x) / 2.0,
+                                                    y: (pos.y + dep_from.y) / 2.0 - 20.0,
+                                                };
+                                                let curve = Path::new(|p| {
+                                                    p.move_to(dep_from);
+                                                    p.quadratic_curve_to(mid, *pos);
+                                                });
 
-                                        for target in targets.iter() {
-                                            let to = state.node_pos[target];
-                                            frame.stroke(
-                                                &Path::line(*pos, to),
-                                                Stroke::default().with_color(Color::BLACK),
-                                            );
+                                                frame.stroke(
+                                                    &curve,
+                                                    Stroke::default().with_width(1.0).with_color(
+                                                        Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                                                    ),
+                                                );
+                                            }
                                         }
                                     }
-                                }
 
-                                frame.fill(
-                                    &Path::rectangle(
-                                        *pos - Vector::new(r * 0.5, r * 0.5),
-                                        Size::new(r, r),
-                                    ),
-                                    Fill::from(Color::BLACK),
-                                );
+                                    match &node.op {
+                                        hashseq::Op::InsertRoot(c)
+                                        | hashseq::Op::InsertAfter(_, c)
+                                        | hashseq::Op::InsertBefore(_, c) => {
+                                            let mut char = Text::from(format!("{c}"));
+                                            char.position = *pos;
+                                            char.size = 24.0;
+                                            char.position.y += 2.0;
+                                            char.position.x -= char.size / 4.0;
+                                            frame.fill_text(char);
+                                        }
+                                        hashseq::Op::Remove(targets) => {
+                                            let x_r = 2.0;
+                                            frame.stroke(
+                                                &Path::line(
+                                                    *pos + Vector::new(-x_r, -x_r),
+                                                    *pos + Vector::new(x_r, x_r),
+                                                ),
+                                                Stroke::default().with_color(Color::BLACK),
+                                            );
+                                            frame.stroke(
+                                                &Path::line(
+                                                    *pos + Vector::new(x_r, -x_r),
+                                                    *pos + Vector::new(-x_r, x_r),
+                                                ),
+                                                Stroke::default().with_color(Color::BLACK),
+                                            );
+
+                                            for target in targets.iter() {
+                                                if let Some(to) = get_node_pos(target) {
+                                                    frame.stroke(
+                                                        &Path::line(*pos, to),
+                                                        Stroke::default().with_color(Color::BLACK),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Draw square node shape for individual elements
+                                    frame.fill(
+                                        &Path::rectangle(
+                                            *pos - Vector::new(r * 0.5, r * 0.5),
+                                            Size::new(r, r),
+                                        ),
+                                        Fill::from(Color::BLACK),
+                                    );
+                                }
                             }
                         });
                 stack.push(content);
