@@ -26,6 +26,7 @@ pub struct Run {
 impl Run {
     /// Create a new run from a string
     pub fn new(insert_after: Id, first_extra_deps: BTreeSet<Id>, first: char) -> Self {
+        // TODO: make construction be Run::from_insert_after(CausalInsert)
         Self {
             insert_after,
             first_extra_deps,
@@ -135,7 +136,7 @@ mod tests {
     fn test_id(n: u8) -> Id {
         let mut id = [0u8; 32];
         id[0] = n;
-        id
+        Id(id)
     }
 
     impl Arbitrary for Run {
@@ -157,7 +158,7 @@ mod tests {
             }
 
             // Create the run with the first character
-            let mut run = Run::new(insert_after, BTreeSet::new(), chars[0]);
+            let mut run = Run::new(Id(insert_after), BTreeSet::new(), chars[0]);
 
             // Extend with remaining characters
             for &ch in &chars[1..] {

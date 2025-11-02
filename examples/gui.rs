@@ -135,7 +135,7 @@ mod hashseq_viz {
     use iced::keyboard::KeyCode;
     use iced::widget::canvas::event::{self, Event};
     use iced::widget::canvas::{self, Canvas, Fill, Frame, Geometry, Path, Stroke, Text};
-    use iced::{mouse, Color, Renderer, Size, Vector};
+    use iced::{Color, Renderer, Size, Vector, mouse};
 
     #[derive(Debug, Clone, Copy)]
     pub enum Msg {
@@ -249,8 +249,7 @@ mod hashseq_viz {
                     return Some(*pos);
                 }
                 // Check if this ID is inside a run
-                if let Some(hashseq::NodeLocation::InRun { run_id, .. }) =
-                    self.seq.id_to_location.get(id)
+                if let Some(hashseq::RunPosition::InRun { run_id, .. }) = self.seq.run_index.get(id)
                 {
                     return nodes.get(run_id).copied();
                 }
@@ -541,8 +540,8 @@ mod hashseq_viz {
                                     return Some(*pos);
                                 }
                                 // Check if this ID is inside a run
-                                if let Some(hashseq::NodeLocation::InRun { .. }) =
-                                    self.seq.id_to_location.get(id)
+                                if let Some(hashseq::RunPosition::InRun { .. }) =
+                                    self.seq.run_index.get(id)
                                 {
                                     // TODO: determine position of char inside the run.
                                 }

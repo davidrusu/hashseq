@@ -6,35 +6,25 @@ use crate::Id;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct SpanNode {
-    span: Vec<Id>,
-    pub after: BTreeSet<Id>,
-    pub before: BTreeSet<Id>,
+    pub span: Vec<Id>,
 }
 
 impl SpanNode {
     fn new(span: Vec<Id>) -> Self {
         debug_assert!(!span.is_empty());
-        Self {
-            span,
-            after: Default::default(),
-            before: Default::default(),
-        }
+        Self { span }
     }
 
-    fn id(&self) -> Id {
-        self.span[0]
+    fn id(&self) -> &Id {
+        self.first()
     }
 
-    fn can_add_before(&self, node: Id) -> bool {
-        self.span[0] == node
+    fn first(&self) -> &Id {
+        &self.span[0]
     }
 
-    fn can_extend_from(&self, node: Id) -> bool {
-        self.after.is_empty() && self.is_last(node)
-    }
-
-    fn is_last(&self, node: Id) -> bool {
-        self.span[self.span.len() - 1] == node
+    fn last(&self) -> &Id {
+        &self.span[self.span.len() - 1]
     }
 
     // Splits this span in place after the given node; returns the span that was split off
@@ -43,12 +33,7 @@ impl SpanNode {
         let p = self.span.iter().position(|n| n == &node).unwrap();
         let new_span = self.span.split_off(p + 1);
 
-        let mut new_node = SpanNode::new(new_span);
-        // the after's are moved to the span that was split off
-        new_node.after = std::mem::take(&mut self.after);
-        self.after.insert(new_node.id());
-
-        new_node
+        SpanNode::new(new_span)
     }
 
     // Splits this span in place before the given node; returns the span that was split off
@@ -57,60 +42,38 @@ impl SpanNode {
         let p = self.span.iter().position(|n| n == &node).unwrap();
         let new_span = self.span.split_off(p);
 
-        let mut new_node = SpanNode::new(new_span);
-        // the after's are moved to the span that was split off
-        new_node.after = std::mem::take(&mut self.after);
-        self.after.insert(new_node.id());
-
-        new_node
+        SpanNode::new(new_span)
     }
 
-    fn add_after(&mut self, node: Id) {
-        self.after.insert(node);
-    }
-
-    fn add_before(&mut self, node: Id) {
-        self.before.insert(node);
-    }
-
-    fn after_of(&self, node: Id) -> BTreeSet<Id> {
-        if self.is_last(node) {
-            self.after.clone()
-        } else {
-            let after = self.span.iter().skip_while(|n| n != &&node).nth(1).unwrap();
-            BTreeSet::from_iter([*after])
-        }
-    }
-
-    fn before_of(&self, node: Id) -> BTreeSet<Id> {
-        if node == self.span[0] {
-            self.before.clone()
-        } else {
-            BTreeSet::new()
-        }
+    fn after_of(&self, node: &Id) -> &Id {
+        assert_ne!(self.last(), node);
+        let after = self.span.iter().skip_while(|n| n != &node).nth(1).unwrap();
+        after
     }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Topo {
     // roots designate the independent causal trees.
-    roots: BTreeSet<Id>,
-    index: HashMap<Id, Id>,
+    pub roots: BTreeSet<Id>,
+    pub befores: HashMap<Id, BTreeSet<Id>>,
+    pub afters: HashMap<Id, BTreeSet<Id>>,
+    pub span_index: HashMap<Id, Id>,
     pub spans: HashMap<Id, SpanNode>,
 }
 
 impl Topo {
     pub fn is_causally_before(&self, a: &Id, b: &Id) -> bool {
         let mut seen = BTreeSet::new();
-        let mut boundary = VecDeque::from_iter(self.after(*a));
+        let mut boundary = VecDeque::from_iter(self.after(a));
         while let Some(n) = boundary.pop_front() {
-            if &n == b {
+            if n == b {
                 return true;
             }
 
             seen.insert(n);
             boundary.extend(self.after(n).into_iter().filter(|a| !seen.contains(a)));
-            if &n != a {
+            if n != a {
                 boundary.extend(self.before(n).into_iter().filter(|a| !seen.contains(a)));
             }
         }
@@ -120,67 +83,78 @@ impl Topo {
 
     pub fn add_root(&mut self, node: Id) {
         debug_assert!(!self.spans.contains_key(&node));
-
         self.roots.insert(node);
-        self.spans.insert(node, SpanNode::new(vec![node]));
-        self.index.insert(node, node);
     }
 
     pub fn add_after(&mut self, anchor: Id, node: Id) {
-        debug_assert!(!self.index.contains_key(&node));
-        debug_assert!(self.index.contains_key(&anchor));
+        match self.span_index.get(&anchor) {
+            Some(span_id) => {
+                // the anchor is already part of a span
+                let span = self.spans.get_mut(span_id).unwrap();
+                if span.last() == &anchor && !self.afters.contains_key(&anchor) {
+                    // we can extend the span
+                    span.span.push(node);
+                    self.span_index.insert(node, *span_id);
+                } else if span.last() == &anchor {
+                    // the span forks at anchor
+                    self.spans.insert(node, SpanNode::new(vec![node]));
+                    self.span_index.insert(node, node);
+                    self.afters.entry(anchor).or_default().insert(node);
+                } else {
+                    // the anchor is somewhere inside the span
+                    // need to split the span at the anchor and create a fork
+                    let new_span = span.split_after(anchor);
+                    // re-index the new span
+                    for id in new_span.span.iter() {
+                        self.span_index.insert(*id, *new_span.id());
+                    }
+                    self.afters
+                        .entry(anchor)
+                        .or_default()
+                        .insert(*new_span.id());
+                    self.spans.insert(*new_span.id(), new_span);
 
-        let span_id = self.index[&anchor];
-        let span = self.spans.get_mut(&span_id).unwrap();
-
-        if span.can_extend_from(anchor) {
-            span.span.push(node);
-            self.index.insert(node, span_id);
-        } else if span.is_last(anchor) {
-            // add to the afters
-            span.add_after(node);
-            self.spans.insert(node, SpanNode::new(vec![node]));
-            self.index.insert(node, node);
-        } else {
-            // need to split the span since we have a fork
-            let new_span = span.split_after(anchor);
-            // re-index the new span
-            for id in new_span.span.iter() {
-                self.index.insert(*id, new_span.id());
+                    self.spans.insert(node, SpanNode::new(vec![node]));
+                    self.span_index.insert(node, node);
+                    self.afters.entry(anchor).or_default().insert(node);
+                }
             }
-
-            span.add_after(node);
-
-            self.spans.insert(new_span.id(), new_span);
-            self.spans.insert(node, SpanNode::new(vec![node]));
-            self.index.insert(node, node);
+            None => {
+                // begin a new span with this node
+                self.spans.insert(node, SpanNode::new(vec![node]));
+                self.span_index.insert(node, node);
+                self.afters.entry(anchor).or_default().insert(node);
+            }
         }
     }
 
     pub fn add_before(&mut self, anchor: Id, node: Id) {
-        debug_assert!(!self.index.contains_key(&node));
-        debug_assert!(self.index.contains_key(&anchor));
+        match self.span_index.get(&anchor) {
+            Some(span_id) => {
+                // the anchor is part of a span
+                let span = self.spans.get_mut(span_id).unwrap();
+                if span.first() == &anchor {
+                    self.befores.entry(anchor).or_default().insert(node);
+                } else {
+                    // the anchor is somewhere inside the span
+                    // need to split the span at the anchor and create a fork
 
-        let span_id = self.index[&anchor];
-        let span = self.spans.get_mut(&span_id).unwrap();
+                    let new_span = span.split_before(anchor);
+                    debug_assert_eq!(new_span.id(), &anchor);
 
-        if span.can_add_before(anchor) {
-            span.add_before(node);
-            self.spans.insert(node, SpanNode::new(vec![node]));
-            self.index.insert(node, node);
-        } else {
-            // need to split the span since we have a fork
-            let mut new_span = span.split_before(anchor);
-            // re-index the new span
-            for id in new_span.span.iter() {
-                self.index.insert(*id, new_span.id());
+                    // re-index the new span
+                    for id in new_span.span.iter() {
+                        self.span_index.insert(*id, anchor);
+                    }
+                    self.afters.entry(*span.last()).or_default().insert(anchor);
+                    self.spans.insert(anchor, new_span);
+
+                    self.befores.entry(anchor).or_default().insert(node);
+                }
             }
-
-            new_span.add_before(node);
-
-            self.spans.insert(new_span.id(), new_span);
-            self.spans.insert(node, SpanNode::new(vec![node]));
-            self.index.insert(node, node);
+            None => {
+                self.befores.entry(anchor).or_default().insert(node);
+            }
         }
     }
 
@@ -188,14 +162,28 @@ impl Topo {
         &self.roots
     }
 
-    pub fn after(&self, id: Id) -> BTreeSet<Id> {
-        let span_id = self.index[&id];
-        self.spans[&span_id].after_of(id)
+    pub fn after(&self, id: &Id) -> Vec<&Id> {
+        match self.afters.get(id) {
+            Some(ns) => Vec::from_iter(ns.iter()),
+            None => match self.span_index.get(id) {
+                Some(span_id) => {
+                    let span = &self.spans[span_id];
+                    if span.last() == id {
+                        Vec::new()
+                    } else {
+                        vec![span.after_of(id)]
+                    }
+                }
+                None => Vec::new(),
+            },
+        }
     }
 
-    pub fn before(&self, id: Id) -> BTreeSet<Id> {
-        let span_id = self.index[&id];
-        self.spans[&span_id].before_of(id)
+    pub fn before(&self, id: &Id) -> Vec<&Id> {
+        match self.befores.get(id) {
+            Some(ns) => Vec::from_iter(ns.iter()),
+            None => Vec::new(),
+        }
     }
 
     pub fn iter<'a, 'b>(&'a self, removed: &'b HashSet<Id>) -> TopoIter<'a, 'b> {
@@ -226,15 +214,16 @@ impl<'a, 'b> TopoIter<'a, 'b> {
     }
 
     fn push_waiting(&mut self, n: &'a Id) {
-        let deps = Vec::from_iter(self.topo.spans[n].before.iter().rev());
+        let mut deps = self.topo.before(n);
+        deps.reverse();
         self.waiting_stack.push((n, deps));
     }
 }
 
 impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
-    type Item = Id;
+    type Item = &'a Id;
 
-    fn next(&mut self) -> Option<Id> {
+    fn next(&mut self) -> Option<Self::Item> {
         loop {
             let (_, deps) = self.waiting_stack.last_mut()?;
 
@@ -246,18 +235,19 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
                 let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
-                if let Some(span) = self.topo.spans.get(n) {
-                    for after in span.after.iter().rev() {
-                        self.push_waiting(after);
+                if let Some(afters) = self.topo.afters.get(n) {
+                    for s in afters.iter().rev() {
+                        self.push_waiting(s);
                     }
-                    for s in span.span.iter().rev() {
-                        if s != n {
-                            self.waiting_stack.push((s, Vec::new()));
-                        }
+                } else if let Some(span) = self.topo.spans.get(n) {
+                    // first entry in the span is `n`, skip that one since it
+                    // is being released in this iteration.
+                    for s in span.span.iter().skip(1).rev() {
+                        self.waiting_stack.push((s, Vec::new()));
                     }
                 }
                 if !self.removed.contains(n) {
-                    return Some(*n);
+                    return Some(n);
                 }
             }
         }
@@ -273,7 +263,7 @@ mod tests {
     fn n(n: u8) -> Id {
         let mut id = [0u8; 32];
         id[0] = n;
-        id
+        Id(id)
     }
 
     #[test]
@@ -282,7 +272,7 @@ mod tests {
 
         topo.add_root(n(0));
 
-        assert_eq!(Vec::from_iter(topo.iter(&Default::default())), vec![n(0)]);
+        assert_eq!(Vec::from_iter(topo.iter(&Default::default())), vec![&n(0)]);
     }
 
     #[test]
@@ -294,8 +284,8 @@ mod tests {
 
         let removed = Default::default();
         let mut iter = topo.iter(&removed);
-        assert_eq!(iter.next(), Some(n(0)));
-        assert_eq!(iter.next(), Some(n(1)));
+        assert_eq!(iter.next(), Some(&n(0)));
+        assert_eq!(iter.next(), Some(&n(1)));
         assert_eq!(iter.next(), None);
 
         let mut topo = Topo::default();
@@ -305,7 +295,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(1), n(0)]
+            vec![&n(1), &n(0)]
         );
     }
 
@@ -319,7 +309,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2)]
+            vec![&n(0), &n(1), &n(2)]
         );
     }
 
@@ -331,15 +321,23 @@ mod tests {
         topo.add_after(n(0), n(1));
         topo.add_before(n(1), n(2));
 
+        assert_eq!(topo.after(&n(0)), vec![&n(1)]);
+        assert!(topo.before(&n(0)).is_empty());
+        assert!(dbg!(topo.after(&n(1))).is_empty());
+        assert_eq!(topo.before(&n(1)), vec![&n(2)]);
+
+        assert!(topo.after(&n(2)).is_empty());
+        assert!(topo.before(&n(2)).is_empty());
+
         let removed = Default::default();
         let mut iter = topo.iter(&removed);
-        assert_eq!(iter.next(), Some(n(0)));
-        assert_eq!(iter.next(), Some(n(2)));
-        assert_eq!(iter.next(), Some(n(1)));
+        assert_eq!(iter.next(), Some(&n(0)));
+        assert_eq!(iter.next(), Some(&n(2)));
+        assert_eq!(iter.next(), Some(&n(1)));
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(2), n(1)]
+            vec![&n(0), &n(2), &n(1)]
         );
     }
 
@@ -363,7 +361,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(4), n(2), n(3)]
+            vec![&n(0), &n(1), &n(4), &n(2), &n(3)]
         );
     }
 
@@ -384,17 +382,17 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(2), n(3)]
+            vec![&n(0), &n(2), &n(3)]
         );
 
         topo.add_before(n(3), n(1));
 
         let removed = Default::default();
         let mut iter = topo.iter(&removed);
-        assert_eq!(iter.next(), Some(n(0)));
+        assert_eq!(iter.next(), Some(&n(0)));
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(2), n(1), n(3)]
+            vec![&n(0), &n(2), &n(1), &n(3)]
         );
     }
 
@@ -415,14 +413,14 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(2), n(3)]
+            vec![&n(0), &n(2), &n(3)]
         );
 
         topo.add_before(n(2), n(1));
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2), n(3)]
+            vec![&n(0), &n(1), &n(2), &n(3)]
         );
     }
 
@@ -433,11 +431,11 @@ mod tests {
         topo.add_after(n(0), n(2));
         topo.add_after(n(0), n(1));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2)]));
+        assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2)]);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2)]
+            vec![&n(0), &n(1), &n(2)]
         );
     }
 
@@ -449,14 +447,14 @@ mod tests {
         topo.add_after(n(0), n(3));
         topo.add_after(n(0), n(1));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2), n(3)]));
-        assert_eq!(topo.after(n(1)), BTreeSet::from_iter([]));
-        assert_eq!(topo.after(n(2)), BTreeSet::from_iter([]));
-        assert_eq!(topo.after(n(3)), BTreeSet::from_iter([]));
+        assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2), &n(3)]);
+        assert!(topo.after(&n(1)).is_empty());
+        assert!(topo.after(&n(2)).is_empty());
+        assert!(topo.after(&n(3)).is_empty());
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2), n(3)]
+            vec![&n(0), &n(1), &n(2), &n(3)]
         );
     }
 
@@ -467,15 +465,15 @@ mod tests {
         topo.add_after(n(0), n(1));
         topo.add_after(n(0), n(3));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(3)]));
+        assert_eq!(topo.after(&n(0)), vec![&n(1), &n(3)]);
 
         topo.add_after(n(0), n(2));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2), n(3)]));
+        assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2), &n(3)]);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2), n(3)]
+            vec![&n(0), &n(1), &n(2), &n(3)]
         );
     }
 
@@ -486,15 +484,15 @@ mod tests {
         topo.add_after(n(0), n(1));
         topo.add_after(n(0), n(2));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2)]));
+        assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2)]);
 
         topo.add_after(n(0), n(3));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1), n(2), n(3)]));
+        assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2), &n(3)]);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2), n(3)]
+            vec![&n(0), &n(1), &n(2), &n(3)]
         );
     }
 
@@ -504,12 +502,12 @@ mod tests {
         topo.add_root(n(0));
         topo.add_before(n(0), n(1));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([]));
-        assert_eq!(topo.before(n(0)), BTreeSet::from_iter([n(1)]));
+        assert!(topo.after(&n(0)).is_empty());
+        assert_eq!(topo.before(&n(0)), vec![&n(1)]);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(1), n(0)]
+            vec![&n(1), &n(0)]
         );
     }
 
@@ -520,12 +518,12 @@ mod tests {
         topo.add_before(n(0), n(1));
         topo.add_before(n(0), n(2));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([]));
-        assert_eq!(topo.before(n(0)), BTreeSet::from_iter([n(1), n(2)]));
+        assert!(topo.after(&n(0)).is_empty());
+        assert_eq!(topo.before(&n(0)), vec![&n(1), &n(2)]);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(1), n(2), n(0)]
+            vec![&n(1), &n(2), &n(0)]
         );
     }
 
@@ -537,12 +535,12 @@ mod tests {
         topo.add_before(n(0), n(3));
         topo.add_before(n(0), n(1));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([]));
-        assert_eq!(topo.before(n(0)), BTreeSet::from_iter([n(1), n(2), n(3)]));
+        assert!(topo.after(&n(0)).is_empty());
+        assert_eq!(topo.before(&n(0)), vec![&n(1), &n(2), &n(3)]);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(1), n(2), n(3), n(0)]
+            vec![&n(1), &n(2), &n(3), &n(0)]
         );
     }
 
@@ -555,7 +553,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(2), n(1)]
+            vec![&n(0), &n(2), &n(1)]
         );
     }
 
@@ -569,7 +567,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(2), n(3), n(1)]
+            vec![&n(0), &n(2), &n(3), &n(1)]
         );
     }
 
@@ -582,7 +580,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1)]
+            vec![&n(0), &n(1)]
         );
     }
 
@@ -593,11 +591,11 @@ mod tests {
         topo.add_after(n(0), n(1));
         topo.add_root(n(2));
 
-        assert_eq!(topo.after(n(0)), BTreeSet::from_iter([n(1)]));
+        assert_eq!(topo.after(&n(0)), vec![&n(1)]);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2)]
+            vec![&n(0), &n(1), &n(2)]
         );
 
         let mut topo_different_order = Topo::default();
@@ -618,7 +616,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(2)]
+            vec![&n(0), &n(1), &n(2)]
         );
     }
 
@@ -631,7 +629,7 @@ mod tests {
         topo.add_before(n(2), n(3));
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(1), n(3), n(2)]
+            vec![&n(0), &n(1), &n(3), &n(2)]
         );
     }
 
@@ -644,7 +642,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(2), n(0), n(1)]
+            vec![&n(2), &n(0), &n(1)]
         );
 
         let mut topo_different_order = Topo::default();
@@ -665,7 +663,7 @@ mod tests {
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
-            vec![n(0), n(2), n(1), n(3)]
+            vec![&n(0), &n(2), &n(1), &n(3)]
         );
 
         let mut topo_reverse_order = Topo::default();
@@ -675,6 +673,23 @@ mod tests {
         topo_reverse_order.add_before(n(1), n(2));
 
         assert_eq!(topo, topo_reverse_order);
+    }
+
+    #[test]
+    fn test_span_split() {
+        let mut topo = Topo::default();
+        topo.add_root(n(0));
+        topo.add_after(n(0), n(1));
+        topo.add_after(n(1), n(2));
+        topo.add_after(n(2), n(3));
+        topo.add_after(n(3), n(4));
+        topo.add_after(n(2), n(5));
+        topo.add_after(n(5), n(6));
+
+        assert_eq!(
+            Vec::from_iter(topo.iter(&Default::default())),
+            vec![&n(0), &n(1), &n(2), &n(3), &n(4), &n(5), &n(6)]
+        );
     }
 
     #[ignore]

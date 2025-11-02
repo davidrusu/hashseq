@@ -8,8 +8,17 @@ pub mod topo_sort;
 // pub mod bloom_tree_do;
 // pub mod pbt;
 
-pub use self::hash_node::{hash_op, HashNode, Op};
-pub use self::hashseq::{HashSeq, NodeLocation};
+pub use self::hash_node::{HashNode, Op};
+pub use self::hashseq::{HashSeq, RunPosition};
 pub use self::run::Run;
 
-pub type Id = [u8; 32];
+#[derive(
+    Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct Id(pub [u8; 32]);
+
+impl std::fmt::Debug for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &hex::encode(self.0)[..3])
+    }
+}

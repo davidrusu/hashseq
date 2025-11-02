@@ -6,12 +6,29 @@ use crate::topo_sort::{Topo, TopoIter};
 use crate::{HashNode, Id, Op, Run};
 
 /// Location information for where a node ID can be found
-#[derive(Debug, Clone)]
-pub enum NodeLocation {
-    /// Node is part of a run at the given position
-    InRun { run_id: Id, position: usize },
-    /// Node is a standalone HashNode
-    Individual(Id),
+#[derive(Debug, Clone, Copy)]
+pub struct RunPosition {
+    run_id: Id,
+    position: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CausalInsert {
+    pub extra_dependencies: BTreeSet<Id>,
+    pub anchor: Id,
+    pub ch: char,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CausalRemove {
+    pub extra_dependencies: BTreeSet<Id>,
+    pub nodes: BTreeSet<Id>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CausalRoot {
+    pub extra_dependencies: BTreeSet<Id>,
+    pub ch: char,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -20,54 +37,22 @@ pub struct HashSeq {
 
     // Hybrid storage: runs for sequential elements, individual nodes for complex operations
     pub runs: BTreeMap<Id, Run>,
-    pub individual_nodes: BTreeMap<Id, HashNode>,
+    pub root_nodes: BTreeMap<Id, CausalRoot>,
+    pub before_nodes: BTreeMap<Id, CausalInsert>,
+    pub remove_nodes: BTreeMap<Id, CausalRemove>,
 
     // ID resolution index for O(1) lookup of any node
-    pub id_to_location: HashMap<Id, NodeLocation>,
+    pub run_index: HashMap<Id, RunPosition>,
 
     pub removed_inserts: HashSet<Id>,
-    pub(crate) roots: BTreeSet<Id>,
+    pub(crate) tips: BTreeSet<Id>,
     pub(crate) orphaned: HashSet<HashNode>,
     index: AssociativePositionalList<Id>,
 }
 
 impl PartialEq for HashSeq {
     fn eq(&self, other: &Self) -> bool {
-        // For equality, we compare the semantic content, not the storage organization
-        // Two HashSeqs are equal if they have:
-        // 1. The same sequence content (visible characters)
-        // 2. The same removed_inserts
-        // 3. The same orphaned nodes
-        // 4. The same topological structure
-
-        // Compare the visible content
-        let self_content: Vec<char> = self.iter().collect();
-        let other_content: Vec<char> = other.iter().collect();
-
-        if self_content != other_content {
-            return false;
-        }
-
-        // Compare removed inserts and orphaned
-        if self.removed_inserts != other.removed_inserts || self.orphaned != other.orphaned {
-            return false;
-        }
-
-        // Compare topological structure by checking that both have the same nodes
-        // and the same ordering relationships
-        let self_ids: BTreeSet<Id> = self.iter_ids().collect();
-        let other_ids: BTreeSet<Id> = other.iter_ids().collect();
-
-        if self_ids != other_ids {
-            return false;
-        }
-
-        // Check that the topological ordering is the same
-        // by comparing the sequence of IDs
-        let self_id_seq: Vec<Id> = self.iter_ids().collect();
-        let other_id_seq: Vec<Id> = other.iter_ids().collect();
-
-        self_id_seq == other_id_seq
+        self.tips == other.tips
     }
 }
 
@@ -76,78 +61,26 @@ impl Eq for HashSeq {}
 impl HashSeq {
     /// Check if a node ID exists (either in runs or individual nodes)
     pub fn contains_node(&self, id: &Id) -> bool {
-        self.id_to_location.contains_key(id)
+        self.root_nodes.contains_key(id)
+            || self.before_nodes.contains_key(id)
+            || self.run_index.contains_key(id)
     }
 
     /// Get the character value for a given node ID
-    pub fn get_node_char(&self, id: &Id) -> Option<char> {
-        match self.id_to_location.get(id)? {
-            NodeLocation::InRun { run_id, position } => {
-                let run = self.runs.get(run_id)?;
-                run.run.chars().nth(*position)
-            }
-            NodeLocation::Individual(node_id) => {
-                let node = self.individual_nodes.get(node_id)?;
-                match &node.op {
-                    Op::InsertRoot(c) | Op::InsertAfter(_, c) | Op::InsertBefore(_, c) => Some(*c),
-                    Op::Remove(_) => None,
-                }
-            }
+    pub fn get_node_char(&self, id: &Id) -> char {
+        if let Some(root) = self.root_nodes.get(id) {
+            return root.ch;
         }
-    }
-
-    /// Add a node to the storage
-    /// All InsertAfter operations are automatically promoted to runs
-    fn add_individual_node(&mut self, node: HashNode) {
-        let id = node.id();
-
-        // Auto-promote all InsertAfter operations to runs
-        if let Op::InsertAfter(parent_id, ch) = &node.op {
-            // Case 1: Parent is the last element of an existing run AND no extra deps - extend it
-            if node.extra_dependencies.is_empty() {
-                if let Some(NodeLocation::InRun { run_id, position }) =
-                    self.id_to_location.get(parent_id)
-                {
-                    if let Some(run) = self.runs.get_mut(run_id) {
-                        if *position == run.len() - 1 {
-                            // Parent is the last element, we can extend
-                            run.extend(*ch);
-                            self.id_to_location.insert(
-                                id,
-                                NodeLocation::InRun {
-                                    run_id: *run_id,
-                                    position: run.len() - 1,
-                                },
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // Case 2: Create a new run (with or without extra dependencies)
-            let new_run = Run::new(*parent_id, node.extra_dependencies.clone(), *ch);
-            self.add_run(new_run);
-            return;
+        if let Some(before) = self.before_nodes.get(id) {
+            return before.ch;
         }
+        let run_pos = &self.run_index[id];
 
-        // Only InsertRoot, InsertBefore, and Remove are stored as individual nodes
-        self.individual_nodes.insert(id, node);
-        self.id_to_location.insert(id, NodeLocation::Individual(id));
-    }
-
-    /// Add a run to storage and update index for all its elements
-    fn add_run(&mut self, run: Run) {
-        let run_id = run.run_id();
-        let nodes = run.decompress();
-
-        // Update index for all elements in the run
-        for (position, node) in nodes.iter().enumerate() {
-            self.id_to_location
-                .insert(node.id(), NodeLocation::InRun { run_id, position });
-        }
-
-        self.runs.insert(run_id, run);
+        self.runs[&run_pos.run_id]
+            .run
+            .chars()
+            .nth(run_pos.position)
+            .unwrap()
     }
 
     pub fn len(&self) -> usize {
@@ -183,345 +116,105 @@ impl HashSeq {
             return;
         }
 
-        // Single character inserts always use individual nodes
-        if chars.len() == 1 {
-            self.insert_single_char(idx, chars[0]);
-            return;
-        }
-
         let (left, right) = self.neighbours(idx);
 
         match (left, right) {
-            (Some(left_id), _) => {
-                // Check if we can extend an existing run
-                // Conditions:
-                // 1. left_id is the last entry of a run
-                // 2. roots is a singleton set containing exactly left_id
-                let can_extend_existing_run =
-                    if let Some(NodeLocation::InRun { run_id, position }) =
-                        self.id_to_location.get(&left_id).cloned()
-                    {
-                        self.runs
-                            .get(&run_id)
-                            .map(|run| {
-                                position == run.len() - 1  // left_id is last entry of run
-                                && self.roots.len() == 1  // roots is singleton
-                                && self.roots.contains(&left_id) // roots contains exactly left_id
-                            })
-                            .unwrap_or(false)
-                    } else {
-                        false
+            (Some(left_id), Some(right_id)) => {
+                let mut chars_iter = chars.into_iter();
+                let mut extra_dependencies = self.tips.clone();
+                extra_dependencies.remove(&left_id);
+                let first_ch = chars_iter.next().unwrap();
+                let mut first_node = HashNode {
+                    extra_dependencies,
+                    op: Op::InsertAfter(left_id, first_ch),
+                };
+
+                if self.topo.is_causally_before(&left_id, &right_id) && first_node.id() > right_id {
+                    // Using InsertAfter for the first node doesn't work.
+                    // use InsertBefore right_id instead
+                    let mut extra_dependencies = self.tips.clone();
+                    extra_dependencies.remove(&right_id);
+                    first_node = HashNode {
+                        extra_dependencies,
+                        op: Op::InsertBefore(right_id, first_ch),
                     };
-
-                if can_extend_existing_run {
-                    // Extend the existing run
-                    let location = self.id_to_location.get(&left_id).cloned().unwrap();
-                    if let NodeLocation::InRun {
-                        run_id,
-                        position: _,
-                    } = location
-                    {
-                        let mut prev_id = left_id;
-
-                        // Extend the run with all new characters
-                        for (i, &ch) in chars.iter().enumerate() {
-                            let new_id = self.generate_node_id_for_char(ch, &prev_id);
-
-                            if let Some(run) = self.runs.get_mut(&run_id) {
-                                run.extend(ch);
-
-                                // Update the ID index
-                                self.id_to_location.insert(
-                                    new_id,
-                                    NodeLocation::InRun {
-                                        run_id,
-                                        position: run.len() - 1,
-                                    },
-                                );
-                            }
-
-                            // Update topology
-                            self.topo.add_after(prev_id, new_id);
-                            self.update_position_index(new_id, idx + i);
-
-                            // Update roots
-                            self.roots.remove(&prev_id);
-                            self.roots.insert(new_id);
-
-                            prev_id = new_id;
-                        }
-                    }
-                } else if self.can_safely_merge_after(&left_id) {
-                    // Check if left is an individual node we can convert to a run
-                    if let Some(left_node) = self.individual_nodes.get(&left_id).cloned() {
-                        // INVARIANT: Runs must start with InsertAfter
-                        if let Op::InsertAfter(left_anchor, left_char) = left_node.op {
-                            // Check if roots is a singleton containing exactly left_id
-                            if self.roots.len() == 1 && self.roots.contains(&left_id) {
-                                // Convert the individual node to a run with all the new characters
-                                let mut run = Run::new(
-                                    left_anchor,
-                                    left_node.extra_dependencies.clone(),
-                                    left_char,
-                                );
-
-                                // Extend with all new characters
-                                for &ch in &chars {
-                                    run.extend(ch);
-                                }
-
-                                // Remove the individual node
-                                self.individual_nodes.remove(&left_id);
-
-                                // Generate IDs and update topology
-                                let mut prev_id = left_id;
-                                let nodes = run.decompress();
-
-                                // Start from index 1 since node 0 is the left_id we already have
-                                for (i, node) in nodes.iter().enumerate().skip(1) {
-                                    let node_id = node.id();
-                                    self.topo.add_after(prev_id, node_id);
-                                    self.update_position_index(node_id, idx + i - 1);
-
-                                    // Update roots
-                                    self.roots.remove(&prev_id);
-                                    self.roots.insert(node_id);
-
-                                    prev_id = node_id;
-                                }
-
-                                // Add the run
-                                self.add_run(run);
-                                return;
-                            }
-                        }
-                    }
-
-                    // Fall through to creating a new run
-                    // Create the run with insert_after = left_id
-                    // No extra dependencies needed when inserting sequentially
-                    let mut run = Run::new(left_id, BTreeSet::new(), chars[0]);
-
-                    // Extend with remaining characters
-                    for &ch in &chars[1..] {
-                        run.extend(ch);
-                    }
-
-                    let nodes = run.decompress();
-                    let mut prev_id = left_id;
-                    for (i, node) in nodes.iter().enumerate() {
-                        if i == 0 {
-                            self.insert_after_anchor(node.id(), prev_id);
-                        } else {
-                            self.topo.add_after(prev_id, node.id());
-                        }
-                        // Update position index for each character
-                        self.update_position_index(node.id(), idx + i);
-                        prev_id = node.id();
-                    }
-
-                    // Add the run to our storage
-                    self.add_run(run);
-
-                    // Update roots
-
-                    let dependencies = BTreeSet::from_iter(nodes[0].dependencies());
-                    let superseded_roots = Vec::from_iter(
-                        self.roots
-                            .iter()
-                            .filter(|r| dependencies.contains(*r))
-                            .copied(),
-                    );
-
-                    for r in superseded_roots {
-                        self.roots.remove(&r);
-                    }
-
-                    self.roots.insert(nodes[nodes.len() - 1].id());
-                } else {
-                    // Cannot safely merge - create a new run
-                    // Use roots as extra dependencies to maintain causal consistency
-                    let mut run = Run::new(left_id, self.roots.clone(), chars[0]);
-
-                    // Extend with remaining characters
-                    for &ch in &chars[1..] {
-                        run.extend(ch);
-                    }
-
-                    let nodes = run.decompress();
-                    let mut prev_id = left_id;
-                    for (i, node) in nodes.iter().enumerate() {
-                        if i == 0 {
-                            self.insert_after_anchor(node.id(), prev_id);
-                        } else {
-                            self.topo.add_after(prev_id, node.id());
-                        }
-                        // Update position index for each character
-                        self.update_position_index(node.id(), idx + i);
-                        prev_id = node.id();
-                    }
-
-                    // Add the run to our storage
-                    self.add_run(run);
-
-                    // Update roots
-
-                    let dependencies = BTreeSet::from_iter(nodes[0].dependencies());
-                    let superseded_roots = Vec::from_iter(
-                        self.roots
-                            .iter()
-                            .filter(|r| dependencies.contains(*r))
-                            .copied(),
-                    );
-
-                    for r in superseded_roots {
-                        self.roots.remove(&r);
-                    }
-
-                    self.roots.insert(nodes[nodes.len() - 1].id());
+                }
+                let mut prev_id = first_node.id();
+                self.apply(first_node);
+                for ch in chars_iter {
+                    let mut extra_dependencies = self.tips.clone();
+                    extra_dependencies.remove(&prev_id);
+                    let node = HashNode {
+                        extra_dependencies,
+                        op: Op::InsertAfter(prev_id, ch),
+                    };
+                    prev_id = node.id();
+                    self.apply(node);
                 }
             }
-            (None, _) => {
-                // No left neighbor - fall back to individual node insertions
-                // This handles InsertRoot and InsertBefore cases
-                for (i, &ch) in chars.iter().enumerate() {
-                    self.insert_single_char(idx + i, ch);
+            (Some(left_id), None) => {
+                // there is no right node, we just chain from left
+                let mut prev_id = left_id;
+                for ch in chars.into_iter() {
+                    let mut extra_dependencies = self.tips.clone();
+                    extra_dependencies.remove(&prev_id);
+                    let node = HashNode {
+                        extra_dependencies,
+                        op: Op::InsertAfter(prev_id, ch),
+                    };
+                    prev_id = node.id();
+
+                    self.apply(node);
+                }
+            }
+            (None, Some(right_id)) => {
+                let mut chars_iter = chars.into_iter();
+                let mut extra_dependencies = self.tips.clone();
+                extra_dependencies.remove(&right_id);
+
+                let first_node = HashNode {
+                    extra_dependencies,
+                    op: Op::InsertBefore(right_id, chars_iter.next().unwrap()),
+                };
+
+                let mut prev_id = first_node.id();
+                self.apply(first_node);
+
+                for ch in chars_iter {
+                    let mut extra_dependencies = self.tips.clone();
+                    extra_dependencies.remove(&prev_id);
+                    let node = HashNode {
+                        extra_dependencies,
+                        op: Op::InsertAfter(prev_id, ch),
+                    };
+                    prev_id = node.id();
+                    self.apply(node);
+                }
+            }
+            (None, None) => {
+                // seq is empty
+                let mut chars_iter = chars.into_iter();
+
+                let first_node = HashNode {
+                    extra_dependencies: self.tips.clone(),
+                    op: Op::InsertRoot(chars_iter.next().unwrap()),
+                };
+
+                let mut prev_id = first_node.id();
+                self.apply(first_node);
+
+                for ch in chars_iter {
+                    let mut extra_dependencies = self.tips.clone();
+                    extra_dependencies.remove(&prev_id);
+                    let node = HashNode {
+                        extra_dependencies,
+                        op: Op::InsertAfter(prev_id, ch),
+                    };
+                    prev_id = node.id();
+                    self.apply(node);
                 }
             }
         }
-    }
-
-    /// Insert a single character using individual node storage
-    /// Attempts to merge with existing nodes/runs when safe to do so
-    fn insert_single_char(&mut self, idx: usize, value: char) {
-        let (left, right) = self.neighbours(idx);
-
-        // Check if we can safely merge with an existing node when inserting after
-        if let Some(left_id) = left {
-            if self.can_safely_merge_after(&left_id) {
-                // Check if the left node is part of a run we can extend
-                if let Some(NodeLocation::InRun { run_id, position }) =
-                    self.id_to_location.get(&left_id).cloned()
-                {
-                    // Extend the run if this character comes at the end
-                    let can_extend = self
-                        .runs
-                        .get(&run_id)
-                        .map(|run| position == run.len() - 1)
-                        .unwrap_or(false);
-
-                    if can_extend {
-                        // Generate the new ID before any mutable borrows
-                        let new_id = self.generate_node_id_for_char(value, &left_id);
-
-                        // Now extend the run
-                        if let Some(run) = self.runs.get_mut(&run_id) {
-                            run.extend(value);
-
-                            // Update the ID index
-                            self.id_to_location.insert(
-                                new_id,
-                                NodeLocation::InRun {
-                                    run_id,
-                                    position: run.len() - 1,
-                                },
-                            );
-
-                            // Update topology
-                            self.topo.add_after(left_id, new_id);
-                            self.update_position_index(new_id, idx);
-
-                            // Update roots: remove left_id, add new_id
-                            self.roots.remove(&left_id);
-                            self.roots.insert(new_id);
-
-                            return;
-                        }
-                    }
-                } else if let Some(left_node) = self.individual_nodes.get(&left_id) {
-                    // Convert individual node to a run with the new character
-                    // INVARIANT: Runs must start with InsertAfter, so we can only convert
-                    // if the left node is an InsertAfter operation
-                    if let Op::InsertAfter(left_anchor, left_char) = left_node.op {
-                        let new_id = self.generate_node_id_for_char(value, &left_id);
-
-                        // Create a new run with both characters
-                        // First element: InsertAfter(left_anchor, left_char)
-                        // Second element: InsertAfter(left_id, value)
-
-                        // Preserve the left node's extra_dependencies for the first element
-                        let mut run =
-                            Run::new(left_anchor, left_node.extra_dependencies.clone(), left_char);
-
-                        // Extend with the second character
-                        run.extend(value);
-
-                        // Remove the individual node
-                        self.individual_nodes.remove(&left_id);
-
-                        // Add the run
-                        self.add_run(run);
-
-                        // Update topology for the new character
-                        self.topo.add_after(left_id, new_id);
-                        self.update_position_index(new_id, idx);
-
-                        // Update roots: remove left_id, add new_id
-                        self.roots.remove(&left_id);
-                        self.roots.insert(new_id);
-
-                        return;
-                    }
-                    // If left_node is InsertRoot or InsertBefore, we can't convert it to a run
-                    // Fall through to the standard individual node insertion below
-                }
-            }
-        }
-
-        // Fallback to standard individual node insertion
-        let op = match (left, right) {
-            (Some(l), Some(r)) => {
-                if self.topo.is_causally_before(&l, &r) {
-                    Op::InsertBefore(r, value)
-                } else {
-                    Op::InsertAfter(l, value)
-                }
-            }
-            (Some(l), None) => Op::InsertAfter(l, value),
-            (None, Some(r)) => Op::InsertBefore(r, value),
-            (None, None) => Op::InsertRoot(value),
-        };
-
-        let extra_dependencies =
-            BTreeSet::from_iter(self.roots.difference(&op.dependencies()).cloned());
-
-        let node = HashNode {
-            extra_dependencies,
-            op,
-        };
-
-        self.apply_with_known_position(node, idx);
-    }
-
-    /// Check if it's safe to merge a character after the given node
-    /// Safe means there are no other nodes chaining off the same parent
-    fn can_safely_merge_after(&self, node_id: &Id) -> bool {
-        // Get all nodes that come after this node
-        let after_nodes = self.topo.after(*node_id);
-
-        // Safe to merge if there are no successors, meaning no other nodes
-        // are chaining off this node
-        after_nodes.is_empty()
-    }
-
-    /// Generate a consistent node ID for a character following another character  
-    fn generate_node_id_for_char(&self, value: char, after_id: &Id) -> Id {
-        use crate::hash_node::hash_op;
-
-        let op = crate::Op::InsertAfter(*after_id, value);
-        let extra_dependencies = BTreeSet::new(); // No extra dependencies for run extensions
-
-        hash_op(&op, &extra_dependencies)
     }
 
     pub fn remove(&mut self, idx: usize) {
@@ -545,7 +238,7 @@ impl HashSeq {
         let op = Op::Remove(to_remove);
 
         let extra_dependencies =
-            BTreeSet::from_iter(self.roots.difference(&op.dependencies()).cloned());
+            BTreeSet::from_iter(self.tips.difference(&op.dependencies()).cloned());
 
         let node = HashNode {
             extra_dependencies,
@@ -565,7 +258,7 @@ impl HashSeq {
         false
     }
 
-    fn insert_root(&mut self, root_id: Id) {
+    fn insert_root(&mut self, root_id: Id, root: CausalRoot) {
         let position = if let Some(next_root) = self
             .topo
             .roots()
@@ -579,35 +272,97 @@ impl HashSeq {
             // inserted at end of list
             self.len()
         };
-        self.insert_root_with_known_position(root_id, position);
+        self.insert_root_with_known_position(root_id, root, position);
     }
 
-    fn insert_root_with_known_position(&mut self, id: Id, position: usize) {
+    fn insert_root_with_known_position(&mut self, id: Id, root: CausalRoot, position: usize) {
         self.index.insert(position, id);
         self.topo.add_root(id);
+        self.root_nodes.insert(id, root);
     }
 
-    fn insert_after_anchor(&mut self, id: Id, anchor: Id) {
-        let position = if let Some(next_node) = self
-            .topo
-            .after(anchor)
+    fn insert_after(&mut self, id: Id, after: CausalInsert) {
+        let position = if let Some(next_node) = BTreeSet::from_iter(self.topo.after(&after.anchor))
             .range(id..)
-            .find(|id| !self.removed_inserts.contains(*id))
+            .find(|id| !self.removed_inserts.contains(**id))
         {
             // new node is inserted just before the other node after our anchor node that is
             // bigger than the new node
             self.index.find(next_node)
         } else {
             // otherwise the new node is inserted after our anchor node (unless it has been removed)
-            self.index.find(&anchor).map(|p| p + 1)
+            self.index.find(&after.anchor).map(|p| p + 1)
         };
 
-        self.topo.add_after(anchor, id);
+        if let Some(RunPosition { run_id, position }) = self.run_index.get(&after.anchor).copied()
+            && after.extra_dependencies.is_empty()
+        {
+            // We are inserting after a node that is in a run.
+            // need to decide if we can extend the run or if we need to split it
+            if self.runs[&run_id].len() == position + 1 && self.topo.after(&after.anchor).is_empty()
+            {
+                // we are inserting at the end of a run, we can safely extend the run
+                self.runs.get_mut(&run_id).unwrap().extend(after.ch);
+                self.run_index.insert(
+                    id,
+                    RunPosition {
+                        run_id,
+                        position: position + 1,
+                    },
+                );
+            } else {
+                let run = self.runs.get_mut(&run_id).unwrap();
+                let right_run = run.split_at(position + 1);
+                debug_assert_eq!(run.last_id(), after.anchor);
+                // re-index the right run
+                for (position, node) in right_run.decompress().into_iter().enumerate() {
+                    self.run_index.insert(
+                        node.id(),
+                        RunPosition {
+                            run_id: right_run.first_id(),
+                            position,
+                        },
+                    );
+                }
+                self.runs.insert(right_run.first_id(), right_run);
+
+                self.runs.insert(
+                    id,
+                    Run::new(after.anchor, after.extra_dependencies, after.ch),
+                );
+                self.run_index.insert(
+                    id,
+                    RunPosition {
+                        run_id: id,
+                        position: 0,
+                    },
+                );
+            }
+        } else {
+            // Either anchor is not a run, or we can't extend from it for some reason, start a new run
+            self.runs.insert(
+                id,
+                Run::new(after.anchor, after.extra_dependencies, after.ch),
+            );
+            self.run_index.insert(
+                id,
+                RunPosition {
+                    run_id: id,
+                    position: 0,
+                },
+            );
+        }
+
+        self.topo.add_after(after.anchor, id);
 
         let position = position.unwrap_or_else(|| {
             // fall back to iterating over the entire sequence if the anchor node has been removed
             // or if next_node is not yet in the index (can happen during merge)
-            let (position, _) = self.iter_ids().enumerate().find(|(_, n)| n == &id).unwrap();
+            let (position, _) = self
+                .iter_ids()
+                .enumerate()
+                .find(|(_, n)| n == &&id)
+                .unwrap();
             position
         });
         self.update_position_index(id, position);
@@ -617,89 +372,66 @@ impl HashSeq {
         self.index.insert(position, id);
     }
 
-    fn remove_nodes(&mut self, nodes: &BTreeSet<Id>) {
+    fn remove_nodes(&mut self, id: Id, remove: CausalRemove) {
         // TODO: if self.nodes.get(node) is not an insert op, then drop this remove.
         //       Are you sure? looks like we would mark this op as an orphan if we hadn't
         //       seen a node yet.
-        for n in nodes {
+        for n in remove.nodes.iter() {
             if let Some(p) = self.index.find(n) {
                 self.index.remove(p);
             }
         }
-        self.removed_inserts.extend(nodes);
+        self.removed_inserts.extend(&remove.nodes);
+        self.remove_nodes.insert(id, remove);
     }
 
-    fn insert_before_anchor(&mut self, id: Id, anchor: Id) {
-        let position = if let Some(next_node) = self
-            .topo
-            .before(anchor)
-            .range(id..)
-            .find(|id| !self.removed_inserts.contains(*id))
+    fn insert_before(&mut self, id: Id, before: CausalInsert) {
+        let position = if let Some(next_node) =
+            BTreeSet::from_iter(self.topo.before(&before.anchor))
+                .range(id..)
+                .find(|id| !self.removed_inserts.contains(**id))
         {
             // new node is inserted just before the other node before our anchor node that is
             // bigger than the new node
             Some(self.index.find(next_node).unwrap())
         } else {
             // otherwise the new node is inserted before our anchor node
-            self.index.find(&anchor)
+            self.index.find(&before.anchor)
         };
 
-        self.topo.add_before(anchor, id);
+        if let Some(run_pos) = self.run_index.get(&before.anchor).copied()
+            && run_pos.position > 0
+        {
+            let run = self.runs.get_mut(&run_pos.run_id).unwrap();
+            let right_run = run.split_at(run_pos.position);
+            debug_assert_eq!(right_run.first_id(), before.anchor);
+            // re-index the right run
+            for (idx, node) in right_run.decompress().into_iter().enumerate() {
+                self.run_index.insert(
+                    node.id(),
+                    RunPosition {
+                        run_id: right_run.first_id(),
+                        position: idx,
+                    },
+                );
+            }
+            self.runs.insert(right_run.first_id(), right_run);
+        }
+
+        self.topo.add_before(before.anchor, id);
+
+        self.before_nodes.insert(id, before);
 
         let position = position.unwrap_or_else(|| {
             // fall back to iterating over the entire sequence if the anchor node has been removed
-            let (position, _) = self.iter_ids().enumerate().find(|(_, n)| n == &id).unwrap();
+            let (position, _) = self
+                .iter_ids()
+                .enumerate()
+                .find(|(_, n)| n == &&id)
+                .unwrap();
             position
         });
         self.update_position_index(id, position);
-    }
-
-    pub fn apply_with_known_position(&mut self, node: HashNode, position: usize) {
-        let id = node.id();
-
-        if self.contains_node(&id) {
-            return; // Already processed this node
-        }
-
-        let dependencies = BTreeSet::from_iter(node.dependencies());
-        if self.any_missing_dependencies(&dependencies) {
-            self.orphaned.insert(node);
-            return;
-        }
-
-        match &node.op {
-            Op::InsertRoot(_) => self.insert_root_with_known_position(id, position),
-            Op::InsertAfter(anchor, _) => {
-                self.topo.add_after(*anchor, id);
-                self.update_position_index(id, position)
-            }
-            Op::InsertBefore(anchor, _) => {
-                self.topo.add_before(*anchor, id);
-                self.update_position_index(id, position)
-            }
-            Op::Remove(nodes) => self.remove_nodes(nodes),
-        }
-
-        self.add_individual_node(node);
-
-        let superseded_roots = Vec::from_iter(
-            self.roots
-                .iter()
-                .filter(|r| dependencies.contains(*r))
-                .copied(),
-        );
-
-        for r in superseded_roots {
-            self.roots.remove(&r);
-        }
-
-        self.roots.insert(id);
-
-        let orphans = std::mem::take(&mut self.orphaned);
-
-        for orphan in orphans {
-            self.apply(orphan);
-        }
     }
 
     pub fn apply(&mut self, node: HashNode) {
@@ -717,29 +449,43 @@ impl HashSeq {
             return;
         }
 
-        match &node.op {
-            Op::InsertRoot(_) => self.insert_root(id),
-            Op::InsertAfter(anchor, _) => self.insert_after_anchor(id, *anchor),
-            Op::InsertBefore(anchor, _) => self.insert_before_anchor(id, *anchor),
-            Op::Remove(nodes) => self.remove_nodes(nodes),
+        match node.op {
+            Op::InsertRoot(ch) => self.insert_root(
+                id,
+                CausalRoot {
+                    extra_dependencies: node.extra_dependencies,
+                    ch,
+                },
+            ),
+            Op::InsertAfter(anchor, ch) => self.insert_after(
+                id,
+                CausalInsert {
+                    extra_dependencies: node.extra_dependencies,
+                    anchor,
+                    ch,
+                },
+            ),
+            Op::InsertBefore(anchor, ch) => self.insert_before(
+                id,
+                CausalInsert {
+                    extra_dependencies: node.extra_dependencies,
+                    anchor,
+                    ch,
+                },
+            ),
+            Op::Remove(nodes) => self.remove_nodes(
+                id,
+                CausalRemove {
+                    extra_dependencies: node.extra_dependencies,
+                    nodes,
+                },
+            ),
         }
 
-        self.add_individual_node(node.clone());
-
-        // For superseding roots, we need to consider all dependencies (op + extra)
-        let dependencies = BTreeSet::from_iter(node.dependencies());
-        let superseded_roots = Vec::from_iter(
-            self.roots
-                .iter()
-                .filter(|r| dependencies.contains(*r))
-                .copied(),
-        );
-
-        for r in superseded_roots {
-            self.roots.remove(&r);
+        for tip in op_dependencies {
+            self.tips.remove(&tip);
         }
-
-        self.roots.insert(id);
+        self.tips.insert(id);
 
         let orphans = std::mem::take(&mut self.orphaned);
 
@@ -752,15 +498,33 @@ impl HashSeq {
         // Simple merge: decompress all nodes from other and apply them
         // The apply function will rebuild runs when possible
 
-        // Collect all nodes from individual_nodes
-        for (_id, node) in other.individual_nodes {
-            self.apply(node);
+        for (id, root) in other.root_nodes {
+            let node = HashNode {
+                extra_dependencies: root.extra_dependencies,
+                op: Op::InsertRoot(root.ch),
+            };
+            debug_assert_eq!(id, node.id());
+            self.apply(node)
+        }
+        for (id, causal_insert) in other.before_nodes {
+            let node = HashNode {
+                extra_dependencies: causal_insert.extra_dependencies,
+                op: Op::InsertBefore(causal_insert.anchor, causal_insert.ch),
+            };
+            debug_assert_eq!(id, node.id());
+            self.apply(node)
+        }
+        for (id, causal_remove) in other.remove_nodes {
+            let node = HashNode {
+                extra_dependencies: causal_remove.extra_dependencies,
+                op: Op::Remove(causal_remove.nodes),
+            };
+            debug_assert_eq!(id, node.id());
+            self.apply(node)
         }
 
-        // Collect all nodes from runs by decompressing them
         for (_run_id, run) in other.runs {
-            let nodes = run.decompress();
-            for node in nodes {
+            for node in run.decompress() {
                 self.apply(node);
             }
         }
@@ -776,7 +540,9 @@ impl HashSeq {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
-        self.iter_ids().filter_map(|id| self.get_node_char(&id))
+        self.iter_ids().map(|id| self.get_node_char(id))
+
+        // self.index.iter().map(|id| self.get_node_char(&id).unwrap())
     }
 }
 
@@ -793,6 +559,17 @@ mod test {
         seq.insert(2, 'c');
 
         assert_eq!(seq.iter().collect::<String>(), "abc");
+    }
+
+    #[test]
+    fn test_insert_after_before() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a');
+        seq.insert(0, 'b');
+        seq.insert(1, 'c');
+
+        assert_eq!(String::from_iter(seq.iter()), "bca");
     }
 
     #[test]
@@ -850,11 +627,9 @@ mod test {
         // insert_batch("ab") followed by insert_batch("cd")
         // This verifies that runs are collapsed identically
 
-        let test_string = "abcd";
-
         // Insert entire string as one batch
         let mut seq_single_batch = HashSeq::default();
-        seq_single_batch.insert_batch(0, test_string.chars());
+        seq_single_batch.insert_batch(0, "abcd".chars());
 
         // Insert as two separate batches
         let mut seq_split_batch = HashSeq::default();
@@ -863,63 +638,21 @@ mod test {
 
         // Verify internal structure is identical
         assert_eq!(
-            seq_single_batch.runs.len(),
-            seq_split_batch.runs.len(),
-            "Number of runs should be identical"
-        );
-        assert_eq!(
-            seq_single_batch.individual_nodes.len(),
-            seq_split_batch.individual_nodes.len(),
-            "Number of individual nodes should be identical"
-        );
-        assert_eq!(
             seq_single_batch.runs, seq_split_batch.runs,
             "Runs should be identical"
         );
         assert_eq!(
-            seq_single_batch.individual_nodes, seq_split_batch.individual_nodes,
-            "Individual nodes should be identical"
+            seq_single_batch.topo, seq_split_batch.topo,
+            "Topo tree should be identical"
         );
         assert_eq!(
-            seq_single_batch.roots, seq_split_batch.roots,
-            "Roots should be identical"
+            seq_single_batch.tips, seq_split_batch.tips,
+            "Tips should be identical"
         );
 
         // Verify output is also the same
-        assert_eq!(seq_single_batch.iter().collect::<String>(), test_string);
-        assert_eq!(seq_split_batch.iter().collect::<String>(), test_string);
-
-        // Test with longer strings and different split points
-        let long_string = "hello world";
-
-        let mut seq1 = HashSeq::default();
-        seq1.insert_batch(0, long_string.chars());
-
-        let mut seq2 = HashSeq::default();
-        seq2.insert_batch(0, "hello ".chars());
-        seq2.insert_batch(6, "world".chars());
-
-        // Verify internal structure matches
-        assert_eq!(
-            seq1.runs, seq2.runs,
-            "Runs should be identical for split 'hello world'"
-        );
-        assert_eq!(seq1.individual_nodes, seq2.individual_nodes);
-        assert_eq!(seq1.iter().collect::<String>(), long_string);
-        assert_eq!(seq2.iter().collect::<String>(), long_string);
-
-        // Test with three batches
-        let mut seq3 = HashSeq::default();
-        seq3.insert_batch(0, "hel".chars());
-        seq3.insert_batch(3, "lo ".chars());
-        seq3.insert_batch(6, "world".chars());
-
-        assert_eq!(
-            seq1.runs, seq3.runs,
-            "Runs should be identical for three-way split"
-        );
-        assert_eq!(seq1.individual_nodes, seq3.individual_nodes);
-        assert_eq!(seq3.iter().collect::<String>(), long_string);
+        assert_eq!(seq_single_batch.iter().collect::<String>(), "abcd");
+        assert_eq!(seq_split_batch.iter().collect::<String>(), "abcd");
     }
 
     #[test]
@@ -940,34 +673,8 @@ mod test {
 
         // Verify internal structures are identical
         assert_eq!(seq1.runs, seq2.runs, "Runs should be identical");
-        assert_eq!(
-            seq1.individual_nodes, seq2.individual_nodes,
-            "Individual nodes should be identical"
-        );
-        assert_eq!(seq1.roots, seq2.roots, "Roots should be identical");
-    }
-
-    #[test]
-    fn test_no_individual_insert_after_ops() {
-        // Test that all InsertAfter operations are stored in runs, never as individual nodes
-        let mut seq = HashSeq::default();
-        seq.insert(0, 'a');
-        seq.insert(1, 'b');
-        seq.insert(2, 'c');
-        seq.insert(3, 'd');
-
-        // Verify no individual nodes contain InsertAfter operations
-        for (_id, node) in seq.individual_nodes.iter() {
-            assert!(
-                !matches!(node.op, Op::InsertAfter(_, _)),
-                "Found InsertAfter in individual_nodes: {:?}",
-                node
-            );
-        }
-
-        // Verify we have runs and roots
-        assert!(!seq.runs.is_empty(), "Should have runs for InsertAfter ops");
-        assert_eq!(seq.individual_nodes.len(), 1, "Should only have root node");
+        assert_eq!(seq1.tips, seq2.tips, "Tips should be identical");
+        assert_eq!(seq1.topo, seq2.topo, "Topo should be identical");
     }
 
     #[test]
@@ -986,18 +693,14 @@ mod test {
             "Runs should be identical after merge"
         );
         assert_eq!(
-            seq_with_abcd.individual_nodes, empty_seq.individual_nodes,
-            "Individual nodes should be identical after merge"
-        );
-        assert_eq!(
-            seq_with_abcd.roots, empty_seq.roots,
-            "Roots should be identical after merge"
+            seq_with_abcd.tips, empty_seq.tips,
+            "tips should be identical after merge"
         );
 
         // Verify the structure is as expected:
         // - Should have 1 root node for 'a'
         assert_eq!(
-            seq_with_abcd.individual_nodes.len(),
+            seq_with_abcd.root_nodes.len(),
             1,
             "Should have 1 individual node (root 'a')"
         );
@@ -1008,16 +711,8 @@ mod test {
         assert_eq!(run.run, "bcd", "Run should contain 'bcd'");
 
         // Verify the text is correct
-        assert_eq!(
-            seq_with_abcd.iter().collect::<String>(),
-            "abcd",
-            "Text should be 'abcd'"
-        );
-        assert_eq!(
-            empty_seq.iter().collect::<String>(),
-            "abcd",
-            "Merged seq should also have 'abcd'"
-        );
+        assert_eq!(seq_with_abcd.iter().collect::<String>(), "abcd");
+        assert_eq!(empty_seq.iter().collect::<String>(), "abcd");
     }
 
     #[quickcheck]
@@ -1085,9 +780,14 @@ mod test {
         }
 
         // Verify internal structures are identical
-        seq1.runs == seq2.runs
-            && seq1.individual_nodes == seq2.individual_nodes
-            && seq1.roots == seq2.roots
+        assert_eq!(seq1.runs, seq2.runs);
+        assert_eq!(seq1.root_nodes, seq2.root_nodes);
+        assert_eq!(seq1.before_nodes, seq2.before_nodes);
+        assert_eq!(seq1.remove_nodes, seq2.remove_nodes);
+        assert_eq!(seq1.topo, seq2.topo);
+        assert_eq!(seq1.tips, seq2.tips);
+
+        true
     }
 
     #[test]
@@ -1097,17 +797,16 @@ mod test {
         // Single characters should create individual nodes
         seq.insert(0, 'x');
         assert_eq!(seq.runs.len(), 0);
-        assert_eq!(seq.individual_nodes.len(), 1);
+        assert_eq!(seq.root_nodes.len(), 1);
 
         // Multi-character batch should create a run
         seq.insert_batch(1, "abc".chars());
         assert_eq!(seq.runs.len(), 1);
-        assert_eq!(seq.individual_nodes.len(), 1);
+        assert_eq!(seq.root_nodes.len(), 1);
 
         // Verify the run contains the right data
         let run = seq.runs.values().next().unwrap();
         assert_eq!(run.run, "abc");
-        assert_eq!(run.len(), 3);
 
         // Verify the final string
         assert_eq!(&seq.iter().collect::<String>(), "xabc");
@@ -1123,7 +822,7 @@ mod test {
 
         // Should create one run
         assert_eq!(seq.runs.len(), 1);
-        assert_eq!(seq.individual_nodes.len(), 1);
+        assert_eq!(seq.root_nodes.len(), 1);
 
         let run = seq.runs.values().next().unwrap();
         assert_eq!(run.len(), long_string.len() - 1); // First char becomes a root (not included in run)
@@ -1156,10 +855,7 @@ mod test {
         seq_a.merge(seq_b);
 
         let merged = seq_a.iter().collect::<String>();
-        assert!(
-            &merged == "hello my name is zameenadavid"
-                || &merged == "hello my name is davidzameena"
-        );
+        assert_eq!(merged, "hello my name is zameenadavid");
     }
 
     #[test]
@@ -1175,6 +871,20 @@ mod test {
 
         seq_a.merge(seq_b);
         assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
+    }
+
+    #[test]
+    fn test_common_prefix_is_deduplicated_simple_2() {
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+
+        seq_a.insert_batch(0, "aaab".chars());
+        seq_b.insert_batch(0, "aaac".chars());
+
+        seq_a.merge(seq_b);
+
+        let merged = seq_a.iter().collect::<String>();
+        assert_eq!(merged, "aaabc");
     }
 
     #[test]
@@ -1772,7 +1482,7 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert(0, 'a');
         seq.insert(0, 'b');
-        let removed = seq.iter_ids().nth(1).unwrap();
+        let removed = seq.iter_ids().nth(1).copied().unwrap();
         seq.remove(1);
 
         seq.apply(HashNode {
@@ -1829,7 +1539,7 @@ mod test {
                     // remove
                     if !seq_a.is_empty() {
                         let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(seq_a.iter_ids().nth(idx).unwrap());
+                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
                         seq_a.remove(idx);
                     }
                 }
@@ -1847,7 +1557,7 @@ mod test {
                     // remove
                     if !seq_b.is_empty() {
                         let idx = idx.min(seq_b.len() - 1);
-                        removed.insert(seq_b.iter_ids().nth(idx).unwrap());
+                        removed.insert(*seq_b.iter_ids().nth(idx).unwrap());
                         seq_b.remove(idx);
                     }
                 }
@@ -1903,7 +1613,7 @@ mod test {
                 false => {
                     if !seq_a.is_empty() {
                         let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(seq_a.iter_ids().nth(idx).unwrap());
+                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
                         seq_a.remove(idx);
                     }
                 }
@@ -1920,7 +1630,7 @@ mod test {
                 false => {
                     if !seq_b.is_empty() {
                         let idx = idx.min(seq_b.len() - 1);
-                        removed.insert(seq_b.iter_ids().nth(idx).unwrap());
+                        removed.insert(*seq_b.iter_ids().nth(idx).unwrap());
                         seq_b.remove(idx);
                     }
                 }
@@ -1983,7 +1693,7 @@ mod test {
                 false => {
                     if !seq_a.is_empty() {
                         let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(seq_a.iter_ids().nth(idx).unwrap());
+                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
                         seq_a.remove(idx);
                     }
                 }
@@ -2000,7 +1710,7 @@ mod test {
                 false => {
                     if !seq_b.is_empty() {
                         let idx = idx.min(seq_b.len() - 1);
-                        removed.insert(seq_b.iter_ids().nth(idx).unwrap());
+                        removed.insert(*seq_b.iter_ids().nth(idx).unwrap());
                         seq_b.remove(idx);
                     }
                 }
@@ -2064,7 +1774,7 @@ mod test {
                 false => {
                     if !seq_a.is_empty() {
                         let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(seq_a.iter_ids().nth(idx).unwrap());
+                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
                         seq_a.remove(idx);
                     }
                 }
@@ -2082,7 +1792,7 @@ mod test {
                     if !seq_b.is_empty() {
                         let idx = idx.min(seq_b.len() - 1);
                         let removed_id = seq_b.iter_ids().nth(idx).unwrap();
-                        removed.insert(removed_id);
+                        removed.insert(*removed_id);
                         seq_b.remove(idx);
                     }
                 }
@@ -2149,28 +1859,6 @@ mod test {
     }
 
     #[test]
-    fn test_hash_collision_check() {
-        use crate::hash_node::hash_op;
-        use std::collections::BTreeSet;
-
-        let id_176 = [
-            176u8, 0, 196, 149, 199, 28, 222, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-
-        let op1 = Op::InsertRoot('\0');
-        let op2 = Op::InsertBefore(id_176, '\0');
-
-        let hash1 = hash_op(&op1, &BTreeSet::new());
-        let hash2 = hash_op(&op2, &BTreeSet::new());
-
-        assert_ne!(
-            hash1, hash2,
-            "These operations should have different hashes!"
-        );
-    }
-
-    #[test]
     fn test_prop_commutative_run_vs_individual() {
         // Failing case: ([], [(true, 0, '\0'), (true, 0, '\0'), (true, 1, '\0'), (true, 2, '\0')])
         // Seq A: empty
@@ -2197,8 +1885,8 @@ mod test {
         // Compare content and IDs
         let merge_a_b_content: Vec<char> = merge_a_b.iter().collect();
         let merge_b_a_content: Vec<char> = merge_b_a.iter().collect();
-        let merge_a_b_ids: Vec<Id> = merge_a_b.iter_ids().collect();
-        let merge_b_a_ids: Vec<Id> = merge_b_a.iter_ids().collect();
+        let merge_a_b_ids: Vec<&Id> = merge_a_b.iter_ids().collect();
+        let merge_b_a_ids: Vec<&Id> = merge_b_a.iter_ids().collect();
         assert_eq!(merge_a_b_content, merge_b_a_content);
         assert_eq!(merge_a_b_ids, merge_b_a_ids);
         assert_eq!(merge_a_b, merge_b_a);
@@ -2228,5 +1916,55 @@ mod test {
         merge_b_a.merge(seq_a.clone());
 
         assert_eq!(merge_a_b, merge_b_a);
+    }
+
+    #[test]
+    fn test_run_equivalent_to_spans_qc1() {
+        // Simplified test case: insert one character at position 0
+        let mut seq = HashSeq::default();
+        seq.insert(0, '\0');
+
+        // Verify runs and spans are equivalent
+        assert_eq!(seq.runs.len(), seq.topo.spans.len());
+        for (run_id, run) in &seq.runs {
+            assert!(seq.topo.spans.contains_key(run_id));
+            let span = &seq.topo.spans[run_id];
+            assert_eq!(run.len(), span.span.len());
+            let run_nodes = run.decompress();
+            for (node, span_id) in run_nodes.iter().zip(&span.span) {
+                assert_eq!(&node.id(), span_id);
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn prop_run_equivalent_to_spans(ops: Vec<(bool, u8, char)>) -> bool {
+        // Build a HashSeq from random operations
+        let mut seq = HashSeq::default();
+        for (is_insert, idx, ch) in ops {
+            let idx = idx as usize % (seq.len() + 1);
+            if is_insert {
+                seq.insert(idx, ch);
+            } else if !seq.is_empty() {
+                let idx = idx % seq.len();
+                seq.remove(idx);
+            }
+
+            assert_eq!(&seq.tips, seq.topo.roots());
+            // TODO: add assert for insert befores equivalance
+
+            assert_eq!(seq.runs.len(), seq.topo.spans.len());
+            for (run_id, run) in &seq.runs {
+                assert!(seq.topo.spans.contains_key(run_id));
+                let span = &seq.topo.spans[run_id];
+                assert_eq!(run.len(), span.span.len());
+                let run_nodes = run.decompress();
+                for (node, span_id) in run_nodes.iter().zip(&span.span) {
+                    assert_eq!(&node.id(), span_id);
+                }
+            }
+        }
+
+        true
     }
 }

@@ -65,20 +65,20 @@ impl Op {
             }
             Op::InsertAfter(n, c) => {
                 hasher.update(b"after");
-                hasher.update(n);
+                hasher.update(&n.0);
                 hasher.update(b"$");
                 hasher.update(&(*c as u32).to_le_bytes());
             }
             Op::InsertBefore(n, c) => {
                 hasher.update(b"before");
-                hasher.update(n);
+                hasher.update(&n.0);
                 hasher.update(b"$");
                 hasher.update(&(*c as u32).to_le_bytes());
             }
             Op::Remove(n) => {
                 hasher.update(b"remove");
                 for node_id in n {
-                    hasher.update(node_id);
+                    hasher.update(&node_id.0);
                 }
             }
         }
@@ -103,7 +103,7 @@ impl HashNode {
             sha3.update(b"extra_deps");
             for dep in self.extra_dependencies.iter() {
                 sha3.update(b"$");
-                sha3.update(dep);
+                sha3.update(&dep.0);
             }
 
             sha3.update(b"op");
@@ -111,7 +111,7 @@ impl HashNode {
             sha3.update(b"done");
 
             sha3.finalize(&mut hash);
-            return hash;
+            Id(hash);
         }
 
         #[cfg(feature = "blake3-hash")]
@@ -121,7 +121,7 @@ impl HashNode {
             hasher.update(b"extra_deps");
             for dep in self.extra_dependencies.iter() {
                 hasher.update(b"$");
-                hasher.update(dep);
+                hasher.update(&dep.0);
             }
 
             hasher.update(b"op");
@@ -129,7 +129,7 @@ impl HashNode {
             hasher.update(b"done");
 
             let hash = hasher.finalize();
-            *hash.as_bytes()
+            Id(*hash.as_bytes())
         }
 
         #[cfg(feature = "fast-hash")]
@@ -143,7 +143,7 @@ impl HashNode {
             // Convert u64 to [u8; 32] by padding with zeros
             let mut id = [0u8; 32];
             id[..8].copy_from_slice(&hash_u64.to_le_bytes());
-            id
+            Id(id)
         }
     }
 
@@ -167,71 +167,11 @@ impl HashNode {
         hasher.update(b"extra_deps");
         for dep in self.extra_dependencies.iter() {
             hasher.update(b"$");
-            hasher.update(dep);
+            hasher.update(&dep.0);
         }
 
         hasher.update(b"op");
         self.op.hash_update(hasher);
         hasher.update(b"done");
-    }
-}
-
-/// Generate a hash ID for an operation with given extra dependencies
-pub fn hash_op(op: &Op, extra_dependencies: &BTreeSet<Id>) -> Id {
-    #[cfg(feature = "sha3-hash")]
-    {
-        use tiny_keccak::Hasher;
-        let mut sha3 = tiny_keccak::Sha3::v256();
-        let mut hash = [0u8; 32];
-
-        sha3.update(b"extra_deps");
-        for dep in extra_dependencies.iter() {
-            sha3.update(b"$");
-            sha3.update(dep);
-        }
-
-        sha3.update(b"op");
-        op.hash_update(&mut sha3);
-        sha3.update(b"done");
-
-        sha3.finalize(&mut hash);
-        return hash;
-    }
-
-    #[cfg(feature = "blake3-hash")]
-    {
-        let mut hasher = blake3::Hasher::new();
-
-        hasher.update(b"extra_deps");
-        for dep in extra_dependencies.iter() {
-            hasher.update(b"$");
-            hasher.update(dep);
-        }
-
-        hasher.update(b"op");
-        op.hash_update(&mut hasher);
-        hasher.update(b"done");
-
-        let hash = hasher.finalize();
-        *hash.as_bytes()
-    }
-
-    #[cfg(feature = "fast-hash")]
-    {
-        use std::hash::Hash;
-        use std::hash::Hasher;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-        // Hash extra dependencies
-        extra_dependencies.hash(&mut hasher);
-        // Hash the operation
-        op.hash(&mut hasher);
-
-        let hash_u64 = hasher.finish();
-
-        // Convert u64 to [u8; 32] by padding with zeros
-        let mut id = [0u8; 32];
-        id[..8].copy_from_slice(&hash_u64.to_le_bytes());
-        id
     }
 }
