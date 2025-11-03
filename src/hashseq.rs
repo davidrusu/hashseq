@@ -129,7 +129,7 @@ impl HashSeq {
                     op: Op::InsertAfter(left_id, first_ch),
                 };
 
-                if self.topo.is_causally_before(&left_id, &right_id) && first_node.id() > right_id {
+                if self.topo.is_causally_before(&left_id, &right_id) {
                     // Using InsertAfter for the first node doesn't work.
                     // use InsertBefore right_id instead
                     let mut extra_dependencies = self.tips.clone();
@@ -1296,37 +1296,15 @@ mod test {
 
     #[test]
     fn test_prop_vec_model_qc3() {
-        let mut model = Vec::new();
         let mut seq = HashSeq::default();
 
-        for (insert_or_remove, idx, elem) in [
-            (true, 0, 'c'),
-            (true, 1, 'c'),
-            (true, 2, 'c'),
-            (false, 1, 'c'),
-            (true, 1, 'b'),
-        ] {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    model.insert(idx.min(model.len()), elem);
-                    seq.insert(idx.min(seq.len()), elem);
-                }
-                false => {
-                    // remove
-                    assert_eq!(seq.is_empty(), model.is_empty());
-                    if !seq.is_empty() {
-                        model.remove(idx.min(model.len() - 1));
-                        seq.remove(idx.min(seq.len() - 1));
-                    }
-                }
-            }
-        }
+        seq.insert(0, 'c'); // "c"
+        seq.insert(1, 'c'); // "cc"
+        seq.insert(2, 'c'); // "ccc"
+        seq.remove(1); // "cc"
+        seq.insert(1, 'b'); // "cbc"
 
-        assert_eq!(seq.iter().collect::<Vec<_>>(), model);
-        assert_eq!(seq.len(), model.len());
-        assert_eq!(seq.is_empty(), model.is_empty());
+        assert_eq!(seq.iter().collect::<String>(), "cbc");
     }
 
     #[test]
