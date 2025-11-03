@@ -295,13 +295,12 @@ impl HashSeq {
             self.index.find(&after.anchor).map(|p| p + 1)
         };
 
-        if let Some(run_pos) = self.run_index.get(&after.anchor).copied()
-            && after.extra_dependencies.is_empty()
-        {
+        if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
             // We are inserting after a node that is in a run.
             // need to decide if we can extend the run or if we need to split it
             if self.runs[&run_pos.run_id].len() == run_pos.position + 1
                 && self.topo.after(&after.anchor).is_empty()
+                && after.extra_dependencies.is_empty()
             {
                 // we are inserting at the end of a run, we can safely extend the run
                 self.runs.get_mut(&run_pos.run_id).unwrap().extend(after.ch);
@@ -313,21 +312,22 @@ impl HashSeq {
                     },
                 );
             } else {
-                let run = self.runs.get_mut(&run_pos.run_id).unwrap();
-                let right_run = run.split_at(run_pos.position + 1);
-                debug_assert_eq!(run.last_id(), after.anchor);
-                // re-index the right run
-                for (idx, node) in right_run.decompress().into_iter().enumerate() {
-                    self.run_index.insert(
-                        node.id(),
-                        RunPosition {
-                            run_id: right_run.first_id(),
-                            position: idx,
-                        },
-                    );
+                if run_pos.position + 1 < self.runs[&run_pos.run_id].len() {
+                    let run = self.runs.get_mut(&run_pos.run_id).unwrap();
+                    let right_run = run.split_at(run_pos.position + 1);
+                    debug_assert_eq!(run.last_id(), after.anchor);
+                    // re-index the right run
+                    for (idx, node) in right_run.decompress().into_iter().enumerate() {
+                        self.run_index.insert(
+                            node.id(),
+                            RunPosition {
+                                run_id: right_run.first_id(),
+                                position: idx,
+                            },
+                        );
+                    }
+                    self.runs.insert(right_run.first_id(), right_run);
                 }
-                self.runs.insert(right_run.first_id(), right_run);
-
                 self.runs.insert(
                     id,
                     Run::new(after.anchor, after.extra_dependencies.clone(), after.ch),
@@ -1161,6 +1161,31 @@ mod test {
         seq.insert(2, '\0');
         seq.remove(0);
         seq.insert(1, '\0');
+
+        // merge(a, a) == a
+        let mut merge_self = seq.clone();
+        merge_self.merge(seq.clone());
+
+        assert_eq!(merge_self, seq);
+    }
+
+    #[test]
+    fn test_reflexive_regression() {
+        // Regression test from quickcheck failure:
+        // [(true, 0, '\0'), (true, 1, '\0'), (false, 0, '\0'), (true, 1, '\0')]
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a'); // op 1: idx=0, len=0 -> insert at 0
+        dbg!(&seq.run_index, &seq.removed_inserts);
+
+        seq.insert(1, 'b'); // op 2: idx=1, len=1 -> insert at 1
+        dbg!(&seq.run_index, &seq.removed_inserts);
+
+        seq.remove(0); // op 3: idx=0, len=2 -> remove at 0
+        dbg!(&seq.run_index, &seq.removed_inserts);
+
+        seq.insert(1, 'c'); // op 4: idx=1, len=1 -> insert at 1
+        dbg!(&seq.run_index, &seq.removed_inserts);
 
         // merge(a, a) == a
         let mut merge_self = seq.clone();
@@ -2011,6 +2036,35 @@ mod test {
                 assert_eq!(&node.id(), span_id);
             }
         }
+    }
+
+    #[test]
+    fn test_run_equivalent_to_spans_regression() {
+        // Regression test from quickcheck failure:
+        // [(true, 0, '\0'), (true, 0, '\0'), (true, 0, '\0'), (false, 0, '\0'),
+        //  (true, 0, '\0'), (true, 0, '\0'), (false, 0, '\0'), (true, 0, '\0'),
+        //  (true, 152, '\0'), (true, 183, '\0'), (false, 52, '\0'), (true, 255, '\0')]
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a'); // a
+        seq.insert(0, 'b'); // ba
+        seq.insert(0, 'c'); // cba
+        seq.remove(0); // ba
+        seq.insert(0, 'd'); // dba
+        seq.insert(0, 'e'); // edba
+        seq.remove(0); // dba
+        seq.insert(0, 'f'); // fdba
+        seq.insert(2, 'g'); // fdgba
+        seq.insert(3, 'h'); // fdghba
+        dbg!(&seq);
+        seq.remove(3); // fdgba
+        dbg!(&seq);
+        seq.insert(3, 'i'); // fdgiba
+        dbg!(&seq);
+
+        assert_eq!(String::from_iter(seq.iter()), "fdgiba");
+
+        assert_eq!(seq.runs.len(), seq.topo.spans.len());
     }
 
     #[quickcheck]
