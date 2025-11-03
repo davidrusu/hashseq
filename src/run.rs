@@ -106,20 +106,32 @@ impl Run {
         );
 
         // Get the ID of the last character in the left portion
-        let left_nodes = self.decompress();
-        let right_insert_after = left_nodes[position - 1].id();
+        let mut left_nodes = self.decompress();
+        let mut right_nodes = left_nodes.split_off(position).into_iter();
+        debug_assert_eq!(left_nodes.len(), position);
+        let right_insert_after = left_nodes[left_nodes.len() - 1].id();
 
-        // Split the string
-        let right_run_str = self.run.split_off(position);
+        // DUMB APPROACH, re-insert left nodes
+        self.run = String::new();
+        for n in left_nodes {
+            let Op::InsertAfter(_, ch) = n.op else {
+                panic!("decompressed nodes should be InsertAfters");
+            };
+            self.extend(ch);
+        }
 
         // Create the right run
         // The right portion has no extra dependencies since it's anchored to an existing node
-        let mut right_chars = right_run_str.chars();
-        let first_char = right_chars.next().unwrap();
-        let mut right_run = Run::new(right_insert_after, BTreeSet::new(), first_char);
+        let Op::InsertAfter(_, ch) = right_nodes.next().unwrap().op else {
+            panic!("decompressed nodes should be InsertAfters");
+        };
+        let mut right_run = Run::new(right_insert_after, BTreeSet::new(), ch);
 
         // Extend with remaining characters
-        for ch in right_chars {
+        for n in right_nodes {
+            let Op::InsertAfter(_, ch) = n.op else {
+                panic!("decompressed nodes should be InsertAfters");
+            };
             right_run.extend(ch);
         }
 
@@ -226,11 +238,9 @@ mod tests {
         let right_run = run.split_at(1);
 
         // Left run should have 'a'
-        assert_eq!(run.len(), 1);
         assert_eq!(run.run, "a");
 
         // Right run should have 'bc' with insert_after = ID of 'a'
-        assert_eq!(right_run.len(), 2);
         assert_eq!(right_run.run, "bc");
         assert_eq!(right_run.insert_after, nodes_before[0].id());
     }

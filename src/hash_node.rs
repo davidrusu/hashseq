@@ -86,11 +86,12 @@ impl Op {
 }
 
 impl HashNode {
-    pub fn dependencies(&self) -> impl Iterator<Item = Id> + '_ {
+    pub fn dependencies(&self) -> Vec<Id> {
         self.extra_dependencies
             .iter()
             .copied()
             .chain(self.op.dependencies())
+            .collect()
     }
 
     pub fn id(&self) -> Id {

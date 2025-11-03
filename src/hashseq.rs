@@ -62,6 +62,7 @@ impl HashSeq {
     /// Check if a node ID exists (either in runs or individual nodes)
     pub fn contains_node(&self, id: &Id) -> bool {
         self.root_nodes.contains_key(id)
+            || self.remove_nodes.contains_key(id)
             || self.before_nodes.contains_key(id)
             || self.run_index.contains_key(id)
     }
@@ -248,8 +249,8 @@ impl HashSeq {
         self.apply(node);
     }
 
-    fn any_missing_dependencies(&self, deps: &BTreeSet<Id>) -> bool {
-        for dep in deps.iter() {
+    fn any_missing_dependencies<'a>(&self, deps: impl IntoIterator<Item = &'a Id>) -> bool {
+        for dep in deps {
             if !self.contains_node(dep) {
                 return true;
             }
@@ -282,9 +283,12 @@ impl HashSeq {
     }
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
-        let position = if let Some(next_node) = BTreeSet::from_iter(self.topo.after(&after.anchor))
-            .range(id..)
-            .find(|id| !self.removed_inserts.contains(**id))
+        dbg!((id, &after, &self));
+
+        let position = if let Some(next_node) =
+            BTreeSet::from_iter(dbg!(self.topo.after(&after.anchor)))
+                .range(id..)
+                .find(|id| !self.removed_inserts.contains(**id))
         {
             // new node is inserted just before the other node after our anchor node that is
             // bigger than the new node
@@ -293,34 +297,37 @@ impl HashSeq {
             // otherwise the new node is inserted after our anchor node (unless it has been removed)
             self.index.find(&after.anchor).map(|p| p + 1)
         };
+        dbg!(&position);
 
-        if let Some(RunPosition { run_id, position }) = self.run_index.get(&after.anchor).copied()
+        if let Some(run_pos) = self.run_index.get(&after.anchor).copied()
             && after.extra_dependencies.is_empty()
         {
             // We are inserting after a node that is in a run.
             // need to decide if we can extend the run or if we need to split it
-            if self.runs[&run_id].len() == position + 1 && self.topo.after(&after.anchor).is_empty()
+            if self.runs[&run_pos.run_id].len() == run_pos.position + 1
+                && self.topo.after(&after.anchor).is_empty()
             {
                 // we are inserting at the end of a run, we can safely extend the run
-                self.runs.get_mut(&run_id).unwrap().extend(after.ch);
+                self.runs.get_mut(&run_pos.run_id).unwrap().extend(after.ch);
                 self.run_index.insert(
                     id,
                     RunPosition {
-                        run_id,
-                        position: position + 1,
+                        run_id: run_pos.run_id,
+                        position: run_pos.position + 1,
                     },
                 );
             } else {
-                let run = self.runs.get_mut(&run_id).unwrap();
-                let right_run = run.split_at(position + 1);
+                dbg!((id, &after, &self));
+                let run = self.runs.get_mut(&run_pos.run_id).unwrap();
+                let right_run = run.split_at(run_pos.position + 1);
                 debug_assert_eq!(run.last_id(), after.anchor);
                 // re-index the right run
-                for (position, node) in right_run.decompress().into_iter().enumerate() {
+                for (idx, node) in right_run.decompress().into_iter().enumerate() {
                     self.run_index.insert(
                         node.id(),
                         RunPosition {
                             run_id: right_run.first_id(),
-                            position,
+                            position: idx,
                         },
                     );
                 }
@@ -441,10 +448,8 @@ impl HashSeq {
             return; // Already processed this node
         }
 
-        // Only check operation dependencies, not extra_dependencies
-        // Extra dependencies are for topological ordering but shouldn't block insertion
-        let op_dependencies = node.op.dependencies();
-        if self.any_missing_dependencies(&op_dependencies) {
+        let dependencies = node.dependencies();
+        if self.any_missing_dependencies(&dependencies) {
             self.orphaned.insert(node);
             return;
         }
@@ -482,14 +487,12 @@ impl HashSeq {
             ),
         }
 
-        for tip in op_dependencies {
+        for tip in dependencies {
             self.tips.remove(&tip);
         }
         self.tips.insert(id);
 
-        let orphans = std::mem::take(&mut self.orphaned);
-
-        for orphan in orphans {
+        for orphan in std::mem::take(&mut self.orphaned) {
             self.apply(orphan);
         }
     }
@@ -506,6 +509,13 @@ impl HashSeq {
             debug_assert_eq!(id, node.id());
             self.apply(node)
         }
+
+        for (_run_id, run) in other.runs {
+            for node in run.decompress() {
+                self.apply(node);
+            }
+        }
+
         for (id, causal_insert) in other.before_nodes {
             let node = HashNode {
                 extra_dependencies: causal_insert.extra_dependencies,
@@ -514,6 +524,7 @@ impl HashSeq {
             debug_assert_eq!(id, node.id());
             self.apply(node)
         }
+
         for (id, causal_remove) in other.remove_nodes {
             let node = HashNode {
                 extra_dependencies: causal_remove.extra_dependencies,
@@ -521,12 +532,6 @@ impl HashSeq {
             };
             debug_assert_eq!(id, node.id());
             self.apply(node)
-        }
-
-        for (_run_id, run) in other.runs {
-            for node in run.decompress() {
-                self.apply(node);
-            }
         }
 
         // Apply all orphaned nodes
@@ -1150,6 +1155,29 @@ mod test {
         assert_eq!(merge_self, seq);
     }
 
+    #[test]
+    fn test_reflexive_merge_with_remove() {
+        // Failing case: [(true, 0, '\0'), (true, 1, '\u{80}'), (true, 2, '\0'), (false, 0, '\0'), (true, 1, '\0')]
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, '\0');
+        dbg!(&seq);
+        seq.insert(1, '\u{80}');
+        dbg!(&seq);
+        seq.insert(2, '\0');
+        dbg!(&seq);
+        seq.remove(0);
+        dbg!(&seq);
+        seq.insert(1, '\0');
+        dbg!(&seq);
+
+        // merge(a, a) == a
+        let mut merge_self = seq.clone();
+        merge_self.merge(seq.clone());
+
+        assert_eq!(merge_self, seq);
+    }
+
     #[quickcheck]
     fn prop_commutative(a: Vec<(bool, u8, char)>, b: Vec<(bool, u8, char)>) {
         let mut seq_a = HashSeq::default();
@@ -1303,6 +1331,8 @@ mod test {
         seq.insert(2, 'c'); // "ccc"
         seq.remove(1); // "cc"
         seq.insert(1, 'b'); // "cbc"
+
+        dbg!(&seq);
 
         assert_eq!(seq.iter().collect::<String>(), "cbc");
     }
@@ -1708,6 +1738,52 @@ mod test {
                 extra_dependencies: BTreeSet::new(),
             });
         }
+
+        let mut iter_a = seq_a.iter_ids();
+        let mut iter_b = seq_b.iter_ids();
+        let mut next_a = iter_a.next();
+        let mut next_b = iter_b.next();
+
+        for id in merged.iter_ids() {
+            if Some(id) == next_a {
+                next_a = iter_a.next();
+            }
+            if Some(id) == next_b {
+                next_b = iter_b.next();
+            }
+        }
+
+        assert_eq!(next_a, None);
+        assert_eq!(next_b, None);
+    }
+
+    #[test]
+    fn test_order_is_stable_remove_then_insert() {
+        // Failing case: a = [], b = [(true, 0, '\0'), (true, 1, '\0'), (true, 2, '\0'), (false, 2, '\0'), (true, 2, '\u{97}')]
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+
+        // seq_a remains empty (a = [])
+
+        // seq_b operations:
+        seq_b.insert(0, '\0');
+        seq_b.insert(1, '\0');
+        seq_b.insert(2, '\0');
+
+        // (false, 2, '\0') - remove at index 2
+        let removed_id = *seq_b.iter_ids().nth(2).unwrap();
+        seq_b.remove(2);
+
+        // (true, 2, '\u{97}') - insert at index 2
+        seq_b.insert(2, '\u{97}');
+
+        let mut merged = seq_a.clone();
+        merged.merge(seq_b.clone());
+
+        seq_a.apply(HashNode {
+            op: Op::Remove(BTreeSet::from_iter([removed_id])),
+            extra_dependencies: BTreeSet::new(),
+        });
 
         let mut iter_a = seq_a.iter_ids();
         let mut iter_b = seq_b.iter_ids();
