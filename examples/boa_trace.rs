@@ -174,12 +174,12 @@ fn main() {
 
     // Estimate memory usage based on internal data structures
     let runs_count = seq.runs.len();
-    let individual_nodes_count = seq.individual_nodes.len();
+    let individual_nodes_count = seq.root_nodes.len() + seq.before_nodes.len() + seq.remove_nodes.len();
     let total_elements_in_runs: usize = seq.runs.values().map(|r| r.len()).sum();
     let removed_count = seq.removed_inserts.len();
 
     println!("Runs in HashSeq: {runs_count}");
-    println!("Individual nodes: {individual_nodes_count}");
+    println!("Individual nodes (roots + before_nodes + remove_nodes): {individual_nodes_count}");
     println!("Total elements in runs: {total_elements_in_runs}");
     println!("Removed inserts: {removed_count}");
 
