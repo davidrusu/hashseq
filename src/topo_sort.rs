@@ -86,12 +86,12 @@ impl Topo {
         self.roots.insert(node);
     }
 
-    pub fn add_after(&mut self, anchor: Id, node: Id) {
+    pub fn add_after(&mut self, anchor: Id, node: Id, has_deps: bool) {
         match self.span_index.get(&anchor) {
             Some(span_id) => {
                 // the anchor is already part of a span
                 let span = self.spans.get_mut(span_id).unwrap();
-                if span.last() == &anchor && !self.afters.contains_key(&anchor) {
+                if span.last() == &anchor && !self.afters.contains_key(&anchor) && !has_deps {
                     // we can extend the span
                     span.span.push(node);
                     self.span_index.insert(node, *span_id);
@@ -280,7 +280,7 @@ mod tests {
         let mut topo = Topo::default();
 
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(1), false);
 
         let removed = Default::default();
         let mut iter = topo.iter(&removed);
@@ -291,7 +291,7 @@ mod tests {
         let mut topo = Topo::default();
 
         topo.add_root(n(1));
-        topo.add_after(n(1), n(0));
+        topo.add_after(n(1), n(0), false);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
@@ -304,8 +304,8 @@ mod tests {
         let mut topo = Topo::default();
 
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
-        topo.add_after(n(0), n(2));
+        topo.add_after(n(0), n(1), false);
+        topo.add_after(n(0), n(2), false);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
@@ -318,7 +318,7 @@ mod tests {
         let mut topo = Topo::default();
 
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(1), false);
         topo.add_before(n(1), n(2));
 
         assert_eq!(topo.after(&n(0)), vec![&n(1)]);
@@ -354,10 +354,10 @@ mod tests {
         let mut topo = Topo::default();
 
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
-        topo.add_after(n(1), n(4));
-        topo.add_after(n(0), n(2));
-        topo.add_after(n(2), n(3));
+        topo.add_after(n(0), n(1), false);
+        topo.add_after(n(1), n(4), false);
+        topo.add_after(n(0), n(2), false);
+        topo.add_after(n(2), n(3), false);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
@@ -377,8 +377,8 @@ mod tests {
 
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(2));
-        topo.add_after(n(0), n(3));
+        topo.add_after(n(0), n(2), false);
+        topo.add_after(n(0), n(3), false);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
@@ -408,8 +408,8 @@ mod tests {
 
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(2));
-        topo.add_after(n(0), n(3));
+        topo.add_after(n(0), n(2), false);
+        topo.add_after(n(0), n(3), false);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
@@ -428,8 +428,8 @@ mod tests {
     fn test_adding_smaller_vertex_at_fork() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(2));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(2), false);
+        topo.add_after(n(0), n(1), false);
 
         assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2)]);
 
@@ -443,9 +443,9 @@ mod tests {
     fn test_adding_smaller_vertex_at_full_fork() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(2));
-        topo.add_after(n(0), n(3));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(2), false);
+        topo.add_after(n(0), n(3), false);
+        topo.add_after(n(0), n(1), false);
 
         assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2), &n(3)]);
         assert!(topo.after(&n(1)).is_empty());
@@ -462,12 +462,12 @@ mod tests {
     fn test_adding_concurrent_middle_vertex() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
-        topo.add_after(n(0), n(3));
+        topo.add_after(n(0), n(1), false);
+        topo.add_after(n(0), n(3), false);
 
         assert_eq!(topo.after(&n(0)), vec![&n(1), &n(3)]);
 
-        topo.add_after(n(0), n(2));
+        topo.add_after(n(0), n(2), false);
 
         assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2), &n(3)]);
 
@@ -481,12 +481,12 @@ mod tests {
     fn test_adding_concurrent_bigger_vertex() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
-        topo.add_after(n(0), n(2));
+        topo.add_after(n(0), n(1), false);
+        topo.add_after(n(0), n(2), false);
 
         assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2)]);
 
-        topo.add_after(n(0), n(3));
+        topo.add_after(n(0), n(3), false);
 
         assert_eq!(topo.after(&n(0)), vec![&n(1), &n(2), &n(3)]);
 
@@ -548,7 +548,7 @@ mod tests {
     fn test_insert_between_root_and_element() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(1), false);
         topo.add_before(n(1), n(2));
 
         assert_eq!(
@@ -561,7 +561,7 @@ mod tests {
     fn test_insert_between_root_and_element_twice() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(1), false);
         topo.add_before(n(1), n(2));
         topo.add_before(n(1), n(3));
 
@@ -588,7 +588,7 @@ mod tests {
     fn test_concurrent_inserts_with_run() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(1), false);
         topo.add_root(n(2));
 
         assert_eq!(topo.after(&n(0)), vec![&n(1)]);
@@ -601,7 +601,7 @@ mod tests {
         let mut topo_different_order = Topo::default();
         topo_different_order.add_root(n(2));
         topo_different_order.add_root(n(0));
-        topo_different_order.add_after(n(0), n(1));
+        topo_different_order.add_after(n(0), n(1), false);
 
         assert_eq!(topo, topo_different_order);
     }
@@ -657,9 +657,9 @@ mod tests {
     fn test_concurrent_prepend_and_append_seperated_by_a_node() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
+        topo.add_after(n(0), n(1), false);
         topo.add_before(n(1), n(2));
-        topo.add_after(n(0), n(3));
+        topo.add_after(n(0), n(3), false);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),
@@ -668,8 +668,8 @@ mod tests {
 
         let mut topo_reverse_order = Topo::default();
         topo_reverse_order.add_root(n(0));
-        topo_reverse_order.add_after(n(0), n(3));
-        topo_reverse_order.add_after(n(0), n(1));
+        topo_reverse_order.add_after(n(0), n(3), false);
+        topo_reverse_order.add_after(n(0), n(1), false);
         topo_reverse_order.add_before(n(1), n(2));
 
         assert_eq!(topo, topo_reverse_order);
@@ -679,12 +679,12 @@ mod tests {
     fn test_span_split() {
         let mut topo = Topo::default();
         topo.add_root(n(0));
-        topo.add_after(n(0), n(1));
-        topo.add_after(n(1), n(2));
-        topo.add_after(n(2), n(3));
-        topo.add_after(n(3), n(4));
-        topo.add_after(n(2), n(5));
-        topo.add_after(n(5), n(6));
+        topo.add_after(n(0), n(1), false);
+        topo.add_after(n(1), n(2), false);
+        topo.add_after(n(2), n(3), false);
+        topo.add_after(n(3), n(4), false);
+        topo.add_after(n(2), n(5), false);
+        topo.add_after(n(5), n(6), false);
 
         assert_eq!(
             Vec::from_iter(topo.iter(&Default::default())),

@@ -283,12 +283,9 @@ impl HashSeq {
     }
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
-        dbg!((id, &after, &self));
-
-        let position = if let Some(next_node) =
-            BTreeSet::from_iter(dbg!(self.topo.after(&after.anchor)))
-                .range(id..)
-                .find(|id| !self.removed_inserts.contains(**id))
+        let position = if let Some(next_node) = BTreeSet::from_iter(self.topo.after(&after.anchor))
+            .range(id..)
+            .find(|id| !self.removed_inserts.contains(**id))
         {
             // new node is inserted just before the other node after our anchor node that is
             // bigger than the new node
@@ -297,7 +294,6 @@ impl HashSeq {
             // otherwise the new node is inserted after our anchor node (unless it has been removed)
             self.index.find(&after.anchor).map(|p| p + 1)
         };
-        dbg!(&position);
 
         if let Some(run_pos) = self.run_index.get(&after.anchor).copied()
             && after.extra_dependencies.is_empty()
@@ -317,7 +313,6 @@ impl HashSeq {
                     },
                 );
             } else {
-                dbg!((id, &after, &self));
                 let run = self.runs.get_mut(&run_pos.run_id).unwrap();
                 let right_run = run.split_at(run_pos.position + 1);
                 debug_assert_eq!(run.last_id(), after.anchor);
@@ -335,7 +330,7 @@ impl HashSeq {
 
                 self.runs.insert(
                     id,
-                    Run::new(after.anchor, after.extra_dependencies, after.ch),
+                    Run::new(after.anchor, after.extra_dependencies.clone(), after.ch),
                 );
                 self.run_index.insert(
                     id,
@@ -349,7 +344,7 @@ impl HashSeq {
             // Either anchor is not a run, or we can't extend from it for some reason, start a new run
             self.runs.insert(
                 id,
-                Run::new(after.anchor, after.extra_dependencies, after.ch),
+                Run::new(after.anchor, after.extra_dependencies.clone(), after.ch),
             );
             self.run_index.insert(
                 id,
@@ -360,7 +355,8 @@ impl HashSeq {
             );
         }
 
-        self.topo.add_after(after.anchor, id);
+        self.topo
+            .add_after(after.anchor, id, !after.extra_dependencies.is_empty());
 
         let position = position.unwrap_or_else(|| {
             // fall back to iterating over the entire sequence if the anchor node has been removed
@@ -1161,15 +1157,10 @@ mod test {
         let mut seq = HashSeq::default();
 
         seq.insert(0, '\0');
-        dbg!(&seq);
         seq.insert(1, '\u{80}');
-        dbg!(&seq);
         seq.insert(2, '\0');
-        dbg!(&seq);
         seq.remove(0);
-        dbg!(&seq);
         seq.insert(1, '\0');
-        dbg!(&seq);
 
         // merge(a, a) == a
         let mut merge_self = seq.clone();
@@ -1331,8 +1322,6 @@ mod test {
         seq.insert(2, 'c'); // "ccc"
         seq.remove(1); // "cc"
         seq.insert(1, 'b'); // "cbc"
-
-        dbg!(&seq);
 
         assert_eq!(seq.iter().collect::<String>(), "cbc");
     }
@@ -1991,6 +1980,39 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_run_equivalent_to_spans_removal_split() {
+        // Failing case extracted from prop test:
+        // [(true, 0, '\0'), (true, 0, '\0'), (true, 5, '\0'), (false, 0, '\0'), (false, 0, '\0'), (true, 15, '\0')]
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'a'); // a
+        seq.insert(0, 'b'); // ba
+        seq.insert(2, 'c'); // bac
+        seq.remove(0); // ac
+        seq.remove(0); // c
+        seq.insert(1, 'd'); // cd
+
+        assert_eq!(String::from_iter(seq.iter()), "cd");
+
+        dbg!(&seq);
+
+        assert_eq!(
+            &BTreeSet::from_iter(seq.root_nodes.keys().copied()),
+            seq.topo.roots()
+        );
+        assert_eq!(seq.runs.len(), seq.topo.spans.len());
+        for (run_id, run) in &seq.runs {
+            assert!(seq.topo.spans.contains_key(run_id));
+            let span = &seq.topo.spans[run_id];
+            assert_eq!(run.len(), span.span.len());
+            let run_nodes = run.decompress();
+            for (node, span_id) in run_nodes.iter().zip(&span.span) {
+                assert_eq!(&node.id(), span_id);
+            }
+        }
+    }
+
     #[quickcheck]
     fn prop_run_equivalent_to_spans(ops: Vec<(bool, u8, char)>) -> bool {
         // Build a HashSeq from random operations
@@ -2004,7 +2026,10 @@ mod test {
                 seq.remove(idx);
             }
 
-            assert_eq!(&seq.tips, seq.topo.roots());
+            assert_eq!(
+                &BTreeSet::from_iter(seq.root_nodes.keys().copied()),
+                seq.topo.roots()
+            );
             // TODO: add assert for insert befores equivalance
 
             assert_eq!(seq.runs.len(), seq.topo.spans.len());
