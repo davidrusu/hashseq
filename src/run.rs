@@ -67,9 +67,18 @@ impl Run {
         nodes
     }
 
+    pub fn first_node(&self) -> HashNode {
+        let mut chars = self.run.chars();
+        let first = chars.next().unwrap(); // we always have at least one char in the run
+        HashNode {
+            extra_dependencies: self.first_extra_deps.clone(),
+            op: Op::InsertAfter(self.insert_after, first),
+        }
+    }
+
     /// Get the ID of the first character in the run
     pub fn first_id(&self) -> Id {
-        self.decompress()[0].id()
+        self.first_node().id()
     }
 
     /// Get the ID of the last character in the run

@@ -133,19 +133,27 @@ fn main() {
     let trace_start = Instant::now();
     let mut seq = HashSeq::default();
 
-    for (i, event) in trace.iter().enumerate() {
-        if i % 50000 == 0 && i > 0 {
-            let elapsed = trace_start.elapsed();
-            let rate = i as f64 / elapsed.as_secs_f64();
-            println!("Progress: {}/{} ({:.0} edits/sec)", i, trace.len(), rate);
-        }
-
-        match event {
-            Trace::Insert(idx, c) => {
-                seq.insert_batch(*idx, c.chars());
+    let repeats = 10;
+    for n in 0..repeats {
+        for (i, event) in trace.iter().enumerate() {
+            if i % 50000 == 0 && i > 0 {
+                let elapsed = trace_start.elapsed();
+                let rate = (i + trace.len() * n) as f64 / elapsed.as_secs_f64();
+                println!(
+                    "Progress: {}/{} ({:.0} edits/sec)",
+                    (i + trace.len() * n),
+                    trace.len() * repeats,
+                    rate
+                );
             }
-            Trace::Delete(idx) => {
-                seq.remove(*idx);
+
+            match event {
+                Trace::Insert(idx, c) => {
+                    seq.insert_batch(*idx, c.chars());
+                }
+                Trace::Delete(idx) => {
+                    seq.remove(*idx);
+                }
             }
         }
     }
@@ -154,7 +162,7 @@ fn main() {
     println!("Trace applied in: {trace_elapsed:?}");
     println!(
         "Average: {:.0} edits/sec",
-        trace.len() as f64 / trace_elapsed.as_secs_f64()
+        (trace.len() * repeats) as f64 / trace_elapsed.as_secs_f64()
     );
 
     // Verify the result
@@ -174,7 +182,8 @@ fn main() {
 
     // Estimate memory usage based on internal data structures
     let runs_count = seq.runs.len();
-    let individual_nodes_count = seq.root_nodes.len() + seq.before_nodes.len() + seq.remove_nodes.len();
+    let individual_nodes_count =
+        seq.root_nodes.len() + seq.before_nodes.len() + seq.remove_nodes.len();
     let total_elements_in_runs: usize = seq.runs.values().map(|r| r.len()).sum();
     let removed_count = seq.removed_inserts.len();
 

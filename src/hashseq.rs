@@ -36,10 +36,10 @@ pub struct HashSeq {
     pub topo: Topo,
 
     // Hybrid storage: runs for sequential elements, individual nodes for complex operations
-    pub runs: BTreeMap<Id, Run>,
+    pub runs: HashMap<Id, Run>,
     pub root_nodes: BTreeMap<Id, CausalRoot>,
-    pub before_nodes: BTreeMap<Id, CausalInsert>,
-    pub remove_nodes: BTreeMap<Id, CausalRemove>,
+    pub before_nodes: HashMap<Id, CausalInsert>,
+    pub remove_nodes: HashMap<Id, CausalRemove>,
 
     // ID resolution index for O(1) lookup of any node
     pub run_index: HashMap<Id, RunPosition>,
@@ -407,18 +407,19 @@ impl HashSeq {
         {
             let run = self.runs.get_mut(&run_pos.run_id).unwrap();
             let right_run = run.split_at(run_pos.position);
-            debug_assert_eq!(right_run.first_id(), before.anchor);
+            let right_run_id = right_run.first_id();
+            debug_assert_eq!(right_run_id, before.anchor);
             // re-index the right run
             for (idx, node) in right_run.decompress().into_iter().enumerate() {
                 self.run_index.insert(
                     node.id(),
                     RunPosition {
-                        run_id: right_run.first_id(),
+                        run_id: right_run_id,
                         position: idx,
                     },
                 );
             }
-            self.runs.insert(right_run.first_id(), right_run);
+            self.runs.insert(right_run_id, right_run);
         }
 
         self.topo.add_before(before.anchor, id);
