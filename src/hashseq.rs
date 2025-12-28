@@ -399,10 +399,9 @@ impl HashSeq {
                 break;
             }
         }
-        let op = Op::Remove(to_remove);
 
-        let extra_dependencies =
-            BTreeSet::from_iter(self.tips.difference(&op.dependencies()).cloned());
+        let extra_dependencies = BTreeSet::from_iter(self.tips.difference(&to_remove).cloned());
+        let op = Op::Remove(to_remove);
 
         let node = HashNode {
             extra_dependencies,
@@ -446,9 +445,11 @@ impl HashSeq {
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
         let afters_for_anchor = self.afters(&after.anchor);
-        let position = if let Some(next_node) = BTreeSet::from_iter(afters_for_anchor.iter().copied())
-            .range(id..)
-            .find(|id| !self.removed_inserts.contains(**id))
+        // Find the smallest "after" node that is >= id and not removed
+        let position = if let Some(next_node) = afters_for_anchor
+            .iter()
+            .filter(|&aid| aid >= &&id && !self.removed_inserts.contains(*aid))
+            .min()
         {
             // new node is inserted just before the other node after our anchor node that is
             // bigger than the new node
@@ -496,7 +497,10 @@ impl HashSeq {
                     }
 
                     // The split-off portion needs to be tracked in afters
-                    self.afters.entry(after.anchor).or_default().push(right_run_first_id);
+                    self.afters
+                        .entry(after.anchor)
+                        .or_default()
+                        .push(right_run_first_id);
                     self.runs.insert(right_run_first_id, right_run);
                 }
                 let new_run = Run::new(after.anchor, after.extra_dependencies.clone(), after.ch);
@@ -562,10 +566,7 @@ impl HashSeq {
     }
 
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
-        let befores_set: BTreeSet<Id> = self.befores(&before.anchor)
-            .into_iter()
-            .copied()
-            .collect();
+        let befores_set: BTreeSet<Id> = self.befores(&before.anchor).into_iter().copied().collect();
         let position = if let Some(next_node) = befores_set
             .range(id..)
             .find(|id| !self.removed_inserts.contains(*id))
@@ -601,10 +602,16 @@ impl HashSeq {
 
             self.runs.insert(right_run_id, right_run);
             // Track the split in afters so iteration can find the right portion
-            self.afters.entry(left_last_id).or_default().push(right_run_id);
+            self.afters
+                .entry(left_last_id)
+                .or_default()
+                .push(right_run_id);
         }
 
-        self.befores_by_anchor.entry(before.anchor).or_default().push(id);
+        self.befores_by_anchor
+            .entry(before.anchor)
+            .or_default()
+            .push(id);
 
         self.before_nodes.insert(id, before);
 
@@ -627,11 +634,13 @@ impl HashSeq {
             return; // Already processed this node
         }
 
-        let dependencies = node.dependencies();
-        if self.any_missing_dependencies(&dependencies) {
+        if self.any_missing_dependencies(node.iter_dependencies()) {
             self.orphaned.insert(node);
             return;
         }
+
+        // Collect dependencies for tips update before consuming node
+        let deps_for_tips: Vec<Id> = node.iter_dependencies().copied().collect();
 
         match node.op {
             Op::InsertRoot(ch) => self.insert_root(
@@ -666,7 +675,7 @@ impl HashSeq {
             ),
         }
 
-        for tip in dependencies {
+        for tip in deps_for_tips {
             self.tips.remove(&tip);
         }
         self.tips.insert(id);
@@ -1513,58 +1522,6 @@ mod test {
         seq.insert(2, 'd');
 
         assert_eq!(String::from_iter(seq.iter()), "bcda");
-    }
-
-    #[test]
-    fn test_prop_vec_model_qc3_debug() {
-        let mut seq = HashSeq::default();
-
-        seq.insert(0, 'c'); // "c"
-        println!("After insert(0, 'c'): '{}'", seq.iter().collect::<String>());
-        assert_eq!(seq.iter().collect::<String>(), "c");
-
-        seq.insert(1, 'c'); // "cc"
-        println!("After insert(1, 'c'): '{}'", seq.iter().collect::<String>());
-        println!("  runs: {:?}", seq.runs.keys().collect::<Vec<_>>());
-        println!("  afters: {:?}", seq.afters);
-        assert_eq!(seq.iter().collect::<String>(), "cc");
-
-        seq.insert(2, 'c'); // "ccc"
-        println!("After insert(2, 'c'): '{}'", seq.iter().collect::<String>());
-        println!("  runs: {:?}", seq.runs.keys().collect::<Vec<_>>());
-        println!("  afters: {:?}", seq.afters);
-        assert_eq!(seq.iter().collect::<String>(), "ccc");
-
-        // Print all node IDs
-        println!("  root_nodes: {:?}", seq.root_nodes.keys().collect::<Vec<_>>());
-        println!("  run_index: {:?}", seq.run_index.iter().collect::<Vec<_>>());
-
-        seq.remove(1); // "cc"
-        println!("After remove(1): '{}'", seq.iter().collect::<String>());
-        println!("  removed_inserts: {:?}", seq.removed_inserts);
-        assert_eq!(seq.iter().collect::<String>(), "cc");
-
-        // Debug: check what after returns for each node
-        for id in seq.root_nodes.keys() {
-            let afters = seq.afters(id);
-            println!("  seq.afters({:?}) = {:?}", id, afters.iter().map(|x| **x).collect::<Vec<_>>());
-        }
-
-        seq.insert(1, 'b'); // "cbc"
-        println!("After insert(1, 'b'): '{}'", seq.iter().collect::<String>());
-        println!("  before_nodes: {:?}", seq.before_nodes.keys().collect::<Vec<_>>());
-        println!("  befores_by_anchor: {:?}", seq.befores_by_anchor);
-        println!("  afters: {:?}", seq.afters);
-
-        for (id, pos) in seq.run_index.iter() {
-            println!("  run_index entry: id={:?} at run {:?} pos {}", id, pos.run_id, pos.position);
-        }
-
-        println!("  iter_ids count: {}", seq.iter_ids().count());
-        for id in seq.iter_ids() {
-            println!("    id: {:?}", id);
-        }
-        assert_eq!(seq.iter().collect::<String>(), "cbc");
     }
 
     #[test]

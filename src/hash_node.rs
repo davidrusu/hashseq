@@ -19,12 +19,23 @@ pub struct HashNode {
 }
 
 impl Op {
-    pub fn dependencies(&self) -> BTreeSet<Id> {
-        match &self {
-            Op::InsertRoot(_) => BTreeSet::new(),
-            Op::InsertAfter(dep, _) | Op::InsertBefore(dep, _) => BTreeSet::from_iter([*dep]),
-            Op::Remove(deps) => deps.clone(),
+    /// Returns the primary dependency if this op has one (avoids allocation)
+    fn primary_dep(&self) -> Option<&Id> {
+        match self {
+            Op::InsertRoot(_) => None,
+            Op::InsertAfter(dep, _) | Op::InsertBefore(dep, _) => Some(dep),
+            Op::Remove(_) => None,
         }
+    }
+
+    /// Returns iterator over remove dependencies (for Remove ops only)
+    fn remove_deps(&self) -> impl Iterator<Item = &Id> {
+        match self {
+            Op::Remove(deps) => Some(deps.iter()),
+            _ => None,
+        }
+        .into_iter()
+        .flatten()
     }
 
     #[cfg(feature = "sha3-hash")]
@@ -86,12 +97,12 @@ impl Op {
 }
 
 impl HashNode {
-    pub fn dependencies(&self) -> Vec<Id> {
+    /// Iterate over all dependencies without allocation
+    pub fn iter_dependencies(&self) -> impl Iterator<Item = &Id> {
         self.extra_dependencies
             .iter()
-            .copied()
-            .chain(self.op.dependencies())
-            .collect()
+            .chain(self.op.primary_dep())
+            .chain(self.op.remove_deps())
     }
 
     pub fn id(&self) -> Id {
