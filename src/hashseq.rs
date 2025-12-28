@@ -68,11 +68,11 @@ impl<'a> Iterator for TopoIter<'a> {
                         }
                     }
                 }
-                // Return reference from the nodes set
-                if let Some(id_ref) = self.seq.nodes.get(&n)
-                    && !self.seq.removed_inserts.contains(id_ref)
-                {
-                    return Some(id_ref);
+                // Return reference from existing data structures
+                if !self.seq.removed_inserts.contains(&n) {
+                    if let Some(id_ref) = self.seq.get_id_ref(&n) {
+                        return Some(id_ref);
+                    }
                 }
             }
         }
@@ -107,9 +107,6 @@ pub struct CausalRoot {
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
-    // All node IDs for stable reference storage (used by TopoIter)
-    pub nodes: BTreeSet<Id>,
-
     // Hybrid storage: runs for sequential elements, individual nodes for complex operations
     pub runs: HashMap<Id, Run>,
     pub root_nodes: BTreeMap<Id, CausalRoot>,
@@ -178,6 +175,24 @@ impl HashSeq {
 
     pub fn orphans(&self) -> &HashSet<HashNode> {
         &self.orphaned
+    }
+
+    /// Get a stable reference to an Id from existing data structures.
+    /// Used by TopoIter to return references without a separate nodes set.
+    fn get_id_ref(&self, id: &Id) -> Option<&Id> {
+        // Try root_nodes first (BTreeMap gives us key references)
+        if let Some((id_ref, _)) = self.root_nodes.get_key_value(id) {
+            return Some(id_ref);
+        }
+        // Try before_nodes
+        if let Some((id_ref, _)) = self.before_nodes.get_key_value(id) {
+            return Some(id_ref);
+        }
+        // Try run_index (covers all run elements)
+        if let Some((id_ref, _)) = self.run_index.get_key_value(id) {
+            return Some(id_ref);
+        }
+        None
     }
 
     /// Get nodes that come after this one. Uses both explicit afters and run data.
@@ -429,7 +444,6 @@ impl HashSeq {
 
     fn insert_root_with_known_position(&mut self, id: Id, root: CausalRoot, position: usize) {
         self.index.insert(position, id);
-        self.nodes.insert(id);  // For TopoIter reference storage
         self.root_nodes.insert(id, root);
     }
 
@@ -495,7 +509,6 @@ impl HashSeq {
 
                     // The split-off portion needs to be tracked in afters
                     self.afters.entry(after.anchor).or_default().push(right_run_first_id);
-                    self.nodes.insert(right_run_first_id);
                     self.runs.insert(right_run_first_id, right_run);
                     self.run_elements.insert(right_run_first_id, right_elements);
                 }
@@ -533,13 +546,8 @@ impl HashSeq {
         };
 
         // Only add to afters if this is a fork (not a run extension)
-        if is_run_extension {
-            // For run extensions, just add to nodes (no afters entry needed)
-            self.nodes.insert(id);
-        } else {
-            // For forks, add to both afters and nodes
+        if !is_run_extension {
             self.afters.entry(after.anchor).or_default().push(id);
-            self.nodes.insert(id);
         }
 
         let position = position.unwrap_or_else(|| {
@@ -623,10 +631,8 @@ impl HashSeq {
             self.run_elements.insert(right_run_id, right_elements);
             // Track the split in afters so iteration can find the right portion
             self.afters.entry(left_last_id).or_default().push(right_run_id);
-            self.nodes.insert(right_run_id);
         }
 
-        self.nodes.insert(id);
         self.befores_by_anchor.entry(before.anchor).or_default().push(id);
 
         self.before_nodes.insert(id, before);
@@ -849,10 +855,6 @@ mod test {
             "Runs should be identical"
         );
         assert_eq!(
-            seq_single_batch.nodes, seq_split_batch.nodes,
-            "Topo tree should be identical"
-        );
-        assert_eq!(
             seq_single_batch.tips, seq_split_batch.tips,
             "Tips should be identical"
         );
@@ -881,7 +883,6 @@ mod test {
         // Verify internal structures are identical
         assert_eq!(seq1.runs, seq2.runs, "Runs should be identical");
         assert_eq!(seq1.tips, seq2.tips, "Tips should be identical");
-        assert_eq!(seq1.nodes, seq2.nodes, "Nodes should be identical");
     }
 
     #[test]
@@ -991,7 +992,6 @@ mod test {
         assert_eq!(seq1.root_nodes, seq2.root_nodes);
         assert_eq!(seq1.before_nodes, seq2.before_nodes);
         assert_eq!(seq1.remove_nodes, seq2.remove_nodes);
-        assert_eq!(seq1.nodes, seq2.nodes);
         assert_eq!(seq1.tips, seq2.tips);
 
         true
@@ -1583,13 +1583,10 @@ mod test {
         println!("After insert(1, 'b'): '{}'", seq.iter().collect::<String>());
         println!("  before_nodes: {:?}", seq.before_nodes.keys().collect::<Vec<_>>());
         println!("  befores_by_anchor: {:?}", seq.befores_by_anchor);
-        println!("  nodes: {:?}", seq.nodes.iter().collect::<Vec<_>>());
         println!("  afters: {:?}", seq.afters);
 
-        // Check if ef6 (the third c) is in nodes
         for (id, pos) in seq.run_index.iter() {
             println!("  run_index entry: id={:?} at run {:?} pos {}", id, pos.run_id, pos.position);
-            println!("    in nodes? {}", seq.nodes.contains(id));
         }
 
         println!("  iter_ids count: {}", seq.iter_ids().count());
