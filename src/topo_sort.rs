@@ -315,7 +315,7 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
                 // queue up any nodes who come after this one
                 if let Some(afters) = self.topo.afters.get(&n_internal) {
                     // Sort by the actual Id value, not IdInternal
-                    let mut afters_sorted: Vec<_> = afters.iter().copied().collect();
+                    let mut afters_sorted: Vec<_> = afters.to_vec();
                     afters_sorted.sort_by_key(|s| &self.topo.internal_to_id[*s as usize]);
                     for s_internal in afters_sorted.into_iter().rev() {
                         self.push_waiting(s_internal);

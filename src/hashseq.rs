@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use associative_positional_list::AssociativePositionalList;
-use serde::{Deserialize, Serialize};
 
 use crate::topo_sort::{Topo, TopoIter};
 use crate::{HashNode, Id, Op, Run};

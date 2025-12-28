@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use boa_engine::{Context, JsString, Source};
 use hashseq::HashSeq;
-use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<std::alloc::System> = &INSTRUMENTED_SYSTEM;

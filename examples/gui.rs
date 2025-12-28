@@ -266,36 +266,35 @@ mod hashseq_viz {
                 let padding = 8.0;
 
                 // Check if id IS a run
-                if let Some(run) = self.seq.runs.get(id) {
-                    if let Some(center) = nodes.get(id) {
-                        let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
-                        return Some(Point {
-                            x: center.x + width / 2.0,
-                            y: center.y,
-                        });
-                    }
+                if let Some(run) = self.seq.runs.get(id)
+                    && let Some(center) = nodes.get(id)
+                {
+                    let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
+                    return Some(Point {
+                        x: center.x + width / 2.0,
+                        y: center.y,
+                    });
                 }
                 // Check if id is INSIDE a run
-                if let Some(run_pos) = self.seq.run_index.get(id) {
-                    if let Some(run) = self.seq.runs.get(&run_pos.run_id) {
-                        if let Some(center) = nodes.get(&run.first_id()) {
-                            let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
-                            return Some(Point {
-                                x: center.x + width / 2.0,
-                                y: center.y,
-                            });
-                        }
-                    }
+                if let Some(run_pos) = self.seq.run_index.get(id)
+                    && let Some(run) = self.seq.runs.get(&run_pos.run_id)
+                    && let Some(center) = nodes.get(&run.first_id())
+                {
+                    let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
+                    return Some(Point {
+                        x: center.x + width / 2.0,
+                        y: center.y,
+                    });
                 }
                 // Check if id is a root node
-                if self.seq.root_nodes.contains_key(id) {
-                    if let Some(center) = nodes.get(id) {
-                        let width = char_width + padding * 2.0;
-                        return Some(Point {
-                            x: center.x + width / 2.0,
-                            y: center.y,
-                        });
-                    }
+                if self.seq.root_nodes.contains_key(id)
+                    && let Some(center) = nodes.get(id)
+                {
+                    let width = char_width + padding * 2.0;
+                    return Some(Point {
+                        x: center.x + width / 2.0,
+                        y: center.y,
+                    });
                 }
                 // For other individual nodes, use center position
                 get_node_pos(id, nodes)
@@ -308,36 +307,35 @@ mod hashseq_viz {
                 let padding = 8.0;
 
                 // Check if id IS a run
-                if let Some(run) = self.seq.runs.get(id) {
-                    if let Some(center) = nodes.get(id) {
-                        let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
-                        return Some(Point {
-                            x: center.x - width / 2.0,
-                            y: center.y,
-                        });
-                    }
+                if let Some(run) = self.seq.runs.get(id)
+                    && let Some(center) = nodes.get(id)
+                {
+                    let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
+                    return Some(Point {
+                        x: center.x - width / 2.0,
+                        y: center.y,
+                    });
                 }
                 // Check if id is INSIDE a run
-                if let Some(run_pos) = self.seq.run_index.get(id) {
-                    if let Some(run) = self.seq.runs.get(&run_pos.run_id) {
-                        if let Some(center) = nodes.get(&run.first_id()) {
-                            let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
-                            return Some(Point {
-                                x: center.x - width / 2.0,
-                                y: center.y,
-                            });
-                        }
-                    }
+                if let Some(run_pos) = self.seq.run_index.get(id)
+                    && let Some(run) = self.seq.runs.get(&run_pos.run_id)
+                    && let Some(center) = nodes.get(&run.first_id())
+                {
+                    let width = run.run.chars().count() as f32 * char_width + padding * 2.0;
+                    return Some(Point {
+                        x: center.x - width / 2.0,
+                        y: center.y,
+                    });
                 }
                 // Check if id is a root node
-                if self.seq.root_nodes.contains_key(id) {
-                    if let Some(center) = nodes.get(id) {
-                        let width = char_width + padding * 2.0;
-                        return Some(Point {
-                            x: center.x - width / 2.0,
-                            y: center.y,
-                        });
-                    }
+                if self.seq.root_nodes.contains_key(id)
+                    && let Some(center) = nodes.get(id)
+                {
+                    let width = char_width + padding * 2.0;
+                    return Some(Point {
+                        x: center.x - width / 2.0,
+                        y: center.y,
+                    });
                 }
                 // For other individual nodes, use center position
                 get_node_pos(id, nodes)
@@ -427,7 +425,6 @@ mod hashseq_viz {
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &state.node_pos) {
                         // Get all siblings (nodes before the same parent)
                         let siblings = self.seq.topo.before(parent);
-                        let num_siblings = siblings.len();
 
                         // Find this node's index among siblings
                         let mut sorted_siblings: Vec<Id> = siblings.iter().map(|&s| *s).collect();
@@ -672,9 +669,9 @@ mod hashseq_viz {
                                     } else {
                                         0.0
                                     }
-                                } else if self.seq.root_nodes.contains_key(id) {
-                                    char_width + padding * 2.0
-                                } else if self.seq.before_nodes.contains_key(id) {
+                                } else if self.seq.root_nodes.contains_key(id)
+                                    || self.seq.before_nodes.contains_key(id)
+                                {
                                     char_width + padding * 2.0
                                 } else {
                                     0.0 // Point node (no width)
