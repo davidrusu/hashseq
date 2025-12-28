@@ -1,7 +1,6 @@
 pub mod hash_node;
 pub mod hashseq;
 pub mod run;
-pub mod topo_sort;
 
 // pub mod bloom_tree;
 // pub mod bloom_tree_balanced;

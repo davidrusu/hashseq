@@ -85,40 +85,19 @@ fn is_causally_before(
 }
 
 #[derive(Debug, Clone)]
-pub struct TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
-    nodes: &'a BTreeSet<Id>,
+pub struct TopoIter<'a> {
+    seq: &'a HashSeq,
     waiting_stack: Vec<(Id, Vec<Id>)>,
-    removed: &'b HashSet<Id>,
-    afters: &'c HashMap<Id, Vec<Id>>,
-    befores: &'d HashMap<Id, Vec<Id>>,
-    run_index: &'e HashMap<Id, RunPosition>,
-    run_elements: &'f HashMap<Id, Vec<Id>>,
 }
 
-impl<'a, 'b, 'c, 'd, 'e, 'f> TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
-    pub fn new<'g, I>(
-        nodes: &'a BTreeSet<Id>,
-        roots: I,
-        removed: &'b HashSet<Id>,
-        afters: &'c HashMap<Id, Vec<Id>>,
-        befores: &'d HashMap<Id, Vec<Id>>,
-        run_index: &'e HashMap<Id, RunPosition>,
-        run_elements: &'f HashMap<Id, Vec<Id>>,
-    ) -> Self
-    where
-        I: IntoIterator<Item = &'g Id>,
-    {
+impl<'a> TopoIter<'a> {
+    fn new(seq: &'a HashSeq) -> Self {
         let mut iter = Self {
-            nodes,
+            seq,
             waiting_stack: Vec::new(),
-            removed,
-            afters,
-            befores,
-            run_index,
-            run_elements,
         };
 
-        let mut roots_vec: Vec<Id> = roots.into_iter().copied().collect();
+        let mut roots_vec: Vec<Id> = seq.root_nodes.keys().copied().collect();
         roots_vec.sort();
         for root in roots_vec.into_iter().rev() {
             iter.push_waiting(root);
@@ -128,7 +107,7 @@ impl<'a, 'b, 'c, 'd, 'e, 'f> TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
     }
 
     fn push_waiting(&mut self, n: Id) {
-        let mut deps: Vec<Id> = before_from_map(&n, self.befores)
+        let mut deps: Vec<Id> = before_from_map(&n, &self.seq.befores_by_anchor)
             .into_iter()
             .cloned()
             .collect();
@@ -138,7 +117,7 @@ impl<'a, 'b, 'c, 'd, 'e, 'f> TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
     }
 }
 
-impl<'a, 'b, 'c, 'd, 'e, 'f> Iterator for TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
+impl<'a> Iterator for TopoIter<'a> {
     type Item = &'a Id;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -153,18 +132,18 @@ impl<'a, 'b, 'c, 'd, 'e, 'f> Iterator for TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
                 let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
-                if let Some(afters) = self.afters.get(&n) {
+                if let Some(afters) = self.seq.afters.get(&n) {
                     // Sort by Id value
                     let mut afters_sorted: Vec<Id> = afters.clone();
                     afters_sorted.sort();
                     for s in afters_sorted.into_iter().rev() {
                         self.push_waiting(s);
                     }
-                } else if let Some(run_pos) = self.run_index.get(&n) {
+                } else if let Some(run_pos) = self.seq.run_index.get(&n) {
                     // Check if n is the first element of this run
                     if run_pos.position == 0 {
                         // Push remaining run elements (skip first which is n)
-                        if let Some(elements) = self.run_elements.get(&run_pos.run_id) {
+                        if let Some(elements) = self.seq.run_elements.get(&run_pos.run_id) {
                             for id in elements.iter().skip(1).rev() {
                                 // Use push_waiting to properly handle befores
                                 self.push_waiting(*id);
@@ -173,8 +152,8 @@ impl<'a, 'b, 'c, 'd, 'e, 'f> Iterator for TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
                     }
                 }
                 // Return reference from the nodes set
-                if let Some(id_ref) = self.nodes.get(&n)
-                    && !self.removed.contains(id_ref)
+                if let Some(id_ref) = self.seq.nodes.get(&n)
+                    && !self.seq.removed_inserts.contains(id_ref)
                 {
                     return Some(id_ref);
                 }
@@ -791,16 +770,8 @@ impl HashSeq {
         }
     }
 
-    pub fn iter_ids(&self) -> TopoIter<'_, '_, '_, '_, '_, '_> {
-        TopoIter::new(
-            &self.nodes,
-            self.root_nodes.keys(),
-            &self.removed_inserts,
-            &self.afters,
-            &self.befores_by_anchor,
-            &self.run_index,
-            &self.run_elements,
-        )
+    pub fn iter_ids(&self) -> TopoIter<'_> {
+        TopoIter::new(self)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
