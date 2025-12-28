@@ -1,3 +1,4 @@
+use hashseq::hashseq::{get_afters, before_from_map};
 use hashseq::HashSeq;
 use iced::widget::{button, checkbox, column, row, text};
 use iced::{Alignment, Element, Font, Length, Point, Rectangle, Sandbox, Settings, Theme};
@@ -396,7 +397,7 @@ mod hashseq_viz {
                         0.0
                     };
 
-                    let roots_vec: Vec<&Id> = self.seq.topo.roots().iter().collect();
+                    let roots_vec: Vec<&Id> = self.seq.root_nodes.keys().collect();
                     let target_pos = match pos_in_set(*id, roots_vec, &state.node_pos) {
                         Some(p) => Point { x: p.x, y: p.y + lane_offset },
                         None => Point { x: pos.x, y: bounds.height / 2.0 + lane_offset },
@@ -424,10 +425,10 @@ mod hashseq_viz {
                     let parent = &before_node.anchor;
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &state.node_pos) {
                         // Get all siblings (nodes before the same parent)
-                        let siblings = self.seq.topo.before(parent);
+                        let siblings = before_from_map(parent, &self.seq.befores_by_anchor);
 
                         // Find this node's index among siblings
-                        let mut sorted_siblings: Vec<Id> = siblings.iter().map(|&s| *s).collect();
+                        let mut sorted_siblings: Vec<Id> = siblings.into_iter().copied().collect();
                         sorted_siblings.sort();
                         let sibling_idx = sorted_siblings.iter().position(|s| s == id).unwrap_or(0);
 
@@ -505,7 +506,12 @@ mod hashseq_viz {
                         let parent = run.insert_after;
                         if let Some(p) = get_node_right_edge(&parent, &state.node_pos) {
                             // Check how many siblings this run has (concurrent branches from same parent)
-                            let siblings = self.seq.topo.after(&parent);
+                            let siblings = get_afters(
+                                &parent,
+                                &self.seq.afters,
+                                &self.seq.run_index,
+                                &self.seq.run_elements,
+                            );
                             let num_siblings = siblings.len();
 
                             // Find this run's index among siblings (sorted by Id for consistency)
@@ -710,7 +716,7 @@ mod hashseq_viz {
                             frame.fill_text(text);
 
                             // Draw "after" edges (green) - from right edge to left edge
-                            for (id, afters) in self.seq.topo.afters.iter() {
+                            for (id, afters) in self.seq.afters.iter() {
                                 let Some(from) = get_node_right_edge(id) else {
                                     continue;
                                 };
@@ -726,11 +732,11 @@ mod hashseq_viz {
                                 }
                             }
                             // Draw "before" edges (red) - from left edge to center of before node
-                            for (id, befores) in self.seq.topo.befores.iter() {
+                            for (id, befores) in self.seq.befores_by_anchor.iter() {
                                 let Some(from) = get_node_left_edge(id) else {
                                     continue;
                                 };
-                                for before in befores.iter() {
+                                for before in befores {
                                     let Some(to) = get_node_pos(before) else {
                                         continue;
                                     };

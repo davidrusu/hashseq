@@ -2,8 +2,186 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use associative_positional_list::AssociativePositionalList;
 
-use crate::topo_sort::{Topo, TopoIter};
 use crate::{HashNode, Id, Op, Run};
+
+/// Get nodes that come after this one. Uses both explicit afters and run data.
+pub fn get_afters<'a>(
+    id: &Id,
+    afters: &'a HashMap<Id, Vec<Id>>,
+    run_index: &'a HashMap<Id, RunPosition>,
+    run_elements: &'a HashMap<Id, Vec<Id>>,
+) -> Vec<&'a Id> {
+    match afters.get(id) {
+        Some(ns) => {
+            let mut result: Vec<&Id> = ns.iter().collect();
+            result.sort();
+            result
+        }
+        None => {
+            // Check if this node is in a run and not the last element
+            if let Some(run_pos) = run_index.get(id) {
+                if let Some(elements) = run_elements.get(&run_pos.run_id) {
+                    if run_pos.position + 1 < elements.len() {
+                        let next_id = &elements[run_pos.position + 1];
+                        // Look up the reference in run_index for stable lifetime
+                        if let Some((id_ref, _)) = run_index.get_key_value(next_id) {
+                            return vec![id_ref];
+                        }
+                    }
+                }
+            }
+            Vec::new()
+        }
+    }
+}
+
+pub fn before_from_map<'a>(id: &Id, befores: &'a HashMap<Id, Vec<Id>>) -> Vec<&'a Id> {
+    match befores.get(id) {
+        Some(ns) => {
+            let mut result: Vec<&Id> = ns.iter().collect();
+            result.sort();
+            result
+        }
+        None => Vec::new(),
+    }
+}
+
+fn is_causally_before(
+    a: &Id,
+    b: &Id,
+    afters: &HashMap<Id, Vec<Id>>,
+    befores: &HashMap<Id, Vec<Id>>,
+    run_index: &HashMap<Id, RunPosition>,
+    run_elements: &HashMap<Id, Vec<Id>>,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut boundary: Vec<Id> = get_afters(a, afters, run_index, run_elements)
+        .into_iter()
+        .cloned()
+        .collect();
+    while let Some(n) = boundary.pop() {
+        if &n == b {
+            return true;
+        }
+
+        seen.insert(n);
+        boundary.extend(
+            get_afters(&n, afters, run_index, run_elements)
+                .into_iter()
+                .cloned()
+                .filter(|x| !seen.contains(x)),
+        );
+        if &n != a {
+            boundary.extend(
+                before_from_map(&n, befores)
+                    .into_iter()
+                    .cloned()
+                    .filter(|x| !seen.contains(x)),
+            );
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Clone)]
+pub struct TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
+    nodes: &'a BTreeSet<Id>,
+    waiting_stack: Vec<(Id, Vec<Id>)>,
+    removed: &'b HashSet<Id>,
+    afters: &'c HashMap<Id, Vec<Id>>,
+    befores: &'d HashMap<Id, Vec<Id>>,
+    run_index: &'e HashMap<Id, RunPosition>,
+    run_elements: &'f HashMap<Id, Vec<Id>>,
+}
+
+impl<'a, 'b, 'c, 'd, 'e, 'f> TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
+    pub fn new<'g, I>(
+        nodes: &'a BTreeSet<Id>,
+        roots: I,
+        removed: &'b HashSet<Id>,
+        afters: &'c HashMap<Id, Vec<Id>>,
+        befores: &'d HashMap<Id, Vec<Id>>,
+        run_index: &'e HashMap<Id, RunPosition>,
+        run_elements: &'f HashMap<Id, Vec<Id>>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = &'g Id>,
+    {
+        let mut iter = Self {
+            nodes,
+            waiting_stack: Vec::new(),
+            removed,
+            afters,
+            befores,
+            run_index,
+            run_elements,
+        };
+
+        let mut roots_vec: Vec<Id> = roots.into_iter().copied().collect();
+        roots_vec.sort();
+        for root in roots_vec.into_iter().rev() {
+            iter.push_waiting(root);
+        }
+
+        iter
+    }
+
+    fn push_waiting(&mut self, n: Id) {
+        let mut deps: Vec<Id> = before_from_map(&n, self.befores)
+            .into_iter()
+            .cloned()
+            .collect();
+        deps.sort();
+        deps.reverse();
+        self.waiting_stack.push((n, deps));
+    }
+}
+
+impl<'a, 'b, 'c, 'd, 'e, 'f> Iterator for TopoIter<'a, 'b, 'c, 'd, 'e, 'f> {
+    type Item = &'a Id;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (_, deps) = self.waiting_stack.last_mut()?;
+
+            if let Some(dep) = deps.pop() {
+                // This node has dependencies that need to be
+                // released ahead of itself.
+                self.push_waiting(dep);
+            } else {
+                let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
+                // This node is free to be released, but first
+                // queue up any nodes who come after this one
+                if let Some(afters) = self.afters.get(&n) {
+                    // Sort by Id value
+                    let mut afters_sorted: Vec<Id> = afters.clone();
+                    afters_sorted.sort();
+                    for s in afters_sorted.into_iter().rev() {
+                        self.push_waiting(s);
+                    }
+                } else if let Some(run_pos) = self.run_index.get(&n) {
+                    // Check if n is the first element of this run
+                    if run_pos.position == 0 {
+                        // Push remaining run elements (skip first which is n)
+                        if let Some(elements) = self.run_elements.get(&run_pos.run_id) {
+                            for id in elements.iter().skip(1).rev() {
+                                // Use push_waiting to properly handle befores
+                                self.push_waiting(*id);
+                            }
+                        }
+                    }
+                }
+                // Return reference from the nodes set
+                if let Some(id_ref) = self.nodes.get(&n)
+                    && !self.removed.contains(id_ref)
+                {
+                    return Some(id_ref);
+                }
+            }
+        }
+    }
+}
 
 /// Location information for where a node ID can be found
 #[derive(Debug, Clone, Copy)]
@@ -33,16 +211,26 @@ pub struct CausalRoot {
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
-    pub topo: Topo,
+    // All node IDs for stable reference storage (used by TopoIter)
+    pub nodes: BTreeSet<Id>,
 
     // Hybrid storage: runs for sequential elements, individual nodes for complex operations
     pub runs: HashMap<Id, Run>,
     pub root_nodes: BTreeMap<Id, CausalRoot>,
     pub before_nodes: HashMap<Id, CausalInsert>,
+    // Reverse index: anchor -> list of nodes inserted before that anchor
+    pub befores_by_anchor: HashMap<Id, Vec<Id>>,
     pub remove_nodes: HashMap<Id, CausalRemove>,
 
     // ID resolution index for O(1) lookup of any node
     pub run_index: HashMap<Id, RunPosition>,
+
+    // Cache of decompressed run element IDs for O(1) lookup in get_afters
+    // Maps run_id -> list of element IDs in that run
+    pub run_elements: HashMap<Id, Vec<Id>>,
+
+    // Fork tracking: maps anchor ID to list of IDs that fork from it
+    pub afters: HashMap<Id, Vec<Id>>,
 
     pub removed_inserts: HashSet<Id>,
     pub(crate) tips: BTreeSet<Id>,
@@ -130,7 +318,14 @@ impl HashSeq {
                     op: Op::InsertAfter(left_id, first_ch),
                 };
 
-                if self.topo.is_causally_before(&left_id, &right_id) {
+                if is_causally_before(
+                    &left_id,
+                    &right_id,
+                    &self.afters,
+                    &self.befores_by_anchor,
+                    &self.run_index,
+                    &self.run_elements,
+                ) {
                     // Using InsertAfter for the first node doesn't work.
                     // use InsertBefore right_id instead
                     let mut extra_dependencies = self.tips.clone();
@@ -261,9 +456,9 @@ impl HashSeq {
 
     fn insert_root(&mut self, root_id: Id, root: CausalRoot) {
         let position = if let Some(next_root) = self
-            .topo
-            .roots()
-            .range(root_id..)
+            .root_nodes
+            .keys()
+            .filter(|id| *id >= &root_id)
             .find(|id| !self.removed_inserts.contains(*id))
         {
             // new root is inserted just before the next biggest root
@@ -278,12 +473,18 @@ impl HashSeq {
 
     fn insert_root_with_known_position(&mut self, id: Id, root: CausalRoot, position: usize) {
         self.index.insert(position, id);
-        self.topo.add_root(id);
+        self.nodes.insert(id);  // For TopoIter reference storage
         self.root_nodes.insert(id, root);
     }
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
-        let position = if let Some(next_node) = BTreeSet::from_iter(self.topo.after(&after.anchor))
+        let afters_for_anchor = get_afters(
+            &after.anchor,
+            &self.afters,
+            &self.run_index,
+            &self.run_elements,
+        );
+        let position = if let Some(next_node) = BTreeSet::from_iter(afters_for_anchor.iter().copied())
             .range(id..)
             .find(|id| !self.removed_inserts.contains(**id))
         {
@@ -295,11 +496,11 @@ impl HashSeq {
             self.index.find(&after.anchor).map(|p| p + 1)
         };
 
-        if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
+        let is_run_extension = if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
             // We are inserting after a node that is in a run.
             // need to decide if we can extend the run or if we need to split it
             if self.runs[&run_pos.run_id].len() == run_pos.position + 1
-                && self.topo.after(&after.anchor).is_empty()
+                && afters_for_anchor.is_empty()
                 && after.extra_dependencies.is_empty()
             {
                 // we are inserting at the end of a run, we can safely extend the run
@@ -311,22 +512,41 @@ impl HashSeq {
                         position: run_pos.position + 1,
                     },
                 );
+                // Update run_elements cache
+                self.run_elements.get_mut(&run_pos.run_id).unwrap().push(id);
+                true // This is a run extension
             } else {
                 if run_pos.position + 1 < self.runs[&run_pos.run_id].len() {
                     let run = self.runs.get_mut(&run_pos.run_id).unwrap();
                     let right_run = run.split_at(run_pos.position + 1);
                     debug_assert_eq!(run.last_id(), after.anchor);
+
+                    // Decompress the right run to get element IDs
+                    let right_nodes = right_run.decompress();
+                    let right_run_first_id = right_run.first_id();
+
                     // re-index the right run
-                    for (idx, node) in right_run.decompress().into_iter().enumerate() {
+                    let mut right_elements = Vec::with_capacity(right_nodes.len());
+                    for (idx, node) in right_nodes.into_iter().enumerate() {
+                        let node_id = node.id();
                         self.run_index.insert(
-                            node.id(),
+                            node_id,
                             RunPosition {
-                                run_id: right_run.first_id(),
+                                run_id: right_run_first_id,
                                 position: idx,
                             },
                         );
+                        right_elements.push(node_id);
                     }
-                    self.runs.insert(right_run.first_id(), right_run);
+
+                    // Update run_elements for left portion (truncate)
+                    self.run_elements.get_mut(&run_pos.run_id).unwrap().truncate(run_pos.position + 1);
+
+                    // The split-off portion needs to be tracked in afters
+                    self.afters.entry(after.anchor).or_default().push(right_run_first_id);
+                    self.nodes.insert(right_run_first_id);
+                    self.runs.insert(right_run_first_id, right_run);
+                    self.run_elements.insert(right_run_first_id, right_elements);
                 }
                 self.runs.insert(
                     id,
@@ -339,6 +559,9 @@ impl HashSeq {
                         position: 0,
                     },
                 );
+                // Add run_elements for the new run
+                self.run_elements.insert(id, vec![id]);
+                false // This is a fork, not a run extension
             }
         } else {
             // Either anchor is not a run, or we can't extend from it for some reason, start a new run
@@ -353,10 +576,20 @@ impl HashSeq {
                     position: 0,
                 },
             );
-        }
+            // Add run_elements for the new run
+            self.run_elements.insert(id, vec![id]);
+            false // This is a fork, not a run extension
+        };
 
-        self.topo
-            .add_after(after.anchor, id, !after.extra_dependencies.is_empty());
+        // Only add to afters if this is a fork (not a run extension)
+        if is_run_extension {
+            // For run extensions, just add to nodes (no afters entry needed)
+            self.nodes.insert(id);
+        } else {
+            // For forks, add to both afters and nodes
+            self.afters.entry(after.anchor).or_default().push(id);
+            self.nodes.insert(id);
+        }
 
         let position = position.unwrap_or_else(|| {
             // fall back to iterating over the entire sequence if the anchor node has been removed
@@ -389,10 +622,13 @@ impl HashSeq {
     }
 
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
-        let position = if let Some(next_node) =
-            BTreeSet::from_iter(self.topo.before(&before.anchor))
-                .range(id..)
-                .find(|id| !self.removed_inserts.contains(**id))
+        let befores_set: BTreeSet<Id> = before_from_map(&before.anchor, &self.befores_by_anchor)
+            .into_iter()
+            .copied()
+            .collect();
+        let position = if let Some(next_node) = befores_set
+            .range(id..)
+            .find(|id| !self.removed_inserts.contains(*id))
         {
             // new node is inserted just before the other node before our anchor node that is
             // bigger than the new node
@@ -406,23 +642,41 @@ impl HashSeq {
             && run_pos.position > 0
         {
             let run = self.runs.get_mut(&run_pos.run_id).unwrap();
+            // Get the last ID of the left portion from run_elements cache
+            let left_last_id = self.run_elements[&run_pos.run_id][run_pos.position - 1];
             let right_run = run.split_at(run_pos.position);
             let right_run_id = right_run.first_id();
             debug_assert_eq!(right_run_id, before.anchor);
+
+            // Decompress the right run to get element IDs
+            let right_nodes = right_run.decompress();
+
             // re-index the right run
-            for (idx, node) in right_run.decompress().into_iter().enumerate() {
+            let mut right_elements = Vec::with_capacity(right_nodes.len());
+            for (idx, node) in right_nodes.into_iter().enumerate() {
+                let node_id = node.id();
                 self.run_index.insert(
-                    node.id(),
+                    node_id,
                     RunPosition {
                         run_id: right_run_id,
                         position: idx,
                     },
                 );
+                right_elements.push(node_id);
             }
+
+            // Update run_elements for left portion (truncate)
+            self.run_elements.get_mut(&run_pos.run_id).unwrap().truncate(run_pos.position);
+
             self.runs.insert(right_run_id, right_run);
+            self.run_elements.insert(right_run_id, right_elements);
+            // Track the split in afters so iteration can find the right portion
+            self.afters.entry(left_last_id).or_default().push(right_run_id);
+            self.nodes.insert(right_run_id);
         }
 
-        self.topo.add_before(before.anchor, id);
+        self.nodes.insert(id);
+        self.befores_by_anchor.entry(before.anchor).or_default().push(id);
 
         self.before_nodes.insert(id, before);
 
@@ -537,8 +791,16 @@ impl HashSeq {
         }
     }
 
-    pub fn iter_ids(&self) -> TopoIter<'_, '_> {
-        self.topo.iter(&self.removed_inserts)
+    pub fn iter_ids(&self) -> TopoIter<'_, '_, '_, '_, '_, '_> {
+        TopoIter::new(
+            &self.nodes,
+            self.root_nodes.keys(),
+            &self.removed_inserts,
+            &self.afters,
+            &self.befores_by_anchor,
+            &self.run_index,
+            &self.run_elements,
+        )
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
@@ -644,7 +906,7 @@ mod test {
             "Runs should be identical"
         );
         assert_eq!(
-            seq_single_batch.topo, seq_split_batch.topo,
+            seq_single_batch.nodes, seq_split_batch.nodes,
             "Topo tree should be identical"
         );
         assert_eq!(
@@ -676,7 +938,7 @@ mod test {
         // Verify internal structures are identical
         assert_eq!(seq1.runs, seq2.runs, "Runs should be identical");
         assert_eq!(seq1.tips, seq2.tips, "Tips should be identical");
-        assert_eq!(seq1.topo, seq2.topo, "Topo should be identical");
+        assert_eq!(seq1.nodes, seq2.nodes, "Nodes should be identical");
     }
 
     #[test]
@@ -786,7 +1048,7 @@ mod test {
         assert_eq!(seq1.root_nodes, seq2.root_nodes);
         assert_eq!(seq1.before_nodes, seq2.before_nodes);
         assert_eq!(seq1.remove_nodes, seq2.remove_nodes);
-        assert_eq!(seq1.topo, seq2.topo);
+        assert_eq!(seq1.nodes, seq2.nodes);
         assert_eq!(seq1.tips, seq2.tips);
 
         true
@@ -1337,6 +1599,61 @@ mod test {
         seq.insert(2, 'd');
 
         assert_eq!(String::from_iter(seq.iter()), "bcda");
+    }
+
+    #[test]
+    fn test_prop_vec_model_qc3_debug() {
+        let mut seq = HashSeq::default();
+
+        seq.insert(0, 'c'); // "c"
+        println!("After insert(0, 'c'): '{}'", seq.iter().collect::<String>());
+        assert_eq!(seq.iter().collect::<String>(), "c");
+
+        seq.insert(1, 'c'); // "cc"
+        println!("After insert(1, 'c'): '{}'", seq.iter().collect::<String>());
+        println!("  runs: {:?}", seq.runs.keys().collect::<Vec<_>>());
+        println!("  afters: {:?}", seq.afters);
+        assert_eq!(seq.iter().collect::<String>(), "cc");
+
+        seq.insert(2, 'c'); // "ccc"
+        println!("After insert(2, 'c'): '{}'", seq.iter().collect::<String>());
+        println!("  runs: {:?}", seq.runs.keys().collect::<Vec<_>>());
+        println!("  afters: {:?}", seq.afters);
+        assert_eq!(seq.iter().collect::<String>(), "ccc");
+
+        // Print all node IDs
+        println!("  root_nodes: {:?}", seq.root_nodes.keys().collect::<Vec<_>>());
+        println!("  run_index: {:?}", seq.run_index.iter().collect::<Vec<_>>());
+
+        seq.remove(1); // "cc"
+        println!("After remove(1): '{}'", seq.iter().collect::<String>());
+        println!("  removed_inserts: {:?}", seq.removed_inserts);
+        assert_eq!(seq.iter().collect::<String>(), "cc");
+
+        // Debug: check what after returns for each node
+        for id in seq.root_nodes.keys() {
+            let afters = get_afters(id, &seq.afters, &seq.run_index, &seq.run_elements);
+            println!("  get_afters({:?}) = {:?}", id, afters.iter().map(|x| **x).collect::<Vec<_>>());
+        }
+
+        seq.insert(1, 'b'); // "cbc"
+        println!("After insert(1, 'b'): '{}'", seq.iter().collect::<String>());
+        println!("  before_nodes: {:?}", seq.before_nodes.keys().collect::<Vec<_>>());
+        println!("  befores_by_anchor: {:?}", seq.befores_by_anchor);
+        println!("  nodes: {:?}", seq.nodes.iter().collect::<Vec<_>>());
+        println!("  afters: {:?}", seq.afters);
+
+        // Check if ef6 (the third c) is in nodes
+        for (id, pos) in seq.run_index.iter() {
+            println!("  run_index entry: id={:?} at run {:?} pos {}", id, pos.run_id, pos.position);
+            println!("    in nodes? {}", seq.nodes.contains(id));
+        }
+
+        println!("  iter_ids count: {}", seq.iter_ids().count());
+        for id in seq.iter_ids() {
+            println!("    id: {:?}", id);
+        }
+        assert_eq!(seq.iter().collect::<String>(), "cbc");
     }
 
     #[test]
@@ -1987,118 +2304,30 @@ mod test {
         assert_eq!(merge_a_b, merge_b_a);
     }
 
+    // Tests for runs (spans have been removed and runs are now the source of truth)
     #[test]
-    fn test_run_equivalent_to_spans_qc1() {
-        // Simplified test case: insert one character at position 0
+    fn test_runs_basic() {
         let mut seq = HashSeq::default();
-        seq.insert(0, '\0');
+        seq.insert(0, 'a'); // This is a root, not in runs
+        seq.insert(1, 'b'); // This starts a run
+        seq.insert(2, 'c'); // This extends the run
 
-        // Verify runs and spans are equivalent
-        assert_eq!(seq.runs.len(), seq.topo.spans.len());
-        for (run_id, run) in &seq.runs {
-            assert!(seq.topo.spans.contains_key(run_id));
-            let span = &seq.topo.spans[run_id];
-            assert_eq!(run.len(), span.span.len());
-            let run_nodes = run.decompress();
-            for (node, span_id) in run_nodes.iter().zip(&span.span) {
-                assert_eq!(node.id(), *span_id);
-            }
-        }
+        // First character is a root, remaining two should be in a single run
+        assert_eq!(seq.root_nodes.len(), 1);
+        assert_eq!(seq.runs.len(), 1);
+        let run = seq.runs.values().next().unwrap();
+        assert_eq!(run.len(), 2);
+        assert_eq!(run.run, "bc");
+        assert_eq!(String::from_iter(seq.iter()), "abc");
     }
 
     #[test]
-    fn test_run_equivalent_to_spans_removal_split() {
-        // Failing case extracted from prop test:
-        // [(true, 0, '\0'), (true, 0, '\0'), (true, 5, '\0'), (false, 0, '\0'), (false, 0, '\0'), (true, 15, '\0')]
+    fn test_runs_with_fork() {
         let mut seq = HashSeq::default();
+        seq.insert(0, 'a'); // a (root)
+        seq.insert(0, 'b'); // ba (insert before 'a')
 
-        seq.insert(0, 'a'); // a
-        seq.insert(0, 'b'); // ba
-        seq.insert(2, 'c'); // bac
-        seq.remove(0); // ac
-        seq.remove(0); // c
-        seq.insert(1, 'd'); // cd
-
-        assert_eq!(String::from_iter(seq.iter()), "cd");
-
-        dbg!(&seq);
-
-        assert_eq!(
-            &BTreeSet::from_iter(seq.root_nodes.keys().copied()),
-            seq.topo.roots()
-        );
-        assert_eq!(seq.runs.len(), seq.topo.spans.len());
-        for (run_id, run) in &seq.runs {
-            assert!(seq.topo.spans.contains_key(run_id));
-            let span = &seq.topo.spans[run_id];
-            assert_eq!(run.len(), span.span.len());
-            let run_nodes = run.decompress();
-            for (node, span_id) in run_nodes.iter().zip(&span.span) {
-                assert_eq!(node.id(), *span_id);
-            }
-        }
-    }
-
-    #[test]
-    fn test_run_equivalent_to_spans_regression() {
-        // Regression test from quickcheck failure:
-        // [(true, 0, '\0'), (true, 0, '\0'), (true, 0, '\0'), (false, 0, '\0'),
-        //  (true, 0, '\0'), (true, 0, '\0'), (false, 0, '\0'), (true, 0, '\0'),
-        //  (true, 152, '\0'), (true, 183, '\0'), (false, 52, '\0'), (true, 255, '\0')]
-        let mut seq = HashSeq::default();
-
-        seq.insert(0, 'a'); // a
-        seq.insert(0, 'b'); // ba
-        seq.insert(0, 'c'); // cba
-        seq.remove(0); // ba
-        seq.insert(0, 'd'); // dba
-        seq.insert(0, 'e'); // edba
-        seq.remove(0); // dba
-        seq.insert(0, 'f'); // fdba
-        seq.insert(2, 'g'); // fdgba
-        seq.insert(3, 'h'); // fdghba
-        dbg!(&seq);
-        seq.remove(3); // fdgba
-        dbg!(&seq);
-        seq.insert(3, 'i'); // fdgiba
-        dbg!(&seq);
-
-        assert_eq!(String::from_iter(seq.iter()), "fdgiba");
-
-        assert_eq!(seq.runs.len(), seq.topo.spans.len());
-    }
-
-    #[quickcheck]
-    fn prop_run_equivalent_to_spans(ops: Vec<(bool, u8, char)>) -> bool {
-        // Build a HashSeq from random operations
-        let mut seq = HashSeq::default();
-        for (is_insert, idx, ch) in ops {
-            let idx = idx as usize % (seq.len() + 1);
-            if is_insert {
-                seq.insert(idx, ch);
-            } else if !seq.is_empty() {
-                let idx = idx % seq.len();
-                seq.remove(idx);
-            }
-
-            assert_eq!(
-                &BTreeSet::from_iter(seq.root_nodes.keys().copied()),
-                seq.topo.roots()
-            );
-            // TODO: add assert for insert befores equivalance
-
-            assert_eq!(seq.runs.len(), seq.topo.spans.len());
-            for (run_id, run) in &seq.runs {
-                assert!(seq.topo.spans.contains_key(run_id));
-                let span = &seq.topo.spans[run_id];
-                assert_eq!(run.len(), span.span.len());
-                let run_nodes = run.decompress();
-                for (node, span_id) in run_nodes.iter().zip(&span.span) {
-                    assert_eq!(node.id(), *span_id);
-                }
-            }
-        }
-
-        true
+        // 'b' is an InsertBefore, which creates a before_node
+        assert_eq!(String::from_iter(seq.iter()), "ba");
     }
 }
