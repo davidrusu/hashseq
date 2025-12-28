@@ -3,6 +3,10 @@ use std::time::Instant;
 
 use boa_engine::{Context, JsString, Source};
 use hashseq::HashSeq;
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<std::alloc::System> = &INSTRUMENTED_SYSTEM;
 
 #[derive(Debug)]
 enum Trace {
@@ -176,46 +180,16 @@ fn main() {
     let final_text_bytes = reconstructed_text.len();
     println!("Final text: {final_text_bytes} bytes");
 
-    // Direct memory size of the HashSeq structure
-    let seq_size = std::mem::size_of_val(&seq);
-    println!("HashSeq struct size: {seq_size} bytes");
-
-    // Estimate memory usage based on internal data structures
-    let runs_count = seq.runs.len();
-    let individual_nodes_count =
-        seq.root_nodes.len() + seq.before_nodes.len() + seq.remove_nodes.len();
-    let total_elements_in_runs: usize = seq.runs.values().map(|r| r.len()).sum();
-    let removed_count = seq.removed_inserts.len();
-
-    println!("Runs in HashSeq: {runs_count}");
-    println!("Individual nodes (roots + before_nodes + remove_nodes): {individual_nodes_count}");
-    println!("Total elements in runs: {total_elements_in_runs}");
-    println!("Removed inserts: {removed_count}");
-
-    // Estimate memory usage:
-    // - Each run: ~200 bytes base + char data + ID index
-    // - Each individual node: ~56 bytes
-    // - ID index: 72 bytes per element (in both runs and individual nodes)
-    let estimated_run_size = 200; // base overhead per run
-    let run_char_overhead = 1; // bytes per char in run
-    let run_id_overhead = 32; // bytes per ID in run
-    let individual_node_size = 56; // bytes per individual node
-    let id_index_overhead = 72; // bytes per element in ID index
-
-    let run_memory = runs_count * estimated_run_size
-        + total_elements_in_runs * (run_char_overhead + run_id_overhead);
-    let individual_memory = individual_nodes_count * individual_node_size;
-    let index_memory = (total_elements_in_runs + individual_nodes_count) * id_index_overhead;
-    let removed_memory = removed_count * 32; // 32 bytes per Id
-
-    let estimated_memory = run_memory + individual_memory + index_memory + removed_memory;
-    println!("Estimated memory usage: {estimated_memory} bytes");
-    println!("  - Runs: {run_memory} bytes");
-    println!("  - Individual nodes: {individual_memory} bytes");
-    println!("  - ID index: {index_memory} bytes");
-    println!("  - Removed IDs: {removed_memory} bytes");
-
+    // Measure memory usage before and then after drop (Archimedes principle)
+    let memory_before = GLOBAL.stats().bytes_allocated;
+    let seq2 = seq.clone();
+    let memory_after = GLOBAL.stats().bytes_allocated;
+    let estimated_memory = memory_after.saturating_sub(memory_before);
+    if seq2.len() > seq.len() {
+        println!("bad");
+    }
     // Calculate overhead
+    println!("Hashseq memory useage: {} bytes", estimated_memory);
     let overhead_ratio = estimated_memory as f64 / final_text_bytes as f64;
     println!("Memory overhead: {overhead_ratio:.2}x the final text size");
     println!(
