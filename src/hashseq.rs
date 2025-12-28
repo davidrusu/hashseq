@@ -138,10 +138,11 @@ impl Eq for HashSeq {}
 impl HashSeq {
     /// Check if a node ID exists (either in runs or individual nodes)
     pub fn contains_node(&self, id: &Id) -> bool {
-        self.root_nodes.contains_key(id)
-            || self.remove_nodes.contains_key(id)
+        // Check run_index first since most nodes are in runs
+        self.run_index.contains_key(id)
             || self.before_nodes.contains_key(id)
-            || self.run_index.contains_key(id)
+            || self.remove_nodes.contains_key(id)
+            || self.root_nodes.contains_key(id)
     }
 
     /// Get the character value for a given node ID
