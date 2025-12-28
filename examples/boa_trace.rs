@@ -132,6 +132,11 @@ fn main() {
     println!("Data parsed in: {:?}", parse_start.elapsed());
     println!("Number of edits: {}", trace.len());
 
+    // Count operation types
+    let inserts = trace.iter().filter(|t| matches!(t, Trace::Insert(_, _))).count();
+    let deletes = trace.iter().filter(|t| matches!(t, Trace::Delete(_))).count();
+    println!("Inserts: {}, Deletes: {} ({:.1}% deletes)", inserts, deletes, 100.0 * deletes as f64 / trace.len() as f64);
+
     // Now apply the trace to a HashSeq
     println!("\nApplying trace to HashSeq...");
     let trace_start = Instant::now();

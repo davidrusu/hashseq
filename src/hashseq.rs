@@ -192,6 +192,22 @@ impl HashSeq {
         None
     }
 
+    /// Check if there are any nodes after this one (without allocating)
+    fn has_afters(&self, id: &Id) -> bool {
+        if self.afters.get(id).map_or(false, |ns| !ns.is_empty()) {
+            return true;
+        }
+        // Check if this node is in a run and not the last element
+        if let Some(run_pos) = self.run_index.get(id) {
+            if let Some(run) = self.runs.get(&run_pos.run_id) {
+                if run_pos.position + 1 < run.elements.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Get nodes that come after this one. Uses both explicit afters and run data.
     pub fn afters(&self, id: &Id) -> Vec<&Id> {
         match self.afters.get(id) {
@@ -285,50 +301,62 @@ impl HashSeq {
         match (left, right) {
             (Some(left_id), Some(right_id)) => {
                 let mut chars_iter = chars.into_iter();
-                let mut extra_dependencies = self.tips.clone();
-                extra_dependencies.remove(&left_id);
                 let first_ch = chars_iter.next().unwrap();
-                let mut first_node = HashNode {
-                    extra_dependencies,
-                    op: Op::InsertAfter(left_id, first_ch),
-                };
 
-                if self.is_causally_before(&left_id, &right_id) {
+                let first_node = if self.is_causally_before(&left_id, &right_id) {
                     // Using InsertAfter for the first node doesn't work.
                     // use InsertBefore right_id instead
                     let mut extra_dependencies = self.tips.clone();
                     extra_dependencies.remove(&right_id);
-                    first_node = HashNode {
+                    HashNode {
                         extra_dependencies,
                         op: Op::InsertBefore(right_id, first_ch),
-                    };
-                }
-                let mut prev_id = first_node.id();
-                self.apply(first_node);
-                for ch in chars_iter {
+                    }
+                } else {
                     let mut extra_dependencies = self.tips.clone();
-                    extra_dependencies.remove(&prev_id);
-                    let node = HashNode {
+                    extra_dependencies.remove(&left_id);
+                    HashNode {
                         extra_dependencies,
+                        op: Op::InsertAfter(left_id, first_ch),
+                    }
+                };
+
+                let mut prev_id = first_node.id();
+                self.apply_with_id(prev_id, first_node);
+
+                // Subsequent nodes have empty extra_deps
+                for ch in chars_iter {
+                    let node = HashNode {
+                        extra_dependencies: BTreeSet::new(),
                         op: Op::InsertAfter(prev_id, ch),
                     };
                     prev_id = node.id();
-                    self.apply(node);
+                    self.apply_with_id(prev_id, node);
                 }
             }
             (Some(left_id), None) => {
                 // there is no right node, we just chain from left
-                let mut prev_id = left_id;
-                for ch in chars.into_iter() {
-                    let mut extra_dependencies = self.tips.clone();
-                    extra_dependencies.remove(&prev_id);
+                let mut chars_iter = chars.into_iter();
+
+                // First node needs full tips (minus anchor)
+                let first_ch = chars_iter.next().unwrap();
+                let mut extra_dependencies = self.tips.clone();
+                extra_dependencies.remove(&left_id);
+                let first_node = HashNode {
+                    extra_dependencies,
+                    op: Op::InsertAfter(left_id, first_ch),
+                };
+                let mut prev_id = first_node.id();
+                self.apply_with_id(prev_id, first_node);
+
+                // Subsequent nodes have empty extra_deps since tips = {prev_id} after first apply
+                for ch in chars_iter {
                     let node = HashNode {
-                        extra_dependencies,
+                        extra_dependencies: BTreeSet::new(),
                         op: Op::InsertAfter(prev_id, ch),
                     };
                     prev_id = node.id();
-
-                    self.apply(node);
+                    self.apply_with_id(prev_id, node);
                 }
             }
             (None, Some(right_id)) => {
@@ -342,17 +370,16 @@ impl HashSeq {
                 };
 
                 let mut prev_id = first_node.id();
-                self.apply(first_node);
+                self.apply_with_id(prev_id, first_node);
 
+                // Subsequent nodes have empty extra_deps
                 for ch in chars_iter {
-                    let mut extra_dependencies = self.tips.clone();
-                    extra_dependencies.remove(&prev_id);
                     let node = HashNode {
-                        extra_dependencies,
+                        extra_dependencies: BTreeSet::new(),
                         op: Op::InsertAfter(prev_id, ch),
                     };
                     prev_id = node.id();
-                    self.apply(node);
+                    self.apply_with_id(prev_id, node);
                 }
             }
             (None, None) => {
@@ -365,17 +392,16 @@ impl HashSeq {
                 };
 
                 let mut prev_id = first_node.id();
-                self.apply(first_node);
+                self.apply_with_id(prev_id, first_node);
 
+                // Subsequent nodes have empty extra_deps
                 for ch in chars_iter {
-                    let mut extra_dependencies = self.tips.clone();
-                    extra_dependencies.remove(&prev_id);
                     let node = HashNode {
-                        extra_dependencies,
+                        extra_dependencies: BTreeSet::new(),
                         op: Op::InsertAfter(prev_id, ch),
                     };
                     prev_id = node.id();
-                    self.apply(node);
+                    self.apply_with_id(prev_id, node);
                 }
             }
         }
@@ -444,6 +470,29 @@ impl HashSeq {
     }
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
+        // Fast path: check for run extension without allocating afters Vec
+        if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
+            if after.extra_dependencies.is_empty()
+                && self.runs[&run_pos.run_id].len() == run_pos.position + 1
+                && !self.has_afters(&after.anchor)
+            {
+                // Run extension - most common case for sequential typing
+                let new_id = self.runs.get_mut(&run_pos.run_id).unwrap().extend(after.ch);
+                debug_assert_eq!(new_id, id);
+                self.run_index.insert(
+                    id,
+                    RunPosition {
+                        run_id: run_pos.run_id,
+                        position: run_pos.position + 1,
+                    },
+                );
+                let position = self.index.find(&after.anchor).map(|p| p + 1);
+                self.update_position_index(id, position.unwrap());
+                return;
+            }
+        }
+
+        // Slow path: need full afters Vec for position calculation
         let afters_for_anchor = self.afters(&after.anchor);
         // Find the smallest "after" node that is >= id and not removed
         let position = if let Some(next_node) = afters_for_anchor
@@ -459,25 +508,10 @@ impl HashSeq {
             self.index.find(&after.anchor).map(|p| p + 1)
         };
 
-        let is_run_extension = if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
+        if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
             // We are inserting after a node that is in a run.
-            // need to decide if we can extend the run or if we need to split it
-            if self.runs[&run_pos.run_id].len() == run_pos.position + 1
-                && afters_for_anchor.is_empty()
-                && after.extra_dependencies.is_empty()
+            // Run extension case is handled by fast path above, so this is a fork/split
             {
-                // we are inserting at the end of a run, we can safely extend the run
-                let new_id = self.runs.get_mut(&run_pos.run_id).unwrap().extend(after.ch);
-                debug_assert_eq!(new_id, id);
-                self.run_index.insert(
-                    id,
-                    RunPosition {
-                        run_id: run_pos.run_id,
-                        position: run_pos.position + 1,
-                    },
-                );
-                true // This is a run extension
-            } else {
                 if run_pos.position + 1 < self.runs[&run_pos.run_id].len() {
                     let run = self.runs.get_mut(&run_pos.run_id).unwrap();
                     let right_run = run.split_at(run_pos.position + 1);
@@ -513,7 +547,6 @@ impl HashSeq {
                         position: 0,
                     },
                 );
-                false // This is a fork, not a run extension
             }
         } else {
             // Either anchor is not a run, or we can't extend from it for some reason, start a new run
@@ -527,13 +560,10 @@ impl HashSeq {
                     position: 0,
                 },
             );
-            false // This is a fork, not a run extension
         };
 
-        // Only add to afters if this is a fork (not a run extension)
-        if !is_run_extension {
-            self.afters.entry(after.anchor).or_default().push(id);
-        }
+        // run extension is handled in the fast path above, fork/split updates the afters set
+        self.afters.entry(after.anchor).or_default().push(id);
 
         let position = position.unwrap_or_else(|| {
             // fall back to iterating over the entire sequence if the anchor node has been removed
@@ -629,7 +659,11 @@ impl HashSeq {
 
     pub fn apply(&mut self, node: HashNode) {
         let id = node.id();
+        self.apply_with_id(id, node);
+    }
 
+    /// Apply a node with a pre-computed ID (avoids double hashing)
+    fn apply_with_id(&mut self, id: Id, node: HashNode) {
         if self.contains_node(&id) {
             return; // Already processed this node
         }
@@ -639,8 +673,11 @@ impl HashSeq {
             return;
         }
 
-        // Collect dependencies for tips update before consuming node
-        let deps_for_tips: Vec<Id> = node.iter_dependencies().copied().collect();
+        // Update tips before consuming node (insert ops don't depend on tips)
+        for tip in node.iter_dependencies() {
+            self.tips.remove(tip);
+        }
+        self.tips.insert(id);
 
         match node.op {
             Op::InsertRoot(ch) => self.insert_root(
@@ -674,11 +711,6 @@ impl HashSeq {
                 },
             ),
         }
-
-        for tip in deps_for_tips {
-            self.tips.remove(&tip);
-        }
-        self.tips.insert(id);
 
         for orphan in std::mem::take(&mut self.orphaned) {
             self.apply(orphan);

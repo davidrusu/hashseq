@@ -41,14 +41,14 @@ impl Run {
         }
     }
 
-    /// Get the number of characters in this run
+    /// Get the number of characters in this run (O(1) using cached elements)
     pub fn len(&self) -> usize {
-        self.run.chars().count()
+        self.elements.len()
     }
 
     /// Check if this run is empty (should never happen for valid runs)
     pub fn is_empty(&self) -> bool {
-        self.run.is_empty()
+        self.elements.is_empty()
     }
 
     /// Decompress the run into individual HashNodes
