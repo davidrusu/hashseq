@@ -710,13 +710,11 @@ mod hashseq_viz {
                             frame.fill_text(text);
 
                             // Draw "after" edges (green) - from right edge to left edge
-                            for (id_internal, afters) in self.seq.topo.afters.iter() {
-                                let id = &self.seq.topo.internal_to_id[*id_internal as usize];
+                            for (id, afters) in self.seq.topo.afters.iter() {
                                 let Some(from) = get_node_right_edge(id) else {
                                     continue;
                                 };
-                                for after_internal in afters.iter() {
-                                    let after = &self.seq.topo.internal_to_id[*after_internal as usize];
+                                for after in afters.iter() {
                                     let Some(to) = get_node_left_edge(after) else {
                                         continue;
                                     };
@@ -728,13 +726,11 @@ mod hashseq_viz {
                                 }
                             }
                             // Draw "before" edges (red) - from left edge to center of before node
-                            for (id_internal, befores) in self.seq.topo.befores.iter() {
-                                let id = &self.seq.topo.internal_to_id[*id_internal as usize];
+                            for (id, befores) in self.seq.topo.befores.iter() {
                                 let Some(from) = get_node_left_edge(id) else {
                                     continue;
                                 };
-                                for before_internal in befores.iter() {
-                                    let before = &self.seq.topo.internal_to_id[*before_internal as usize];
+                                for before in befores.iter() {
                                     let Some(to) = get_node_pos(before) else {
                                         continue;
                                     };

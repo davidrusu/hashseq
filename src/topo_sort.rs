@@ -1,35 +1,34 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Id;
-pub type IdInternal = u64;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct SpanNode {
-    pub span: Vec<IdInternal>,
+    pub span: Vec<Id>,
 }
 
 impl SpanNode {
-    fn new(span: Vec<IdInternal>) -> Self {
+    fn new(span: Vec<Id>) -> Self {
         debug_assert!(!span.is_empty());
         Self { span }
     }
 
-    fn id(&self) -> IdInternal {
+    fn id(&self) -> Id {
         self.first()
     }
 
-    fn first(&self) -> IdInternal {
+    fn first(&self) -> Id {
         self.span[0]
     }
 
-    fn last(&self) -> IdInternal {
+    fn last(&self) -> Id {
         self.span[self.span.len() - 1]
     }
 
     // Splits this span in place after the given node; returns the span that was split off
-    fn split_after(&mut self, node: IdInternal) -> SpanNode {
+    fn split_after(&mut self, node: Id) -> SpanNode {
         // first find the position of the node
         let p = self.span.iter().position(|n| n == &node).unwrap();
         let new_span = self.span.split_off(p + 1);
@@ -38,7 +37,7 @@ impl SpanNode {
     }
 
     // Splits this span in place before the given node; returns the span that was split off
-    fn split_before(&mut self, node: IdInternal) -> SpanNode {
+    fn split_before(&mut self, node: Id) -> SpanNode {
         // first find the position of the node
         let p = self.span.iter().position(|n| n == &node).unwrap();
         let new_span = self.span.split_off(p);
@@ -46,55 +45,42 @@ impl SpanNode {
         SpanNode::new(new_span)
     }
 
-    fn after_of(&self, node: IdInternal) -> IdInternal {
-        assert_ne!(self.last(), node);
-        let after = self.span.iter().skip_while(|n| **n != node).nth(1).unwrap();
-        *after
-    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Topo {
+    // All node IDs for stable reference storage
+    pub nodes: BTreeSet<Id>,
     // roots designate the independent causal trees.
-    pub id_to_internal: HashMap<Id, IdInternal>,
-    pub internal_to_id: Vec<Id>,
     pub roots: BTreeSet<Id>,
-    pub befores: HashMap<IdInternal, Vec<IdInternal>>,
-    pub afters: HashMap<IdInternal, Vec<IdInternal>>,
-    pub span_index: HashMap<IdInternal, IdInternal>,
-    pub spans: HashMap<IdInternal, SpanNode>,
+    pub befores: HashMap<Id, Vec<Id>>,
+    pub afters: HashMap<Id, Vec<Id>>,
+    pub span_index: HashMap<Id, Id>,
+    pub spans: HashMap<Id, SpanNode>,
 }
 
 impl Topo {
-    fn create_internal(&mut self, id: Id) -> IdInternal {
-        let internal = self.internal_to_id.len() as IdInternal;
-        self.id_to_internal.insert(id, internal);
-        self.internal_to_id.push(id);
-        internal
-    }
-
     pub fn is_causally_before(&self, a: &Id, b: &Id) -> bool {
-        self.is_causally_before_internal(self.id_to_internal[a], self.id_to_internal[b])
-    }
-    pub fn is_causally_before_internal(&self, a: IdInternal, b: IdInternal) -> bool {
         let mut seen = BTreeSet::new();
-        let mut boundary = VecDeque::from_iter(self.after_internal(a));
-        while let Some(n) = boundary.pop_front() {
-            if n == b {
+        let mut boundary: Vec<Id> = self.after(a).into_iter().cloned().collect();
+        while let Some(n) = boundary.pop() {
+            if &n == b {
                 return true;
             }
 
             seen.insert(n);
             boundary.extend(
-                self.after_internal(n)
+                self.after(&n)
                     .into_iter()
-                    .filter(|a| !seen.contains(a)),
+                    .cloned()
+                    .filter(|x| !seen.contains(x)),
             );
-            if n != a {
+            if &n != a {
                 boundary.extend(
-                    self.before_internal(n)
+                    self.before(&n)
                         .into_iter()
-                        .filter(|a| !seen.contains(a)),
+                        .cloned()
+                        .filter(|x| !seen.contains(x)),
                 );
             }
         }
@@ -103,112 +89,83 @@ impl Topo {
     }
 
     pub fn add_root(&mut self, node: Id) {
-        let node_internal = self.create_internal(node);
-        debug_assert!(!self.spans.contains_key(&node_internal));
+        debug_assert!(!self.spans.contains_key(&node));
+        self.nodes.insert(node);
         self.roots.insert(node);
     }
 
     pub fn add_after(&mut self, anchor: Id, node: Id, has_deps: bool) {
-        let anchor_internal = self.id_to_internal[&anchor];
-        let node_internal = self.create_internal(node);
-
-        match self.span_index.get(&anchor_internal) {
+        self.nodes.insert(node);
+        match self.span_index.get(&anchor) {
             Some(span_id) => {
+                let span_id = *span_id;
                 // the anchor is already part of a span
-                let span = self.spans.get_mut(span_id).unwrap();
-                if span.last() == anchor_internal
-                    && !self.afters.contains_key(&anchor_internal)
+                let span = self.spans.get_mut(&span_id).unwrap();
+                if span.last() == anchor
+                    && !self.afters.contains_key(&anchor)
                     && !has_deps
                 {
                     // we can extend the span
-                    span.span.push(node_internal);
-                    self.span_index.insert(node_internal, *span_id);
-                } else if span.last() == anchor_internal {
+                    span.span.push(node);
+                    self.span_index.insert(node, span_id);
+                } else if span.last() == anchor {
                     // the span forks at anchor
-                    self.spans
-                        .insert(node_internal, SpanNode::new(vec![node_internal]));
-                    self.span_index.insert(node_internal, node_internal);
-                    self.afters
-                        .entry(anchor_internal)
-                        .or_default()
-                        .push(node_internal);
+                    self.spans.insert(node, SpanNode::new(vec![node]));
+                    self.span_index.insert(node, node);
+                    self.afters.entry(anchor).or_default().push(node);
                 } else {
                     // the anchor is somewhere inside the span
                     // need to split the span at the anchor and create a fork
-                    let new_span = span.split_after(anchor_internal);
+                    let new_span = span.split_after(anchor);
+                    let new_span_id = new_span.id();
                     // re-index the new span
                     for id in new_span.span.iter() {
-                        self.span_index.insert(*id, new_span.id());
+                        self.span_index.insert(*id, new_span_id);
                     }
-                    self.afters
-                        .entry(anchor_internal)
-                        .or_default()
-                        .push(new_span.id());
-                    self.spans.insert(new_span.id(), new_span);
+                    self.afters.entry(anchor).or_default().push(new_span_id);
+                    self.spans.insert(new_span_id, new_span);
 
-                    self.spans
-                        .insert(node_internal, SpanNode::new(vec![node_internal]));
-                    self.span_index.insert(node_internal, node_internal);
-                    self.afters
-                        .entry(anchor_internal)
-                        .or_default()
-                        .push(node_internal);
+                    self.spans.insert(node, SpanNode::new(vec![node]));
+                    self.span_index.insert(node, node);
+                    self.afters.entry(anchor).or_default().push(node);
                 }
             }
             None => {
                 // begin a new span with this node
-                self.spans
-                    .insert(node_internal, SpanNode::new(vec![node_internal]));
-                self.span_index.insert(node_internal, node_internal);
-                self.afters
-                    .entry(anchor_internal)
-                    .or_default()
-                    .push(node_internal);
+                self.spans.insert(node, SpanNode::new(vec![node]));
+                self.span_index.insert(node, node);
+                self.afters.entry(anchor).or_default().push(node);
             }
         }
     }
 
     pub fn add_before(&mut self, anchor: Id, node: Id) {
-        let anchor_internal = self.id_to_internal[&anchor];
-        let node_internal = self.create_internal(node);
-
-        match self.span_index.get(&anchor_internal) {
+        self.nodes.insert(node);
+        match self.span_index.get(&anchor) {
             Some(span_id) => {
+                let span_id = *span_id;
                 // the anchor is part of a span
-                let span = self.spans.get_mut(span_id).unwrap();
-                if span.first() == anchor_internal {
-                    self.befores
-                        .entry(anchor_internal)
-                        .or_default()
-                        .push(node_internal);
+                let span = self.spans.get_mut(&span_id).unwrap();
+                if span.first() == anchor {
+                    self.befores.entry(anchor).or_default().push(node);
                 } else {
                     // the anchor is somewhere inside the span
                     // need to split the span at the anchor and create a fork
-
-                    let new_span = span.split_before(anchor_internal);
-                    debug_assert_eq!(new_span.id(), anchor_internal);
+                    let new_span = span.split_before(anchor);
+                    debug_assert_eq!(new_span.id(), anchor);
 
                     // re-index the new span
                     for id in new_span.span.iter() {
-                        self.span_index.insert(*id, anchor_internal);
+                        self.span_index.insert(*id, anchor);
                     }
-                    self.afters
-                        .entry(span.last())
-                        .or_default()
-                        .push(anchor_internal);
-                    self.spans.insert(anchor_internal, new_span);
+                    self.afters.entry(span.last()).or_default().push(anchor);
+                    self.spans.insert(anchor, new_span);
 
-                    self.befores
-                        .entry(anchor_internal)
-                        .or_default()
-                        .push(node_internal);
+                    self.befores.entry(anchor).or_default().push(node);
                 }
             }
             None => {
-                self.befores
-                    .entry(anchor_internal)
-                    .or_default()
-                    .push(node_internal);
+                self.befores.entry(anchor).or_default().push(node);
             }
         }
     }
@@ -218,25 +175,21 @@ impl Topo {
     }
 
     pub fn after(&self, id: &Id) -> Vec<&Id> {
-        let mut result: Vec<&Id> = self
-            .after_internal(self.id_to_internal[id])
-            .into_iter()
-            .map(|id| &self.internal_to_id[id as usize])
-            .collect();
-        result.sort();
-        result
-    }
-
-    pub fn after_internal(&self, id: IdInternal) -> Vec<IdInternal> {
-        match self.afters.get(&id) {
-            Some(ns) => ns.clone(),
-            None => match self.span_index.get(&id) {
+        match self.afters.get(id) {
+            Some(ns) => {
+                let mut result: Vec<&Id> = ns.iter().collect();
+                result.sort();
+                result
+            }
+            None => match self.span_index.get(id) {
                 Some(span_id) => {
                     let span = &self.spans[span_id];
-                    if span.last() == id {
+                    if span.last() == *id {
                         Vec::new()
                     } else {
-                        vec![span.after_of(id)]
+                        // Find position in span and return next element
+                        let pos = span.span.iter().position(|n| n == id).unwrap();
+                        vec![&span.span[pos + 1]]
                     }
                 }
                 None => Vec::new(),
@@ -245,18 +198,12 @@ impl Topo {
     }
 
     pub fn before(&self, id: &Id) -> Vec<&Id> {
-        let mut result: Vec<&Id> = self
-            .before_internal(self.id_to_internal[id])
-            .into_iter()
-            .map(|id| &self.internal_to_id[id as usize])
-            .collect();
-        result.sort();
-        result
-    }
-
-    pub fn before_internal(&self, id: IdInternal) -> Vec<IdInternal> {
-        match self.befores.get(&id) {
-            Some(ns) => ns.clone(),
+        match self.befores.get(id) {
+            Some(ns) => {
+                let mut result: Vec<&Id> = ns.iter().collect();
+                result.sort();
+                result
+            }
             None => Vec::new(),
         }
     }
@@ -269,7 +216,7 @@ impl Topo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopoIter<'a, 'b> {
     topo: &'a Topo,
-    waiting_stack: Vec<(IdInternal, Vec<IdInternal>)>,
+    waiting_stack: Vec<(Id, Vec<Id>)>,
     removed: &'b HashSet<Id>,
 }
 
@@ -282,17 +229,15 @@ impl<'a, 'b> TopoIter<'a, 'b> {
         };
 
         for root in topo.roots().iter().rev() {
-            let root_internal = topo.id_to_internal[root];
-            iter.push_waiting(root_internal);
+            iter.push_waiting(*root);
         }
 
         iter
     }
 
-    fn push_waiting(&mut self, n: IdInternal) {
-        let mut deps = self.topo.before_internal(n);
-        // Sort by the actual Id value, not IdInternal
-        deps.sort_by_key(|s| &self.topo.internal_to_id[*s as usize]);
+    fn push_waiting(&mut self, n: Id) {
+        let mut deps: Vec<Id> = self.topo.before(&n).into_iter().cloned().collect();
+        deps.sort();
         deps.reverse();
         self.waiting_stack.push((n, deps));
     }
@@ -310,26 +255,31 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
                 // released ahead of itself.
                 self.push_waiting(dep);
             } else {
-                let (n_internal, _) = self.waiting_stack.pop().expect("Failed to pop");
+                let (n, _) = self.waiting_stack.pop().expect("Failed to pop");
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
-                if let Some(afters) = self.topo.afters.get(&n_internal) {
-                    // Sort by the actual Id value, not IdInternal
-                    let mut afters_sorted: Vec<_> = afters.to_vec();
-                    afters_sorted.sort_by_key(|s| &self.topo.internal_to_id[*s as usize]);
-                    for s_internal in afters_sorted.into_iter().rev() {
-                        self.push_waiting(s_internal);
+                if let Some(afters) = self.topo.afters.get(&n) {
+                    // Sort by Id value
+                    let mut afters_sorted: Vec<Id> = afters.clone();
+                    afters_sorted.sort();
+                    for s in afters_sorted.into_iter().rev() {
+                        self.push_waiting(s);
                     }
-                } else if let Some(span) = self.topo.spans.get(&n_internal) {
-                    // first entry in the span is `n_internal`, skip that one since it
-                    // is being released in this iteration.
-                    for s_internal in span.span.iter().skip(1).rev() {
-                        self.waiting_stack.push((*s_internal, Vec::new()));
+                } else if let Some(span_id) = self.topo.span_index.get(&n) {
+                    let span = &self.topo.spans[span_id];
+                    // Check if n is the first element of this span
+                    if span.first() == n {
+                        // Push remaining span elements (skip first which is n)
+                        for s in span.span.iter().skip(1).rev() {
+                            self.waiting_stack.push((*s, Vec::new()));
+                        }
                     }
                 }
-                let n = &self.topo.internal_to_id[n_internal as usize];
-                if !self.removed.contains(n) {
-                    return Some(n);
+                // Return reference from the nodes set
+                if let Some(id_ref) = self.topo.nodes.get(&n)
+                    && !self.removed.contains(id_ref)
+                {
+                    return Some(id_ref);
                 }
             }
         }
@@ -338,8 +288,6 @@ impl<'a, 'b> Iterator for TopoIter<'a, 'b> {
 
 #[cfg(test)]
 mod tests {
-    use quickcheck_macros::quickcheck;
-
     use super::*;
 
     fn n(n: u8) -> Id {
@@ -784,7 +732,7 @@ mod tests {
     }
 
     #[ignore]
-    #[quickcheck]
+    #[test]
     fn prop_order_preservation_across_forks() {
         // for nodes a, b
         // if there exists sequence s \in S, a,b \in s with a < b in s

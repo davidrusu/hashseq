@@ -1996,14 +1996,12 @@ mod test {
         // Verify runs and spans are equivalent
         assert_eq!(seq.runs.len(), seq.topo.spans.len());
         for (run_id, run) in &seq.runs {
-            let run_id_internal = seq.topo.id_to_internal[run_id];
-            assert!(seq.topo.spans.contains_key(&run_id_internal));
-            let span = &seq.topo.spans[&run_id_internal];
+            assert!(seq.topo.spans.contains_key(run_id));
+            let span = &seq.topo.spans[run_id];
             assert_eq!(run.len(), span.span.len());
             let run_nodes = run.decompress();
             for (node, span_id) in run_nodes.iter().zip(&span.span) {
-                let node_id_internal = seq.topo.id_to_internal[&node.id()];
-                assert_eq!(node_id_internal, *span_id);
+                assert_eq!(node.id(), *span_id);
             }
         }
     }
@@ -2031,14 +2029,12 @@ mod test {
         );
         assert_eq!(seq.runs.len(), seq.topo.spans.len());
         for (run_id, run) in &seq.runs {
-            let run_id_internal = seq.topo.id_to_internal[run_id];
-            assert!(seq.topo.spans.contains_key(&run_id_internal));
-            let span = &seq.topo.spans[&run_id_internal];
+            assert!(seq.topo.spans.contains_key(run_id));
+            let span = &seq.topo.spans[run_id];
             assert_eq!(run.len(), span.span.len());
             let run_nodes = run.decompress();
             for (node, span_id) in run_nodes.iter().zip(&span.span) {
-                let node_id_internal = seq.topo.id_to_internal[&node.id()];
-                assert_eq!(node_id_internal, *span_id);
+                assert_eq!(node.id(), *span_id);
             }
         }
     }
@@ -2093,14 +2089,12 @@ mod test {
 
             assert_eq!(seq.runs.len(), seq.topo.spans.len());
             for (run_id, run) in &seq.runs {
-                let run_id_internal = seq.topo.id_to_internal[run_id];
-                assert!(seq.topo.spans.contains_key(&run_id_internal));
-                let span = &seq.topo.spans[&run_id_internal];
+                assert!(seq.topo.spans.contains_key(run_id));
+                let span = &seq.topo.spans[run_id];
                 assert_eq!(run.len(), span.span.len());
                 let run_nodes = run.decompress();
                 for (node, span_id) in run_nodes.iter().zip(&span.span) {
-                    let node_id_internal = seq.topo.id_to_internal[&node.id()];
-                    assert_eq!(node_id_internal, *span_id);
+                    assert_eq!(node.id(), *span_id);
                 }
             }
         }
