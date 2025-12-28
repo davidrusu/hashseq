@@ -137,7 +137,7 @@ fn main() {
     let trace_start = Instant::now();
     let mut seq = HashSeq::default();
 
-    let repeats = 10;
+    let repeats = 1;
     for n in 0..repeats {
         for (i, event) in trace.iter().enumerate() {
             if i % 50000 == 0 && i > 0 {

@@ -9,8 +9,8 @@ use crate::{HashNode, Id, Op, Run};
 /// Location information for where a node ID can be found
 #[derive(Debug, Clone, Copy)]
 pub struct RunPosition {
-    run_id: Id,
-    position: usize,
+    pub run_id: Id,
+    pub position: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
