@@ -60,8 +60,8 @@ impl<'a> Iterator for TopoIter<'a> {
                     // Check if n is the first element of this run
                     if run_pos.position == 0 {
                         // Push remaining run elements (skip first which is n)
-                        if let Some(elements) = self.seq.run_elements.get(&run_pos.run_id) {
-                            for id in elements.iter().skip(1).rev() {
+                        if let Some(run) = self.seq.runs.get(&run_pos.run_id) {
+                            for id in run.elements.iter().skip(1).rev() {
                                 // Use push_waiting to properly handle befores
                                 self.push_waiting(*id);
                             }
@@ -117,10 +117,6 @@ pub struct HashSeq {
 
     // ID resolution index for O(1) lookup of any node
     pub run_index: HashMap<Id, RunPosition>,
-
-    // Cache of decompressed run element IDs for O(1) lookup in get_afters
-    // Maps run_id -> list of element IDs in that run
-    pub run_elements: HashMap<Id, Vec<Id>>,
 
     // Fork tracking: maps anchor ID to list of IDs that fork from it
     pub afters: HashMap<Id, Vec<Id>>,
@@ -206,9 +202,9 @@ impl HashSeq {
             None => {
                 // Check if this node is in a run and not the last element
                 if let Some(run_pos) = self.run_index.get(id) {
-                    if let Some(elements) = self.run_elements.get(&run_pos.run_id) {
-                        if run_pos.position + 1 < elements.len() {
-                            let next_id = &elements[run_pos.position + 1];
+                    if let Some(run) = self.runs.get(&run_pos.run_id) {
+                        if run_pos.position + 1 < run.elements.len() {
+                            let next_id = &run.elements[run_pos.position + 1];
                             // Look up the reference in run_index for stable lifetime
                             if let Some((id_ref, _)) = self.run_index.get_key_value(next_id) {
                                 return vec![id_ref];
@@ -469,7 +465,8 @@ impl HashSeq {
                 && after.extra_dependencies.is_empty()
             {
                 // we are inserting at the end of a run, we can safely extend the run
-                self.runs.get_mut(&run_pos.run_id).unwrap().extend(after.ch);
+                let new_id = self.runs.get_mut(&run_pos.run_id).unwrap().extend(after.ch);
+                debug_assert_eq!(new_id, id);
                 self.run_index.insert(
                     id,
                     RunPosition {
@@ -477,8 +474,6 @@ impl HashSeq {
                         position: run_pos.position + 1,
                     },
                 );
-                // Update run_elements cache
-                self.run_elements.get_mut(&run_pos.run_id).unwrap().push(id);
                 true // This is a run extension
             } else {
                 if run_pos.position + 1 < self.runs[&run_pos.run_id].len() {
@@ -486,36 +481,26 @@ impl HashSeq {
                     let right_run = run.split_at(run_pos.position + 1);
                     debug_assert_eq!(run.last_id(), after.anchor);
 
-                    // Decompress the right run to get element IDs
-                    let right_nodes = right_run.decompress();
                     let right_run_first_id = right_run.first_id();
 
-                    // re-index the right run
-                    let mut right_elements = Vec::with_capacity(right_nodes.len());
-                    for (idx, node) in right_nodes.into_iter().enumerate() {
-                        let node_id = node.id();
+                    // re-index the right run using cached elements
+                    for (idx, elem_id) in right_run.elements.iter().enumerate() {
                         self.run_index.insert(
-                            node_id,
+                            *elem_id,
                             RunPosition {
                                 run_id: right_run_first_id,
                                 position: idx,
                             },
                         );
-                        right_elements.push(node_id);
                     }
-
-                    // Update run_elements for left portion (truncate)
-                    self.run_elements.get_mut(&run_pos.run_id).unwrap().truncate(run_pos.position + 1);
 
                     // The split-off portion needs to be tracked in afters
                     self.afters.entry(after.anchor).or_default().push(right_run_first_id);
                     self.runs.insert(right_run_first_id, right_run);
-                    self.run_elements.insert(right_run_first_id, right_elements);
                 }
-                self.runs.insert(
-                    id,
-                    Run::new(after.anchor, after.extra_dependencies.clone(), after.ch),
-                );
+                let new_run = Run::new(after.anchor, after.extra_dependencies.clone(), after.ch);
+                debug_assert_eq!(new_run.first_id(), id);
+                self.runs.insert(id, new_run);
                 self.run_index.insert(
                     id,
                     RunPosition {
@@ -523,16 +508,13 @@ impl HashSeq {
                         position: 0,
                     },
                 );
-                // Add run_elements for the new run
-                self.run_elements.insert(id, vec![id]);
                 false // This is a fork, not a run extension
             }
         } else {
             // Either anchor is not a run, or we can't extend from it for some reason, start a new run
-            self.runs.insert(
-                id,
-                Run::new(after.anchor, after.extra_dependencies.clone(), after.ch),
-            );
+            let new_run = Run::new(after.anchor, after.extra_dependencies.clone(), after.ch);
+            debug_assert_eq!(new_run.first_id(), id);
+            self.runs.insert(id, new_run);
             self.run_index.insert(
                 id,
                 RunPosition {
@@ -540,8 +522,6 @@ impl HashSeq {
                     position: 0,
                 },
             );
-            // Add run_elements for the new run
-            self.run_elements.insert(id, vec![id]);
             false // This is a fork, not a run extension
         };
 
@@ -601,34 +581,24 @@ impl HashSeq {
             && run_pos.position > 0
         {
             let run = self.runs.get_mut(&run_pos.run_id).unwrap();
-            // Get the last ID of the left portion from run_elements cache
-            let left_last_id = self.run_elements[&run_pos.run_id][run_pos.position - 1];
+            // Get the last ID of the left portion from run's elements cache
+            let left_last_id = run.elements[run_pos.position - 1];
             let right_run = run.split_at(run_pos.position);
             let right_run_id = right_run.first_id();
             debug_assert_eq!(right_run_id, before.anchor);
 
-            // Decompress the right run to get element IDs
-            let right_nodes = right_run.decompress();
-
-            // re-index the right run
-            let mut right_elements = Vec::with_capacity(right_nodes.len());
-            for (idx, node) in right_nodes.into_iter().enumerate() {
-                let node_id = node.id();
+            // re-index the right run using cached elements
+            for (idx, elem_id) in right_run.elements.iter().enumerate() {
                 self.run_index.insert(
-                    node_id,
+                    *elem_id,
                     RunPosition {
                         run_id: right_run_id,
                         position: idx,
                     },
                 );
-                right_elements.push(node_id);
             }
 
-            // Update run_elements for left portion (truncate)
-            self.run_elements.get_mut(&run_pos.run_id).unwrap().truncate(run_pos.position);
-
             self.runs.insert(right_run_id, right_run);
-            self.run_elements.insert(right_run_id, right_elements);
             // Track the split in afters so iteration can find the right portion
             self.afters.entry(left_last_id).or_default().push(right_run_id);
         }

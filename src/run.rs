@@ -21,16 +21,23 @@ pub struct Run {
     pub first_extra_deps: BTreeSet<Id>,
     /// The string content of this run
     pub run: String,
+    /// Cached element IDs for O(1) lookup (avoids recomputing hashes)
+    pub elements: Vec<Id>,
 }
 
 impl Run {
     /// Create a new run from a string
     pub fn new(insert_after: Id, first_extra_deps: BTreeSet<Id>, first: char) -> Self {
-        // TODO: make construction be Run::from_insert_after(CausalInsert)
+        let first_node = HashNode {
+            extra_dependencies: first_extra_deps.clone(),
+            op: Op::InsertAfter(insert_after, first),
+        };
+        let first_id = first_node.id();
         Self {
             insert_after,
             first_extra_deps,
             run: first.to_string(),
+            elements: vec![first_id],
         }
     }
 
@@ -78,13 +85,12 @@ impl Run {
 
     /// Get the ID of the first character in the run
     pub fn first_id(&self) -> Id {
-        self.first_node().id()
+        self.elements[0]
     }
 
     /// Get the ID of the last character in the run
     pub fn last_id(&self) -> Id {
-        let nodes = self.decompress();
-        nodes[nodes.len() - 1].id()
+        *self.elements.last().unwrap()
     }
 
     /// Get the run's ID (same as the first character's ID)
@@ -94,13 +100,21 @@ impl Run {
 
     /// Find the position of a given ID within this run
     pub fn find_position(&self, id: &Id) -> Option<usize> {
-        self.decompress().iter().position(|node| &node.id() == id)
+        self.elements.iter().position(|elem_id| elem_id == id)
     }
 
-    /// Extend this run by appending a character
+    /// Extend this run by appending a character and return the new element's ID
     /// The new character will be InsertAfter(current_last_character, ch)
-    pub fn extend(&mut self, ch: char) {
+    pub fn extend(&mut self, ch: char) -> Id {
+        let prev_id = *self.elements.last().unwrap();
+        let new_node = HashNode {
+            extra_dependencies: BTreeSet::new(),
+            op: Op::InsertAfter(prev_id, ch),
+        };
+        let new_id = new_node.id();
         self.run.push(ch);
+        self.elements.push(new_id);
+        new_id
     }
 
     /// Split this run at the given position, returning the right portion
@@ -114,37 +128,21 @@ impl Run {
             "Invalid split position"
         );
 
-        // Get the ID of the last character in the left portion
-        let mut left_nodes = self.decompress();
-        let mut right_nodes = left_nodes.split_off(position).into_iter();
-        debug_assert_eq!(left_nodes.len(), position);
-        let right_insert_after = left_nodes[left_nodes.len() - 1].id();
+        // Split the elements vector
+        let right_elements = self.elements.split_off(position);
+        let right_insert_after = *self.elements.last().unwrap();
 
-        // DUMB APPROACH, re-insert left nodes
-        self.run = String::new();
-        for n in left_nodes {
-            let Op::InsertAfter(_, ch) = n.op else {
-                panic!("decompressed nodes should be InsertAfters");
-            };
-            self.extend(ch);
+        // Split the string - need to find byte position for char position
+        let byte_pos = self.run.char_indices().nth(position).unwrap().0;
+        let right_str = self.run.split_off(byte_pos);
+
+        // Create the right run with pre-computed elements
+        Run {
+            insert_after: right_insert_after,
+            first_extra_deps: BTreeSet::new(),
+            run: right_str,
+            elements: right_elements,
         }
-
-        // Create the right run
-        // The right portion has no extra dependencies since it's anchored to an existing node
-        let Op::InsertAfter(_, ch) = right_nodes.next().unwrap().op else {
-            panic!("decompressed nodes should be InsertAfters");
-        };
-        let mut right_run = Run::new(right_insert_after, BTreeSet::new(), ch);
-
-        // Extend with remaining characters
-        for n in right_nodes {
-            let Op::InsertAfter(_, ch) = n.op else {
-                panic!("decompressed nodes should be InsertAfters");
-            };
-            right_run.extend(ch);
-        }
-
-        right_run
     }
 }
 
