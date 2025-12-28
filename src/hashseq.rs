@@ -4,86 +4,6 @@ use associative_positional_list::AssociativePositionalList;
 
 use crate::{HashNode, Id, Op, Run};
 
-/// Get nodes that come after this one. Uses both explicit afters and run data.
-pub fn get_afters<'a>(
-    id: &Id,
-    afters: &'a HashMap<Id, Vec<Id>>,
-    run_index: &'a HashMap<Id, RunPosition>,
-    run_elements: &'a HashMap<Id, Vec<Id>>,
-) -> Vec<&'a Id> {
-    match afters.get(id) {
-        Some(ns) => {
-            let mut result: Vec<&Id> = ns.iter().collect();
-            result.sort();
-            result
-        }
-        None => {
-            // Check if this node is in a run and not the last element
-            if let Some(run_pos) = run_index.get(id) {
-                if let Some(elements) = run_elements.get(&run_pos.run_id) {
-                    if run_pos.position + 1 < elements.len() {
-                        let next_id = &elements[run_pos.position + 1];
-                        // Look up the reference in run_index for stable lifetime
-                        if let Some((id_ref, _)) = run_index.get_key_value(next_id) {
-                            return vec![id_ref];
-                        }
-                    }
-                }
-            }
-            Vec::new()
-        }
-    }
-}
-
-pub fn before_from_map<'a>(id: &Id, befores: &'a HashMap<Id, Vec<Id>>) -> Vec<&'a Id> {
-    match befores.get(id) {
-        Some(ns) => {
-            let mut result: Vec<&Id> = ns.iter().collect();
-            result.sort();
-            result
-        }
-        None => Vec::new(),
-    }
-}
-
-fn is_causally_before(
-    a: &Id,
-    b: &Id,
-    afters: &HashMap<Id, Vec<Id>>,
-    befores: &HashMap<Id, Vec<Id>>,
-    run_index: &HashMap<Id, RunPosition>,
-    run_elements: &HashMap<Id, Vec<Id>>,
-) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut boundary: Vec<Id> = get_afters(a, afters, run_index, run_elements)
-        .into_iter()
-        .cloned()
-        .collect();
-    while let Some(n) = boundary.pop() {
-        if &n == b {
-            return true;
-        }
-
-        seen.insert(n);
-        boundary.extend(
-            get_afters(&n, afters, run_index, run_elements)
-                .into_iter()
-                .cloned()
-                .filter(|x| !seen.contains(x)),
-        );
-        if &n != a {
-            boundary.extend(
-                before_from_map(&n, befores)
-                    .into_iter()
-                    .cloned()
-                    .filter(|x| !seen.contains(x)),
-            );
-        }
-    }
-
-    false
-}
-
 #[derive(Debug, Clone)]
 pub struct TopoIter<'a> {
     seq: &'a HashSeq,
@@ -107,10 +27,7 @@ impl<'a> TopoIter<'a> {
     }
 
     fn push_waiting(&mut self, n: Id) {
-        let mut deps: Vec<Id> = before_from_map(&n, &self.seq.befores_by_anchor)
-            .into_iter()
-            .cloned()
-            .collect();
+        let mut deps: Vec<Id> = self.seq.befores(&n).into_iter().cloned().collect();
         deps.sort();
         deps.reverse();
         self.waiting_stack.push((n, deps));
@@ -263,6 +180,73 @@ impl HashSeq {
         &self.orphaned
     }
 
+    /// Get nodes that come after this one. Uses both explicit afters and run data.
+    pub fn afters(&self, id: &Id) -> Vec<&Id> {
+        match self.afters.get(id) {
+            Some(ns) => {
+                let mut result: Vec<&Id> = ns.iter().collect();
+                result.sort();
+                result
+            }
+            None => {
+                // Check if this node is in a run and not the last element
+                if let Some(run_pos) = self.run_index.get(id) {
+                    if let Some(elements) = self.run_elements.get(&run_pos.run_id) {
+                        if run_pos.position + 1 < elements.len() {
+                            let next_id = &elements[run_pos.position + 1];
+                            // Look up the reference in run_index for stable lifetime
+                            if let Some((id_ref, _)) = self.run_index.get_key_value(next_id) {
+                                return vec![id_ref];
+                            }
+                        }
+                    }
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Get nodes that come before this one (inserted with InsertBefore).
+    pub fn befores(&self, id: &Id) -> Vec<&Id> {
+        match self.befores_by_anchor.get(id) {
+            Some(ns) => {
+                let mut result: Vec<&Id> = ns.iter().collect();
+                result.sort();
+                result
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Check if node `a` is causally before node `b`.
+    fn is_causally_before(&self, a: &Id, b: &Id) -> bool {
+        let mut seen = BTreeSet::new();
+        let mut boundary: Vec<Id> = self.afters(a).into_iter().cloned().collect();
+        while let Some(n) = boundary.pop() {
+            if &n == b {
+                return true;
+            }
+
+            seen.insert(n);
+            boundary.extend(
+                self.afters(&n)
+                    .into_iter()
+                    .cloned()
+                    .filter(|x| !seen.contains(x)),
+            );
+            if &n != a {
+                boundary.extend(
+                    self.befores(&n)
+                        .into_iter()
+                        .cloned()
+                        .filter(|x| !seen.contains(x)),
+                );
+            }
+        }
+
+        false
+    }
+
     fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {
         let left = idx
             .checked_sub(1)
@@ -297,14 +281,7 @@ impl HashSeq {
                     op: Op::InsertAfter(left_id, first_ch),
                 };
 
-                if is_causally_before(
-                    &left_id,
-                    &right_id,
-                    &self.afters,
-                    &self.befores_by_anchor,
-                    &self.run_index,
-                    &self.run_elements,
-                ) {
+                if self.is_causally_before(&left_id, &right_id) {
                     // Using InsertAfter for the first node doesn't work.
                     // use InsertBefore right_id instead
                     let mut extra_dependencies = self.tips.clone();
@@ -457,12 +434,7 @@ impl HashSeq {
     }
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
-        let afters_for_anchor = get_afters(
-            &after.anchor,
-            &self.afters,
-            &self.run_index,
-            &self.run_elements,
-        );
+        let afters_for_anchor = self.afters(&after.anchor);
         let position = if let Some(next_node) = BTreeSet::from_iter(afters_for_anchor.iter().copied())
             .range(id..)
             .find(|id| !self.removed_inserts.contains(**id))
@@ -601,7 +573,7 @@ impl HashSeq {
     }
 
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
-        let befores_set: BTreeSet<Id> = before_from_map(&before.anchor, &self.befores_by_anchor)
+        let befores_set: BTreeSet<Id> = self.befores(&before.anchor)
             .into_iter()
             .copied()
             .collect();
@@ -1603,8 +1575,8 @@ mod test {
 
         // Debug: check what after returns for each node
         for id in seq.root_nodes.keys() {
-            let afters = get_afters(id, &seq.afters, &seq.run_index, &seq.run_elements);
-            println!("  get_afters({:?}) = {:?}", id, afters.iter().map(|x| **x).collect::<Vec<_>>());
+            let afters = seq.afters(id);
+            println!("  seq.afters({:?}) = {:?}", id, afters.iter().map(|x| **x).collect::<Vec<_>>());
         }
 
         seq.insert(1, 'b'); // "cbc"

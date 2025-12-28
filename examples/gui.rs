@@ -1,4 +1,3 @@
-use hashseq::hashseq::{get_afters, before_from_map};
 use hashseq::HashSeq;
 use iced::widget::{button, checkbox, column, row, text};
 use iced::{Alignment, Element, Font, Length, Point, Rectangle, Sandbox, Settings, Theme};
@@ -425,7 +424,7 @@ mod hashseq_viz {
                     let parent = &before_node.anchor;
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &state.node_pos) {
                         // Get all siblings (nodes before the same parent)
-                        let siblings = before_from_map(parent, &self.seq.befores_by_anchor);
+                        let siblings = self.seq.befores(parent);
 
                         // Find this node's index among siblings
                         let mut sorted_siblings: Vec<Id> = siblings.into_iter().copied().collect();
@@ -506,12 +505,7 @@ mod hashseq_viz {
                         let parent = run.insert_after;
                         if let Some(p) = get_node_right_edge(&parent, &state.node_pos) {
                             // Check how many siblings this run has (concurrent branches from same parent)
-                            let siblings = get_afters(
-                                &parent,
-                                &self.seq.afters,
-                                &self.seq.run_index,
-                                &self.seq.run_elements,
-                            );
+                            let siblings = self.seq.afters(&parent);
                             let num_siblings = siblings.len();
 
                             // Find this run's index among siblings (sorted by Id for consistency)
