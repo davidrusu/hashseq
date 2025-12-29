@@ -529,7 +529,7 @@ impl HashSeq {
                         .push(right_run_first_id);
                     self.runs.insert(right_run_first_id, right_run);
                 }
-                let new_run = Run::new(after.anchor, after.extra_dependencies.clone(), after.ch);
+                let new_run = Run::new(after.anchor, after.extra_dependencies, after.ch);
                 debug_assert_eq!(new_run.first_id(), id);
                 self.runs.insert(id, new_run);
                 self.run_index.insert(
@@ -542,7 +542,7 @@ impl HashSeq {
             }
         } else {
             // Either anchor is not a run, or we can't extend from it for some reason, start a new run
-            let new_run = Run::new(after.anchor, after.extra_dependencies.clone(), after.ch);
+            let new_run = Run::new(after.anchor, after.extra_dependencies, after.ch);
             debug_assert_eq!(new_run.first_id(), id);
             self.runs.insert(id, new_run);
             self.run_index.insert(
