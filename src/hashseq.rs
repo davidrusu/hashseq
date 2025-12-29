@@ -69,10 +69,10 @@ impl<'a> Iterator for TopoIter<'a> {
                     }
                 }
                 // Return reference from existing data structures
-                if !self.seq.removed_inserts.contains(&n) {
-                    if let Some(id_ref) = self.seq.get_id_ref(&n) {
-                        return Some(id_ref);
-                    }
+                if !self.seq.removed_inserts.contains(&n)
+                    && let Some(id_ref) = self.seq.get_id_ref(&n)
+                {
+                    return Some(id_ref);
                 }
             }
         }
@@ -192,22 +192,6 @@ impl HashSeq {
         None
     }
 
-    /// Check if there are any nodes after this one (without allocating)
-    fn has_afters(&self, id: &Id) -> bool {
-        if self.afters.get(id).map_or(false, |ns| !ns.is_empty()) {
-            return true;
-        }
-        // Check if this node is in a run and not the last element
-        if let Some(run_pos) = self.run_index.get(id) {
-            if let Some(run) = self.runs.get(&run_pos.run_id) {
-                if run_pos.position + 1 < run.elements.len() {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Get nodes that come after this one. Uses both explicit afters and run data.
     pub fn afters(&self, id: &Id) -> Vec<&Id> {
         match self.afters.get(id) {
@@ -218,15 +202,14 @@ impl HashSeq {
             }
             None => {
                 // Check if this node is in a run and not the last element
-                if let Some(run_pos) = self.run_index.get(id) {
-                    if let Some(run) = self.runs.get(&run_pos.run_id) {
-                        if run_pos.position + 1 < run.elements.len() {
-                            let next_id = &run.elements[run_pos.position + 1];
-                            // Look up the reference in run_index for stable lifetime
-                            if let Some((id_ref, _)) = self.run_index.get_key_value(next_id) {
-                                return vec![id_ref];
-                            }
-                        }
+                if let Some(run_pos) = self.run_index.get(id)
+                    && let Some(run) = self.runs.get(&run_pos.run_id)
+                    && run_pos.position + 1 < run.elements.len()
+                {
+                    let next_id = &run.elements[run_pos.position + 1];
+                    // Look up the reference in run_index for stable lifetime
+                    if let Some((id_ref, _)) = self.run_index.get_key_value(next_id) {
+                        return vec![id_ref];
                     }
                 }
                 Vec::new()
@@ -471,24 +454,33 @@ impl HashSeq {
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
         // Fast path: check for run extension without allocating afters Vec
-        if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
-            if after.extra_dependencies.is_empty()
-                && self.runs[&run_pos.run_id].len() == run_pos.position + 1
-                && !self.has_afters(&after.anchor)
-            {
-                // Run extension - most common case for sequential typing
-                let new_id = self.runs.get_mut(&run_pos.run_id).unwrap().extend(after.ch);
-                debug_assert_eq!(new_id, id);
-                self.run_index.insert(
-                    id,
-                    RunPosition {
-                        run_id: run_pos.run_id,
-                        position: run_pos.position + 1,
-                    },
-                );
-                let position = self.index.find(&after.anchor).map(|p| p + 1);
-                self.update_position_index(id, position.unwrap());
-                return;
+        if after.extra_dependencies.is_empty()
+            && let Some(run_pos) = self.run_index.get(&after.anchor).copied()
+        {
+            // Check for explicit forks first (cheap HashMap lookup)
+            let has_explicit_afters = self
+                .afters
+                .get(&after.anchor)
+                .is_some_and(|ns| !ns.is_empty());
+
+            if !has_explicit_afters {
+                // Get the run and check if anchor is the last element
+                let run = self.runs.get_mut(&run_pos.run_id).unwrap();
+                if run_pos.position + 1 == run.len() {
+                    // Run extension - most common case for sequential typing
+                    let new_id = run.extend(after.ch);
+                    debug_assert_eq!(new_id, id);
+                    self.run_index.insert(
+                        id,
+                        RunPosition {
+                            run_id: run_pos.run_id,
+                            position: run_pos.position + 1,
+                        },
+                    );
+                    let position = self.index.find(&after.anchor).map(|p| p + 1);
+                    self.update_position_index(id, position.unwrap());
+                    return;
+                }
             }
         }
 
