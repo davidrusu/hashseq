@@ -468,8 +468,7 @@ impl HashSeq {
                 let run = self.runs.get_mut(&run_pos.run_id).unwrap();
                 if run_pos.position + 1 == run.len() {
                     // Run extension - most common case for sequential typing
-                    let new_id = run.extend(after.ch);
-                    debug_assert_eq!(new_id, id);
+                    run.extend_with_id(id, after.ch);
                     self.run_index.insert(
                         id,
                         RunPosition {

@@ -112,9 +112,14 @@ impl Run {
             op: Op::InsertAfter(prev_id, ch),
         };
         let new_id = new_node.id();
-        self.run.push(ch);
-        self.elements.push(new_id);
+        self.extend_with_id(new_id, ch);
         new_id
+    }
+
+    /// Extend this run with a pre-computed ID (avoids hash computation)
+    pub fn extend_with_id(&mut self, id: Id, ch: char) {
+        self.run.push(ch);
+        self.elements.push(id);
     }
 
     /// Split this run at the given position, returning the right portion
