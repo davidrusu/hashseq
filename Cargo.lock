@@ -1327,6 +1327,7 @@ dependencies = [
  "boa_engine",
  "content-tree",
  "criterion",
+ "flate2",
  "hex",
  "iced",
  "pprof",

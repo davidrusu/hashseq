@@ -29,6 +29,7 @@ blake3-hash = []
 
 [dev-dependencies]
 serde_json = "1.0.86"
+flate2 = "1.0"
 # indicatif = "0.17.1"
 pprof = { version = "0.13", default-features = false, features = ["flamegraph", "frame-pointer"] }
 quickcheck = "1"
