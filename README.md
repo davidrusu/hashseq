@@ -27,42 +27,68 @@ On merge we see:
 
 `hello earthmars` OR `hello marsearth`
 
-(i.e. hello is not duplicated even though Site 1 and Site 2 both inserted it.)
+(i.e. the common prefix "hello " is not duplicated even though both sites inserted it.)
 
-### Stable Ordering
-let _S_,_R_ be HashSeq instances on Site 1, Site 2 respectively.
+## Performance
 
-Both _S_ and _R_ form a montonic sub-sequence of _Q_ = merge(_S_, _R_).
-
-Stated differently, for sequence elements _a_,_b_ ∈ _S_, if _a_ comes before _b_ in _S_, and _a_,_b_ ∈ _R_, then _a_ comes before _b_ in _R_.
-
-## Current Complexity:
-
-Assuming you are using the Cursor interface:
-
-|   op   | time | space |
-|--------|------|-------|
-| insert | O(1) | O(1)  |
-| remove | O(n) | O(n)  |
-| seek   | O(n) | O(n)  |
-
-These are still WIP, we should be able to get `remove` and `seek` down to O(log(n)) once we have a secondary position index into the ordering tree.
+HashSeq achieves over 1 million operations per second on real-world editing traces (tested on sequential traces from the [editing-traces](https://github.com/josephg/editing-traces) benchmark suite).
 
 ## Design
 
+HashSeq is based on RGA (Replicated Growable Array) but introduces a key extension: the `InsertBefore` operation.
 
-Each edit produces a HashNode containing an Op and some extra dependencies:
+### The InsertBefore Problem
+
+Traditional RGA uses Lamport timestamps to order concurrent insertions at the same position. This works because timestamps encode causal information - if you've seen an element, your clock is higher.
+
+HashSeq is content-addressed: node IDs are hashes of their content and dependencies. This is crucial for BFT: a malicious actor cannot manipulate ordering by tampering with their clock or forging actor IDs. It also means no per-collaborator metadata - no actor IDs, no vector clocks that grow with each participant. Collaborators can join and leave without causing metadata bloat.
+
+When specific ordering is needed, use `InsertAfter` or `InsertBefore`. Hash comparison only determines ordering for truly concurrent insertions that share the same anchor - where either ordering is equally valid.
+
+Consider inserting between two causally related characters:
+
+```
+'a'
+  \
+  'b'    (b was inserted after a)
+```
+
+If we use `InsertAfter(a, 'x')`, then 'x' becomes a sibling of 'b':
+
+```
+'a'
+  \---\
+  'b' 'x'
+```
+
+The result could be `axb` or `abx` depending on whether `hash(x) < hash(b)` - essentially random.
+
+HashSeq solves this with `InsertBefore(b, 'x')`, which explicitly constrains 'x' to appear before 'b':
+
+```
+'a'
+  \
+  'b'
+  /
+'x'    (x is before b)
+```
+
+This guarantees the result is `axb`, regardless of hash ordering.
+
+### Operations
+
+Each edit produces a HashNode containing an Op and extra dependencies:
 
 ```rust
 pub enum Op {
     InsertRoot(char),
     InsertAfter(Id, char),
     InsertBefore(Id, char),
-    Remove(Id),
+    Remove(BTreeSet<Id>),
 }
 
 pub struct HashNode {
-    extra_dependenciess: BTreeSet<Id>,
+    extra_dependencies: BTreeSet<Id>,
     op: Op,
 }
 
@@ -72,11 +98,13 @@ impl HashNode {
 ```
 
 * `InsertRoot` is used when the HashSeq is empty.
-* `InsertAfter(id, char) is used to constrain this `HashNode` to appear after the node with id `id`.
+* `InsertAfter(id, char)` is used to constrain this HashNode to appear after the node with id `id`.
 * `InsertBefore(id, char)` is used to constrain this HashNode to appear before the node with id `id`.
-* `Remove(id)` is used to removing the node with id `id`.
+* `Remove(ids)` is used to remove a set of nodes.
 
-#### Example 1. Writing "hello" by appending end
+Node IDs are content-addressed hashes (blake3 by default) of the operation and its dependencies.
+
+#### Example 1. Writing "hello" by appending to end
 
 ```
 InsertRoot('h')       -- id = 0x0
@@ -85,101 +113,108 @@ InsertAfter(0x1, 'l') -- id = 0x2
 InsertAfter(0x2, 'l') -- id = 0x3
 InsertAfter(0x3, 'o') -- id = 0x4
 
-  h <- e <- l <- l <- o
+'h'
+  \
+  'e'
+    \
+    'l'
+      \
+      'l'
+        \
+        'o'
 
 -- "hello"
 ```
 
-
-
-
-Each insert produces a Node holding a value, the hashes of the immediate nodes to the left, and the immediate nodes to the right:
-s
-```
-struct Node<V> {
-   value: V,
-   lefts: Set<Hash>,
-   rights: Set<Hash>,
-}
-```
-E.g.
-
-Inserting 'a', 'b', 'c' in sequential order produces the graph:
-```
- a <- b <- c
-```
-
-Inserting 'd' between 'a' and 'b'
-```
-a <- d -> b <- c
-   \_____/
-```
-
-We linearize these Hash Graphs by performing a biased topological sort.
-
-The bias is used to decide a canonical ordering in cases where multiple linearizations satisfy the left/right constraints.
-
-E.g.
-```
-            s - a - m
-           /         \
-h - i - ' '           ! - !
-           \         /
-            d - a - n
+Since IDs are content-addressed, we can store the sequence succinctly as:
 
 ```
-
-The above hash-graph can serialize to `hi samdan!!` or `hi dansam` or even any interleaving of sam/dan: `hi sdaamn`, `hi sdanam`, ... . We need a canonical ordering that preserves some semantic information, (i.e. no interleaving of concurrent runs)
-
-The choice we make is: in a fork, we choose the branch whose starting element has the smaller hash, then to avoid interleaving of concurrent runs, our topological sort runs depth first rather than the traditional breadth first.
-
-So in the above example, assuming `hash(s)` < `hash(d)`, we'd get is: `hi samdan!!`.
-
-
-## Optimizations:
-
-
-If we detect hash-chains, we can collabse them to just the first left hashes and the right hashes:
-
-```rust
-struct Run<T> {
-   run: Vec<T>
-   lefts: Set<Hash>
-   rights: Set<Hash>
-}
+InsertRoot('h') 
+Run(0x0, "ello")
 ```
 
-i.e. in the first example, a,b,c are sequential, they all have a common right hand (empty set), and their left hand is the previous element in the sequence.
+Since text is highly compressible, we could further compress the string inside a run to achieve further storage compression. Then we can always decompress the run and reconstruct the operations and IDs of each character when needed to resolve order of concurrent edits.
 
-So we could represent this as:
 
-```rust
 
-// a <- b <- c == RUN("abc")
+#### Example 2. Concurrent editing
 
-Run {
-  run: "abc",
-  lefts: {},
-  rights: {}
-}
+Two users concurrently insert `"hi sam"` and `"hi dan"`. The two underlying hashseq structures look like:
 
 ```
-
-Inserting 'd' splits the run:
-
-```
-a <- d -> RUN("bc")
-   \_____/
-```
-
-And the fork example:
-
-```
-           RUN("sam")
-          /          \
-RUN("hi ")            RUN("!!")
-          \          /
-           RUN("dan")
+1. 'h'                      2. 'h'
+     \                           \
+     'i'                         'i'
+       \                           \
+       ' '                         ' '
+         \                           \
+         's'                         'd'
+           \                           \
+           'a'                         'a'
+             \                           \
+             'm'                         'n'
 ```
 
-This way we only store hashes at forks, the rest can be recomputed when necessary.
+Upon syncing, the common prefix `"hi "` is dedupped and the causal tree becomes:
+
+```
+'h'
+  \
+  'i'
+    \
+    ' '
+      \---\
+      's' 'd'
+        \   \
+        'a' 'a'
+          \   \
+          'm' 'n'
+```
+
+The HashSeq underlying structure is a causal insertion tree (each node has exactly one anchor). Forks occur when multiple nodes share the same anchor and the visualization above shows two right children of the ' ' node. A naive traversal could produce interleavings like `hi sdaamn` or `hi sdanam`. We need a canonical ordering that preserves semantic information - keeping concurrent runs intact.
+
+The choice made in HashSeq is to order child nodes by their hash. In a fork, we choose the branch whose starting element has the smaller hash, then to avoid interleaving of concurrent runs, our topological sort runs depth first. So in the above example, assuming `hash(s)` < `hash(d)`, we'd get: `hi samdan`.
+
+#### Example 3. Fixing a typo (inserting in the middle of a run)
+
+Consider a user who has typed "hllo" (missing an 'e'):
+
+```
+'h'
+  \
+  'l'
+    \
+    'l'
+      \
+      'o'
+```
+
+This is stored as a single run: `Run(root_h, "llo")`.
+
+Now the user wants to insert 'e' between 'h' and 'l' to get "hello". Using only `InsertAfter(id_h, 'e')` would make 'e' a sibling of the first 'l':
+
+```
+'h'
+  \---\
+  'l' 'e'
+    \
+    'l'
+      \
+      'o'
+```
+
+The result could be "hello" or "hlloe" depending on hash ordering (depth-first traversal follows one branch completely before the other) - not what we want.
+
+Instead, HashSeq uses `InsertBefore(id_l, 'e')` which creates an explicit constraint:
+
+```
+'h'
+  \
+  'l'
+  / \
+'e' 'l'
+      \
+      'o'
+```
+
+The left child `/` indicates 'e' is inserted before 'l'. This guarantees "hello" regardless of hash values since left children (insert-befores) are always traversed before right children (insert-afters).
