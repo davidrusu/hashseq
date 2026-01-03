@@ -206,12 +206,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
 
 [[package]]
-name = "bitmaps"
-version = "3.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d084b0137aaa901caf9f1e8b21daa6aa24d41cd806e111335541eff9683bd6"
-
-[[package]]
 name = "blake3"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,17 +645,6 @@ name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
-
-[[package]]
-name = "content-tree"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e72803b8ffda40310d30a12b110283a4e3acf8069759ab2e1f741ceae724bee5"
-dependencies = [
- "humansize",
- "rle",
- "smallvec",
-]
 
 [[package]]
 name = "core-foundation"
@@ -1322,10 +1305,8 @@ version = "0.1.0"
 dependencies = [
  "associative_positional_list",
  "bincode",
- "bitmaps",
  "blake3",
  "boa_engine",
- "content-tree",
  "criterion",
  "flate2",
  "hex",
@@ -1334,11 +1315,9 @@ dependencies = [
  "quickcheck",
  "quickcheck_macros",
  "rand",
- "rle",
  "serde",
  "serde_json",
  "stats_alloc",
- "tiny-keccak",
 ]
 
 [[package]]
@@ -1379,12 +1358,6 @@ name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
-
-[[package]]
-name = "humansize"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02296996cb8796d7c6e3bc2d9211b7802812d36999a51bb754123ead7d37d026"
 
 [[package]]
 name = "iced"
@@ -2976,15 +2949,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rle"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fd5726657d98c187858059ce5b8328c7fc2b0ddae32e0b7f84aa8c9bdce8c24"
-dependencies = [
- "smallvec",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3500,15 +3464,6 @@ checksum = "3526739392ec93fd8b359c8e98514cb3e8e021beb4e5f597b00a0221f8ed8a49"
 dependencies = [
  "num-conv",
  "time-core",
-]
-
-[[package]]
-name = "tiny-keccak"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
-dependencies = [
- "crunchy",
 ]
 
 [[package]]

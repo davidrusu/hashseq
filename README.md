@@ -102,7 +102,7 @@ impl HashNode {
 * `InsertBefore(id, char)` is used to constrain this HashNode to appear before the node with id `id`.
 * `Remove(ids)` is used to remove a set of nodes.
 
-Node IDs are content-addressed hashes (blake3 by default) of the operation and its dependencies.
+Node IDs are content-addressed hashes (blake3) of the operation and its dependencies.
 
 #### Example 1. Writing "hello" by appending to end
 
