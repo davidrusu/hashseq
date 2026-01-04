@@ -5,12 +5,12 @@ use associative_positional_list::AssociativePositionalList;
 use crate::{HashNode, Id, Op, Run};
 
 #[derive(Debug, Clone)]
-pub struct TopoIter<'a> {
+pub struct HashSeqIter<'a> {
     seq: &'a HashSeq,
     waiting_stack: Vec<(Id, Vec<Id>)>,
 }
 
-impl<'a> TopoIter<'a> {
+impl<'a> HashSeqIter<'a> {
     fn new(seq: &'a HashSeq) -> Self {
         let mut iter = Self {
             seq,
@@ -34,7 +34,7 @@ impl<'a> TopoIter<'a> {
     }
 }
 
-impl<'a> Iterator for TopoIter<'a> {
+impl<'a> Iterator for HashSeqIter<'a> {
     type Item = &'a Id;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -175,7 +175,7 @@ impl HashSeq {
     }
 
     /// Get a stable reference to an Id from existing data structures.
-    /// Used by TopoIter to return references without a separate nodes set.
+    /// Used by HashSeqIter to return references without a separate nodes set.
     fn get_id_ref(&self, id: &Id) -> Option<&Id> {
         // Try root_nodes first (BTreeMap gives us key references)
         if let Some((id_ref, _)) = self.root_nodes.get_key_value(id) {
@@ -751,8 +751,8 @@ impl HashSeq {
         }
     }
 
-    pub fn iter_ids(&self) -> TopoIter<'_> {
-        TopoIter::new(self)
+    pub fn iter_ids(&self) -> HashSeqIter<'_> {
+        HashSeqIter::new(self)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
