@@ -1,7 +1,11 @@
+pub mod encoding;
 pub mod hash_node;
 pub mod hashseq;
 pub mod run;
 
+pub use self::encoding::{
+    decode_batch, decode_hashseq, encode_batch, encode_hashseq, DecodeError, EncodableOp,
+};
 pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::{HashSeq, RunPosition};
 pub use self::run::Run;
