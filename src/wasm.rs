@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
 
-use crate::encoding::{decode_hashseq_dict, encode_hashseq_dict};
+use crate::encoding::{decode_hashseq, encode_hashseq};
 use crate::hashseq::HashSeq;
 
 #[wasm_bindgen]
@@ -34,11 +34,11 @@ impl WasmHashSeq {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        encode_hashseq_dict(&self.inner)
+        encode_hashseq(&self.inner)
     }
 
     pub fn merge_encoded(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
-        let other = decode_hashseq_dict(bytes)
+        let other = decode_hashseq(bytes)
             .map_err(|e| JsValue::from_str(&format!("decode error: {e}")))?;
         self.inner.merge(other);
         Ok(())

@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::time::Instant;
 
 use flate2::read::GzDecoder;
-use hashseq::{HashSeq, Id, encode_hashseq, encode_hashseq_dict, encode_hashseq_hybrid};
+use hashseq::encoding::{decode_string, decode_utf8_char, decode_varint};
+use hashseq::{HashSeq, encode_hashseq};
 use serde::Deserialize;
 use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 
@@ -72,22 +72,22 @@ struct RunStats {
     final_text_bytes: usize,
     memory_bytes: usize,
     encoded_bytes: usize,
-    encoded_dict_bytes: usize,
-    encoded_hybrid_bytes: usize,
-    dict_breakdown: DictBreakdown,
+    breakdown: ByteBreakdown,
 }
 
 #[derive(Default)]
-struct DictBreakdown {
-    total_ids: usize,
-    ids_from_run_anchors: usize,
-    ids_from_run_first_deps: usize,
-    ids_from_root_deps: usize,
-    ids_from_before_anchors: usize,
-    ids_from_before_deps: usize,
-    ids_from_remove_deps: usize,
-    ids_from_remove_targets: usize,
-    ids_unique_to_remove_targets: usize,
+struct ByteBreakdown {
+    dict_header: usize,
+    roots: usize,
+    runs: usize,
+    runs_text: usize,
+    befores: usize,
+    forward_remove_runs: usize,
+    backward_remove_runs: usize,
+    single_run_removes: usize,
+    before_removes: usize,
+    root_removes: usize,
+    orphans: usize,
 }
 
 impl RunStats {
@@ -133,80 +133,196 @@ fn build_seq(data: &TestData) -> (HashSeq, std::time::Duration) {
     (seq, elapsed)
 }
 
-fn dict_breakdown(seq: &HashSeq) -> DictBreakdown {
-    let mut all: BTreeSet<Id> = BTreeSet::new();
+/// Re-walk an encoded HashSeq using the public primitive decoders to attribute
+/// every byte to a section. Mirrors `encode_hashseq`'s layout exactly.
+///
+/// Also asserts every entry in the dictionary header is referenced at least
+/// once by the body — an unused entry would mean wasted bytes in the encoder.
+fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
+    // Tag bytes for orphan ops (must match the constants in src/encoding.rs).
+    const TAG_INSERT_ROOT: u8 = 0x01;
+    const TAG_INSERT_BEFORE: u8 = 0x02;
+    const TAG_REMOVE: u8 = 0x03;
+    const TAG_INSERT_AFTER: u8 = 0x04;
 
-    let mut from_run_anchors: BTreeSet<Id> = BTreeSet::new();
-    for run in seq.runs.values() {
-        from_run_anchors.insert(run.insert_after);
+    fn read_varint(bytes: &[u8], pos: &mut usize) -> usize {
+        let (v, sz) = decode_varint(&bytes[*pos..]).expect("varint");
+        *pos += sz;
+        v
     }
-    all.extend(&from_run_anchors);
-
-    let mut from_run_first_deps: BTreeSet<Id> = BTreeSet::new();
-    for run in seq.runs.values() {
-        for id in &run.first_extra_deps {
-            from_run_first_deps.insert(*id);
+    /// Skip a varint that's a positional index (run_idx, elem_idx, before_idx, etc.)
+    /// or just a count — *not* a reference into the dictionary.
+    fn skip_varint(bytes: &[u8], pos: &mut usize) {
+        let (_, sz) = decode_varint(&bytes[*pos..]).expect("varint");
+        *pos += sz;
+    }
+    /// Skip a varint that *is* a reference into the ID dictionary, and mark it.
+    fn skip_idx(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
+        let (idx, sz) = decode_varint(&bytes[*pos..]).expect("idx");
+        assert!(
+            idx < referenced.len(),
+            "dict index {idx} out of bounds (dict has {} entries)",
+            referenced.len()
+        );
+        referenced[idx] = true;
+        *pos += sz;
+    }
+    fn skip_idx_set(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
+        let n = read_varint(bytes, pos);
+        for _ in 0..n {
+            skip_idx(bytes, pos, referenced);
         }
     }
-    let prev = all.len();
-    all.extend(&from_run_first_deps);
-    let added_from_run_first_deps = all.len() - prev;
+    fn skip_utf8_char(bytes: &[u8], pos: &mut usize) {
+        let (_, sz) = decode_utf8_char(&bytes[*pos..]).expect("char");
+        *pos += sz;
+    }
 
-    let mut from_root_deps: BTreeSet<Id> = BTreeSet::new();
-    for root in seq.root_nodes.values() {
-        for dep in &root.extra_dependencies {
-            from_root_deps.insert(*dep);
+    let mut b = ByteBreakdown::default();
+    let mut pos = 0;
+
+    // Dict header: varint(num_ids) + num_ids * 32.
+    let dict_start = pos;
+    let num_ids = read_varint(bytes, &mut pos);
+    pos += num_ids * 32;
+    b.dict_header = pos - dict_start;
+    let mut referenced: Vec<bool> = vec![false; num_ids];
+
+    // Roots: varint(num) + num * { idx_set extra_deps, utf8 ch }
+    let s = pos;
+    let num_roots = read_varint(bytes, &mut pos);
+    for _ in 0..num_roots {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_utf8_char(bytes, &mut pos);
+    }
+    b.roots = pos - s;
+
+    // Runs: varint(num) + num * { idx insert_after, idx_set first_extra_deps, string run_text }
+    let s = pos;
+    let num_runs = read_varint(bytes, &mut pos);
+    for _ in 0..num_runs {
+        skip_idx(bytes, &mut pos, &mut referenced);
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        let (run_text, sz) = decode_string(&bytes[pos..]).expect("string");
+        pos += sz;
+        b.runs_text += run_text.len();
+    }
+    b.runs = pos - s;
+
+    // Befores: varint(num) + num * { idx_set extra_deps, idx anchor, utf8 ch }
+    let s = pos;
+    let num_befores = read_varint(bytes, &mut pos);
+    for _ in 0..num_befores {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_idx(bytes, &mut pos, &mut referenced);
+        skip_utf8_char(bytes, &mut pos);
+    }
+    b.befores = pos - s;
+
+    // Forward remove runs: varint(num) + num * { idx_set first_extra_deps, varint run_idx, varint start, varint end }
+    let s = pos;
+    let num_forward = read_varint(bytes, &mut pos);
+    for _ in 0..num_forward {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_varint(bytes, &mut pos); // run_idx (positional)
+        skip_varint(bytes, &mut pos); // start_idx (positional)
+        skip_varint(bytes, &mut pos); // end_idx (positional)
+    }
+    b.forward_remove_runs = pos - s;
+
+    // Backward remove runs: same shape
+    let s = pos;
+    let num_backward = read_varint(bytes, &mut pos);
+    for _ in 0..num_backward {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_varint(bytes, &mut pos); // run_idx
+        skip_varint(bytes, &mut pos); // start_idx
+        skip_varint(bytes, &mut pos); // end_idx
+    }
+    b.backward_remove_runs = pos - s;
+
+    // Single-run standalone removes: varint(num) + num * { idx_set extra_deps, varint run_idx, varint elem_idx }
+    let s = pos;
+    let num_single = read_varint(bytes, &mut pos);
+    for _ in 0..num_single {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_varint(bytes, &mut pos); // run_idx
+        skip_varint(bytes, &mut pos); // elem_idx
+    }
+    b.single_run_removes = pos - s;
+
+    // Before-target standalone removes: varint(num) + num * { idx_set extra_deps, varint before_idx }
+    let s = pos;
+    let num_before_rm = read_varint(bytes, &mut pos);
+    for _ in 0..num_before_rm {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_varint(bytes, &mut pos); // before_idx (positional)
+    }
+    b.before_removes = pos - s;
+
+    // Root-target standalone removes: varint(num) + num * { idx_set extra_deps, varint root_idx }
+    let s = pos;
+    let num_root_rm = read_varint(bytes, &mut pos);
+    for _ in 0..num_root_rm {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_varint(bytes, &mut pos); // root_idx (positional)
+    }
+    b.root_removes = pos - s;
+
+    // Orphans: varint(num) + num * tagged HashNode
+    let s = pos;
+    let num_orphans = read_varint(bytes, &mut pos);
+    for _ in 0..num_orphans {
+        let tag = bytes[pos];
+        pos += 1;
+        match tag {
+            TAG_INSERT_ROOT => {
+                skip_idx_set(bytes, &mut pos, &mut referenced);
+                skip_utf8_char(bytes, &mut pos);
+            }
+            TAG_INSERT_AFTER | TAG_INSERT_BEFORE => {
+                skip_idx_set(bytes, &mut pos, &mut referenced);
+                skip_idx(bytes, &mut pos, &mut referenced);
+                skip_utf8_char(bytes, &mut pos);
+            }
+            TAG_REMOVE => {
+                skip_idx_set(bytes, &mut pos, &mut referenced);
+                let n = read_varint(bytes, &mut pos);
+                for _ in 0..n {
+                    skip_idx(bytes, &mut pos, &mut referenced);
+                }
+            }
+            other => panic!("unknown orphan tag: {other:#x}"),
         }
     }
-    let prev = all.len();
-    all.extend(&from_root_deps);
-    let added_from_root_deps = all.len() - prev;
+    b.orphans = pos - s;
 
-    let mut from_before_anchors: BTreeSet<Id> = BTreeSet::new();
-    let mut from_before_deps: BTreeSet<Id> = BTreeSet::new();
-    for before in seq.before_nodes.values() {
-        from_before_anchors.insert(before.anchor);
-        for dep in &before.extra_dependencies {
-            from_before_deps.insert(*dep);
-        }
-    }
-    let prev = all.len();
-    all.extend(&from_before_anchors);
-    let added_from_before_anchors = all.len() - prev;
-    let prev = all.len();
-    all.extend(&from_before_deps);
-    let added_from_before_deps = all.len() - prev;
+    assert_eq!(
+        pos,
+        bytes.len(),
+        "byte_breakdown didn't consume the full encoding ({} of {} bytes)",
+        pos,
+        bytes.len()
+    );
 
-    let mut from_remove_deps: BTreeSet<Id> = BTreeSet::new();
-    let mut from_remove_targets: BTreeSet<Id> = BTreeSet::new();
-    for remove in seq.remove_nodes.values() {
-        for dep in &remove.extra_dependencies {
-            from_remove_deps.insert(*dep);
-        }
-        for target in &remove.nodes {
-            from_remove_targets.insert(*target);
-        }
-    }
-    let prev = all.len();
-    all.extend(&from_remove_deps);
-    let added_from_remove_deps = all.len() - prev;
-    let before_targets = all.clone();
-    all.extend(&from_remove_targets);
-    let added_from_remove_targets = all.len() - before_targets.len();
-    // IDs that *only* show up because of remove targets (not contributed by any earlier source).
-    let unique_to_targets = from_remove_targets.difference(&before_targets).count();
+    // Sanity check: every dictionary entry must be referenced by the body.
+    // An unused entry would mean the encoder wrote a 32-byte ID nobody asked for.
+    let unused: Vec<usize> = referenced
+        .iter()
+        .enumerate()
+        .filter_map(|(i, used)| (!*used).then_some(i))
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "{} of {} dictionary entries are never referenced (e.g. indices {:?}) — \
+         {} bytes of dict header are wasted",
+        unused.len(),
+        referenced.len(),
+        &unused[..unused.len().min(8)],
+        unused.len() * 32,
+    );
 
-    DictBreakdown {
-        total_ids: all.len(),
-        ids_from_run_anchors: from_run_anchors.len(),
-        ids_from_run_first_deps: added_from_run_first_deps,
-        ids_from_root_deps: added_from_root_deps,
-        ids_from_before_anchors: added_from_before_anchors,
-        ids_from_before_deps: added_from_before_deps,
-        ids_from_remove_deps: added_from_remove_deps,
-        ids_from_remove_targets: added_from_remove_targets,
-        ids_unique_to_remove_targets: unique_to_targets,
-    }
+    b
 }
 
 fn measure_memory(seq: &HashSeq) -> usize {
@@ -238,10 +354,9 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let (seq, _) = build_seq(data);
     let final_text_bytes = seq.iter().map(|c| c.len_utf8()).sum();
     let memory_bytes = measure_memory(&seq);
-    let encoded_bytes = encode_hashseq(&seq).len();
-    let encoded_dict_bytes = encode_hashseq_dict(&seq).len();
-    let encoded_hybrid_bytes = encode_hashseq_hybrid(&seq).len();
-    let breakdown = dict_breakdown(&seq);
+    let encoded = encode_hashseq(&seq);
+    let encoded_bytes = encoded.len();
+    let breakdown = byte_breakdown(&encoded);
 
     RunStats {
         times_ms,
@@ -252,15 +367,13 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
         final_text_bytes,
         memory_bytes,
         encoded_bytes,
-        encoded_dict_bytes,
-        encoded_hybrid_bytes,
-        dict_breakdown: breakdown,
+        breakdown,
     }
 }
 
 fn main() {
     let traces_dir = Path::new("../editing-traces/sequential_traces");
-    let iterations = 3;
+    let iterations = 1;
 
     let traces = [
         "automerge-paper.json.gz",
@@ -318,74 +431,97 @@ fn main() {
 
     println!("\nStorage (bytes; ratios are over final UTF-8 text size)");
     println!(
-        "{:<25} {:>10} {:>10} {:>8} {:>10} {:>8} {:>10} {:>8} {:>10} {:>8}",
-        "Trace",
-        "Text",
-        "Memory",
-        "Mem/x",
-        "OpRef",
-        "OpRef/x",
-        "Dict",
-        "Dict/x",
-        "Hybrid",
-        "Hybrid/x",
+        "{:<25} {:>10} {:>10} {:>8} {:>10} {:>8}",
+        "Trace", "Text", "Memory", "Mem/x", "Encoded", "Enc/x",
     );
-    println!("{}", "-".repeat(116));
+    println!("{}", "-".repeat(78));
 
     for (name, stats) in &all_stats {
         let text = stats.final_text_bytes.max(1) as f64;
         println!(
-            "{:<25} {:>10} {:>10} {:>7.2}x {:>10} {:>7.2}x {:>10} {:>7.2}x {:>10} {:>7.2}x",
+            "{:<25} {:>10} {:>10} {:>7.2}x {:>10} {:>7.2}x",
             name,
             stats.final_text_bytes,
             stats.memory_bytes,
             stats.memory_bytes as f64 / text,
             stats.encoded_bytes,
             stats.encoded_bytes as f64 / text,
-            stats.encoded_dict_bytes,
-            stats.encoded_dict_bytes as f64 / text,
-            stats.encoded_hybrid_bytes,
-            stats.encoded_hybrid_bytes as f64 / text,
         );
     }
 
-    // Dict breakdown — where does the dict's pain come from?
-    // The dict header alone is 32 bytes per unique ID.
-    println!("\nDict ID census (how the dict-encoder's ID set is composed)");
+    println!("\nEncoded byte breakdown by section");
     println!(
-        "{:<25} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>11}",
+        "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "Trace",
         "Total",
-        "HdrBytes",
-        "RunAnch",
-        "RunDeps",
-        "RootDep",
-        "BefAnch",
-        "BefDeps",
-        "RmDeps",
-        "RmTargets*",
+        "Dict",
+        "Roots",
+        "Runs",
+        "RunText",
+        "Befores",
+        "RmRunF",
+        "RmRunB",
+        "RmSing",
+        "RmBef",
+        "RmRoot",
     );
-    println!("{}", "-".repeat(120));
+    println!("{}", "-".repeat(140));
     for (name, stats) in &all_stats {
-        let b = &stats.dict_breakdown;
+        let b = &stats.breakdown;
         println!(
-            "{:<25} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>11}",
+            "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
             name,
-            b.total_ids,
-            b.total_ids * 32,
-            b.ids_from_run_anchors,
-            b.ids_from_run_first_deps,
-            b.ids_from_root_deps,
-            b.ids_from_before_anchors,
-            b.ids_from_before_deps,
-            b.ids_from_remove_deps,
-            // Show how many IDs are in the dict *only* because removes target them.
-            // The OpRef encoder represents these as (run_idx, elem_idx) pairs and never stores their full IDs.
-            format!("{} ({})", b.ids_from_remove_targets, b.ids_unique_to_remove_targets),
+            stats.encoded_bytes,
+            b.dict_header,
+            b.roots,
+            b.runs,
+            b.runs_text,
+            b.befores,
+            b.forward_remove_runs,
+            b.backward_remove_runs,
+            b.single_run_removes,
+            b.before_removes,
+            b.root_removes,
         );
     }
     println!(
-        "  RmTargets* = total remove-target IDs (how many of those are unique to that source, i.e. \
-         pure overhead vs. OpRef which stores them as (run_idx, elem_idx) pairs)"
+        "  RunText is the actual character bytes (UTF-8) inside the Runs section — \
+         everything else is structural overhead."
     );
+
+    println!("\nByte breakdown as % of encoding");
+    println!(
+        "{:<25} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "Trace",
+        "Dict%",
+        "Roots%",
+        "Runs%",
+        "Text%",
+        "Bef%",
+        "RmRunF%",
+        "RmRunB%",
+        "RmSing%",
+        "RmBef%",
+        "RmRoot%",
+    );
+    println!("{}", "-".repeat(115));
+    for (name, stats) in &all_stats {
+        let b = &stats.breakdown;
+        let t = stats.encoded_bytes.max(1) as f64;
+        let pct = |x: usize| 100.0 * x as f64 / t;
+        println!(
+            "{:<25} {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}%",
+            name,
+            pct(b.dict_header),
+            pct(b.roots),
+            pct(b.runs),
+            pct(b.runs_text),
+            pct(b.befores),
+            pct(b.forward_remove_runs),
+            pct(b.backward_remove_runs),
+            pct(b.single_run_removes),
+            pct(b.before_removes),
+            pct(b.root_removes),
+        );
+    }
 }

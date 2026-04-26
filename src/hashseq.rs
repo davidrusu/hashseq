@@ -107,7 +107,7 @@ pub struct CausalRoot {
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
-    // Hybrid storage: runs for sequential elements, individual nodes for complex operations
+    // Sequential inserts are coalesced into runs; everything else lives as individual nodes.
     pub runs: HashMap<Id, Run>,
     pub root_nodes: BTreeMap<Id, CausalRoot>,
     pub before_nodes: HashMap<Id, CausalInsert>,
