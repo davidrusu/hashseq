@@ -245,12 +245,11 @@ fn main() {
     for run in seq.runs.values() {
         // Check if this run's insert_after points to the last elem of another run
         // AND this run has no extra dependencies on its first element
-        if run.first_extra_deps.is_empty() {
-            if let Some(parent_run) = last_elem_to_run.get(&run.insert_after) {
-                // This run could potentially be merged with parent_run
-                mergeable_runs += 1;
-                mergeable_chars += run.len();
-            }
+        if run.first_extra_deps.is_empty()
+            && last_elem_to_run.contains_key(&run.insert_after)
+        {
+            mergeable_runs += 1;
+            mergeable_chars += run.len();
         }
     }
 
@@ -440,7 +439,6 @@ fn main() {
         pos += size;
     }
     let backward_runs_total = pos - backward_runs_start;
-    let num_remove_runs = num_forward_runs + num_backward_runs;
 
     // Parse single-run removes: [count][extra_deps, run_idx, elem_idx]...
     let single_run_start = pos;
@@ -476,7 +474,6 @@ fn main() {
         pos += size;
     }
     let root_removes_total = pos - root_removes_start;
-    let num_standalone = num_single_run + num_before_removes + num_root_removes;
     let removes_total = pos - removes_start;
 
     // Parse orphans section
