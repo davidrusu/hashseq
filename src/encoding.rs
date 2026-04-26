@@ -464,10 +464,10 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         let mut run_ref = None;
         if remove.nodes.len() == 1 {
             let removed_id = remove.nodes.iter().next().unwrap();
-            if let Some(op_ref) = id_to_ref.get(removed_id) {
-                if op_ref.tag == REF_TAG_RUN {
-                    run_ref = Some((op_ref.op_idx, op_ref.sub_idx));
-                }
+            if let Some(op_ref) = id_to_ref.get(removed_id)
+                && op_ref.tag == REF_TAG_RUN
+            {
+                run_ref = Some((op_ref.op_idx, op_ref.sub_idx));
             }
         }
         remove_infos.push(RemoveInfo {
@@ -489,17 +489,17 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let mut chain_next: Vec<Option<usize>> = vec![None; remove_infos.len()];
 
     for (i, info) in remove_infos.iter().enumerate() {
-        if let Some((run_idx, elem_idx)) = info.run_ref {
-            if let Some(&next_idx) = dep_to_idx.get(&info.id) {
-                let next_info = &remove_infos[next_idx];
-                if let Some((next_run, next_elem)) = next_info.run_ref {
-                    if next_run == run_idx {
-                        let is_adjacent = (elem_idx > 0 && next_elem == elem_idx - 1)
-                            || next_elem == elem_idx + 1;
-                        if is_adjacent {
-                            chain_next[i] = Some(next_idx);
-                        }
-                    }
+        if let Some((run_idx, elem_idx)) = info.run_ref
+            && let Some(&next_idx) = dep_to_idx.get(&info.id)
+        {
+            let next_info = &remove_infos[next_idx];
+            if let Some((next_run, next_elem)) = next_info.run_ref
+                && next_run == run_idx
+            {
+                let is_adjacent =
+                    (elem_idx > 0 && next_elem == elem_idx - 1) || next_elem == elem_idx + 1;
+                if is_adjacent {
+                    chain_next[i] = Some(next_idx);
                 }
             }
         }

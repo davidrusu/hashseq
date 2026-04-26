@@ -24,6 +24,12 @@ getrandom = { version = "0.2", features = ["js"] }
 [features]
 default = []
 
+[package.metadata.cargo-machete]
+# `getrandom` is a feature-flag-only dependency: we declare it solely to
+# enable the `js` feature on the transitive copy that wasm-bindgen and blake3
+# pull in, so the wasm32 builds get browser-provided randomness.
+ignored = ["getrandom"]
+
 [dev-dependencies]
 rand = "0.8.5"
 serde_json = "1.0.86"

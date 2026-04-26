@@ -4,6 +4,7 @@ use crate::encoding::{decode_hashseq, encode_hashseq};
 use crate::hashseq::HashSeq;
 
 #[wasm_bindgen]
+#[derive(Default)]
 pub struct WasmHashSeq {
     inner: HashSeq,
 }
@@ -12,9 +13,7 @@ pub struct WasmHashSeq {
 impl WasmHashSeq {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self {
-            inner: HashSeq::default(),
-        }
+        Self::default()
     }
 
     pub fn insert(&mut self, idx: usize, text: &str) {
@@ -31,6 +30,10 @@ impl WasmHashSeq {
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 
     pub fn encode(&self) -> Vec<u8> {
