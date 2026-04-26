@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HashSeq CRDT Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 2rem;
+    }
+    h1 {
+      text-align: center;
+      margin-bottom: 0.5rem;
+      font-size: 1.8rem;
+      color: #f8fafc;
+    }
+    .subtitle {
+      text-align: center;
+      color: #94a3b8;
+      margin-bottom: 2rem;
+      font-size: 0.95rem;
+    }
+    .editors {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      max-width: 1200px;
+      margin: 0 auto 1.5rem;
+    }
+    .editor-panel {
+      background: #1e293b;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #334155;
+    }
+    .editor-header {
+      padding: 0.75rem 1rem;
+      background: #334155;
+      font-weight: 600;
+      font-size: 0.9rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .editor-header .len {
+      font-weight: 400;
+      color: #94a3b8;
+      font-size: 0.8rem;
+    }
+    .cm-editor {
+      height: 300px;
+    }
+    .cm-editor .cm-scroller {
+      font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 14px;
+    }
+    .cm-editor.cm-focused {
+      outline: none;
+    }
+    .controls {
+      text-align: center;
+      margin-bottom: 1.5rem;
+    }
+    button {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 0.75rem 2rem;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover {
+      background: #2563eb;
+    }
+    button:active {
+      background: #1d4ed8;
+    }
+    .status {
+      text-align: center;
+      color: #94a3b8;
+      font-size: 0.85rem;
+      min-height: 1.5em;
+    }
+    .status.synced {
+      color: #4ade80;
+    }
+    @media (max-width: 768px) {
+      .editors { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>HashSeq CRDT Demo</h1>
+  <p class="subtitle">Two editors, each backed by an independent HashSeq instance. Edit both, then sync to merge.</p>
+  <div class="editors">
+    <div class="editor-panel">
+      <div class="editor-header">
+        <span>Peer A</span>
+        <span class="len" id="len-a">0 chars</span>
+      </div>
+      <div id="editor-a"></div>
+    </div>
+    <div class="editor-panel">
+      <div class="editor-header">
+        <span>Peer B</span>
+        <span class="len" id="len-b">0 chars</span>
+      </div>
+      <div id="editor-b"></div>
+    </div>
+  </div>
+  <div class="controls">
+    <button id="sync-btn">Sync</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <script type="module" src="index.js"></script>
+</body>
+</html>
