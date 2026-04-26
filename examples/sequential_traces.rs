@@ -1,9 +1,11 @@
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use flate2::Compression;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use hashseq::encoding::{decode_string, decode_utf8_char, decode_varint};
 use hashseq::{HashSeq, encode_hashseq};
 use serde::Deserialize;
@@ -72,6 +74,8 @@ struct RunStats {
     final_text_bytes: usize,
     memory_bytes: usize,
     encoded_bytes: usize,
+    text_gzip_bytes: usize,
+    encoded_gzip_bytes: usize,
     breakdown: ByteBreakdown,
 }
 
@@ -325,6 +329,12 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     b
 }
 
+fn gzip_size(bytes: &[u8]) -> usize {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).expect("gzip");
+    encoder.finish().expect("gzip finish").len()
+}
+
 fn measure_memory(seq: &HashSeq) -> usize {
     let before = GLOBAL.stats().bytes_allocated;
     let clone = seq.clone();
@@ -357,6 +367,9 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let encoded = encode_hashseq(&seq);
     let encoded_bytes = encoded.len();
     let breakdown = byte_breakdown(&encoded);
+    let text: String = seq.iter().collect();
+    let text_gzip_bytes = gzip_size(text.as_bytes());
+    let encoded_gzip_bytes = gzip_size(&encoded);
 
     RunStats {
         times_ms,
@@ -367,6 +380,8 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
         final_text_bytes,
         memory_bytes,
         encoded_bytes,
+        text_gzip_bytes,
+        encoded_gzip_bytes,
         breakdown,
     }
 }
@@ -431,21 +446,25 @@ fn main() {
 
     println!("\nStorage (bytes; ratios are over final UTF-8 text size)");
     println!(
-        "{:<25} {:>10} {:>10} {:>8} {:>10} {:>8}",
-        "Trace", "Text", "Memory", "Mem/x", "Encoded", "Enc/x",
+        "{:<25} {:>10} {:>10} {:>8} {:>10} {:>8} {:>10} {:>10} {:>9}",
+        "Trace", "Text", "Memory", "Mem/x", "Encoded", "Enc/x", "Text+gz", "Enc+gz", "Enc/Enc+gz",
     );
-    println!("{}", "-".repeat(78));
+    println!("{}", "-".repeat(110));
 
     for (name, stats) in &all_stats {
         let text = stats.final_text_bytes.max(1) as f64;
+        let enc_gz = stats.encoded_gzip_bytes.max(1) as f64;
         println!(
-            "{:<25} {:>10} {:>10} {:>7.2}x {:>10} {:>7.2}x",
+            "{:<25} {:>10} {:>10} {:>7.2}x {:>10} {:>7.2}x {:>10} {:>10} {:>8.2}x",
             name,
             stats.final_text_bytes,
             stats.memory_bytes,
             stats.memory_bytes as f64 / text,
             stats.encoded_bytes,
             stats.encoded_bytes as f64 / text,
+            stats.text_gzip_bytes,
+            stats.encoded_gzip_bytes,
+            stats.encoded_bytes as f64 / enc_gz,
         );
     }
 
