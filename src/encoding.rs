@@ -695,6 +695,14 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     }
 
     // Runs
+    //
+    // TODO: a run whose first_extra_deps is empty and whose insert_after is
+    // the last element of another run *could* be folded into that parent run
+    // and emitted as a single longer string. Measured on real editing traces:
+    // ~45% of runs in automerge-paper (4,375 of 9,680) qualify, representing
+    // ~140 KB of avoidable insert_after IDs. Fixing this likely belongs in
+    // HashSeq's run-management (avoid creating the split in the first place)
+    // rather than as a post-pass in the encoder.
     encode_varint(runs.len(), &mut buf);
     for run in &runs {
         encode_idx(&run.insert_after, &mut buf);

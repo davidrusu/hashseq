@@ -77,6 +77,43 @@ struct RunStats {
     text_gzip_bytes: usize,
     encoded_gzip_bytes: usize,
     breakdown: ByteBreakdown,
+    run_size_dist: RunSizeDist,
+}
+
+#[derive(Default)]
+struct RunSizeDist {
+    total_chars: usize,
+    min: usize,
+    median: usize,
+    p99: usize,
+    p99_5: usize,
+    p99_9: usize,
+    max: usize,
+    avg: f64,
+}
+
+fn run_size_dist(seq: &HashSeq) -> RunSizeDist {
+    let mut sizes: Vec<usize> = seq.runs.values().map(|r| r.len()).collect();
+    sizes.sort();
+    let num = sizes.len();
+    if num == 0 {
+        return RunSizeDist::default();
+    }
+    let total_chars: usize = sizes.iter().sum();
+    let percentile = |p: f64| {
+        let idx = ((num as f64 * p / 100.0).ceil() as usize).saturating_sub(1);
+        sizes[idx.min(num - 1)]
+    };
+    RunSizeDist {
+        total_chars,
+        min: sizes[0],
+        median: percentile(50.0),
+        p99: percentile(99.0),
+        p99_5: percentile(99.5),
+        p99_9: percentile(99.9),
+        max: sizes[num - 1],
+        avg: total_chars as f64 / num as f64,
+    }
 }
 
 #[derive(Default)]
@@ -370,6 +407,7 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let text: String = seq.iter().collect();
     let text_gzip_bytes = gzip_size(text.as_bytes());
     let encoded_gzip_bytes = gzip_size(&encoded);
+    let run_size_dist = run_size_dist(&seq);
 
     RunStats {
         times_ms,
@@ -383,12 +421,13 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
         text_gzip_bytes,
         encoded_gzip_bytes,
         breakdown,
+        run_size_dist,
     }
 }
 
 fn main() {
     let traces_dir = Path::new("../editing-traces/sequential_traces");
-    let iterations = 1;
+    let iterations = 50;
 
     let traces = [
         "automerge-paper.json.gz",
@@ -541,6 +580,29 @@ fn main() {
             pct(b.single_run_removes),
             pct(b.before_removes),
             pct(b.root_removes),
+        );
+    }
+
+    println!("\nRun size distribution (chars per run)");
+    println!(
+        "{:<25} {:>8} {:>10} {:>5} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "Trace", "Runs", "TotalChrs", "Min", "Median", "p99", "p99.5", "p99.9", "Max", "Avg",
+    );
+    println!("{}", "-".repeat(96));
+    for (name, stats) in &all_stats {
+        let d = &stats.run_size_dist;
+        println!(
+            "{:<25} {:>8} {:>10} {:>5} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7.2}",
+            name,
+            stats.run_count,
+            d.total_chars,
+            d.min,
+            d.median,
+            d.p99,
+            d.p99_5,
+            d.p99_9,
+            d.max,
+            d.avg,
         );
     }
 }

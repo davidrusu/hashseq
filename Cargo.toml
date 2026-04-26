@@ -32,7 +32,6 @@ quickcheck = "1"
 quickcheck_macros = "1"
 criterion = "0.5"
 iced = { version = "0.10", features=["canvas", "tokio"]} # { git = "https://github.com/iced-rs/iced.git", rev = "7dd32f3be43c72e11dac5e07918e9ad6d36b6555" }
-boa_engine = "0.20.0"
 stats_alloc = "0.1.10"
 
 [profile.bench]
