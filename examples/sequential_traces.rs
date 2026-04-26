@@ -1,10 +1,11 @@
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::time::Instant;
 
 use flate2::read::GzDecoder;
-use hashseq::{HashSeq, encode_hashseq, encode_hashseq_dict};
+use hashseq::{HashSeq, Id, encode_hashseq, encode_hashseq_dict};
 use serde::Deserialize;
 use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 
@@ -72,6 +73,20 @@ struct RunStats {
     memory_bytes: usize,
     encoded_bytes: usize,
     encoded_dict_bytes: usize,
+    dict_breakdown: DictBreakdown,
+}
+
+#[derive(Default)]
+struct DictBreakdown {
+    total_ids: usize,
+    ids_from_run_anchors: usize,
+    ids_from_run_first_deps: usize,
+    ids_from_root_deps: usize,
+    ids_from_before_anchors: usize,
+    ids_from_before_deps: usize,
+    ids_from_remove_deps: usize,
+    ids_from_remove_targets: usize,
+    ids_unique_to_remove_targets: usize,
 }
 
 impl RunStats {
@@ -117,6 +132,82 @@ fn build_seq(data: &TestData) -> (HashSeq, std::time::Duration) {
     (seq, elapsed)
 }
 
+fn dict_breakdown(seq: &HashSeq) -> DictBreakdown {
+    let mut all: BTreeSet<Id> = BTreeSet::new();
+
+    let mut from_run_anchors: BTreeSet<Id> = BTreeSet::new();
+    for run in seq.runs.values() {
+        from_run_anchors.insert(run.insert_after);
+    }
+    all.extend(&from_run_anchors);
+
+    let mut from_run_first_deps: BTreeSet<Id> = BTreeSet::new();
+    for run in seq.runs.values() {
+        for id in &run.first_extra_deps {
+            from_run_first_deps.insert(*id);
+        }
+    }
+    let prev = all.len();
+    all.extend(&from_run_first_deps);
+    let added_from_run_first_deps = all.len() - prev;
+
+    let mut from_root_deps: BTreeSet<Id> = BTreeSet::new();
+    for root in seq.root_nodes.values() {
+        for dep in &root.extra_dependencies {
+            from_root_deps.insert(*dep);
+        }
+    }
+    let prev = all.len();
+    all.extend(&from_root_deps);
+    let added_from_root_deps = all.len() - prev;
+
+    let mut from_before_anchors: BTreeSet<Id> = BTreeSet::new();
+    let mut from_before_deps: BTreeSet<Id> = BTreeSet::new();
+    for before in seq.before_nodes.values() {
+        from_before_anchors.insert(before.anchor);
+        for dep in &before.extra_dependencies {
+            from_before_deps.insert(*dep);
+        }
+    }
+    let prev = all.len();
+    all.extend(&from_before_anchors);
+    let added_from_before_anchors = all.len() - prev;
+    let prev = all.len();
+    all.extend(&from_before_deps);
+    let added_from_before_deps = all.len() - prev;
+
+    let mut from_remove_deps: BTreeSet<Id> = BTreeSet::new();
+    let mut from_remove_targets: BTreeSet<Id> = BTreeSet::new();
+    for remove in seq.remove_nodes.values() {
+        for dep in &remove.extra_dependencies {
+            from_remove_deps.insert(*dep);
+        }
+        for target in &remove.nodes {
+            from_remove_targets.insert(*target);
+        }
+    }
+    let prev = all.len();
+    all.extend(&from_remove_deps);
+    let added_from_remove_deps = all.len() - prev;
+    let before_targets = all.clone();
+    all.extend(&from_remove_targets);
+    let added_from_remove_targets = all.len() - before_targets.len();
+    // IDs that *only* show up because of remove targets (not contributed by any earlier source).
+    let unique_to_targets = from_remove_targets.difference(&before_targets).count();
+
+    DictBreakdown {
+        total_ids: all.len(),
+        ids_from_run_anchors: from_run_anchors.len(),
+        ids_from_run_first_deps: added_from_run_first_deps,
+        ids_from_root_deps: added_from_root_deps,
+        ids_from_before_anchors: added_from_before_anchors,
+        ids_from_before_deps: added_from_before_deps,
+        ids_from_remove_deps: added_from_remove_deps,
+        ids_from_remove_targets: added_from_remove_targets,
+        ids_unique_to_remove_targets: unique_to_targets,
+    }
+}
+
 fn measure_memory(seq: &HashSeq) -> usize {
     let before = GLOBAL.stats().bytes_allocated;
     let clone = seq.clone();
@@ -148,6 +239,7 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let memory_bytes = measure_memory(&seq);
     let encoded_bytes = encode_hashseq(&seq).len();
     let encoded_dict_bytes = encode_hashseq_dict(&seq).len();
+    let breakdown = dict_breakdown(&seq);
 
     RunStats {
         times_ms,
@@ -159,6 +251,7 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
         memory_bytes,
         encoded_bytes,
         encoded_dict_bytes,
+        dict_breakdown: breakdown,
     }
 }
 
@@ -241,4 +334,44 @@ fn main() {
             stats.encoded_dict_bytes as f64 / text,
         );
     }
+
+    // Dict breakdown — where does the dict's pain come from?
+    // The dict header alone is 32 bytes per unique ID.
+    println!("\nDict ID census (how the dict-encoder's ID set is composed)");
+    println!(
+        "{:<25} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>11}",
+        "Trace",
+        "Total",
+        "HdrBytes",
+        "RunAnch",
+        "RunDeps",
+        "RootDep",
+        "BefAnch",
+        "BefDeps",
+        "RmDeps",
+        "RmTargets*",
+    );
+    println!("{}", "-".repeat(120));
+    for (name, stats) in &all_stats {
+        let b = &stats.dict_breakdown;
+        println!(
+            "{:<25} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>11}",
+            name,
+            b.total_ids,
+            b.total_ids * 32,
+            b.ids_from_run_anchors,
+            b.ids_from_run_first_deps,
+            b.ids_from_root_deps,
+            b.ids_from_before_anchors,
+            b.ids_from_before_deps,
+            b.ids_from_remove_deps,
+            // Show how many IDs are in the dict *only* because removes target them.
+            // The OpRef encoder represents these as (run_idx, elem_idx) pairs and never stores their full IDs.
+            format!("{} ({})", b.ids_from_remove_targets, b.ids_unique_to_remove_targets),
+        );
+    }
+    println!(
+        "  RmTargets* = total remove-target IDs (how many of those are unique to that source, i.e. \
+         pure overhead vs. OpRef which stores them as (run_idx, elem_idx) pairs)"
+    );
 }

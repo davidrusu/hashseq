@@ -1619,4 +1619,172 @@ mod tests {
         let (decoded, size) = decode_run(&buf).unwrap();
         size == buf.len() && decoded == run
     }
+
+    // --- Dict encoder roundtrip tests (parallel to the OpRef tests above) ---
+
+    #[test]
+    fn test_hashseq_dict_empty_roundtrip() {
+        let seq = HashSeq::default();
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        assert_eq!(seq.iter().collect::<String>(), decoded.iter().collect::<String>());
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_dict_simple_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert(0, 'h');
+        seq.insert(1, 'e');
+        seq.insert(2, 'l');
+        seq.insert(3, 'l');
+        seq.insert(4, 'o');
+
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), "hello");
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_dict_with_removes_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert(0, 'a');
+        seq.insert(1, 'b');
+        seq.insert(2, 'c');
+        seq.remove(1);
+
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), "ac");
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_dict_batch_insert_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello world".chars());
+
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), "hello world");
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_dict_complex_roundtrip() {
+        let mut seq = HashSeq::default();
+
+        seq.insert_batch(0, "hello".chars());
+        seq.insert(0, 'X');
+        seq.insert(6, 'Y');
+        seq.remove(3);
+
+        let original_str: String = seq.iter().collect();
+
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), original_str);
+        assert_eq!(seq, decoded);
+    }
+
+    #[quickcheck]
+    fn prop_hashseq_dict_roundtrip_preserves_content(ops: Vec<(bool, u8, char)>) -> bool {
+        let mut seq = HashSeq::default();
+
+        for (is_insert, idx, ch) in ops {
+            let idx = idx as usize;
+            if is_insert {
+                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                seq.insert(insert_idx, ch);
+            } else if !seq.is_empty() {
+                let remove_idx = idx % seq.len();
+                seq.remove(remove_idx);
+            }
+        }
+
+        let original_str: String = seq.iter().collect();
+
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        let decoded_str: String = decoded.iter().collect();
+        original_str == decoded_str
+    }
+
+    #[quickcheck]
+    fn prop_hashseq_dict_roundtrip_preserves_equality(ops: Vec<(bool, u8, char)>) -> bool {
+        let mut seq = HashSeq::default();
+
+        for (is_insert, idx, ch) in ops {
+            let idx = idx as usize;
+            if is_insert {
+                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                seq.insert(insert_idx, ch);
+            } else if !seq.is_empty() {
+                let remove_idx = idx % seq.len();
+                seq.remove(remove_idx);
+            }
+        }
+
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        seq == decoded
+    }
+
+    #[quickcheck]
+    fn prop_hashseq_dict_batch_roundtrip(text: String, remove_indices: Vec<u8>) -> bool {
+        let mut seq = HashSeq::default();
+
+        if !text.is_empty() {
+            seq.insert_batch(0, text.chars());
+
+            for idx in remove_indices {
+                if !seq.is_empty() {
+                    let remove_idx = idx as usize % seq.len();
+                    seq.remove(remove_idx);
+                }
+            }
+        }
+
+        let original_str: String = seq.iter().collect();
+
+        let encoded = encode_hashseq_dict(&seq);
+        let decoded = decode_hashseq_dict(&encoded).unwrap();
+
+        let decoded_str: String = decoded.iter().collect();
+        original_str == decoded_str && seq == decoded
+    }
+
+    /// Both encoders should accept any valid HashSeq and roundtrip to an equivalent one.
+    /// They produce different byte streams but should agree on the resulting state.
+    #[quickcheck]
+    fn prop_both_encoders_agree_on_decoded_seq(
+        ops: Vec<(bool, u8, char)>,
+    ) -> bool {
+        let mut seq = HashSeq::default();
+
+        for (is_insert, idx, ch) in ops {
+            let idx = idx as usize;
+            if is_insert {
+                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                seq.insert(insert_idx, ch);
+            } else if !seq.is_empty() {
+                let remove_idx = idx % seq.len();
+                seq.remove(remove_idx);
+            }
+        }
+
+        let opref_decoded = decode_hashseq(&encode_hashseq(&seq)).unwrap();
+        let dict_decoded = decode_hashseq_dict(&encode_hashseq_dict(&seq)).unwrap();
+
+        opref_decoded == dict_decoded
+            && opref_decoded.iter().collect::<String>() == dict_decoded.iter().collect::<String>()
+    }
 }
