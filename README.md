@@ -33,6 +33,24 @@ On merge we see:
 
 HashSeq achieves over 1 million operations per second on real-world editing traces (tested on sequential traces from the [editing-traces](https://github.com/josephg/editing-traces) benchmark suite).
 
+## Wasm Demo
+
+A two-peer browser demo lives in `web/`. It compiles HashSeq to WebAssembly and wires two CodeMirror editors to independent CRDT instances so you can edit each side and merge them with a Sync button.
+
+Prerequisites: [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/) and any static file server.
+
+```sh
+# Build the wasm bundle into web/pkg/
+wasm-pack build --target web --out-dir web/pkg
+
+# Serve the web/ directory (ES modules require HTTP, not file://)
+python3 -m http.server --directory web 8000
+```
+
+Then open <http://localhost:8000> in a browser. Type into both editors, then click **Sync** to merge.
+
+Rebuild with the `wasm-pack build` command above whenever you change Rust sources.
+
 ## Design
 
 HashSeq is based on RGA (Replicated Growable Array) but introduces a key extension: the `InsertBefore` operation.

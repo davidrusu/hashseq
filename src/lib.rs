@@ -2,6 +2,7 @@ pub mod encoding;
 pub mod hash_node;
 pub mod hashseq;
 pub mod run;
+pub mod wasm;
 
 pub use self::encoding::{
     decode_batch, decode_hashseq, encode_batch, encode_hashseq, DecodeError, EncodableOp,
