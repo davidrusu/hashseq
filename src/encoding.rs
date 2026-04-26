@@ -1254,6 +1254,692 @@ pub fn decode_hashseq_dict(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
     Ok(seq)
 }
 
+// --- Hybrid HashSeq encoding/decoding ---
+// OpRef's structural choices (positional remove references + remove-chain compression)
+// combined with the dict encoder's ID dictionary for the IDs OpRef would otherwise emit raw.
+// Format: [id_dict][roots][runs][befores][removes][orphans]
+
+/// Encode a HashSeq using OpRef's structure plus an ID dictionary.
+///
+/// Format:
+/// - [num_ids: varint][id_0..id_n: 32 bytes each]
+/// - [num_roots][roots...]            roots: { idx_set extra_deps, utf8 ch }
+/// - [num_runs][runs...]              runs:  { idx insert_after, idx_set first_extra_deps, string }
+/// - [num_befores][befores...]        before: { idx_set extra_deps, idx anchor, utf8 ch }
+/// - [num_forward_runs][...]          rmrun: { idx_set first_extra_deps, varint run_idx, varint start, varint end }
+/// - [num_backward_runs][...]
+/// - [num_single_run][...]            { idx_set extra_deps, varint run_idx, varint elem_idx }
+/// - [num_before_removes][...]        { idx_set extra_deps, varint before_idx }
+/// - [num_root_removes][...]          { idx_set extra_deps, varint root_idx }
+/// - [num_orphans][orphans...]        tagged HashNodes with idx-encoded IDs
+pub fn encode_hashseq_hybrid(seq: &HashSeq) -> Vec<u8> {
+    // Build ID -> OpRef mapping for compact remove encoding.
+    let mut id_to_ref: HashMap<Id, OpRef> = HashMap::new();
+
+    let roots: Vec<_> = seq.root_nodes.iter().collect();
+    let runs: Vec<_> = seq.runs.values().collect();
+    let befores: Vec<_> = seq.before_nodes.iter().collect();
+
+    for (op_idx, (id, _root)) in roots.iter().enumerate() {
+        id_to_ref.insert(**id, OpRef { tag: REF_TAG_ROOT, op_idx, sub_idx: 0 });
+    }
+    for (op_idx, run) in runs.iter().enumerate() {
+        for (sub_idx, id) in run.elements.iter().enumerate() {
+            id_to_ref.insert(*id, OpRef { tag: REF_TAG_RUN, op_idx, sub_idx });
+        }
+    }
+    for (op_idx, (id, _before)) in befores.iter().enumerate() {
+        id_to_ref.insert(**id, OpRef { tag: REF_TAG_BEFORE, op_idx, sub_idx: 0 });
+    }
+
+    // --- Chain analysis (mirrors encode_hashseq) ---
+
+    struct RemoveInfo {
+        id: Id,
+        extra_deps: BTreeSet<Id>,
+        run_ref: Option<(usize, usize)>,
+    }
+
+    let removes: Vec<_> = seq.remove_nodes.iter().collect();
+    let mut remove_infos: Vec<RemoveInfo> = Vec::new();
+
+    for (remove_id, remove) in &removes {
+        let mut run_ref = None;
+        if remove.nodes.len() == 1 {
+            let removed_id = remove.nodes.iter().next().unwrap();
+            if let Some(op_ref) = id_to_ref.get(removed_id) {
+                if op_ref.tag == REF_TAG_RUN {
+                    run_ref = Some((op_ref.op_idx, op_ref.sub_idx));
+                }
+            }
+        }
+        remove_infos.push(RemoveInfo {
+            id: **remove_id,
+            extra_deps: remove.extra_dependencies.clone(),
+            run_ref,
+        });
+    }
+
+    let mut dep_to_idx: HashMap<Id, usize> = HashMap::new();
+    for (i, info) in remove_infos.iter().enumerate() {
+        if info.extra_deps.len() == 1 && info.run_ref.is_some() {
+            let dep = *info.extra_deps.iter().next().unwrap();
+            dep_to_idx.insert(dep, i);
+        }
+    }
+
+    let mut in_chain: Vec<bool> = vec![false; remove_infos.len()];
+    let mut chain_next: Vec<Option<usize>> = vec![None; remove_infos.len()];
+
+    for (i, info) in remove_infos.iter().enumerate() {
+        if let Some((run_idx, elem_idx)) = info.run_ref {
+            if let Some(&next_idx) = dep_to_idx.get(&info.id) {
+                let next_info = &remove_infos[next_idx];
+                if let Some((next_run, next_elem)) = next_info.run_ref {
+                    if next_run == run_idx {
+                        let is_adjacent = (elem_idx > 0 && next_elem == elem_idx - 1)
+                            || next_elem == elem_idx + 1;
+                        if is_adjacent {
+                            chain_next[i] = Some(next_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut has_predecessor: Vec<bool> = vec![false; remove_infos.len()];
+    for next in chain_next.iter().flatten() {
+        has_predecessor[*next] = true;
+    }
+
+    struct RemoveRun {
+        first_extra_deps: BTreeSet<Id>,
+        run_idx: usize,
+        start_idx: usize,
+        end_idx: usize,
+        backwards: bool,
+    }
+
+    let mut remove_runs: Vec<RemoveRun> = Vec::new();
+
+    for (i, info) in remove_infos.iter().enumerate() {
+        if has_predecessor[i] || in_chain[i] { continue; }
+        if info.run_ref.is_none() { continue; }
+        if chain_next[i].is_none() { continue; }
+
+        let (run_idx, first_elem) = info.run_ref.unwrap();
+        let mut elems_in_order = vec![first_elem];
+        let mut chain_len = 1;
+
+        in_chain[i] = true;
+        let mut current = i;
+        while let Some(next) = chain_next[current] {
+            if in_chain[next] { break; }
+            in_chain[next] = true;
+            if let Some((_, elem)) = remove_infos[next].run_ref {
+                elems_in_order.push(elem);
+            }
+            chain_len += 1;
+            current = next;
+        }
+
+        let min_elem = *elems_in_order.iter().min().unwrap();
+        let max_elem = *elems_in_order.iter().max().unwrap();
+        let expected_len = max_elem - min_elem + 1;
+        let is_contiguous = chain_len == expected_len;
+
+        let last_elem = *elems_in_order.last().unwrap();
+        let backwards = first_elem > last_elem;
+
+        if chain_len > 1 && is_contiguous {
+            remove_runs.push(RemoveRun {
+                first_extra_deps: info.extra_deps.clone(),
+                run_idx,
+                start_idx: first_elem,
+                end_idx: last_elem,
+                backwards,
+            });
+        } else {
+            in_chain[i] = false;
+            let mut cur = i;
+            while let Some(nxt) = chain_next[cur] {
+                if !in_chain[nxt] { break; }
+                in_chain[nxt] = false;
+                cur = nxt;
+            }
+        }
+    }
+
+    let standalone_removes: Vec<_> = removes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !in_chain[*i])
+        .map(|(_, r)| r)
+        .collect();
+
+    let forward_runs: Vec<_> = remove_runs.iter().filter(|rr| !rr.backwards).collect();
+    let backward_runs: Vec<_> = remove_runs.iter().filter(|rr| rr.backwards).collect();
+
+    let mut single_run_removes: Vec<(&BTreeSet<Id>, usize, usize)> = Vec::new();
+    let mut before_removes: Vec<(&BTreeSet<Id>, usize)> = Vec::new();
+    let mut root_removes: Vec<(&BTreeSet<Id>, usize)> = Vec::new();
+
+    for (_id, remove) in &standalone_removes {
+        for id in &remove.nodes {
+            if let Some(op_ref) = id_to_ref.get(id) {
+                match op_ref.tag {
+                    REF_TAG_RUN => {
+                        single_run_removes.push((
+                            &remove.extra_dependencies,
+                            op_ref.op_idx,
+                            op_ref.sub_idx,
+                        ));
+                    }
+                    REF_TAG_BEFORE => {
+                        before_removes.push((&remove.extra_dependencies, op_ref.op_idx));
+                    }
+                    REF_TAG_ROOT => {
+                        root_removes.push((&remove.extra_dependencies, op_ref.op_idx));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // --- Build the ID dictionary ---
+    // Includes every ID that will be encoded as a varint index in the body below.
+    // Notably excludes: removed-element IDs targeted by RemoveRuns or by the standalone
+    // single_run/before/root sections, since those use positional refs.
+    let mut id_set: BTreeSet<Id> = BTreeSet::new();
+
+    for run in &runs {
+        id_set.insert(run.insert_after);
+        for id in &run.first_extra_deps {
+            id_set.insert(*id);
+        }
+    }
+    for (_id, root) in &roots {
+        for dep in &root.extra_dependencies {
+            id_set.insert(*dep);
+        }
+    }
+    for (_id, before) in &befores {
+        id_set.insert(before.anchor);
+        for dep in &before.extra_dependencies {
+            id_set.insert(*dep);
+        }
+    }
+    for rr in &remove_runs {
+        for dep in &rr.first_extra_deps {
+            id_set.insert(*dep);
+        }
+    }
+    for (extra_deps, _, _) in &single_run_removes {
+        for dep in *extra_deps {
+            id_set.insert(*dep);
+        }
+    }
+    for (extra_deps, _) in &before_removes {
+        for dep in *extra_deps {
+            id_set.insert(*dep);
+        }
+    }
+    for (extra_deps, _) in &root_removes {
+        for dep in *extra_deps {
+            id_set.insert(*dep);
+        }
+    }
+    for orphan in &seq.orphaned {
+        for dep in &orphan.extra_dependencies {
+            id_set.insert(*dep);
+        }
+        match &orphan.op {
+            Op::InsertRoot(_) => {}
+            Op::InsertAfter(id, _) | Op::InsertBefore(id, _) => {
+                id_set.insert(*id);
+            }
+            Op::Remove(ids) => {
+                for id in ids {
+                    id_set.insert(*id);
+                }
+            }
+        }
+    }
+
+    let id_list: Vec<Id> = id_set.into_iter().collect();
+    let id_to_idx: HashMap<Id, usize> =
+        id_list.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+
+    // --- Emit ---
+    let mut buf = Vec::new();
+
+    encode_varint(id_list.len(), &mut buf);
+    for id in &id_list {
+        encode_id(id, &mut buf);
+    }
+
+    let encode_idx = |id: &Id, buf: &mut Vec<u8>| {
+        encode_varint(id_to_idx[id], buf);
+    };
+    let encode_idx_set = |ids: &BTreeSet<Id>, buf: &mut Vec<u8>| {
+        encode_varint(ids.len(), buf);
+        for id in ids {
+            encode_varint(id_to_idx[id], buf);
+        }
+    };
+
+    // Roots
+    encode_varint(roots.len(), &mut buf);
+    for (_id, root) in &roots {
+        encode_idx_set(&root.extra_dependencies, &mut buf);
+        encode_utf8_char(root.ch, &mut buf);
+    }
+
+    // Runs
+    encode_varint(runs.len(), &mut buf);
+    for run in &runs {
+        encode_idx(&run.insert_after, &mut buf);
+        encode_idx_set(&run.first_extra_deps, &mut buf);
+        encode_string(&run.run, &mut buf);
+    }
+
+    // Befores
+    encode_varint(befores.len(), &mut buf);
+    for (_id, before) in &befores {
+        encode_idx_set(&before.extra_dependencies, &mut buf);
+        encode_idx(&before.anchor, &mut buf);
+        encode_utf8_char(before.ch, &mut buf);
+    }
+
+    // Forward remove runs
+    encode_varint(forward_runs.len(), &mut buf);
+    for rr in &forward_runs {
+        encode_idx_set(&rr.first_extra_deps, &mut buf);
+        encode_varint(rr.run_idx, &mut buf);
+        encode_varint(rr.start_idx, &mut buf);
+        encode_varint(rr.end_idx, &mut buf);
+    }
+
+    // Backward remove runs
+    encode_varint(backward_runs.len(), &mut buf);
+    for rr in &backward_runs {
+        encode_idx_set(&rr.first_extra_deps, &mut buf);
+        encode_varint(rr.run_idx, &mut buf);
+        encode_varint(rr.start_idx, &mut buf);
+        encode_varint(rr.end_idx, &mut buf);
+    }
+
+    // Single-run standalone removes
+    encode_varint(single_run_removes.len(), &mut buf);
+    for (extra_deps, run_idx, elem_idx) in &single_run_removes {
+        encode_idx_set(extra_deps, &mut buf);
+        encode_varint(*run_idx, &mut buf);
+        encode_varint(*elem_idx, &mut buf);
+    }
+
+    // Before-target standalone removes
+    encode_varint(before_removes.len(), &mut buf);
+    for (extra_deps, before_idx) in &before_removes {
+        encode_idx_set(extra_deps, &mut buf);
+        encode_varint(*before_idx, &mut buf);
+    }
+
+    // Root-target standalone removes
+    encode_varint(root_removes.len(), &mut buf);
+    for (extra_deps, root_idx) in &root_removes {
+        encode_idx_set(extra_deps, &mut buf);
+        encode_varint(*root_idx, &mut buf);
+    }
+
+    // Orphans (tagged, with idx-encoded IDs)
+    encode_varint(seq.orphaned.len(), &mut buf);
+    for orphan in &seq.orphaned {
+        match &orphan.op {
+            Op::InsertRoot(ch) => {
+                buf.push(TAG_INSERT_ROOT);
+                encode_idx_set(&orphan.extra_dependencies, &mut buf);
+                encode_utf8_char(*ch, &mut buf);
+            }
+            Op::InsertAfter(id, ch) => {
+                buf.push(TAG_INSERT_AFTER);
+                encode_idx_set(&orphan.extra_dependencies, &mut buf);
+                encode_idx(id, &mut buf);
+                encode_utf8_char(*ch, &mut buf);
+            }
+            Op::InsertBefore(id, ch) => {
+                buf.push(TAG_INSERT_BEFORE);
+                encode_idx_set(&orphan.extra_dependencies, &mut buf);
+                encode_idx(id, &mut buf);
+                encode_utf8_char(*ch, &mut buf);
+            }
+            Op::Remove(ids) => {
+                buf.push(TAG_REMOVE);
+                encode_idx_set(&orphan.extra_dependencies, &mut buf);
+                encode_varint(ids.len(), &mut buf);
+                for id in ids {
+                    encode_idx(id, &mut buf);
+                }
+            }
+        }
+    }
+
+    buf
+}
+
+/// Decode a hybrid-encoded HashSeq.
+pub fn decode_hashseq_hybrid(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
+    let mut pos = 0;
+
+    // Read dictionary
+    let (num_ids, size) = decode_varint(bytes)?;
+    pos += size;
+
+    let mut id_list: Vec<Id> = Vec::with_capacity(num_ids);
+    for _ in 0..num_ids {
+        let (id, size) = decode_id(&bytes[pos..])?;
+        id_list.push(id);
+        pos += size;
+    }
+
+    let lookup_id = |idx: usize| -> Result<Id, DecodeError> {
+        id_list
+            .get(idx)
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(idx))
+    };
+    let decode_idx_at = |bytes: &[u8]| -> Result<(Id, usize), DecodeError> {
+        let (idx, size) = decode_varint(bytes)?;
+        Ok((lookup_id(idx)?, size))
+    };
+    let decode_idx_set_at = |bytes: &[u8]| -> Result<(BTreeSet<Id>, usize), DecodeError> {
+        let (count, size) = decode_varint(bytes)?;
+        let mut total = size;
+        let mut ids = BTreeSet::new();
+        for _ in 0..count {
+            let (idx, size) = decode_varint(&bytes[total..])?;
+            ids.insert(lookup_id(idx)?);
+            total += size;
+        }
+        Ok((ids, total))
+    };
+
+    let mut seq = HashSeq::default();
+    let mut root_ids: Vec<Id> = Vec::new();
+    let mut run_element_ids: Vec<Vec<Id>> = Vec::new();
+    let mut before_ids: Vec<Id> = Vec::new();
+
+    // Roots
+    let (num_roots, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_roots {
+        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (ch, size) = decode_utf8_char(&bytes[pos..])?;
+        pos += size;
+        let node = HashNode {
+            extra_dependencies: extra_deps,
+            op: Op::InsertRoot(ch),
+        };
+        root_ids.push(node.id());
+        seq.apply(node);
+    }
+
+    // Runs
+    let (num_runs, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_runs {
+        let (insert_after, size) = decode_idx_at(&bytes[pos..])?;
+        pos += size;
+        let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (run_str, size) = decode_string(&bytes[pos..])?;
+        pos += size;
+
+        let mut chars = run_str.chars();
+        let first_char = chars.next().ok_or(DecodeError::EmptyRun)?;
+        let mut run = Run::new(insert_after, first_extra_deps.clone(), first_char);
+        for ch in chars {
+            run.extend(ch);
+        }
+        let elements = run.elements.clone();
+        run_element_ids.push(elements);
+        for node in run.decompress() {
+            seq.apply(node);
+        }
+    }
+
+    // Befores
+    let (num_befores, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_befores {
+        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (anchor, size) = decode_idx_at(&bytes[pos..])?;
+        pos += size;
+        let (ch, size) = decode_utf8_char(&bytes[pos..])?;
+        pos += size;
+        let node = HashNode {
+            extra_dependencies: extra_deps,
+            op: Op::InsertBefore(anchor, ch),
+        };
+        before_ids.push(node.id());
+        seq.apply(node);
+    }
+
+    // Forward remove runs
+    let (num_forward_runs, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_forward_runs {
+        let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (run_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+        let (start_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+        let (end_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+
+        let run_elements = run_element_ids
+            .get(run_idx)
+            .ok_or(DecodeError::InvalidIdIndex(run_idx))?;
+
+        let mut prev_remove_id: Option<Id> = None;
+        for elem_idx in start_idx..=end_idx {
+            let removed_id = run_elements
+                .get(elem_idx)
+                .copied()
+                .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
+
+            let extra_deps = if let Some(prev_id) = prev_remove_id {
+                let mut deps = BTreeSet::new();
+                deps.insert(prev_id);
+                deps
+            } else {
+                first_extra_deps.clone()
+            };
+
+            let node = HashNode {
+                extra_dependencies: extra_deps,
+                op: Op::Remove(std::iter::once(removed_id).collect()),
+            };
+            prev_remove_id = Some(node.id());
+            seq.apply(node);
+        }
+    }
+
+    // Backward remove runs
+    let (num_backward_runs, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_backward_runs {
+        let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (run_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+        let (start_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+        let (end_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+
+        let run_elements = run_element_ids
+            .get(run_idx)
+            .ok_or(DecodeError::InvalidIdIndex(run_idx))?;
+
+        let mut prev_remove_id: Option<Id> = None;
+        for elem_idx in (end_idx..=start_idx).rev() {
+            let removed_id = run_elements
+                .get(elem_idx)
+                .copied()
+                .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
+
+            let extra_deps = if let Some(prev_id) = prev_remove_id {
+                let mut deps = BTreeSet::new();
+                deps.insert(prev_id);
+                deps
+            } else {
+                first_extra_deps.clone()
+            };
+
+            let node = HashNode {
+                extra_dependencies: extra_deps,
+                op: Op::Remove(std::iter::once(removed_id).collect()),
+            };
+            prev_remove_id = Some(node.id());
+            seq.apply(node);
+        }
+    }
+
+    // Single-run standalone removes
+    let (num_single_run, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_single_run {
+        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (run_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+        let (elem_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+
+        let removed_id = run_element_ids
+            .get(run_idx)
+            .and_then(|e| e.get(elem_idx))
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
+
+        seq.apply(HashNode {
+            extra_dependencies: extra_deps,
+            op: Op::Remove(std::iter::once(removed_id).collect()),
+        });
+    }
+
+    // Before-target standalone removes
+    let (num_before_removes, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_before_removes {
+        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (before_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+
+        let removed_id = before_ids
+            .get(before_idx)
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(before_idx))?;
+
+        seq.apply(HashNode {
+            extra_dependencies: extra_deps,
+            op: Op::Remove(std::iter::once(removed_id).collect()),
+        });
+    }
+
+    // Root-target standalone removes
+    let (num_root_removes, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_root_removes {
+        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (root_idx, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+
+        let removed_id = root_ids
+            .get(root_idx)
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(root_idx))?;
+
+        seq.apply(HashNode {
+            extra_dependencies: extra_deps,
+            op: Op::Remove(std::iter::once(removed_id).collect()),
+        });
+    }
+
+    // Orphans (tagged)
+    let (num_orphans, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_orphans {
+        if pos >= bytes.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let tag = bytes[pos];
+        pos += 1;
+        match tag {
+            TAG_INSERT_ROOT => {
+                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                pos += size;
+                let (ch, size) = decode_utf8_char(&bytes[pos..])?;
+                pos += size;
+                seq.apply(HashNode {
+                    extra_dependencies: extra_deps,
+                    op: Op::InsertRoot(ch),
+                });
+            }
+            TAG_INSERT_AFTER => {
+                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                pos += size;
+                let (id, size) = decode_idx_at(&bytes[pos..])?;
+                pos += size;
+                let (ch, size) = decode_utf8_char(&bytes[pos..])?;
+                pos += size;
+                seq.apply(HashNode {
+                    extra_dependencies: extra_deps,
+                    op: Op::InsertAfter(id, ch),
+                });
+            }
+            TAG_INSERT_BEFORE => {
+                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                pos += size;
+                let (id, size) = decode_idx_at(&bytes[pos..])?;
+                pos += size;
+                let (ch, size) = decode_utf8_char(&bytes[pos..])?;
+                pos += size;
+                seq.apply(HashNode {
+                    extra_dependencies: extra_deps,
+                    op: Op::InsertBefore(id, ch),
+                });
+            }
+            TAG_REMOVE => {
+                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                pos += size;
+                let (count, size) = decode_varint(&bytes[pos..])?;
+                pos += size;
+                let mut removed_ids = BTreeSet::new();
+                for _ in 0..count {
+                    let (id, size) = decode_idx_at(&bytes[pos..])?;
+                    pos += size;
+                    removed_ids.insert(id);
+                }
+                seq.apply(HashNode {
+                    extra_dependencies: extra_deps,
+                    op: Op::Remove(removed_ids),
+                });
+            }
+            _ => return Err(DecodeError::InvalidOpTag(tag)),
+        }
+    }
+
+    Ok(seq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,5 +2472,189 @@ mod tests {
 
         opref_decoded == dict_decoded
             && opref_decoded.iter().collect::<String>() == dict_decoded.iter().collect::<String>()
+    }
+
+    // --- Hybrid encoder roundtrip tests ---
+
+    #[test]
+    fn test_hashseq_hybrid_empty_roundtrip() {
+        let seq = HashSeq::default();
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        assert_eq!(seq.iter().collect::<String>(), decoded.iter().collect::<String>());
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_hybrid_simple_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert(0, 'h');
+        seq.insert(1, 'e');
+        seq.insert(2, 'l');
+        seq.insert(3, 'l');
+        seq.insert(4, 'o');
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), "hello");
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_hybrid_with_removes_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert(0, 'a');
+        seq.insert(1, 'b');
+        seq.insert(2, 'c');
+        seq.remove(1);
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), "ac");
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_hybrid_batch_insert_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello world".chars());
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), "hello world");
+        assert_eq!(seq, decoded);
+    }
+
+    #[test]
+    fn test_hashseq_hybrid_complex_roundtrip() {
+        let mut seq = HashSeq::default();
+
+        seq.insert_batch(0, "hello".chars());
+        seq.insert(0, 'X');
+        seq.insert(6, 'Y');
+        seq.remove(3);
+
+        let original_str: String = seq.iter().collect();
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), original_str);
+        assert_eq!(seq, decoded);
+    }
+
+    /// A backspace burst — chains the OpRef encoder compresses heavily.
+    #[test]
+    fn test_hashseq_hybrid_backspace_chain() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcdefghij".chars());
+        for _ in 0..5 {
+            seq.remove(seq.len() - 1);
+        }
+
+        let original_str: String = seq.iter().collect();
+        assert_eq!(original_str, "abcde");
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        assert_eq!(decoded.iter().collect::<String>(), original_str);
+        assert_eq!(seq, decoded);
+    }
+
+    #[quickcheck]
+    fn prop_hashseq_hybrid_roundtrip_preserves_content(ops: Vec<(bool, u8, char)>) -> bool {
+        let mut seq = HashSeq::default();
+
+        for (is_insert, idx, ch) in ops {
+            let idx = idx as usize;
+            if is_insert {
+                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                seq.insert(insert_idx, ch);
+            } else if !seq.is_empty() {
+                let remove_idx = idx % seq.len();
+                seq.remove(remove_idx);
+            }
+        }
+
+        let original_str: String = seq.iter().collect();
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        original_str == decoded.iter().collect::<String>()
+    }
+
+    #[quickcheck]
+    fn prop_hashseq_hybrid_roundtrip_preserves_equality(ops: Vec<(bool, u8, char)>) -> bool {
+        let mut seq = HashSeq::default();
+
+        for (is_insert, idx, ch) in ops {
+            let idx = idx as usize;
+            if is_insert {
+                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                seq.insert(insert_idx, ch);
+            } else if !seq.is_empty() {
+                let remove_idx = idx % seq.len();
+                seq.remove(remove_idx);
+            }
+        }
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        seq == decoded
+    }
+
+    #[quickcheck]
+    fn prop_hashseq_hybrid_batch_roundtrip(text: String, remove_indices: Vec<u8>) -> bool {
+        let mut seq = HashSeq::default();
+
+        if !text.is_empty() {
+            seq.insert_batch(0, text.chars());
+
+            for idx in remove_indices {
+                if !seq.is_empty() {
+                    let remove_idx = idx as usize % seq.len();
+                    seq.remove(remove_idx);
+                }
+            }
+        }
+
+        let original_str: String = seq.iter().collect();
+
+        let encoded = encode_hashseq_hybrid(&seq);
+        let decoded = decode_hashseq_hybrid(&encoded).unwrap();
+
+        original_str == decoded.iter().collect::<String>() && seq == decoded
+    }
+
+    /// All three encoders must roundtrip to the same `HashSeq` for any input.
+    #[quickcheck]
+    fn prop_all_three_encoders_agree(ops: Vec<(bool, u8, char)>) -> bool {
+        let mut seq = HashSeq::default();
+
+        for (is_insert, idx, ch) in ops {
+            let idx = idx as usize;
+            if is_insert {
+                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                seq.insert(insert_idx, ch);
+            } else if !seq.is_empty() {
+                let remove_idx = idx % seq.len();
+                seq.remove(remove_idx);
+            }
+        }
+
+        let opref = decode_hashseq(&encode_hashseq(&seq)).unwrap();
+        let dict = decode_hashseq_dict(&encode_hashseq_dict(&seq)).unwrap();
+        let hybrid = decode_hashseq_hybrid(&encode_hashseq_hybrid(&seq)).unwrap();
+
+        opref == dict
+            && dict == hybrid
+            && opref.iter().collect::<String>() == hybrid.iter().collect::<String>()
     }
 }

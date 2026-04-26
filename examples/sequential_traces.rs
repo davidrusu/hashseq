@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use flate2::read::GzDecoder;
-use hashseq::{HashSeq, Id, encode_hashseq, encode_hashseq_dict};
+use hashseq::{HashSeq, Id, encode_hashseq, encode_hashseq_dict, encode_hashseq_hybrid};
 use serde::Deserialize;
 use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 
@@ -73,6 +73,7 @@ struct RunStats {
     memory_bytes: usize,
     encoded_bytes: usize,
     encoded_dict_bytes: usize,
+    encoded_hybrid_bytes: usize,
     dict_breakdown: DictBreakdown,
 }
 
@@ -239,6 +240,7 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let memory_bytes = measure_memory(&seq);
     let encoded_bytes = encode_hashseq(&seq).len();
     let encoded_dict_bytes = encode_hashseq_dict(&seq).len();
+    let encoded_hybrid_bytes = encode_hashseq_hybrid(&seq).len();
     let breakdown = dict_breakdown(&seq);
 
     RunStats {
@@ -251,6 +253,7 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
         memory_bytes,
         encoded_bytes,
         encoded_dict_bytes,
+        encoded_hybrid_bytes,
         dict_breakdown: breakdown,
     }
 }
@@ -315,15 +318,24 @@ fn main() {
 
     println!("\nStorage (bytes; ratios are over final UTF-8 text size)");
     println!(
-        "{:<25} {:>10} {:>10} {:>8} {:>10} {:>8} {:>10} {:>8}",
-        "Trace", "Text", "Memory", "Mem/x", "Encoded", "Enc/x", "EncDict", "Dict/x",
+        "{:<25} {:>10} {:>10} {:>8} {:>10} {:>8} {:>10} {:>8} {:>10} {:>8}",
+        "Trace",
+        "Text",
+        "Memory",
+        "Mem/x",
+        "OpRef",
+        "OpRef/x",
+        "Dict",
+        "Dict/x",
+        "Hybrid",
+        "Hybrid/x",
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(116));
 
     for (name, stats) in &all_stats {
         let text = stats.final_text_bytes.max(1) as f64;
         println!(
-            "{:<25} {:>10} {:>10} {:>7.2}x {:>10} {:>7.2}x {:>10} {:>7.2}x",
+            "{:<25} {:>10} {:>10} {:>7.2}x {:>10} {:>7.2}x {:>10} {:>7.2}x {:>10} {:>7.2}x",
             name,
             stats.final_text_bytes,
             stats.memory_bytes,
@@ -332,6 +344,8 @@ fn main() {
             stats.encoded_bytes as f64 / text,
             stats.encoded_dict_bytes,
             stats.encoded_dict_bytes as f64 / text,
+            stats.encoded_hybrid_bytes,
+            stats.encoded_hybrid_bytes as f64 / text,
         );
     }
 

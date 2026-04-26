@@ -5,8 +5,8 @@ pub mod run;
 pub mod wasm;
 
 pub use self::encoding::{
-    decode_batch, decode_hashseq, decode_hashseq_dict, encode_batch, encode_hashseq,
-    encode_hashseq_dict, DecodeError, EncodableOp,
+    decode_batch, decode_hashseq, decode_hashseq_dict, decode_hashseq_hybrid, encode_batch,
+    encode_hashseq, encode_hashseq_dict, encode_hashseq_hybrid, DecodeError, EncodableOp,
 };
 pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::{HashSeq, RunPosition};
