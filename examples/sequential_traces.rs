@@ -4,8 +4,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use flate2::read::GzDecoder;
-use hashseq::HashSeq;
+use hashseq::{HashSeq, encode_hashseq, encode_hashseq_dict};
 use serde::Deserialize;
+use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<std::alloc::System> = &INSTRUMENTED_SYSTEM;
 
 /// (position, delete_count, insert_content)
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +68,10 @@ struct RunStats {
     run_count: usize,
     ops: usize,
     patches: usize,
+    final_text_bytes: usize,
+    memory_bytes: usize,
+    encoded_bytes: usize,
+    encoded_dict_bytes: usize,
 }
 
 impl RunStats {
@@ -98,21 +106,24 @@ impl RunStats {
     }
 }
 
-fn run_trace_once(data: &TestData) -> (std::time::Duration, bool, usize) {
+fn build_seq(data: &TestData) -> (HashSeq, std::time::Duration) {
     let mut seq = HashSeq::default();
-
     let start = Instant::now();
     for TestPatch(pos, del, ins) in data.patches() {
         seq.remove_batch(*pos, *del);
         seq.insert_batch(*pos, ins.chars());
     }
     let elapsed = start.elapsed();
+    (seq, elapsed)
+}
 
-    let result: String = seq.iter().collect();
-    let correct = result == data.end_content;
-    let run_count = seq.runs.len();
-
-    (elapsed, correct, run_count)
+fn measure_memory(seq: &HashSeq) -> usize {
+    let before = GLOBAL.stats().bytes_allocated;
+    let clone = seq.clone();
+    let after = GLOBAL.stats().bytes_allocated;
+    // Use clone to prevent the allocation from being optimized away.
+    std::hint::black_box(&clone);
+    after.saturating_sub(before)
 }
 
 fn run_trace(data: &TestData, iterations: usize) -> RunStats {
@@ -124,11 +135,19 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let mut run_count = 0;
 
     for _ in 0..iterations {
-        let (elapsed, iter_correct, iter_run_count) = run_trace_once(data);
+        let (seq, elapsed) = build_seq(data);
         times_ms.push(elapsed.as_secs_f64() * 1000.0);
-        correct = correct && iter_correct;
-        run_count = iter_run_count;
+        let result: String = seq.iter().collect();
+        correct = correct && result == data.end_content;
+        run_count = seq.runs.len();
     }
+
+    // Storage measurements: build once more outside the timing loop.
+    let (seq, _) = build_seq(data);
+    let final_text_bytes = seq.iter().map(|c| c.len_utf8()).sum();
+    let memory_bytes = measure_memory(&seq);
+    let encoded_bytes = encode_hashseq(&seq).len();
+    let encoded_dict_bytes = encode_hashseq_dict(&seq).len();
 
     RunStats {
         times_ms,
@@ -136,12 +155,16 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
         run_count,
         ops,
         patches,
+        final_text_bytes,
+        memory_bytes,
+        encoded_bytes,
+        encoded_dict_bytes,
     }
 }
 
 fn main() {
     let traces_dir = Path::new("../editing-traces/sequential_traces");
-    let iterations = 50;
+    let iterations = 3;
 
     let traces = [
         "automerge-paper.json.gz",
@@ -154,6 +177,8 @@ fn main() {
     ];
 
     println!("Running each trace {} times\n", iterations);
+
+    println!("Performance");
     println!(
         "{:<25} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>12} {:>12}",
         "Trace",
@@ -168,13 +193,15 @@ fn main() {
     );
     println!("{}", "-".repeat(117));
 
+    let mut all_stats: Vec<(&str, RunStats)> = Vec::new();
+
     for trace_name in traces {
         let path = traces_dir.join(trace_name);
+        let display_name = trace_name.trim_end_matches(".json.gz");
         if path.exists() {
             let data = load_testing_data(path.to_str().unwrap());
             let stats = run_trace(&data, iterations);
 
-            let display_name = trace_name.trim_end_matches(".json.gz");
             println!(
                 "{:<25} {:>10.2} {:>9.1}% {:>10.2} {:>10.2} {:>8} {:>10} {:>12.0} {:>12.0}",
                 display_name,
@@ -187,9 +214,31 @@ fn main() {
                 stats.ops_per_sec(),
                 stats.patches_per_sec()
             );
+            all_stats.push((display_name, stats));
         } else {
-            let display_name = trace_name.trim_end_matches(".json.gz");
             println!("{:<25} File not found: {:?}", display_name, path);
         }
+    }
+
+    println!("\nStorage (bytes; ratios are over final UTF-8 text size)");
+    println!(
+        "{:<25} {:>10} {:>10} {:>8} {:>10} {:>8} {:>10} {:>8}",
+        "Trace", "Text", "Memory", "Mem/x", "Encoded", "Enc/x", "EncDict", "Dict/x",
+    );
+    println!("{}", "-".repeat(96));
+
+    for (name, stats) in &all_stats {
+        let text = stats.final_text_bytes.max(1) as f64;
+        println!(
+            "{:<25} {:>10} {:>10} {:>7.2}x {:>10} {:>7.2}x {:>10} {:>7.2}x",
+            name,
+            stats.final_text_bytes,
+            stats.memory_bytes,
+            stats.memory_bytes as f64 / text,
+            stats.encoded_bytes,
+            stats.encoded_bytes as f64 / text,
+            stats.encoded_dict_bytes,
+            stats.encoded_dict_bytes as f64 / text,
+        );
     }
 }
