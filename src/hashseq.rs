@@ -1,8 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use associative_positional_list::AssociativePositionalList;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{HashNode, HashSeqIter, Id, Op, Run};
+
+/// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
+/// already a BLAKE3 hash, so adversaries cannot craft colliding keys without
+/// inverting BLAKE3 (HashDoS protection from SipHash is redundant here).
+pub type IdMap<V> = FxHashMap<Id, V>;
+/// HashSet of `Id`. Same FxHash rationale as `IdMap`.
+pub type IdSet = FxHashSet<Id>;
 
 /// Location information for where a node ID can be found
 #[derive(Debug, Clone, Copy)]
@@ -33,21 +41,23 @@ pub struct CausalRoot {
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
     // Sequential inserts are coalesced into runs; everything else lives as individual nodes.
-    pub runs: HashMap<Id, Run>,
+    pub runs: IdMap<Run>,
     pub root_nodes: BTreeMap<Id, CausalRoot>,
-    pub before_nodes: HashMap<Id, CausalInsert>,
+    pub before_nodes: IdMap<CausalInsert>,
     // Reverse index: anchor -> list of nodes inserted before that anchor
-    pub befores_by_anchor: HashMap<Id, BTreeSet<Id>>,
-    pub remove_nodes: HashMap<Id, CausalRemove>,
+    pub befores_by_anchor: IdMap<BTreeSet<Id>>,
+    pub remove_nodes: IdMap<CausalRemove>,
 
     // ID resolution index for O(1) lookup of any node
-    pub run_index: HashMap<Id, RunPosition>,
+    pub run_index: IdMap<RunPosition>,
 
     // Fork tracking: maps anchor ID to list of IDs that fork from it
-    pub afters: HashMap<Id, BTreeSet<Id>>,
+    pub afters: IdMap<BTreeSet<Id>>,
 
-    pub removed_inserts: HashSet<Id>,
+    pub removed_inserts: IdSet,
     pub(crate) tips: BTreeSet<Id>,
+    // orphaned uses HashNode as key (not Id), so keep std HashSet — the input is
+    // adversary-controllable and benefits from SipHash's HashDoS protection.
     pub(crate) orphaned: HashSet<HashNode>,
     index: AssociativePositionalList<Id>,
 }

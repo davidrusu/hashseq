@@ -20,6 +20,11 @@ associative_positional_list = "0.1.3"
 hex = "0.4"
 wasm-bindgen = "0.2"
 getrandom = { version = "0.2", features = ["js"] }
+# Non-cryptographic hasher used for HashMap<Id, _> / HashSet<Id>. Safe because
+# Id is already a BLAKE3 hash — adversaries cannot craft Id values that collide
+# in FxHash without inverting BLAKE3, so HashDoS protection from SipHash is
+# redundant here.
+rustc-hash = "2"
 
 [features]
 default = []
