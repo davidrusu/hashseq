@@ -151,7 +151,9 @@ impl HashSeq {
 
     /// Check if node `a` is causally before node `b`.
     fn is_causally_before(&self, a: &Id, b: &Id) -> bool {
-        let mut seen = BTreeSet::new();
+        // FxHashSet (not BTreeSet/std HashSet): Id is already a BLAKE3 hash, so
+        // FxHash gives ~5-cycle lookups vs SipHash's ~50, with no HashDoS risk.
+        let mut seen: FxHashSet<Id> = FxHashSet::default();
         let mut boundary: Vec<Id> = self.afters(a).copied().collect();
         while let Some(n) = boundary.pop() {
             if &n == b {
