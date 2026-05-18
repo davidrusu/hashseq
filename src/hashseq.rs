@@ -168,6 +168,21 @@ impl HashSeq {
         (left, right)
     }
 
+    /// Clone of `self.tips` with `anchor` removed.
+    ///
+    /// Fast path: sequential typing leaves `tips == {anchor}`, in which case the
+    /// result is empty and we skip cloning the BTreeSet entirely (which would
+    /// allocate a tree node just to drop it).
+    fn tips_minus(&self, anchor: &Id) -> BTreeSet<Id> {
+        if self.tips.len() == 1 && self.tips.contains(anchor) {
+            BTreeSet::new()
+        } else {
+            let mut deps = self.tips.clone();
+            deps.remove(anchor);
+            deps
+        }
+    }
+
     pub fn insert(&mut self, idx: usize, value: char) {
         self.insert_batch(idx, [value]);
     }
@@ -189,17 +204,13 @@ impl HashSeq {
                 let first_node = if self.is_causally_before(&left_id, &right_id) {
                     // Using InsertAfter for the first node doesn't work.
                     // use InsertBefore right_id instead
-                    let mut extra_dependencies = self.tips.clone();
-                    extra_dependencies.remove(&right_id);
                     HashNode {
-                        extra_dependencies,
+                        extra_dependencies: self.tips_minus(&right_id),
                         op: Op::InsertBefore(right_id, first_ch),
                     }
                 } else {
-                    let mut extra_dependencies = self.tips.clone();
-                    extra_dependencies.remove(&left_id);
                     HashNode {
-                        extra_dependencies,
+                        extra_dependencies: self.tips_minus(&left_id),
                         op: Op::InsertAfter(left_id, first_ch),
                     }
                 };
@@ -223,10 +234,8 @@ impl HashSeq {
 
                 // First node needs full tips (minus anchor)
                 let first_ch = chars_iter.next().unwrap();
-                let mut extra_dependencies = self.tips.clone();
-                extra_dependencies.remove(&left_id);
                 let first_node = HashNode {
-                    extra_dependencies,
+                    extra_dependencies: self.tips_minus(&left_id),
                     op: Op::InsertAfter(left_id, first_ch),
                 };
                 let mut prev_id = first_node.id();
@@ -244,11 +253,8 @@ impl HashSeq {
             }
             (None, Some(right_id)) => {
                 let mut chars_iter = chars.into_iter();
-                let mut extra_dependencies = self.tips.clone();
-                extra_dependencies.remove(&right_id);
-
                 let first_node = HashNode {
-                    extra_dependencies,
+                    extra_dependencies: self.tips_minus(&right_id),
                     op: Op::InsertBefore(right_id, chars_iter.next().unwrap()),
                 };
 
