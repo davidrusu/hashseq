@@ -1,6 +1,7 @@
 pub mod encoding;
 pub mod hash_node;
 pub mod hashseq;
+pub mod hashseq_iter;
 pub mod run;
 pub mod wasm;
 
@@ -9,6 +10,7 @@ pub use self::encoding::{
 };
 pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::{HashSeq, RunPosition};
+pub use self::hashseq_iter::HashSeqIter;
 pub use self::run::Run;
 
 #[derive(
