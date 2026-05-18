@@ -23,9 +23,8 @@ impl<'a> HashSeqIter<'a> {
     }
 
     fn push_waiting(&mut self, n: Id) {
-        let mut deps: Vec<Id> = self.seq.befores(&n).into_iter().cloned().collect();
-        deps.sort();
-        deps.reverse();
+        // befores() yields sorted; reverse so .pop() returns ascending order.
+        let deps: Vec<Id> = self.seq.befores(&n).rev().copied().collect();
         self.waiting_stack.push((n, deps));
     }
 }

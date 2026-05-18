@@ -502,12 +502,9 @@ mod hashseq_viz {
                     });
                     let parent = &before_node.anchor;
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &self.node_pos) {
-                        // Get all siblings (nodes before the same parent)
-                        let siblings = seq.befores(parent);
-
-                        // Find this node's index among siblings
-                        let mut sorted_siblings: Vec<Id> = siblings.into_iter().copied().collect();
-                        sorted_siblings.sort();
+                        // Get all siblings (nodes before the same parent).
+                        // befores() yields sorted order already.
+                        let sorted_siblings: Vec<Id> = seq.befores(parent).copied().collect();
                         let sibling_idx = sorted_siblings.iter().position(|s| s == id).unwrap_or(0);
 
                         // Calculate lane offset - always offset below the anchor
@@ -583,13 +580,10 @@ mod hashseq_viz {
                         // Has left dependencies
                         let parent = run.insert_after;
                         if let Some(p) = get_node_right_edge(&parent, &self.node_pos) {
-                            // Check how many siblings this run has (concurrent branches from same parent)
-                            let siblings = seq.afters(&parent);
-                            let num_siblings = siblings.len();
-
-                            // Find this run's index among siblings (sorted by Id for consistency)
-                            let mut sorted_siblings: Vec<Id> = siblings.iter().map(|&id| *id).collect();
-                            sorted_siblings.sort();
+                            // Check how many siblings this run has (concurrent branches from same parent).
+                            // afters() yields sorted order already.
+                            let sorted_siblings: Vec<Id> = seq.afters(&parent).copied().collect();
+                            let num_siblings = sorted_siblings.len();
                             let sibling_idx = sorted_siblings.iter().position(|id| id == run_id).unwrap_or(0);
 
                             // Calculate vertical offset to spread siblings into lanes

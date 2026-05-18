@@ -118,57 +118,44 @@ impl HashSeq {
     }
 
     /// Get nodes that come after this one. Uses both explicit afters and run data.
-    pub fn afters(&self, id: &Id) -> Vec<&Id> {
-        match self.afters.get(id) {
-            Some(ns) => ns.iter().collect(),
-            None => {
-                // Check if this node is in a run and not the last element
-                if let Some(run_pos) = self.run_index.get(id)
-                    && let Some(run) = self.runs.get(&run_pos.run_id)
-                    && run_pos.position + 1 < run.elements.len()
-                {
-                    let next_id = &run.elements[run_pos.position + 1];
-                    // Look up the reference in run_index for stable lifetime
-                    if let Some((id_ref, _)) = self.run_index.get_key_value(next_id) {
-                        return vec![id_ref];
-                    }
+    /// Yields Ids in sorted (BTreeSet) order.
+    pub fn afters(&self, id: &Id) -> impl DoubleEndedIterator<Item = &Id> + '_ {
+        let explicit = self.afters.get(id);
+        // Run fallback only fires when there's no explicit afters entry.
+        let from_run = if explicit.is_none() {
+            self.run_index.get(id).and_then(|run_pos| {
+                let run = self.runs.get(&run_pos.run_id)?;
+                if run_pos.position + 1 >= run.elements.len() {
+                    return None;
                 }
-                Vec::new()
-            }
-        }
+                let next_id = &run.elements[run_pos.position + 1];
+                self.run_index.get_key_value(next_id).map(|(r, _)| r)
+            })
+        } else {
+            None
+        };
+        explicit.into_iter().flatten().chain(from_run)
     }
 
     /// Get nodes that come before this one (inserted with InsertBefore).
-    pub fn befores(&self, id: &Id) -> Vec<&Id> {
-        match self.befores_by_anchor.get(id) {
-            Some(ns) => ns.iter().collect(),
-            None => Vec::new(),
-        }
+    /// Yields Ids in sorted (BTreeSet) order.
+    pub fn befores(&self, id: &Id) -> impl DoubleEndedIterator<Item = &Id> + '_ {
+        self.befores_by_anchor.get(id).into_iter().flatten()
     }
 
     /// Check if node `a` is causally before node `b`.
     fn is_causally_before(&self, a: &Id, b: &Id) -> bool {
         let mut seen = BTreeSet::new();
-        let mut boundary: Vec<Id> = self.afters(a).into_iter().cloned().collect();
+        let mut boundary: Vec<Id> = self.afters(a).copied().collect();
         while let Some(n) = boundary.pop() {
             if &n == b {
                 return true;
             }
 
             seen.insert(n);
-            boundary.extend(
-                self.afters(&n)
-                    .into_iter()
-                    .cloned()
-                    .filter(|x| !seen.contains(x)),
-            );
+            boundary.extend(self.afters(&n).copied().filter(|x| !seen.contains(x)));
             if &n != a {
-                boundary.extend(
-                    self.befores(&n)
-                        .into_iter()
-                        .cloned()
-                        .filter(|x| !seen.contains(x)),
-                );
+                boundary.extend(self.befores(&n).copied().filter(|x| !seen.contains(x)));
             }
         }
 
@@ -400,12 +387,10 @@ impl HashSeq {
             }
         }
 
-        // Slow path: need full afters Vec for position calculation
-        let afters_for_anchor = self.afters(&after.anchor);
-        // Find the smallest "after" node that is >= id and not removed
-        let position = if let Some(next_node) = afters_for_anchor
-            .iter()
-            .filter(|&aid| aid >= &&id && !self.removed_inserts.contains(*aid))
+        // Slow path: scan afters for the smallest one >= id and not removed.
+        let position = if let Some(next_node) = self
+            .afters(&after.anchor)
+            .filter(|aid| *aid >= &id && !self.removed_inserts.contains(*aid))
             .min()
         {
             // new node is inserted just before the other node after our anchor node that is
@@ -504,10 +489,12 @@ impl HashSeq {
     }
 
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
-        let befores_set: BTreeSet<Id> = self.befores(&before.anchor).into_iter().copied().collect();
-        let position = if let Some(next_node) = befores_set
-            .range(id..)
-            .find(|id| !self.removed_inserts.contains(*id))
+        // befores() iterates the underlying BTreeSet in sorted order, so skip_while + find
+        // is equivalent to the previous range(id..).find(...) — no intermediate set needed.
+        let position = if let Some(next_node) = self
+            .befores(&before.anchor)
+            .skip_while(|n| **n < id)
+            .find(|n| !self.removed_inserts.contains(*n))
         {
             // new node is inserted just before the other node before our anchor node that is
             // bigger than the new node
