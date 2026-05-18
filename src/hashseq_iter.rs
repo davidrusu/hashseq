@@ -46,11 +46,9 @@ impl<'a> Iterator for HashSeqIter<'a> {
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
                 if let Some(afters) = self.seq.afters.get(&n) {
-                    // Sort by Id value
-                    let mut afters_sorted: Vec<Id> = afters.clone();
-                    afters_sorted.sort();
-                    for s in afters_sorted.into_iter().rev() {
-                        self.push_waiting(s);
+                    // BTreeSet iterates in sorted order; reverse for stack push.
+                    for s in afters.iter().rev() {
+                        self.push_waiting(*s);
                     }
                 } else if let Some(run_pos) = self.seq.run_index.get(&n) {
                     // Check if n is the first element of this run

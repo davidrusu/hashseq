@@ -37,14 +37,14 @@ pub struct HashSeq {
     pub root_nodes: BTreeMap<Id, CausalRoot>,
     pub before_nodes: HashMap<Id, CausalInsert>,
     // Reverse index: anchor -> list of nodes inserted before that anchor
-    pub befores_by_anchor: HashMap<Id, Vec<Id>>,
+    pub befores_by_anchor: HashMap<Id, BTreeSet<Id>>,
     pub remove_nodes: HashMap<Id, CausalRemove>,
 
     // ID resolution index for O(1) lookup of any node
     pub run_index: HashMap<Id, RunPosition>,
 
     // Fork tracking: maps anchor ID to list of IDs that fork from it
-    pub afters: HashMap<Id, Vec<Id>>,
+    pub afters: HashMap<Id, BTreeSet<Id>>,
 
     pub removed_inserts: HashSet<Id>,
     pub(crate) tips: BTreeSet<Id>,
@@ -120,11 +120,7 @@ impl HashSeq {
     /// Get nodes that come after this one. Uses both explicit afters and run data.
     pub fn afters(&self, id: &Id) -> Vec<&Id> {
         match self.afters.get(id) {
-            Some(ns) => {
-                let mut result: Vec<&Id> = ns.iter().collect();
-                result.sort();
-                result
-            }
+            Some(ns) => ns.iter().collect(),
             None => {
                 // Check if this node is in a run and not the last element
                 if let Some(run_pos) = self.run_index.get(id)
@@ -145,11 +141,7 @@ impl HashSeq {
     /// Get nodes that come before this one (inserted with InsertBefore).
     pub fn befores(&self, id: &Id) -> Vec<&Id> {
         match self.befores_by_anchor.get(id) {
-            Some(ns) => {
-                let mut result: Vec<&Id> = ns.iter().collect();
-                result.sort();
-                result
-            }
+            Some(ns) => ns.iter().collect(),
             None => Vec::new(),
         }
     }
@@ -450,7 +442,7 @@ impl HashSeq {
                     self.afters
                         .entry(after.anchor)
                         .or_default()
-                        .push(right_run_first_id);
+                        .insert(right_run_first_id);
                     self.runs.insert(right_run_first_id, right_run);
                 }
                 let new_run = Run::new(after.anchor, after.extra_dependencies, after.ch);
@@ -479,7 +471,7 @@ impl HashSeq {
         };
 
         // run extension is handled in the fast path above, fork/split updates the afters set
-        self.afters.entry(after.anchor).or_default().push(id);
+        self.afters.entry(after.anchor).or_default().insert(id);
 
         let position = position.unwrap_or_else(|| {
             // fall back to iterating over the entire sequence if the anchor node has been removed
@@ -551,13 +543,13 @@ impl HashSeq {
             self.afters
                 .entry(left_last_id)
                 .or_default()
-                .push(right_run_id);
+                .insert(right_run_id);
         }
 
         self.befores_by_anchor
             .entry(before.anchor)
             .or_default()
-            .push(id);
+            .insert(id);
 
         self.before_nodes.insert(id, before);
 
