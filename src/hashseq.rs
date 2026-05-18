@@ -125,11 +125,7 @@ impl HashSeq {
         let from_run = if explicit.is_none() {
             self.run_index.get(id).and_then(|run_pos| {
                 let run = self.runs.get(&run_pos.run_id)?;
-                if run_pos.position + 1 >= run.elements.len() {
-                    return None;
-                }
-                let next_id = &run.elements[run_pos.position + 1];
-                self.run_index.get_key_value(next_id).map(|(r, _)| r)
+                run.elements.get(run_pos.position + 1)
             })
         } else {
             None
@@ -387,12 +383,18 @@ impl HashSeq {
             }
         }
 
-        // Slow path: scan afters for the smallest one >= id and not removed.
-        let position = if let Some(next_node) = self
-            .afters(&after.anchor)
-            .filter(|aid| *aid >= &id && !self.removed_inserts.contains(*aid))
-            .min()
-        {
+        // Slow path: find the smallest afters node >= id and not removed.
+        // Explicit-afters case: O(log n) range seek into the BTreeSet.
+        // Run-fallback case: at most one candidate, just check it.
+        let next_node = if let Some(siblings) = self.afters.get(&after.anchor) {
+            siblings
+                .range(&id..)
+                .find(|aid| !self.removed_inserts.contains(*aid))
+        } else {
+            self.afters(&after.anchor)
+                .find(|aid| **aid >= id && !self.removed_inserts.contains(*aid))
+        };
+        let position = if let Some(next_node) = next_node {
             // new node is inserted just before the other node after our anchor node that is
             // bigger than the new node
             self.index.find(next_node)
@@ -489,12 +491,11 @@ impl HashSeq {
     }
 
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
-        // befores() iterates the underlying BTreeSet in sorted order, so skip_while + find
-        // is equivalent to the previous range(id..).find(...) — no intermediate set needed.
+        // O(log n) range seek into the underlying BTreeSet, no intermediate allocation.
         let position = if let Some(next_node) = self
-            .befores(&before.anchor)
-            .skip_while(|n| **n < id)
-            .find(|n| !self.removed_inserts.contains(*n))
+            .befores_by_anchor
+            .get(&before.anchor)
+            .and_then(|s| s.range(id..).find(|n| !self.removed_inserts.contains(*n)))
         {
             // new node is inserted just before the other node before our anchor node that is
             // bigger than the new node
