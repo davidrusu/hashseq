@@ -9,9 +9,9 @@ pub use self::encoding::{
     decode_batch, decode_hashseq, encode_batch, encode_hashseq, DecodeError, EncodableOp,
 };
 pub use self::hash_node::{HashNode, Op};
-pub use self::hashseq::{HashSeq, RunPosition};
+pub use self::hashseq::{Cursor, HashSeq, RunPosition};
 pub use self::hashseq_iter::HashSeqIter;
-pub use self::run::Run;
+pub use self::run::{FirstOp, Run};
 
 #[derive(
     Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,

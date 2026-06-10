@@ -2,20 +2,32 @@ use crate::{HashNode, Id, Op};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// How the first element of a run is anchored relative to its `anchor` node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FirstOp {
+    /// First char is `InsertAfter(anchor, ch)`. Subsequent chars chain InsertAfter.
+    After,
+    /// First char is `InsertBefore(anchor, ch)`. Subsequent chars chain InsertAfter
+    /// from the first char.
+    Before,
+}
+
 /// A run represents a sequence of consecutive characters that can be compressed
 /// together instead of storing each as an individual HashNode.
 ///
-/// For example, inserting "abc" after node X creates a run containing "abc"
-/// where 'a' is InsertAfter(X), 'b' is InsertAfter('a'), 'c' is InsertAfter('b').
+/// The first element is anchored according to `first_op` (After or Before). All
+/// subsequent elements chain `InsertAfter` from the previous element in the run.
 ///
-/// INVARIANT: All runs must start with an InsertAfter operation. This means:
-/// - The first element is InsertAfter(insert_after, first_char)
-/// - Subsequent elements are InsertAfter(previous_element, char)
-/// - Runs can never start with InsertRoot or InsertBefore
+/// HashSeq's internal storage only contains `FirstOp::After` runs (created by
+/// `Run::new`). `FirstOp::Before` runs are only used at the cursor / wire-format
+/// level — when applied via `apply_op`, the first char goes to `before_nodes` and
+/// the rest form a normal `FirstOp::After` chain anchored at it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
-    /// The node that comes before this run (the anchor for the first character)
-    pub insert_after: Id,
+    /// The node this run is anchored against (semantic role depends on `first_op`).
+    pub anchor: Id,
+    /// How the first element relates to `anchor`.
+    pub first_op: FirstOp,
     /// Extra dependencies for the first element of the run
     /// This is needed to correctly reconstruct the node's hash when decompressing
     pub first_extra_deps: BTreeSet<Id>,
@@ -26,15 +38,35 @@ pub struct Run {
 }
 
 impl Run {
-    /// Create a new run from a string
+    /// Create a new InsertAfter-rooted run.
     pub fn new(insert_after: Id, first_extra_deps: BTreeSet<Id>, first: char) -> Self {
+        Self::with_first_op(insert_after, FirstOp::After, first_extra_deps, first)
+    }
+
+    /// Create a new InsertBefore-rooted run. The first character is constrained to
+    /// appear immediately before `anchor`; subsequent characters chain InsertAfter
+    /// from the first.
+    pub fn new_before(anchor: Id, first_extra_deps: BTreeSet<Id>, first: char) -> Self {
+        Self::with_first_op(anchor, FirstOp::Before, first_extra_deps, first)
+    }
+
+    fn with_first_op(
+        anchor: Id,
+        first_op: FirstOp,
+        first_extra_deps: BTreeSet<Id>,
+        first: char,
+    ) -> Self {
         let first_node = HashNode {
             extra_dependencies: first_extra_deps.clone(),
-            op: Op::InsertAfter(insert_after, first),
+            op: match first_op {
+                FirstOp::After => Op::InsertAfter(anchor, first),
+                FirstOp::Before => Op::InsertBefore(anchor, first),
+            },
         };
         let first_id = first_node.id();
         Self {
-            insert_after,
+            anchor,
+            first_op,
             first_extra_deps,
             run: first.to_string(),
             elements: vec![first_id],
@@ -59,10 +91,7 @@ impl Run {
         let mut chars = self.run.chars();
 
         let first = chars.next().unwrap(); // we always have at least one char in the run
-        nodes.push(HashNode {
-            extra_dependencies: self.first_extra_deps.clone(),
-            op: Op::InsertAfter(self.insert_after, first),
-        });
+        nodes.push(self.first_node_with_char(first));
 
         for ch in chars {
             nodes.push(HashNode {
@@ -75,11 +104,17 @@ impl Run {
     }
 
     pub fn first_node(&self) -> HashNode {
-        let mut chars = self.run.chars();
-        let first = chars.next().unwrap(); // we always have at least one char in the run
+        let first = self.run.chars().next().unwrap();
+        self.first_node_with_char(first)
+    }
+
+    fn first_node_with_char(&self, first: char) -> HashNode {
         HashNode {
             extra_dependencies: self.first_extra_deps.clone(),
-            op: Op::InsertAfter(self.insert_after, first),
+            op: match self.first_op {
+                FirstOp::After => Op::InsertAfter(self.anchor, first),
+                FirstOp::Before => Op::InsertBefore(self.anchor, first),
+            },
         }
     }
 
@@ -126,24 +161,23 @@ impl Run {
     /// The left portion remains in self, the right portion is returned
     ///
     /// Example: run "abc" split at position 1 becomes "a" and "bc"
-    /// The right run's insert_after becomes the ID of the last element of the left run
+    /// The right run's anchor becomes the ID of the last element of the left run
+    /// and is always `FirstOp::After` (the chain extends after the left tail).
     pub fn split_at(&mut self, position: usize) -> Run {
         assert!(
             position > 0 && position < self.len(),
             "Invalid split position"
         );
 
-        // Split the elements vector
         let right_elements = self.elements.split_off(position);
-        let right_insert_after = *self.elements.last().unwrap();
+        let right_anchor = *self.elements.last().unwrap();
 
-        // Split the string - need to find byte position for char position
         let byte_pos = self.run.char_indices().nth(position).unwrap().0;
         let right_str = self.run.split_off(byte_pos);
 
-        // Create the right run with pre-computed elements
         Run {
-            insert_after: right_insert_after,
+            anchor: right_anchor,
+            first_op: FirstOp::After,
             first_extra_deps: BTreeSet::new(),
             run: right_str,
             elements: right_elements,
@@ -202,7 +236,8 @@ mod tests {
 
         assert_eq!(run.len(), 3);
         assert_eq!(run.run, "abc");
-        assert_eq!(run.insert_after, anchor);
+        assert_eq!(run.anchor, anchor);
+        assert_eq!(run.first_op, FirstOp::After);
     }
 
     #[test]
@@ -252,9 +287,10 @@ mod tests {
         // Left run should have 'a'
         assert_eq!(run.run, "a");
 
-        // Right run should have 'bc' with insert_after = ID of 'a'
+        // Right run should have 'bc' with anchor = ID of 'a'
         assert_eq!(right_run.run, "bc");
-        assert_eq!(right_run.insert_after, nodes_before[0].id());
+        assert_eq!(right_run.anchor, nodes_before[0].id());
+        assert_eq!(right_run.first_op, FirstOp::After);
     }
 
     #[test]

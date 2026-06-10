@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use associative_positional_list::AssociativePositionalList;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{HashNode, HashSeqIter, Id, Op, Run};
+use crate::{EncodableOp, HashNode, HashSeqIter, Id, Op, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
 /// already a BLAKE3 hash, so adversaries cannot craft colliding keys without
@@ -17,6 +17,46 @@ pub type IdSet = FxHashSet<Id>;
 pub struct RunPosition {
     pub run_id: Id,
     pub position: usize,
+}
+
+/// A causal anchor for inserting into a HashSeq.
+///
+/// Captures both the anchor node and the op kind (`InsertAfter` or `InsertBefore`)
+/// needed to land an insert at the cursor's position deterministically — even when
+/// the local neighborhood is involved in concurrent forks. `extra_deps` snapshots
+/// the tips visible at cursor-placement time (with the anchor itself removed).
+///
+/// A `Run` built from this cursor (`Run::new` for After, `Run::new_before` for
+/// Before) can be applied later — even after concurrent mutations — and will land
+/// in the causally correct position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cursor {
+    /// Insert immediately after `anchor`.
+    After {
+        anchor: Id,
+        extra_deps: BTreeSet<Id>,
+    },
+    /// Insert immediately before `anchor`. Used when the cursor sits between two
+    /// causally-related neighbors and a fork at the left neighbor would otherwise
+    /// give hash-determined ordering.
+    Before {
+        anchor: Id,
+        extra_deps: BTreeSet<Id>,
+    },
+}
+
+impl Cursor {
+    pub fn anchor(&self) -> Id {
+        match self {
+            Cursor::After { anchor, .. } | Cursor::Before { anchor, .. } => *anchor,
+        }
+    }
+
+    pub fn extra_deps(&self) -> &BTreeSet<Id> {
+        match self {
+            Cursor::After { extra_deps, .. } | Cursor::Before { extra_deps, .. } => extra_deps,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -170,7 +210,7 @@ impl HashSeq {
         false
     }
 
-    fn neighbours(&mut self, idx: usize) -> (Option<Id>, Option<Id>) {
+    fn neighbours(&self, idx: usize) -> (Option<Id>, Option<Id>) {
         let left = idx
             .checked_sub(1)
             .and_then(|prev_idx| self.index.get(prev_idx).copied());
@@ -312,10 +352,14 @@ impl HashSeq {
         self.remove_batch(idx, 1);
     }
 
-    pub fn remove_batch(&mut self, idx: usize, amount: usize) {
+    /// Remove `amount` characters starting at visible position `idx`.
+    ///
+    /// Returns the `HashNode` that was applied — useful when the caller wants to
+    /// re-broadcast the op over the wire. Returns `None` if `amount == 0` or if
+    /// `idx` is past the end (no characters were actually removed).
+    pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
         if amount == 0 {
-            // Nothing to remove
-            return;
+            return None;
         }
 
         let mut to_remove = BTreeSet::new();
@@ -327,6 +371,10 @@ impl HashSeq {
             }
         }
 
+        if to_remove.is_empty() {
+            return None;
+        }
+
         let extra_dependencies = BTreeSet::from_iter(self.tips.difference(&to_remove).cloned());
         let op = Op::Remove(to_remove);
 
@@ -335,7 +383,9 @@ impl HashSeq {
             op,
         };
 
+        let node_for_return = node.clone();
         self.apply(node);
+        Some(node_for_return)
     }
 
     fn any_missing_dependencies<'a>(&self, deps: impl IntoIterator<Item = &'a Id>) -> bool {
@@ -682,6 +732,81 @@ impl HashSeq {
         self.iter_ids().map(|id| self.get_node_char(id))
 
         // self.index.iter().map(|id| self.get_node_char(&id).unwrap())
+    }
+
+    /// Return the node ID at visible position `idx`, if any.
+    pub fn id_at(&self, idx: usize) -> Option<Id> {
+        self.index.get(idx).copied()
+    }
+
+    /// Return the current visible position of `id`, if it is present and not removed.
+    pub fn position_of(&self, id: &Id) -> Option<usize> {
+        self.index.find(id)
+    }
+
+    /// The current causal tips (heads of the causal DAG).
+    pub fn tips(&self) -> &BTreeSet<Id> {
+        &self.tips
+    }
+
+    /// Build a `Cursor` for inserting at position `idx`.
+    ///
+    /// Mirrors `insert_batch`'s op-choice logic: if the cursor sits between two
+    /// causally-related neighbors, the cursor uses `InsertBefore(right)` so the
+    /// insert has an explicit ordering constraint and doesn't get hash-ordered into
+    /// a fork. Otherwise it uses `InsertAfter(left)`. At the start of a non-empty
+    /// sequence, returns a `Before(id_at(0))` cursor. Returns `None` only for the
+    /// empty-sequence case (caller must use `InsertRoot` directly).
+    pub fn cursor_at(&self, idx: usize) -> Option<Cursor> {
+        let (left, right) = self.neighbours(idx);
+        match (left, right) {
+            (Some(left_id), Some(right_id)) => {
+                let mut extra_deps = self.tips.clone();
+                if self.is_causally_before(&left_id, &right_id) {
+                    extra_deps.remove(&right_id);
+                    Some(Cursor::Before {
+                        anchor: right_id,
+                        extra_deps,
+                    })
+                } else {
+                    extra_deps.remove(&left_id);
+                    Some(Cursor::After {
+                        anchor: left_id,
+                        extra_deps,
+                    })
+                }
+            }
+            (Some(left_id), None) => {
+                let mut extra_deps = self.tips.clone();
+                extra_deps.remove(&left_id);
+                Some(Cursor::After {
+                    anchor: left_id,
+                    extra_deps,
+                })
+            }
+            (None, Some(right_id)) => {
+                let mut extra_deps = self.tips.clone();
+                extra_deps.remove(&right_id);
+                Some(Cursor::Before {
+                    anchor: right_id,
+                    extra_deps,
+                })
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// Apply an `EncodableOp` to the sequence. `Run` ops are decompressed into their
+    /// constituent `HashNode`s and applied one at a time.
+    pub fn apply_op(&mut self, op: EncodableOp) {
+        match op {
+            EncodableOp::Node(node) => self.apply(node),
+            EncodableOp::Run(run) => {
+                for node in run.decompress() {
+                    self.apply(node);
+                }
+            }
+        }
     }
 }
 
@@ -2143,5 +2268,174 @@ mod test {
 
         // 'b' is an InsertBefore, which creates a before_node
         assert_eq!(String::from_iter(seq.iter()), "ba");
+    }
+
+    #[test]
+    fn test_id_at_and_position_of_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello".chars());
+
+        for i in 0..seq.len() {
+            let id = seq.id_at(i).expect("id_at within bounds");
+            assert_eq!(seq.position_of(&id), Some(i));
+        }
+        assert_eq!(seq.id_at(seq.len()), None);
+    }
+
+    #[test]
+    fn test_position_of_returns_none_for_removed_node() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let id_b = seq.id_at(1).unwrap();
+        seq.remove(1);
+        assert_eq!(seq.position_of(&id_b), None);
+        assert_eq!(String::from_iter(seq.iter()), "ac");
+    }
+
+    #[test]
+    fn test_cursor_at_edges() {
+        let seq = HashSeq::default();
+        assert!(seq.cursor_at(0).is_none(), "no cursor on empty seq at 0");
+
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hi".chars());
+
+        // idx 0 in a non-empty seq → Before(id_at(0)) so leading inserts get an
+        // explicit ordering constraint relative to the first visible char.
+        match seq.cursor_at(0).expect("cursor at idx 0") {
+            Cursor::Before { anchor, extra_deps } => {
+                assert_eq!(Some(anchor), seq.id_at(0));
+                assert!(!extra_deps.contains(&anchor));
+            }
+            other => panic!("expected Before cursor at idx 0, got {other:?}"),
+        }
+
+        // idx 1 sits between 'h' and 'i', which are causally related (run chain).
+        // Should be Before(right) so the insert lands deterministically between them.
+        match seq.cursor_at(1).expect("cursor at idx 1") {
+            Cursor::Before { anchor, extra_deps } => {
+                assert_eq!(Some(anchor), seq.id_at(1));
+                assert!(!extra_deps.contains(&anchor));
+            }
+            other => panic!("expected Before cursor at idx 1 (causally related neighbors), got {other:?}"),
+        }
+
+        // idx == len: no right neighbor → After(last).
+        match seq.cursor_at(seq.len()).expect("cursor at end") {
+            Cursor::After { anchor, extra_deps } => {
+                assert_eq!(Some(anchor), seq.id_at(seq.len() - 1));
+                assert!(!extra_deps.contains(&anchor));
+            }
+            other => panic!("expected After cursor at end, got {other:?}"),
+        }
+
+        assert!(seq.cursor_at(seq.len() + 1).is_none(), "out of bounds");
+    }
+
+    #[test]
+    fn test_apply_op_matches_apply_for_node() {
+        let mut seq_a = HashSeq::default();
+        seq_a.insert(0, 'x');
+        let mut seq_b = seq_a.clone();
+
+        let node = HashNode {
+            extra_dependencies: BTreeSet::new(),
+            op: Op::InsertAfter(seq_a.id_at(0).unwrap(), 'y'),
+        };
+
+        seq_a.apply(node.clone());
+        seq_b.apply_op(EncodableOp::Node(node));
+
+        assert_eq!(
+            String::from_iter(seq_a.iter()),
+            String::from_iter(seq_b.iter()),
+        );
+        assert_eq!(String::from_iter(seq_a.iter()), "xy");
+    }
+
+    #[test]
+    fn test_apply_op_run_matches_decompress_and_apply() {
+        let mut seq_a = HashSeq::default();
+        seq_a.insert(0, 'x');
+        let mut seq_b = seq_a.clone();
+
+        let anchor = seq_a.id_at(0).unwrap();
+        let mut run = Run::new(anchor, BTreeSet::new(), 'a');
+        run.extend('b');
+        run.extend('c');
+
+        for node in run.decompress() {
+            seq_a.apply(node);
+        }
+        seq_b.apply_op(EncodableOp::Run(run));
+
+        assert_eq!(
+            String::from_iter(seq_a.iter()),
+            String::from_iter(seq_b.iter()),
+        );
+        assert_eq!(String::from_iter(seq_a.iter()), "xabc");
+    }
+
+    /// The key behavioral guarantee for the cursor model: a Run built from a Cursor
+    /// can be applied later, after concurrent mutation of the HashSeq, and still lands
+    /// at the cursor's anchor.
+    #[test]
+    fn test_run_from_cursor_survives_concurrent_mutation() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello world".chars());
+
+        // Place cursor between "hello" and " world". The neighbors ('o' and ' ')
+        // are causally related, so cursor_at picks Before(' ').
+        let cursor = seq.cursor_at(5).expect("cursor after 'hello'");
+        let space_id = seq.id_at(5).unwrap();
+        assert!(
+            matches!(&cursor, Cursor::Before { anchor, .. } if *anchor == space_id),
+            "expected Before cursor anchored at ' ', got {cursor:?}",
+        );
+
+        // Concurrent mutation: another edit lands at the start of the buffer.
+        seq.insert_batch(0, "X ".chars());
+        assert_eq!(String::from_iter(seq.iter()), "X hello world");
+
+        // Build a Before-run from the cursor — anchored to the original ' '.
+        let (anchor, deps) = match cursor {
+            Cursor::Before { anchor, extra_deps } => (anchor, extra_deps),
+            _ => unreachable!(),
+        };
+        let mut run = Run::new_before(anchor, deps, ',');
+        run.extend('!');
+
+        seq.apply_op(EncodableOp::Run(run));
+
+        // The run lands immediately before the ' ' it was anchored to. The "X "
+        // prepend doesn't disturb the relative ordering.
+        assert_eq!(String::from_iter(seq.iter()), "X hello,! world");
+    }
+
+    /// Regression: inserting between causally-related neighbors via the cursor
+    /// model must use InsertBefore — not InsertAfter — to avoid hash-determined
+    /// fork ordering. Without this, A's run could end up after the existing run
+    /// continuation instead of before it.
+    #[test]
+    fn test_cursor_between_run_chain_uses_insert_before() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello world".chars());
+
+        let cursor = seq.cursor_at(5).unwrap();
+        assert!(matches!(cursor, Cursor::Before { .. }));
+
+        let (anchor, deps) = match cursor {
+            Cursor::Before { anchor, extra_deps } => (anchor, extra_deps),
+            _ => unreachable!(),
+        };
+        let mut run = Run::new_before(anchor, deps, ' ');
+        for ch in "mighty".chars() {
+            run.extend(ch);
+        }
+        seq.apply_op(EncodableOp::Run(run));
+
+        // The crucial assertion: the new run lands between "hello" and " world",
+        // deterministically — not after " world" via hash ordering.
+        assert_eq!(String::from_iter(seq.iter()), "hello mighty world");
     }
 }

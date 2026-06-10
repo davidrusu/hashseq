@@ -1,126 +1,173 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>HashSeq CRDT Demo</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      background: #0f172a;
-      color: #e2e8f0;
-      min-height: 100vh;
-      padding: 2rem;
-    }
-    h1 {
-      text-align: center;
-      margin-bottom: 0.5rem;
-      font-size: 1.8rem;
-      color: #f8fafc;
-    }
-    .subtitle {
-      text-align: center;
-      color: #94a3b8;
-      margin-bottom: 2rem;
-      font-size: 0.95rem;
-    }
-    .editors {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.5rem;
-      max-width: 1200px;
-      margin: 0 auto 1.5rem;
-    }
-    .editor-panel {
-      background: #1e293b;
-      border-radius: 8px;
-      overflow: hidden;
-      border: 1px solid #334155;
-    }
-    .editor-header {
-      padding: 0.75rem 1rem;
-      background: #334155;
-      font-weight: 600;
-      font-size: 0.9rem;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .editor-header .len {
-      font-weight: 400;
-      color: #94a3b8;
-      font-size: 0.8rem;
-    }
-    .cm-editor {
-      height: 300px;
-    }
-    .cm-editor .cm-scroller {
-      font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-      font-size: 14px;
-    }
-    .cm-editor.cm-focused {
-      outline: none;
-    }
-    .controls {
-      text-align: center;
-      margin-bottom: 1.5rem;
-    }
-    button {
-      background: #3b82f6;
-      color: white;
-      border: none;
-      padding: 0.75rem 2rem;
-      border-radius: 6px;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.15s;
-    }
-    button:hover {
-      background: #2563eb;
-    }
-    button:active {
-      background: #1d4ed8;
-    }
-    .status {
-      text-align: center;
-      color: #94a3b8;
-      font-size: 0.85rem;
-      min-height: 1.5em;
-    }
-    .status.synced {
-      color: #4ade80;
-    }
-    @media (max-width: 768px) {
-      .editors { grid-template-columns: 1fr; }
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HashSeq — Insertion Tree</title>
+<style>
+  @font-face { font-family:'PM'; font-weight:400; src:url('./fonts/ibm-plex-mono-400.woff2') format('woff2'); }
+  @font-face { font-family:'PM'; font-weight:500; src:url('./fonts/ibm-plex-mono-500.woff2') format('woff2'); }
+  @font-face { font-family:'PM'; font-weight:600; src:url('./fonts/ibm-plex-mono-600.woff2') format('woff2'); }
+
+  :root {
+    --paper:#EFE9DB; --paper2:#F6F1E5; --ink:#1B1816; --muted:#7C7361;
+    --red:#B23A2E; --green:#2F5D43; --amber:#C8782D; --grid:#D2C8B2; --line:#1B1816;
+    --blue:#3F5C86;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    font-family:'PM','IBM Plex Mono',monospace; color:var(--ink); background:var(--paper);
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+    background-image:radial-gradient(var(--grid) 0.7px, transparent 0.7px);
+    background-size:22px 22px;
+  }
+  header {
+    display:flex; align-items:baseline; justify-content:space-between;
+    padding:10px 16px; border-bottom:1.25px solid var(--line); background:rgba(239,233,219,0.9);
+  }
+  header .brand { font-weight:600; letter-spacing:3px; font-size:12px; }
+  header .title { font-weight:600; font-size:15px; letter-spacing:0.5px; }
+  header .fig { color:var(--muted); font-size:11px; letter-spacing:1px; }
+
+  .toolbar {
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:8px 16px; border-bottom:1px solid var(--line); background:rgba(246,241,229,0.85);
+    font-size:12px;
+  }
+  .tabs { display:flex; border:1px solid var(--ink); }
+  .tabs button { border:none; border-right:1px solid var(--ink); }
+  .tabs button:last-child { border-right:none; }
+  .tabs button.active { background:var(--ink); color:var(--paper); }
+
+  button, select {
+    font-family:inherit; font-size:12px; color:var(--ink); background:var(--paper2);
+    border:1px solid var(--ink); padding:4px 10px; cursor:pointer; letter-spacing:0.5px;
+  }
+  button:hover { background:#ece5d3; }
+  button:disabled { opacity:0.4; cursor:default; }
+  .group { display:flex; align-items:center; gap:6px; }
+  .group.hidden { display:none; }
+  label.lbl { color:var(--muted); letter-spacing:1px; }
+  input[type=range] { accent-color:var(--red); }
+  label.chk { display:flex; align-items:center; gap:5px; letter-spacing:1px; cursor:pointer;
+              border:1px solid var(--ink); padding:3px 9px; background:var(--paper2); user-select:none; }
+  label.chk input { accent-color:var(--blue); margin:0; }
+
+  .progress { flex:1; min-width:120px; height:8px; border:1px solid var(--ink); background:var(--paper2); position:relative; }
+  .progress > i { position:absolute; left:0; top:0; bottom:0; background:var(--red); width:0%; }
+  .progress-txt { color:var(--muted); min-width:140px; text-align:right; }
+
+  main { flex:1; display:grid; grid-template-columns: 360px 1fr; min-height:0; }
+  .left { display:flex; flex-direction:column; border-right:1px solid var(--line); min-height:0; }
+  .pane-h { padding:6px 12px; font-size:11px; letter-spacing:2px; color:var(--muted); border-bottom:1px dashed var(--grid); }
+  #editor {
+    flex:1; resize:none; border:none; outline:none; padding:12px; font-family:inherit;
+    font-size:13px; line-height:1.5; background:transparent; color:var(--ink); min-height:120px;
+  }
+  #editor:read-only { color:#4a443a; background:rgba(0,0,0,0.015); }
+
+  .stats { display:grid; grid-template-columns:1fr 1fr; gap:2px 14px; padding:10px 12px;
+           border-top:1px solid var(--line); font-size:12px; }
+  .stats .k { color:var(--muted); }
+  .stats .v { text-align:right; font-weight:500; }
+
+  .oplog { border-top:1px solid var(--line); height:148px; overflow:auto; padding:6px 12px; font-size:11px; }
+  .oplog .row { display:flex; gap:8px; padding:1px 0; white-space:nowrap; }
+  .oplog .tag { width:62px; flex:none; font-weight:500; letter-spacing:0.5px; }
+  .oplog .tag.after { color:var(--red); } .oplog .tag.before { color:var(--green); }
+  .oplog .tag.remove { color:var(--amber); } .oplog .tag.root { color:var(--ink); }
+  .oplog .hex { color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
+
+  .right { position:relative; min-height:0; }
+  .canvas-stack { position:absolute; inset:0; }
+  #tree, #tree-gl { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  #tree { cursor:grab; }
+  #tree.panning { cursor:grabbing; }
+  #tree-gl { display:none; pointer-events:none; }       /* shown only in shader mode */
+  body[data-proj="shader"] #tree-gl { display:block; }
+  .legend { position:absolute; right:12px; top:10px; font-size:11px; background:rgba(239,233,219,0.92);
+            border:1px solid var(--ink); padding:6px 9px; line-height:1.7; }
+  .legend .sw { display:inline-block; width:10px; height:10px; border:1.5px solid; margin-right:5px; vertical-align:-1px; }
+  .hint { position:absolute; left:12px; bottom:10px; font-size:11px; color:var(--muted);
+          background:rgba(239,233,219,0.85); padding:3px 7px; border:1px solid var(--grid); }
+  .viewbtns { position:absolute; left:12px; top:10px; display:flex; gap:6px; }
+</style>
 </head>
 <body>
-  <h1>HashSeq CRDT Demo</h1>
-  <p class="subtitle">Two editors, each backed by an independent HashSeq instance. Edit both, then sync to merge.</p>
-  <div class="editors">
-    <div class="editor-panel">
-      <div class="editor-header">
-        <span>Peer A</span>
-        <span class="len" id="len-a">0 chars</span>
-      </div>
-      <div id="editor-a"></div>
-    </div>
-    <div class="editor-panel">
-      <div class="editor-header">
-        <span>Peer B</span>
-        <span class="len" id="len-b">0 chars</span>
-      </div>
-      <div id="editor-b"></div>
-    </div>
-  </div>
-  <div class="controls">
-    <button id="sync-btn">Sync</button>
-  </div>
-  <div class="status" id="status"></div>
+  <header>
+    <span class="brand">H A S H S E Q</span>
+    <span class="title">THE INSERTION TREE</span>
+    <span class="fig">FIG. 01 · LIVE</span>
+  </header>
 
-  <script type="module" src="index.js"></script>
+  <div class="toolbar">
+    <div class="tabs" id="tabs">
+      <button data-mode="type" class="active">TYPE</button>
+      <button data-mode="replay">REPLAY TRACE</button>
+    </div>
+
+    <label class="chk"><input type="checkbox" id="show-deps"> EXTRA-DEPS</label>
+    <label class="lbl">PROJ</label>
+    <select id="proj">
+      <option value="tess" selected>TESS (canvas)</option>
+      <option value="shader">SHADER (webgl warp)</option>
+      <option value="linear">LINEAR (no projection)</option>
+    </select>
+
+    <div class="group" id="replay-controls">
+      <select id="trace-select">
+        <option value="">— choose trace —</option>
+        <option value="json-crdt-patch">json-crdt-patch (19k patches)</option>
+        <option value="sveltecomponent">sveltecomponent (20k patches · heavy edits)</option>
+        <option value="json-crdt-blog-post">json-crdt-blog-post (21k patches)</option>
+        <option value="clownschool_flat">clownschool (23k patches)</option>
+        <option value="friendsforever_flat">friendsforever (26k patches)</option>
+        <option value="rustcode">rustcode (40k patches · large)</option>
+        <option value="seph-blog1">seph-blog1 (138k patches · large)</option>
+        <option value="automerge-paper">automerge-paper (260k patches · very large)</option>
+      </select>
+      <button id="play" disabled>▶ PLAY</button>
+      <button id="step" disabled>⏭ STEP</button>
+      <button id="reset" disabled>⟲ RESET</button>
+      <label class="lbl">SPEED</label>
+      <input type="range" id="speed" min="1" max="2000" value="200" style="width:90px">
+      <div class="progress"><i id="progress-bar"></i></div>
+      <span class="progress-txt" id="progress-txt">0 / 0</span>
+    </div>
+  </div>
+
+  <main>
+    <section class="left">
+      <div class="pane-h">DOCUMENT</div>
+      <textarea id="editor" spellcheck="false" placeholder="Type here — watch the insertion tree build on the right."></textarea>
+      <div class="stats">
+        <span class="k">characters</span><span class="v" id="s-chars">0</span>
+        <span class="k">tree nodes</span><span class="v" id="s-nodes">0</span>
+        <span class="k">runs</span><span class="v" id="s-runs">0</span>
+        <span class="k">causal tips</span><span class="v" id="s-tips">0</span>
+      </div>
+      <div class="pane-h" style="border-top:1px solid var(--line)">OP LOG · encoded deltas</div>
+      <div class="oplog" id="oplog"></div>
+    </section>
+
+    <section class="right">
+      <div class="canvas-stack">
+        <canvas id="tree"></canvas>
+        <canvas id="tree-gl"></canvas>
+      </div>
+      <div class="viewbtns"><button id="fit">FIT</button></div>
+      <div class="legend">
+        <div><span class="sw" style="border-color:var(--ink)"></span>root</div>
+        <div><span class="sw" style="border-color:var(--red)"></span>after (right child)</div>
+        <div><span class="sw" style="border-color:var(--green)"></span>before (left child)</div>
+        <div><span class="sw" style="border-color:var(--amber)"></span>causal tip</div>
+        <div><span class="sw" style="border-color:var(--blue);border-style:dashed"></span>extra-dep</div>
+      </div>
+      <div class="hint">scroll = zoom · drag = pan · in-order: lefts · node · rights</div>
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
 </body>
 </html>

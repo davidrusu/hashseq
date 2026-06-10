@@ -163,16 +163,30 @@ pub fn decode_id_set(bytes: &[u8]) -> Result<(BTreeSet<Id>, usize), DecodeError>
 
 // --- Run encoding/decoding ---
 
+// First-op tag for wire-format runs. Internal-storage runs in encode_hashseq
+// always use After and omit the tag for compactness.
+const RUN_OP_AFTER: u8 = 0x00;
+const RUN_OP_BEFORE: u8 = 0x01;
+
 pub fn encode_run(run: &Run, buf: &mut Vec<u8>) {
-    encode_id(&run.insert_after, buf);
+    buf.push(match run.first_op {
+        crate::run::FirstOp::After => RUN_OP_AFTER,
+        crate::run::FirstOp::Before => RUN_OP_BEFORE,
+    });
+    encode_id(&run.anchor, buf);
     encode_id_set(&run.first_extra_deps, buf);
     encode_string(&run.run, buf);
 }
 
 pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
+    if bytes.is_empty() {
+        return Err(DecodeError::UnexpectedEof);
+    }
     let mut pos = 0;
+    let first_op_tag = bytes[pos];
+    pos += 1;
 
-    let (insert_after, id_size) = decode_id(bytes)?;
+    let (anchor, id_size) = decode_id(&bytes[pos..])?;
     pos += id_size;
 
     let (first_extra_deps, deps_size) = decode_id_set(&bytes[pos..])?;
@@ -181,11 +195,14 @@ pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
     let (run_str, str_size) = decode_string(&bytes[pos..])?;
     pos += str_size;
 
-    // Reconstruct the Run with computed elements
     let mut chars = run_str.chars();
     let first_char = chars.next().ok_or(DecodeError::EmptyRun)?;
 
-    let mut run = Run::new(insert_after, first_extra_deps, first_char);
+    let mut run = match first_op_tag {
+        RUN_OP_AFTER => Run::new(anchor, first_extra_deps, first_char),
+        RUN_OP_BEFORE => Run::new_before(anchor, first_extra_deps, first_char),
+        _ => return Err(DecodeError::InvalidOpTag(first_op_tag)),
+    };
     for ch in chars {
         run.extend(ch);
     }
@@ -612,7 +629,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let mut id_set: BTreeSet<Id> = BTreeSet::new();
 
     for run in &runs {
-        id_set.insert(run.insert_after);
+        id_set.insert(run.anchor);
         for id in &run.first_extra_deps {
             id_set.insert(*id);
         }
@@ -703,9 +720,13 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // ~140 KB of avoidable insert_after IDs. Fixing this likely belongs in
     // HashSeq's run-management (avoid creating the split in the first place)
     // rather than as a post-pass in the encoder.
+    // HashSeq's internal storage only holds `FirstOp::After` runs (see Run docs),
+    // so the encoded-hashseq format omits the op tag — decode reconstructs via
+    // Run::new which produces After-rooted runs.
     encode_varint(runs.len(), &mut buf);
     for run in &runs {
-        encode_idx(&run.insert_after, &mut buf);
+        debug_assert!(matches!(run.first_op, crate::run::FirstOp::After));
+        encode_idx(&run.anchor, &mut buf);
         encode_idx_set(&run.first_extra_deps, &mut buf);
         encode_string(&run.run, &mut buf);
     }

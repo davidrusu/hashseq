@@ -578,7 +578,7 @@ mod hashseq_viz {
                     // Determine target position based on run structure
                     let target_pos = {
                         // Has left dependencies
-                        let parent = run.insert_after;
+                        let parent = run.anchor;
                         if let Some(p) = get_node_right_edge(&parent, &self.node_pos) {
                             // Check how many siblings this run has (concurrent branches from same parent).
                             // afters() yields sorted order already.
