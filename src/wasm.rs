@@ -15,7 +15,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::encoding::{decode_hashseq, decode_op, encode_hashseq, encode_op};
-use crate::hashseq::Cursor;
+use crate::hashseq::{Cursor, Loc};
 use crate::{EncodableOp, HashSeq, Id, Run};
 
 fn id_to_hex(id: &Id) -> String {
@@ -235,9 +235,9 @@ impl WasmHashSeq {
         // Map any element id to the id of the box (run head or root) it belongs
         // to; anchors may point at interior run elements.
         let resolve = |id: &Id| -> Id {
-            match s.run_index.get(id) {
-                Some(rp) => rp.run_id,
-                None => *id,
+            match s.idx_of(id).map(|i| s.loc_of(i)) {
+                Some(Loc::Run { run, .. }) => s.id_of(run),
+                _ => *id,
             }
         };
 
@@ -315,29 +315,29 @@ impl WasmHashSeq {
                 &root.ch.to_string(),
                 None,
                 None,
-                s.removed_inserts.contains(id),
+                s.is_removed_id(id),
                 &resolve_deps(&root.extra_dependencies),
             );
         }
-        for (run_id, run) in &s.runs {
+        for (head, run) in &s.runs {
+            let head_id = s.id_of(*head);
             let (kind, rel) = match run.first_op {
                 crate::run::FirstOp::After => ("run", "after"),
                 crate::run::FirstOp::Before => ("before", "before"),
             };
             // The anchor may be an interior element of the parent box (befores
             // don't split runs); report its offset so the layout can attach there.
-            let anchor_offset = s
-                .run_index
-                .get(&run.anchor)
-                .map(|rp| rp.position)
-                .unwrap_or(0);
+            let anchor_offset = match s.idx_of(&run.anchor).map(|i| s.loc_of(i)) {
+                Some(Loc::Run { pos, .. }) => pos as usize,
+                _ => 0,
+            };
             emit(
-                run_id,
+                &head_id,
                 kind,
-                &run.run,
+                &run.text,
                 Some((resolve(&run.anchor), anchor_offset)),
                 Some(rel),
-                s.removed_inserts.contains(run_id),
+                s.is_removed(*head),
                 &resolve_deps(&run.first_extra_deps),
             );
         }

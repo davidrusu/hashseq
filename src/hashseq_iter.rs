@@ -1,36 +1,46 @@
-use crate::{hashseq::HashSeq, Id};
+use crate::{
+    Id,
+    hashseq::{HashSeq, Loc, NodeIdx},
+};
 
+/// Core in-order traversal, in handle space: run interiors walk `elements`
+/// directly (no hashing); explicit forks and befores resolve their Id-ordered
+/// sibling sets through the interning map.
 #[derive(Debug, Clone)]
-pub struct HashSeqIter<'a> {
+pub(crate) struct HashSeqIdxIter<'a> {
     seq: &'a HashSeq,
-    waiting_stack: Vec<(Id, Vec<Id>)>,
+    waiting_stack: Vec<(NodeIdx, Vec<NodeIdx>)>,
 }
 
-impl<'a> HashSeqIter<'a> {
+impl<'a> HashSeqIdxIter<'a> {
     pub(crate) fn new(seq: &'a HashSeq) -> Self {
         let mut iter = Self {
             seq,
             waiting_stack: Vec::new(),
         };
 
-        let mut roots_vec: Vec<Id> = seq.root_nodes.keys().copied().collect();
-        roots_vec.sort();
-        for root in roots_vec.into_iter().rev() {
+        // root_nodes is Id-ordered; reverse so .pop() releases ascending.
+        let roots: Vec<NodeIdx> = seq
+            .root_nodes
+            .keys()
+            .map(|id| seq.idx_of(id).unwrap())
+            .collect();
+        for root in roots.into_iter().rev() {
             iter.push_waiting(root);
         }
 
         iter
     }
 
-    fn push_waiting(&mut self, n: Id) {
-        // befores() yields sorted; reverse so .pop() returns ascending order.
-        let deps: Vec<Id> = self.seq.befores(&n).rev().copied().collect();
+    fn push_waiting(&mut self, n: NodeIdx) {
+        // befores_of yields Id-sorted; reverse so .pop() returns ascending order.
+        let deps: Vec<NodeIdx> = self.seq.befores_of(n).rev().collect();
         self.waiting_stack.push((n, deps));
     }
 }
 
-impl<'a> Iterator for HashSeqIter<'a> {
-    type Item = &'a Id;
+impl<'a> Iterator for HashSeqIdxIter<'a> {
+    type Item = NodeIdx;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -45,29 +55,60 @@ impl<'a> Iterator for HashSeqIter<'a> {
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
                 if let Some(afters) = self.seq.afters.get(&n) {
-                    // BTreeSet iterates in sorted order; reverse for stack push.
-                    for s in afters.iter().rev() {
-                        self.push_waiting(*s);
+                    // BTreeSet iterates in Id order; reverse for stack push.
+                    let afters: Vec<NodeIdx> = afters
+                        .iter()
+                        .rev()
+                        .map(|id| self.seq.idx_of(id).unwrap())
+                        .collect();
+                    for s in afters {
+                        self.push_waiting(s);
                     }
-                } else if let Some(run_pos) = self.seq.run_index.get(&n) {
-                    // Check if n is the first element of this run
-                    if run_pos.position == 0 {
-                        // Push remaining run elements (skip first which is n)
-                        if let Some(run) = self.seq.runs.get(&run_pos.run_id) {
-                            for id in run.elements.iter().skip(1).rev() {
-                                // Use push_waiting to properly handle befores
-                                self.push_waiting(*id);
-                            }
-                        }
+                } else if let Loc::Run { run, pos } = self.seq.loc_of(n)
+                    && pos == 0
+                {
+                    // n is the head of a run: push the remaining elements
+                    // (skip the head itself, which is n). Use push_waiting to
+                    // properly handle each element's befores.
+                    let rest: Vec<NodeIdx> = self.seq.runs[&run]
+                        .elements
+                        .iter()
+                        .skip(1)
+                        .rev()
+                        .copied()
+                        .collect();
+                    for e in rest {
+                        self.push_waiting(e);
                     }
                 }
-                // Return reference from existing data structures
-                if !self.seq.removed_inserts.contains(&n)
-                    && let Some(id_ref) = self.seq.get_id_ref(&n)
-                {
-                    return Some(id_ref);
+                if !self.seq.is_removed(n) {
+                    return Some(n);
                 }
             }
         }
+    }
+}
+
+/// Public iterator over node ids in document order.
+#[derive(Debug, Clone)]
+pub struct HashSeqIter<'a> {
+    seq: &'a HashSeq,
+    inner: HashSeqIdxIter<'a>,
+}
+
+impl<'a> HashSeqIter<'a> {
+    pub(crate) fn new(seq: &'a HashSeq) -> Self {
+        Self {
+            seq,
+            inner: HashSeqIdxIter::new(seq),
+        }
+    }
+}
+
+impl<'a> Iterator for HashSeqIter<'a> {
+    type Item = &'a Id;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|idx| self.seq.id_ref(idx))
     }
 }

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use associative_positional_list::AssociativePositionalList;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{EncodableOp, HashNode, HashSeqIter, Id, Op, Run};
+use crate::{EncodableOp, FirstOp, HashNode, HashSeqIter, Id, Op, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
 /// already a BLAKE3 hash, so adversaries cannot craft colliding keys without
@@ -12,11 +12,28 @@ pub type IdMap<V> = FxHashMap<Id, V>;
 /// HashSet of `Id`. Same FxHash rationale as `IdMap`.
 pub type IdSet = FxHashSet<Id>;
 
-/// Location information for where a node ID can be found
-#[derive(Debug, Clone, Copy)]
-pub struct RunPosition {
-    pub run_id: Id,
-    pub position: usize,
+/// Compact handle for an applied node. Handles are allocated densely in local
+/// apply order, so `Vec`s indexed by `NodeIdx` replace `Id`-keyed maps for
+/// everything but the single interning map.
+///
+/// Handles are replica-local: two replicas applying the same ops in different
+/// orders assign different handles. They must never participate in anything
+/// convergence-relevant — sibling ordering, hashing, and the wire format all
+/// operate on `Id`s.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeIdx(pub u32);
+
+/// Where an applied node lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loc {
+    /// Element of an insert run: (run head, position within the run).
+    Run { run: NodeIdx, pos: u32 },
+    /// Root insert (stored in `root_nodes`).
+    Root,
+    /// Link in a remove chain: (chain head, position within the chain).
+    RemoveChain { chain: NodeIdx, pos: u32 },
+    /// Multi-target remove (stored in `remove_nodes`).
+    MultiRemove,
 }
 
 /// A causal anchor for inserting into a HashSeq.
@@ -85,52 +102,102 @@ pub struct CausalInsert {
     pub ch: char,
 }
 
+/// Storage form of a multi-target remove (`remove_batch` spanning several
+/// chars). Single-target removes live in `RemoveRun` chains instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalRemove {
     pub extra_dependencies: BTreeSet<Id>,
-    /// Removed element ids, sorted (BTreeSet order). Stored as a slice rather
-    /// than a BTreeSet — batch removes can target thousands of elements and the
-    /// tree's per-node overhead triples the footprint.
-    pub nodes: Box<[Id]>,
+    /// Removed element handles, in Id order.
+    pub nodes: Box<[NodeIdx]>,
 }
 
 /// A coalesced chain of single-target removes: remove `i` deletes `targets[i]`
 /// and causally depends on remove `i-1`; the first link carries
 /// `first_extra_deps`. This is how backspace/delete bursts are stored — the
 /// in-memory mirror of the wire format's remove-run sections, and the remove
-/// analog of insert `Run`s.
+/// analog of insert runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoveRun {
     pub first_extra_deps: BTreeSet<Id>,
-    /// Element ids removed, in removal order.
-    pub targets: Vec<Id>,
-    /// Cached ids of the remove nodes themselves; `ids[i]` removes `targets[i]`.
-    pub ids: Vec<Id>,
+    /// Element handles removed, in removal order.
+    pub targets: Vec<NodeIdx>,
+    /// Handles of the remove nodes themselves; `links[i]` removes `targets[i]`.
+    pub links: Vec<NodeIdx>,
 }
 
 impl RemoveRun {
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.links.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.links.is_empty()
+    }
+}
+
+/// Storage form of an insert run. Mirrors the wire-level [`Run`] but holds
+/// element handles instead of full ids: the id of element `i` is
+/// `seq.id_of(elements[i])`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRun {
+    pub anchor: Id,
+    pub first_op: FirstOp,
+    pub first_extra_deps: BTreeSet<Id>,
+    pub text: String,
+    pub elements: Vec<NodeIdx>,
+}
+
+impl StoredRun {
+    pub fn len(&self) -> usize {
+        self.elements.len()
     }
 
-    /// Reconstruct the chain's `HashNode`s (for merge / re-broadcast).
-    pub fn decompress(&self) -> Vec<HashNode> {
-        self.targets
-            .iter()
-            .enumerate()
-            .map(|(i, target)| HashNode {
-                extra_dependencies: if i == 0 {
-                    self.first_extra_deps.clone()
-                } else {
-                    BTreeSet::from_iter([self.ids[i - 1]])
-                },
-                op: Op::Remove(BTreeSet::from_iter([*target])),
-            })
-            .collect()
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
+    pub fn char_at(&self, pos: usize) -> char {
+        self.text.chars().nth(pos).unwrap()
+    }
+
+    pub fn head(&self) -> NodeIdx {
+        self.elements[0]
+    }
+
+    pub fn last(&self) -> NodeIdx {
+        *self.elements.last().unwrap()
+    }
+
+    fn extend(&mut self, idx: NodeIdx, ch: char) {
+        self.text.push(ch);
+        self.elements.push(idx);
+    }
+
+    /// Split at element index `at` (0 < at < len), returning the right portion.
+    /// `right_anchor` is the id of the left portion's last element.
+    fn split_at(&mut self, at: usize, right_anchor: Id) -> StoredRun {
+        assert!(at > 0 && at < self.len(), "Invalid split position");
+        let right_elements = self.elements.split_off(at);
+        let byte_pos = self.text.char_indices().nth(at).unwrap().0;
+        let right_text = self.text.split_off(byte_pos);
+        StoredRun {
+            anchor: right_anchor,
+            first_op: FirstOp::After,
+            first_extra_deps: BTreeSet::new(),
+            text: right_text,
+            elements: right_elements,
+        }
+    }
+
+    /// Reconstruct the wire-level run (recomputes element ids by hashing).
+    pub fn to_run(&self) -> Run {
+        Run::from_text(
+            self.anchor,
+            self.first_op,
+            self.first_extra_deps.clone(),
+            &self.text,
+        )
+        .expect("stored runs are never empty")
     }
 }
 
@@ -142,34 +209,39 @@ pub struct CausalRoot {
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
+    // ---- id <-> handle interning: the only Id-keyed lookup structure ----
+    id_to_idx: IdMap<NodeIdx>,
+    /// NodeIdx -> Id (append-only).
+    pub ids: Vec<Id>,
+    /// NodeIdx -> location.
+    pub locs: Vec<Loc>,
+    /// NodeIdx -> tombstone.
+    pub removed: Vec<bool>,
+
     // All inserts except roots live in runs: sequential typing extends a run,
     // and a lone insert is just a 1-char run. A run is After- or Before-anchored
-    // (`Run::first_op`); subsequent elements always chain InsertAfter.
-    pub runs: IdMap<Run>,
+    // (`StoredRun::first_op`); subsequent elements always chain InsertAfter.
+    pub runs: FxHashMap<NodeIdx, StoredRun>,
+    /// Root inserts, Id-ordered (root order is a convergence concern).
     pub root_nodes: BTreeMap<Id, CausalRoot>,
-    // Reverse index: anchor -> heads of Before-runs anchored at it
-    pub befores_by_anchor: IdMap<BTreeSet<Id>>,
-    // Multi-target removes only (`remove_batch` spanning several chars at once);
-    // single-target removes coalesce into `remove_runs`.
-    pub remove_nodes: IdMap<CausalRemove>,
-    // Chained single-target removes (backspace/delete bursts), keyed by the
-    // first remove's id.
-    pub remove_runs: IdMap<RemoveRun>,
-    // remove id -> (remove_runs key, index within the chain)
-    pub remove_index: IdMap<RunPosition>,
+    /// Reverse index: anchor -> heads of Before-runs anchored at it. Values are
+    /// Id-ordered: sibling order is a convergence concern, so it must not use
+    /// replica-local handles.
+    pub befores_by_anchor: FxHashMap<NodeIdx, BTreeSet<Id>>,
+    /// Multi-target removes only; single-target removes coalesce into chains.
+    pub remove_nodes: FxHashMap<NodeIdx, CausalRemove>,
+    /// Chained single-target removes (backspace/delete bursts), keyed by the
+    /// first remove's handle.
+    pub remove_runs: FxHashMap<NodeIdx, RemoveRun>,
+    /// Fork tracking: anchor -> ids that fork from it (Id-ordered, see
+    /// `befores_by_anchor`).
+    pub afters: FxHashMap<NodeIdx, BTreeSet<Id>>,
 
-    // ID resolution index for O(1) lookup of any node
-    pub run_index: IdMap<RunPosition>,
-
-    // Fork tracking: maps anchor ID to list of IDs that fork from it
-    pub afters: IdMap<BTreeSet<Id>>,
-
-    pub removed_inserts: IdSet,
     pub(crate) tips: BTreeSet<Id>,
     // orphaned uses HashNode as key (not Id), so keep std HashSet — the input is
     // adversary-controllable and benefits from SipHash's HashDoS protection.
     pub(crate) orphaned: HashSet<HashNode>,
-    index: AssociativePositionalList<Id>,
+    index: AssociativePositionalList<NodeIdx>,
 }
 
 impl PartialEq for HashSeq {
@@ -181,27 +253,57 @@ impl PartialEq for HashSeq {
 impl Eq for HashSeq {}
 
 impl HashSeq {
-    /// Check if a node ID exists (either in runs or individual nodes)
+    // ---- interning ----
+
+    fn next_idx(&self) -> NodeIdx {
+        NodeIdx(self.ids.len() as u32)
+    }
+
+    fn intern(&mut self, id: Id, loc: Loc) -> NodeIdx {
+        let idx = self.next_idx();
+        self.ids.push(id);
+        self.locs.push(loc);
+        self.removed.push(false);
+        self.id_to_idx.insert(id, idx);
+        idx
+    }
+
+    pub fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
+        self.id_to_idx.get(id).copied()
+    }
+
+    pub fn id_of(&self, idx: NodeIdx) -> Id {
+        self.ids[idx.0 as usize]
+    }
+
+    pub(crate) fn id_ref(&self, idx: NodeIdx) -> &Id {
+        &self.ids[idx.0 as usize]
+    }
+
+    pub fn loc_of(&self, idx: NodeIdx) -> Loc {
+        self.locs[idx.0 as usize]
+    }
+
+    pub fn is_removed(&self, idx: NodeIdx) -> bool {
+        self.removed[idx.0 as usize]
+    }
+
+    /// Check if a node ID exists (insert, remove, or root) — one map probe.
     pub fn contains_node(&self, id: &Id) -> bool {
-        // Check run_index first since most nodes are in runs
-        self.run_index.contains_key(id)
-            || self.remove_index.contains_key(id)
-            || self.remove_nodes.contains_key(id)
-            || self.root_nodes.contains_key(id)
+        self.id_to_idx.contains_key(id)
+    }
+
+    pub(crate) fn char_at(&self, idx: NodeIdx) -> char {
+        match self.loc_of(idx) {
+            Loc::Run { run, pos } => self.runs[&run].char_at(pos as usize),
+            Loc::Root => self.root_nodes[self.id_ref(idx)].ch,
+            _ => panic!("char_at on a non-insert node"),
+        }
     }
 
     /// Get the character value for a given node ID
     pub fn get_node_char(&self, id: &Id) -> char {
-        if let Some(root) = self.root_nodes.get(id) {
-            return root.ch;
-        }
-        let run_pos = &self.run_index[id];
-
-        self.runs[&run_pos.run_id]
-            .run
-            .chars()
-            .nth(run_pos.position)
-            .unwrap()
+        self.char_at(self.idx_of(id).expect("unknown id"))
     }
 
     pub fn len(&self) -> usize {
@@ -216,64 +318,81 @@ impl HashSeq {
         &self.orphaned
     }
 
-    /// Get a stable reference to an Id from existing data structures.
-    /// Used by HashSeqIter to return references without a separate nodes set.
-    pub(crate) fn get_id_ref(&self, id: &Id) -> Option<&Id> {
-        // Try root_nodes first (BTreeMap gives us key references)
-        if let Some((id_ref, _)) = self.root_nodes.get_key_value(id) {
-            return Some(id_ref);
-        }
-        // Try run_index (covers all run elements)
-        if let Some((id_ref, _)) = self.run_index.get_key_value(id) {
-            return Some(id_ref);
-        }
-        None
-    }
+    // ---- causal adjacency (handle space) ----
 
-    /// Get nodes that come after this one. Uses both explicit afters and run data.
-    /// Yields Ids in sorted (BTreeSet) order.
-    pub fn afters(&self, id: &Id) -> impl DoubleEndedIterator<Item = &Id> + '_ {
-        let explicit = self.afters.get(id);
+    /// Successors of `idx`: explicit forks (Id-ordered) or the run continuation.
+    pub(crate) fn afters_of(&self, idx: NodeIdx) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
+        let explicit = self.afters.get(&idx);
         // Run fallback only fires when there's no explicit afters entry.
         let from_run = if explicit.is_none() {
-            self.run_index.get(id).and_then(|run_pos| {
-                let run = self.runs.get(&run_pos.run_id)?;
-                run.elements.get(run_pos.position + 1)
-            })
+            match self.loc_of(idx) {
+                Loc::Run { run, pos } => self.runs[&run].elements.get(pos as usize + 1).copied(),
+                _ => None,
+            }
         } else {
             None
         };
-        explicit.into_iter().flatten().chain(from_run)
+        explicit
+            .into_iter()
+            .flatten()
+            .map(|id| self.id_to_idx[id])
+            .chain(from_run)
     }
 
-    /// Get nodes that come before this one (inserted with InsertBefore).
-    /// Yields Ids in sorted (BTreeSet) order.
-    pub fn befores(&self, id: &Id) -> impl DoubleEndedIterator<Item = &Id> + '_ {
-        self.befores_by_anchor.get(id).into_iter().flatten()
+    /// Before-run heads anchored at `idx`, in Id order.
+    pub(crate) fn befores_of(&self, idx: NodeIdx) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
+        self.befores_by_anchor
+            .get(&idx)
+            .into_iter()
+            .flatten()
+            .map(|id| self.id_to_idx[id])
+    }
+
+    /// Ids that come after `id`: explicit forks (Id-ordered) or the run
+    /// continuation. Id-space convenience over [`Self::afters_of`].
+    pub fn afters(&self, id: &Id) -> impl Iterator<Item = Id> + '_ {
+        self.idx_of(id)
+            .into_iter()
+            .flat_map(|i| self.afters_of(i))
+            .map(|i| self.id_of(i))
+    }
+
+    /// Ids of Before-runs anchored at `id`, in Id order.
+    pub fn befores(&self, id: &Id) -> impl Iterator<Item = Id> + '_ {
+        self.idx_of(id)
+            .into_iter()
+            .flat_map(|i| self.befores_of(i))
+            .map(|i| self.id_of(i))
+    }
+
+    /// Whether `id` is a tombstoned insert.
+    pub fn is_removed_id(&self, id: &Id) -> bool {
+        self.idx_of(id).is_some_and(|i| self.is_removed(i))
     }
 
     /// Check if node `a` is causally before node `b`.
-    fn is_causally_before(&self, a: &Id, b: &Id) -> bool {
-        // FxHashSet (not BTreeSet/std HashSet): Id is already a BLAKE3 hash, so
-        // FxHash gives ~5-cycle lookups vs SipHash's ~50, with no HashDoS risk.
-        let mut seen: FxHashSet<Id> = FxHashSet::default();
-        let mut boundary: Vec<Id> = self.afters(a).copied().collect();
+    ///
+    /// Walks handle space: the common case (run-chain neighbors) follows
+    /// `elements` directly with no hashing at all.
+    fn is_causally_before(&self, a: NodeIdx, b: NodeIdx) -> bool {
+        let mut seen: FxHashSet<NodeIdx> = FxHashSet::default();
+        let mut boundary: Vec<NodeIdx> = self.afters_of(a).collect();
         while let Some(n) = boundary.pop() {
-            if &n == b {
+            if n == b {
                 return true;
             }
 
             seen.insert(n);
-            boundary.extend(self.afters(&n).copied().filter(|x| !seen.contains(x)));
-            if &n != a {
-                boundary.extend(self.befores(&n).copied().filter(|x| !seen.contains(x)));
+            boundary.extend(self.afters_of(n).filter(|x| !seen.contains(x)));
+            if n != a {
+                boundary.extend(self.befores_of(n).filter(|x| !seen.contains(x)));
             }
         }
 
         false
     }
 
-    fn neighbours(&self, idx: usize) -> (Option<Id>, Option<Id>) {
+    fn neighbours(&self, idx: usize) -> (Option<NodeIdx>, Option<NodeIdx>) {
         let left = idx
             .checked_sub(1)
             .and_then(|prev_idx| self.index.get(prev_idx).copied());
@@ -347,8 +466,8 @@ impl HashSeq {
 
         let mut to_remove = BTreeSet::new();
         for pos in idx..(idx + amount) {
-            if let Some(id) = self.index.get(pos) {
-                to_remove.insert(*id);
+            if let Some(i) = self.index.get(pos) {
+                to_remove.insert(self.id_of(*i));
             } else {
                 break;
             }
@@ -382,240 +501,231 @@ impl HashSeq {
     }
 
     fn insert_root(&mut self, root_id: Id, root: CausalRoot) {
+        let idx = self.intern(root_id, Loc::Root);
         let position = if let Some(next_root) = self
             .root_nodes
             .keys()
             .filter(|id| *id >= &root_id)
-            .find(|id| !self.removed_inserts.contains(*id))
+            .find(|id| !self.removed[self.id_to_idx[*id].0 as usize])
         {
             // new root is inserted just before the next biggest root
-            self.index.find(next_root).unwrap()
+            self.index.find(&self.id_to_idx[next_root]).unwrap()
         } else {
             // otherwise if there is no bigger root, the new root is
             // inserted at end of list
             self.len()
         };
-        self.insert_root_with_known_position(root_id, root, position);
-    }
-
-    fn insert_root_with_known_position(&mut self, id: Id, root: CausalRoot, position: usize) {
-        self.index.insert(position, id);
-        self.root_nodes.insert(id, root);
+        self.index.insert(position, idx);
+        self.root_nodes.insert(root_id, root);
     }
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
-        // Fast path: check for run extension without allocating afters Vec
-        if after.extra_dependencies.is_empty()
-            && let Some(run_pos) = self.run_index.get(&after.anchor).copied()
-        {
-            // Check for explicit forks first (cheap HashMap lookup)
-            let has_explicit_afters = self
-                .afters
-                .get(&after.anchor)
-                .is_some_and(|ns| !ns.is_empty());
+        // The anchor is a checked dependency, so it is interned.
+        let anchor = self.id_to_idx[&after.anchor];
 
-            if !has_explicit_afters {
-                // Get the run and check if anchor is the last element
-                let run = self.runs.get_mut(&run_pos.run_id).unwrap();
-                if run_pos.position + 1 == run.len() {
-                    // Run extension - most common case for sequential typing
-                    run.extend_with_id(id, after.ch);
-                    self.run_index.insert(
-                        id,
-                        RunPosition {
-                            run_id: run_pos.run_id,
-                            position: run_pos.position + 1,
-                        },
-                    );
-                    let position = self.index.find(&after.anchor).unwrap() + 1;
-                    self.index.insert(position, id);
-                    return;
-                }
+        // Fast path: extend the run whose tail is the anchor.
+        if after.extra_dependencies.is_empty()
+            && let Loc::Run { run, pos } = self.loc_of(anchor)
+        {
+            // Check for explicit forks first (cheap u32-keyed lookup)
+            let has_explicit_afters = self.afters.get(&anchor).is_some_and(|ns| !ns.is_empty());
+
+            if !has_explicit_afters && pos as usize + 1 == self.runs[&run].len() {
+                // Run extension - most common case for sequential typing
+                let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
+                self.runs.get_mut(&run).unwrap().extend(idx, after.ch);
+                let position = self.index.find(&anchor).unwrap() + 1;
+                self.index.insert(position, idx);
+                return;
             }
         }
 
         // Slow path: find the smallest afters node >= id and not removed.
         // Explicit-afters case: O(log n) range seek into the BTreeSet.
         // Run-fallback case: at most one candidate, just check it.
-        let next_node = if let Some(siblings) = self.afters.get(&after.anchor) {
+        let next_node = if let Some(siblings) = self.afters.get(&anchor) {
             siblings
                 .range(&id..)
-                .find(|aid| !self.removed_inserts.contains(*aid))
+                .map(|aid| self.id_to_idx[aid])
+                .find(|a| !self.removed[a.0 as usize])
         } else {
-            self.afters(&after.anchor)
-                .find(|aid| **aid >= id && !self.removed_inserts.contains(*aid))
+            self.afters_of(anchor)
+                .find(|a| self.ids[a.0 as usize] >= id && !self.removed[a.0 as usize])
         };
         let position = if let Some(next_node) = next_node {
             // new node is inserted just before the other node after our anchor node that is
             // bigger than the new node
-            self.index.find(next_node)
+            self.index.find(&next_node)
         } else {
             // otherwise the new node is inserted after our anchor node (unless it has been removed)
-            self.index.find(&after.anchor).map(|p| p + 1)
+            self.index.find(&anchor).map(|p| p + 1)
         };
 
         // We are inserting after a node inside a run (the extension case was
         // handled by the fast path above, so this is a fork). If the anchor isn't
         // the run's tail, split off everything after it first.
-        if let Some(run_pos) = self.run_index.get(&after.anchor).copied()
-            && run_pos.position + 1 < self.runs[&run_pos.run_id].len()
+        if let Loc::Run { run, pos } = self.loc_of(anchor)
+            && (pos as usize) + 1 < self.runs[&run].len()
         {
-            self.split_run_at(run_pos.run_id, run_pos.position + 1);
-            debug_assert_eq!(self.runs[&run_pos.run_id].last_id(), after.anchor);
+            self.split_run_at(run, pos as usize + 1);
+            debug_assert_eq!(self.runs[&run].last(), anchor);
         }
 
         // Start a new run anchored at the anchor node.
-        let new_run = Run::new(after.anchor, after.extra_dependencies, after.ch);
-        debug_assert_eq!(new_run.first_id(), id);
-        self.runs.insert(id, new_run);
-        self.run_index.insert(
-            id,
-            RunPosition {
-                run_id: id,
-                position: 0,
+        let idx = self.next_idx();
+        self.intern(id, Loc::Run { run: idx, pos: 0 });
+        self.runs.insert(
+            idx,
+            StoredRun {
+                anchor: after.anchor,
+                first_op: FirstOp::After,
+                first_extra_deps: after.extra_dependencies,
+                text: after.ch.to_string(),
+                elements: vec![idx],
             },
         );
 
         // run extension is handled in the fast path above, fork/split updates the afters set
-        self.afters.entry(after.anchor).or_default().insert(id);
+        self.afters.entry(anchor).or_default().insert(id);
 
-        let position = position.unwrap_or_else(|| self.position_by_scan(&id));
-        self.index.insert(position, id);
+        let position = position.unwrap_or_else(|| self.position_by_scan(idx));
+        self.index.insert(position, idx);
     }
 
-    /// Split the run `run_id` at element index `at` (0 < at < len). The right
-    /// portion becomes its own run, re-indexed and tracked in `afters` of the left
-    /// portion's last element. Returns the right run's id.
-    fn split_run_at(&mut self, run_id: Id, at: usize) -> Id {
-        let run = self.runs.get_mut(&run_id).unwrap();
-        let left_last_id = run.elements[at - 1];
-        let right_run = run.split_at(at);
-        let right_run_id = right_run.first_id();
+    /// Split the run `run` at element index `at` (0 < at < len). The right
+    /// portion becomes its own run, re-located and tracked in `afters` of the
+    /// left portion's last element. Returns the right run's head.
+    fn split_run_at(&mut self, run: NodeIdx, at: usize) -> NodeIdx {
+        let r = self.runs.get_mut(&run).unwrap();
+        let left_last = r.elements[at - 1];
+        let right_anchor = self.ids[left_last.0 as usize];
+        let right_run = r.split_at(at, right_anchor);
+        let right_head = right_run.head();
 
-        // re-index the right run using cached elements
-        for (idx, elem_id) in right_run.elements.iter().enumerate() {
-            self.run_index.insert(
-                *elem_id,
-                RunPosition {
-                    run_id: right_run_id,
-                    position: idx,
-                },
-            );
+        // re-locate the right run's elements
+        for (i, e) in right_run.elements.iter().enumerate() {
+            self.locs[e.0 as usize] = Loc::Run {
+                run: right_head,
+                pos: i as u32,
+            };
         }
 
-        self.runs.insert(right_run_id, right_run);
+        let right_head_id = self.ids[right_head.0 as usize];
+        self.runs.insert(right_head, right_run);
         // Track the split in afters so iteration can find the right portion
         self.afters
-            .entry(left_last_id)
+            .entry(left_last)
             .or_default()
-            .insert(right_run_id);
-        right_run_id
+            .insert(right_head_id);
+        right_head
     }
 
-    /// Position of `id` by walking the whole sequence — the fallback when the
+    /// Position of `idx` by walking the whole sequence — the fallback when the
     /// anchor-relative lookup fails (anchor removed, or the neighbor isn't in the
     /// position index yet, which can happen mid-merge).
-    fn position_by_scan(&self, id: &Id) -> usize {
-        let (position, _) = self
-            .iter_ids()
-            .enumerate()
-            .find(|(_, n)| n == &id)
-            .unwrap();
-        position
+    fn position_by_scan(&self, idx: NodeIdx) -> usize {
+        self.iter_idxs().position(|n| n == idx).unwrap()
     }
 
-    fn remove_nodes(&mut self, id: Id, remove: CausalRemove) {
-        // A remove targeting a non-insert node (e.g. another remove) is harmless:
-        // it's not in the position index, and marking it in removed_inserts is inert.
-        for n in remove.nodes.iter() {
-            if let Some(p) = self.index.find(n) {
+    fn apply_remove(&mut self, id: Id, extra_deps: BTreeSet<Id>, target_ids: BTreeSet<Id>) {
+        // Targets are checked dependencies of the remove, so they are interned.
+        // (A remove targeting a non-insert node is harmless: it's not in the
+        // position index, and its tombstone bit is inert.)
+        let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.id_to_idx[t]).collect();
+        for t in &targets {
+            if let Some(p) = self.index.find(t) {
                 self.index.remove(p);
             }
+            self.removed[t.0 as usize] = true;
         }
-        self.removed_inserts.extend(&remove.nodes);
 
         // Single-target removes coalesce into RemoveRuns, the delete analog of
         // sequential typing: if our only extra dep is the current tail of an
         // existing chain, extend that chain in place.
-        if remove.nodes.len() == 1 {
-            let target = *remove.nodes.first().unwrap();
-            if remove.extra_dependencies.len() == 1 {
-                let dep = *remove.extra_dependencies.first().unwrap();
-                if let Some(pos) = self.remove_index.get(&dep).copied()
-                    && let Some(chain) = self.remove_runs.get_mut(&pos.run_id)
-                    && pos.position + 1 == chain.ids.len()
+        if let [target] = targets[..] {
+            if extra_deps.len() == 1 {
+                let dep = extra_deps.first().unwrap();
+                if let Some(dep) = self.idx_of(dep)
+                    && let Loc::RemoveChain { chain, pos } = self.loc_of(dep)
+                    && pos as usize + 1 == self.remove_runs[&chain].links.len()
                 {
-                    chain.targets.push(target);
-                    chain.ids.push(id);
-                    self.remove_index.insert(
-                        id,
-                        RunPosition {
-                            run_id: pos.run_id,
-                            position: pos.position + 1,
-                        },
-                    );
+                    let idx = self.intern(id, Loc::RemoveChain { chain, pos: pos + 1 });
+                    let rr = self.remove_runs.get_mut(&chain).unwrap();
+                    rr.targets.push(target);
+                    rr.links.push(idx);
                     return;
                 }
             }
             // Start a new chain (a lone remove is a 1-link chain).
+            let idx = self.next_idx();
+            self.intern(id, Loc::RemoveChain { chain: idx, pos: 0 });
             self.remove_runs.insert(
-                id,
+                idx,
                 RemoveRun {
-                    first_extra_deps: remove.extra_dependencies,
+                    first_extra_deps: extra_deps,
                     targets: vec![target],
-                    ids: vec![id],
-                },
-            );
-            self.remove_index.insert(
-                id,
-                RunPosition {
-                    run_id: id,
-                    position: 0,
+                    links: vec![idx],
                 },
             );
             return;
         }
 
-        self.remove_nodes.insert(id, remove);
+        let idx = self.intern(id, Loc::MultiRemove);
+        self.remove_nodes.insert(
+            idx,
+            CausalRemove {
+                extra_dependencies: extra_deps,
+                nodes: targets.into(),
+            },
+        );
     }
 
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
+        // The anchor is a checked dependency, so it is interned.
+        let anchor = self.id_to_idx[&before.anchor];
+
         // O(log n) range seek into the underlying BTreeSet, no intermediate allocation.
         let position = if let Some(next_node) = self
             .befores_by_anchor
-            .get(&before.anchor)
-            .and_then(|s| s.range(id..).find(|n| !self.removed_inserts.contains(*n)))
+            .get(&anchor)
+            .and_then(|s| {
+                s.range(id..)
+                    .map(|n| self.id_to_idx[n])
+                    .find(|n| !self.removed[n.0 as usize])
+            })
         {
             // new node is inserted just before the other node before our anchor node that is
             // bigger than the new node
-            Some(self.index.find(next_node).unwrap())
+            Some(self.index.find(&next_node).unwrap())
         } else {
             // otherwise the new node is inserted before our anchor node
-            self.index.find(&before.anchor)
+            self.index.find(&anchor)
         };
 
         // The anchor may sit mid-run: no split is needed. Iteration visits the
         // befores of every run element individually (see HashSeqIter), and unlike
         // an after-fork there is no sibling ordering to resolve — a Before-run
         // always lands immediately before its anchor.
-        let new_run = Run::new_before(before.anchor, before.extra_dependencies, before.ch);
-        debug_assert_eq!(new_run.first_id(), id);
-        self.runs.insert(id, new_run);
-        self.run_index.insert(
-            id,
-            RunPosition {
-                run_id: id,
-                position: 0,
+        let idx = self.next_idx();
+        self.intern(id, Loc::Run { run: idx, pos: 0 });
+        self.runs.insert(
+            idx,
+            StoredRun {
+                anchor: before.anchor,
+                first_op: FirstOp::Before,
+                first_extra_deps: before.extra_dependencies,
+                text: before.ch.to_string(),
+                elements: vec![idx],
             },
         );
 
         self.befores_by_anchor
-            .entry(before.anchor)
+            .entry(anchor)
             .or_default()
             .insert(id);
 
-        let position = position.unwrap_or_else(|| self.position_by_scan(&id));
-        self.index.insert(position, id);
+        let position = position.unwrap_or_else(|| self.position_by_scan(idx));
+        self.index.insert(position, idx);
     }
 
     pub fn apply(&mut self, node: HashNode) {
@@ -664,14 +774,7 @@ impl HashSeq {
                     ch,
                 },
             ),
-            Op::Remove(nodes) => self.remove_nodes(
-                id,
-                CausalRemove {
-                    extra_dependencies: node.extra_dependencies,
-                    // BTreeSet iterates sorted, so the slice stays sorted
-                    nodes: nodes.into_iter().collect(),
-                },
-            ),
+            Op::Remove(nodes) => self.apply_remove(id, node.extra_dependencies, nodes),
         }
 
         for orphan in std::mem::take(&mut self.orphaned) {
@@ -679,40 +782,56 @@ impl HashSeq {
         }
     }
 
+    /// Reconstruct a remove chain's `HashNode`s (for merge / re-broadcast).
+    pub fn remove_run_nodes(&self, rr: &RemoveRun) -> Vec<HashNode> {
+        rr.targets
+            .iter()
+            .enumerate()
+            .map(|(i, target)| HashNode {
+                extra_dependencies: if i == 0 {
+                    rr.first_extra_deps.clone()
+                } else {
+                    BTreeSet::from_iter([self.id_of(rr.links[i - 1])])
+                },
+                op: Op::Remove(BTreeSet::from_iter([self.id_of(*target)])),
+            })
+            .collect()
+    }
+
     pub fn merge(&mut self, other: Self) {
         // Simple merge: decompress all nodes from other and apply them
         // The apply function will rebuild runs when possible
 
-        for (id, root) in other.root_nodes {
+        for (id, root) in &other.root_nodes {
             let node = HashNode {
-                extra_dependencies: root.extra_dependencies,
+                extra_dependencies: root.extra_dependencies.clone(),
                 op: Op::InsertRoot(root.ch),
             };
-            debug_assert_eq!(id, node.id());
+            debug_assert_eq!(*id, node.id());
             self.apply(node)
         }
 
         // Covers both After- and Before-anchored runs: decompress reconstructs
         // the anchoring first node for either kind.
-        for (_run_id, run) in other.runs {
-            for node in run.decompress() {
+        for run in other.runs.values() {
+            for node in run.to_run().decompress() {
                 self.apply(node);
             }
         }
 
-        for (_first_id, remove_run) in other.remove_runs {
-            for (i, node) in remove_run.decompress().into_iter().enumerate() {
-                debug_assert_eq!(node.id(), remove_run.ids[i]);
+        for remove_run in other.remove_runs.values() {
+            for (i, node) in other.remove_run_nodes(remove_run).into_iter().enumerate() {
+                debug_assert_eq!(node.id(), other.id_of(remove_run.links[i]));
                 self.apply(node);
             }
         }
 
-        for (id, causal_remove) in other.remove_nodes {
+        for (idx, causal_remove) in &other.remove_nodes {
             let node = HashNode {
-                extra_dependencies: causal_remove.extra_dependencies,
-                op: Op::Remove(causal_remove.nodes.iter().copied().collect()),
+                extra_dependencies: causal_remove.extra_dependencies.clone(),
+                op: Op::Remove(causal_remove.nodes.iter().map(|i| other.id_of(*i)).collect()),
             };
-            debug_assert_eq!(id, node.id());
+            debug_assert_eq!(other.id_of(*idx), node.id());
             self.apply(node)
         }
 
@@ -726,18 +845,22 @@ impl HashSeq {
         HashSeqIter::new(self)
     }
 
+    pub(crate) fn iter_idxs(&self) -> impl Iterator<Item = NodeIdx> + '_ {
+        crate::hashseq_iter::HashSeqIdxIter::new(self)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
-        self.iter_ids().map(|id| self.get_node_char(id))
+        self.iter_idxs().map(|idx| self.char_at(idx))
     }
 
     /// Return the node ID at visible position `idx`, if any.
     pub fn id_at(&self, idx: usize) -> Option<Id> {
-        self.index.get(idx).copied()
+        self.index.get(idx).map(|i| self.id_of(*i))
     }
 
     /// Return the current visible position of `id`, if it is present and not removed.
     pub fn position_of(&self, id: &Id) -> Option<usize> {
-        self.index.find(id)
+        self.index.find(&self.idx_of(id)?)
     }
 
     /// The current causal tips (heads of the causal DAG).
@@ -759,27 +882,35 @@ impl HashSeq {
             return None;
         }
         match self.neighbours(idx) {
-            (Some(left_id), Some(right_id)) => {
-                if self.is_causally_before(&left_id, &right_id) {
+            (Some(left), Some(right)) => {
+                if self.is_causally_before(left, right) {
+                    let anchor = self.id_of(right);
                     Some(Cursor::Before {
-                        anchor: right_id,
-                        extra_deps: self.tips_minus(&right_id),
+                        extra_deps: self.tips_minus(&anchor),
+                        anchor,
                     })
                 } else {
+                    let anchor = self.id_of(left);
                     Some(Cursor::After {
-                        anchor: left_id,
-                        extra_deps: self.tips_minus(&left_id),
+                        extra_deps: self.tips_minus(&anchor),
+                        anchor,
                     })
                 }
             }
-            (Some(left_id), None) => Some(Cursor::After {
-                anchor: left_id,
-                extra_deps: self.tips_minus(&left_id),
-            }),
-            (None, Some(right_id)) => Some(Cursor::Before {
-                anchor: right_id,
-                extra_deps: self.tips_minus(&right_id),
-            }),
+            (Some(left), None) => {
+                let anchor = self.id_of(left);
+                Some(Cursor::After {
+                    extra_deps: self.tips_minus(&anchor),
+                    anchor,
+                })
+            }
+            (None, Some(right)) => {
+                let anchor = self.id_of(right);
+                Some(Cursor::Before {
+                    extra_deps: self.tips_minus(&anchor),
+                    anchor,
+                })
+            }
             (None, None) => Some(Cursor::Root {
                 extra_deps: self.tips.clone(),
             }),
@@ -1032,7 +1163,7 @@ mod test {
         // - Should have 1 run containing "bcd"
         assert_eq!(seq_with_abcd.runs.len(), 1, "Should have 1 run");
         let run = seq_with_abcd.runs.values().next().unwrap();
-        assert_eq!(run.run, "bcd", "Run should contain 'bcd'");
+        assert_eq!(run.text, "bcd", "Run should contain 'bcd'");
 
         // Verify the text is correct
         assert_eq!(seq_with_abcd.iter().collect::<String>(), "abcd");
@@ -1129,7 +1260,7 @@ mod test {
 
         // Verify the run contains the right data
         let run = seq.runs.values().next().unwrap();
-        assert_eq!(run.run, "abc");
+        assert_eq!(run.text, "abc");
 
         // Verify the final string
         assert_eq!(&seq.iter().collect::<String>(), "xabc");
@@ -1917,7 +2048,7 @@ mod test {
         assert_eq!(seq.runs.len(), 1);
         let run = seq.runs.values().next().unwrap();
         assert_eq!(run.len(), 2);
-        assert_eq!(run.run, "bc");
+        assert_eq!(run.text, "bc");
         assert_eq!(String::from_iter(seq.iter()), "abc");
     }
 

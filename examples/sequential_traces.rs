@@ -411,28 +411,28 @@ fn memory_breakdown(seq: &HashSeq, total: usize, label: &str) {
     let run_strings = measure_alloc(|| {
         seq.runs
             .values()
-            .map(|r| r.run.clone())
+            .map(|r| r.text.clone())
             .collect::<Vec<_>>()
     });
-    let run_index = measure_alloc(|| seq.run_index.clone());
+    let intern = measure_alloc(|| {
+        (seq.ids.clone(), seq.locs.clone(), seq.removed.clone())
+    });
     let befores = measure_alloc(|| seq.befores_by_anchor.clone());
     let afters = measure_alloc(|| seq.afters.clone());
-    let removed = measure_alloc(|| seq.removed_inserts.clone());
+
     let removes = measure_alloc(|| seq.remove_nodes.clone());
     let remove_runs = measure_alloc(|| seq.remove_runs.clone());
-    let remove_index = measure_alloc(|| seq.remove_index.clone());
+
     let roots = measure_alloc(|| seq.root_nodes.clone());
-    let rest = total.saturating_sub(
-        runs + run_index + befores + afters + removed + removes + remove_runs + remove_index
-            + roots,
-    );
+    let rest =
+        total.saturating_sub(runs + intern + befores + afters + removes + remove_runs + roots);
     let n_elems: usize = seq.runs.values().map(|r| r.len()).sum();
     let n_removes = seq.remove_nodes.len();
     eprintln!(
         "MEM {label}: total={total} runs={runs} (elements={elements} text={run_strings}) \
-         run_index={run_index} befores={befores} afters={afters} removed_set={removed} \
-         remove_nodes={removes} remove_runs={remove_runs} remove_index={remove_index} \
-         roots={roots} index+rest={rest} [elems={n_elems} removes={n_removes}]"
+         intern_vecs={intern} befores={befores} afters={afters} \
+         remove_nodes={removes} remove_runs={remove_runs} \
+         roots={roots} id_map+index+rest={rest} [elems={n_elems} removes={n_removes}]"
     );
 }
 

@@ -9,7 +9,7 @@ pub use self::encoding::{
     decode_batch, decode_hashseq, encode_batch, encode_hashseq, DecodeError, EncodableOp,
 };
 pub use self::hash_node::{HashNode, Op};
-pub use self::hashseq::{Cursor, HashSeq, RunPosition};
+pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};
 pub use self::hashseq_iter::HashSeqIter;
 pub use self::run::{FirstOp, Run};
 

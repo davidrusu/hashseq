@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::hashseq::{CausalRemove, RemoveRun};
-use crate::{HashNode, HashSeq, Id, Op, Run};
+use rustc_hash::FxHashMap;
+
+use crate::hashseq::{CausalRemove, Loc, RemoveRun};
+use crate::{HashNode, HashSeq, Id, NodeIdx, Op, Run, StoredRun};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -408,22 +410,10 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<EncodableOp>, DecodeError> {
 //
 // Format: [id_dict][roots][after-runs][before-runs][removes][orphans]
 
-// Op reference tags used during encoding to classify which positional
-// section a given ID belongs to.
-const REF_TAG_RUN: u8 = 0x00;
-const REF_TAG_ROOT: u8 = 0x01;
-
 // Target-reference tags in the "other removes" section.
 const RM_TARGET_RUN: u8 = 0x00;
 const RM_TARGET_ROOT: u8 = 0x01;
 const RM_TARGET_DICT: u8 = 0x02;
-
-#[derive(Debug, Clone, Copy)]
-struct OpRef {
-    tag: u8,
-    op_idx: usize,
-    sub_idx: usize,
-}
 
 /// Encode a HashSeq to a compact byte representation.
 ///
@@ -443,34 +433,36 @@ struct OpRef {
 /// Remove sections address elements by `run_idx` into the concatenated
 /// after-runs ++ before-runs list.
 pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
-    // Build ID -> OpRef mapping for compact remove encoding.
-    let mut id_to_ref: HashMap<Id, OpRef> = HashMap::new();
-
     // root_nodes is a BTreeMap, so its iteration order is already deterministic.
     // runs/remove_nodes are HashMaps with a randomized iteration order; we sort
-    // by ID so the encoded bytes are byte-identical across processes.
+    // by ID so the encoded bytes are byte-identical across processes (handles
+    // are replica-local and never drive ordering).
     let roots: Vec<_> = seq.root_nodes.iter().collect();
-    let mut after_runs: Vec<&Run> = Vec::new();
-    let mut before_runs: Vec<&Run> = Vec::new();
-    for run in seq.runs.values() {
+    let mut after_runs: Vec<(NodeIdx, &StoredRun)> = Vec::new();
+    let mut before_runs: Vec<(NodeIdx, &StoredRun)> = Vec::new();
+    for (head, run) in &seq.runs {
         match run.first_op {
-            crate::run::FirstOp::After => after_runs.push(run),
-            crate::run::FirstOp::Before => before_runs.push(run),
+            crate::run::FirstOp::After => after_runs.push((*head, run)),
+            crate::run::FirstOp::Before => before_runs.push((*head, run)),
         }
     }
-    after_runs.sort_by_key(|r| r.elements.first().copied());
-    before_runs.sort_by_key(|r| r.elements.first().copied());
+    after_runs.sort_by_key(|(h, _)| seq.id_of(*h));
+    before_runs.sort_by_key(|(h, _)| seq.id_of(*h));
     // Removes address run elements by index into this concatenated list.
-    let runs: Vec<&Run> = after_runs.iter().chain(before_runs.iter()).copied().collect();
+    let runs: Vec<(NodeIdx, &StoredRun)> = after_runs
+        .iter()
+        .chain(before_runs.iter())
+        .copied()
+        .collect();
 
-    for (op_idx, (id, _root)) in roots.iter().enumerate() {
-        id_to_ref.insert(**id, OpRef { tag: REF_TAG_ROOT, op_idx, sub_idx: 0 });
-    }
-    for (op_idx, run) in runs.iter().enumerate() {
-        for (sub_idx, id) in run.elements.iter().enumerate() {
-            id_to_ref.insert(*id, OpRef { tag: REF_TAG_RUN, op_idx, sub_idx });
-        }
-    }
+    // Map storage handles to positions in the encoded layout.
+    let run_pos: FxHashMap<NodeIdx, usize> =
+        runs.iter().enumerate().map(|(i, (h, _))| (*h, i)).collect();
+    let root_pos: FxHashMap<NodeIdx, usize> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (seq.idx_of(id).unwrap(), i))
+        .collect();
 
     // --- Removes ---
     // In-memory `RemoveRun` chains are already what the wire wants; each chain is
@@ -491,11 +483,11 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         /// referenced through the ID dictionary instead.
         Dict(Id),
     }
-    let resolve_target = |id: &Id| -> TargetRef {
-        match id_to_ref.get(id) {
-            Some(r) if r.tag == REF_TAG_RUN => TargetRef::Run(r.op_idx, r.sub_idx),
-            Some(r) => TargetRef::Root(r.op_idx),
-            None => TargetRef::Dict(*id),
+    let resolve_target = |idx: NodeIdx| -> TargetRef {
+        match seq.loc_of(idx) {
+            Loc::Run { run, pos } => TargetRef::Run(run_pos[&run], pos as usize),
+            Loc::Root => TargetRef::Root(root_pos[&idx]),
+            _ => TargetRef::Dict(seq.id_of(idx)),
         }
     };
 
@@ -515,7 +507,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let mut other_removes: Vec<(BTreeSet<Id>, Vec<TargetRef>)> = Vec::new();
 
     let mut chains: Vec<&RemoveRun> = seq.remove_runs.values().collect();
-    chains.sort_by_key(|c| c.ids.first().copied());
+    chains.sort_by_key(|c| c.links.first().map(|l| seq.id_of(*l)));
 
     for chain in &chains {
         let mut i = 0;
@@ -523,9 +515,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             let deps = if i == 0 {
                 chain.first_extra_deps.clone()
             } else {
-                BTreeSet::from_iter([chain.ids[i - 1]])
+                BTreeSet::from_iter([seq.id_of(chain.links[i - 1])])
             };
-            match resolve_target(&chain.targets[i]) {
+            match resolve_target(chain.targets[i]) {
                 TargetRef::Run(run_idx, elem_idx) => {
                     // Greedy span: stay in the same encoded run, stepping ±1 in a
                     // consistent direction.
@@ -533,7 +525,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     let mut backwards = None;
                     let mut last = elem_idx;
                     while j < chain.targets.len() {
-                        let TargetRef::Run(r2, e2) = resolve_target(&chain.targets[j]) else {
+                        let TargetRef::Run(r2, e2) = resolve_target(chain.targets[j]) else {
                             break;
                         };
                         if r2 != run_idx {
@@ -579,10 +571,14 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     }
 
-    let mut multi_removes: Vec<(&Id, &CausalRemove)> = seq.remove_nodes.iter().collect();
-    multi_removes.sort_by_key(|(id, _)| **id);
-    for (_id, remove) in &multi_removes {
-        let targets = remove.nodes.iter().map(&resolve_target).collect();
+    let mut multi_removes: Vec<(NodeIdx, &CausalRemove)> = seq
+        .remove_nodes
+        .iter()
+        .map(|(i, r)| (*i, r))
+        .collect();
+    multi_removes.sort_by_key(|(idx, _)| seq.id_of(*idx));
+    for (_idx, remove) in &multi_removes {
+        let targets = remove.nodes.iter().map(|t| resolve_target(*t)).collect();
         other_removes.push((remove.extra_dependencies.clone(), targets));
     }
 
@@ -592,7 +588,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // single_run/before/root sections, since those use positional refs.
     let mut id_set: BTreeSet<Id> = BTreeSet::new();
 
-    for run in &runs {
+    for (_, run) in &runs {
         id_set.insert(run.anchor);
         for id in &run.first_extra_deps {
             id_set.insert(*id);
@@ -678,10 +674,10 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // so the op kind is implied by the section rather than a per-run tag.
     for runs in [&after_runs, &before_runs] {
         encode_varint(runs.len(), &mut buf);
-        for run in runs.iter() {
+        for (_, run) in runs.iter() {
             encode_idx(&run.anchor, &mut buf);
             encode_idx_set(&run.first_extra_deps, &mut buf);
-            encode_string(&run.run, &mut buf);
+            encode_string(&run.text, &mut buf);
         }
     }
 
