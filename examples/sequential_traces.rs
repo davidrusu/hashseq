@@ -126,7 +126,6 @@ struct ByteBreakdown {
     forward_remove_runs: usize,
     backward_remove_runs: usize,
     single_run_removes: usize,
-    before_removes: usize,
     root_removes: usize,
     orphans: usize,
 }
@@ -238,27 +237,24 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     }
     b.roots = pos - s;
 
-    // Runs: varint(num) + num * { idx insert_after, idx_set first_extra_deps, string run_text }
-    let s = pos;
-    let num_runs = read_varint(bytes, &mut pos);
-    for _ in 0..num_runs {
-        skip_idx(bytes, &mut pos, &mut referenced);
-        skip_idx_set(bytes, &mut pos, &mut referenced);
-        let (run_text, sz) = decode_string(&bytes[pos..]).expect("string");
-        pos += sz;
-        b.runs_text += run_text.len();
+    // After-runs then Before-runs, both shaped:
+    // varint(num) + num * { idx anchor, idx_set first_extra_deps, string run_text }
+    for backwards in [false, true] {
+        let s = pos;
+        let num_runs = read_varint(bytes, &mut pos);
+        for _ in 0..num_runs {
+            skip_idx(bytes, &mut pos, &mut referenced);
+            skip_idx_set(bytes, &mut pos, &mut referenced);
+            let (run_text, sz) = decode_string(&bytes[pos..]).expect("string");
+            pos += sz;
+            b.runs_text += run_text.len();
+        }
+        if backwards {
+            b.befores = pos - s;
+        } else {
+            b.runs = pos - s;
+        }
     }
-    b.runs = pos - s;
-
-    // Befores: varint(num) + num * { idx_set extra_deps, idx anchor, utf8 ch }
-    let s = pos;
-    let num_befores = read_varint(bytes, &mut pos);
-    for _ in 0..num_befores {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
-        skip_idx(bytes, &mut pos, &mut referenced);
-        skip_utf8_char(bytes, &mut pos);
-    }
-    b.befores = pos - s;
 
     // Forward remove runs: varint(num) + num * { idx_set first_extra_deps, varint run_idx, varint start, varint end }
     let s = pos;
@@ -291,15 +287,6 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
         skip_varint(bytes, &mut pos); // elem_idx
     }
     b.single_run_removes = pos - s;
-
-    // Before-target standalone removes: varint(num) + num * { idx_set extra_deps, varint before_idx }
-    let s = pos;
-    let num_before_rm = read_varint(bytes, &mut pos);
-    for _ in 0..num_before_rm {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
-        skip_varint(bytes, &mut pos); // before_idx (positional)
-    }
-    b.before_removes = pos - s;
 
     // Root-target standalone removes: varint(num) + num * { idx_set extra_deps, varint root_idx }
     let s = pos;
@@ -509,7 +496,7 @@ fn main() {
 
     println!("\nEncoded byte breakdown by section");
     println!(
-        "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "Trace",
         "Total",
         "Dict",
@@ -520,14 +507,13 @@ fn main() {
         "RmRunF",
         "RmRunB",
         "RmSing",
-        "RmBef",
         "RmRoot",
     );
     println!("{}", "-".repeat(140));
     for (name, stats) in &all_stats {
         let b = &stats.breakdown;
         println!(
-            "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
             name,
             stats.encoded_bytes,
             b.dict_header,
@@ -538,7 +524,6 @@ fn main() {
             b.forward_remove_runs,
             b.backward_remove_runs,
             b.single_run_removes,
-            b.before_removes,
             b.root_removes,
         );
     }
@@ -549,7 +534,7 @@ fn main() {
 
     println!("\nByte breakdown as % of encoding");
     println!(
-        "{:<25} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "{:<25} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
         "Trace",
         "Dict%",
         "Roots%",
@@ -559,7 +544,6 @@ fn main() {
         "RmRunF%",
         "RmRunB%",
         "RmSing%",
-        "RmBef%",
         "RmRoot%",
     );
     println!("{}", "-".repeat(115));
@@ -568,7 +552,7 @@ fn main() {
         let t = stats.encoded_bytes.max(1) as f64;
         let pct = |x: usize| 100.0 * x as f64 / t;
         println!(
-            "{:<25} {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}%",
+            "{:<25} {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}%",
             name,
             pct(b.dict_header),
             pct(b.roots),
@@ -578,7 +562,6 @@ fn main() {
             pct(b.forward_remove_runs),
             pct(b.backward_remove_runs),
             pct(b.single_run_removes),
-            pct(b.before_removes),
             pct(b.root_removes),
         );
     }

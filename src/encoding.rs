@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::hashseq::{CausalInsert, CausalRemove};
+use crate::hashseq::CausalRemove;
 use crate::{HashNode, HashSeq, Id, Op, Run};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,17 +402,16 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<EncodableOp>, DecodeError> {
 //
 // Removes are addressed positionally (run_idx, elem_idx) and adjacent
 // remove chains are compressed into ranges. Every other ID — run anchors,
-// extra_dependencies, before anchors, orphan refs — goes through a
-// dictionary header so each unique ID only takes 32 bytes once and is
-// referenced by varint index thereafter.
+// extra_dependencies, orphan refs — goes through a dictionary header so
+// each unique ID only takes 32 bytes once and is referenced by varint
+// index thereafter.
 //
-// Format: [id_dict][roots][runs][befores][removes][orphans]
+// Format: [id_dict][roots][after-runs][before-runs][removes][orphans]
 
 // Op reference tags used during encoding to classify which positional
 // section a given ID belongs to.
 const REF_TAG_RUN: u8 = 0x00;
 const REF_TAG_ROOT: u8 = 0x01;
-const REF_TAG_BEFORE: u8 = 0x02;
 
 #[derive(Debug, Clone, Copy)]
 struct OpRef {
@@ -426,26 +425,36 @@ struct OpRef {
 /// Format:
 /// - [num_ids: varint][id_0..id_n: 32 bytes each]
 /// - [num_roots][roots...]            roots: { idx_set extra_deps, utf8 ch }
-/// - [num_runs][runs...]              runs:  { idx insert_after, idx_set first_extra_deps, string }
-/// - [num_befores][befores...]        before: { idx_set extra_deps, idx anchor, utf8 ch }
+/// - [num_after_runs][runs...]        run:   { idx anchor, idx_set first_extra_deps, string }
+/// - [num_before_runs][runs...]       same shape; first char anchors InsertBefore
 /// - [num_forward_runs][...]          rmrun: { idx_set first_extra_deps, varint run_idx, varint start, varint end }
 /// - [num_backward_runs][...]
 /// - [num_single_run][...]            { idx_set extra_deps, varint run_idx, varint elem_idx }
-/// - [num_before_removes][...]        { idx_set extra_deps, varint before_idx }
 /// - [num_root_removes][...]          { idx_set extra_deps, varint root_idx }
 /// - [num_orphans][orphans...]        tagged HashNodes with idx-encoded IDs
+///
+/// Remove sections address elements by `run_idx` into the concatenated
+/// after-runs ++ before-runs list.
 pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // Build ID -> OpRef mapping for compact remove encoding.
     let mut id_to_ref: HashMap<Id, OpRef> = HashMap::new();
 
     // root_nodes is a BTreeMap, so its iteration order is already deterministic.
-    // runs/before_nodes/remove_nodes are HashMaps with a randomized iteration order;
-    // we sort by ID so the encoded bytes are byte-identical across processes.
+    // runs/remove_nodes are HashMaps with a randomized iteration order; we sort
+    // by ID so the encoded bytes are byte-identical across processes.
     let roots: Vec<_> = seq.root_nodes.iter().collect();
-    let mut runs: Vec<&Run> = seq.runs.values().collect();
-    runs.sort_by_key(|r| r.elements.first().copied());
-    let mut befores: Vec<(&Id, &CausalInsert)> = seq.before_nodes.iter().collect();
-    befores.sort_by_key(|(id, _)| **id);
+    let mut after_runs: Vec<&Run> = Vec::new();
+    let mut before_runs: Vec<&Run> = Vec::new();
+    for run in seq.runs.values() {
+        match run.first_op {
+            crate::run::FirstOp::After => after_runs.push(run),
+            crate::run::FirstOp::Before => before_runs.push(run),
+        }
+    }
+    after_runs.sort_by_key(|r| r.elements.first().copied());
+    before_runs.sort_by_key(|r| r.elements.first().copied());
+    // Removes address run elements by index into this concatenated list.
+    let runs: Vec<&Run> = after_runs.iter().chain(before_runs.iter()).copied().collect();
 
     for (op_idx, (id, _root)) in roots.iter().enumerate() {
         id_to_ref.insert(**id, OpRef { tag: REF_TAG_ROOT, op_idx, sub_idx: 0 });
@@ -454,9 +463,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         for (sub_idx, id) in run.elements.iter().enumerate() {
             id_to_ref.insert(*id, OpRef { tag: REF_TAG_RUN, op_idx, sub_idx });
         }
-    }
-    for (op_idx, (id, _before)) in befores.iter().enumerate() {
-        id_to_ref.insert(**id, OpRef { tag: REF_TAG_BEFORE, op_idx, sub_idx: 0 });
     }
 
     // --- Remove-chain analysis ---
@@ -594,7 +600,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let backward_runs: Vec<_> = remove_runs.iter().filter(|rr| rr.backwards).collect();
 
     let mut single_run_removes: Vec<(&BTreeSet<Id>, usize, usize)> = Vec::new();
-    let mut before_removes: Vec<(&BTreeSet<Id>, usize)> = Vec::new();
     let mut root_removes: Vec<(&BTreeSet<Id>, usize)> = Vec::new();
 
     for (_id, remove) in &standalone_removes {
@@ -607,9 +612,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                             op_ref.op_idx,
                             op_ref.sub_idx,
                         ));
-                    }
-                    REF_TAG_BEFORE => {
-                        before_removes.push((&remove.extra_dependencies, op_ref.op_idx));
                     }
                     REF_TAG_ROOT => {
                         root_removes.push((&remove.extra_dependencies, op_ref.op_idx));
@@ -637,23 +639,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             id_set.insert(*dep);
         }
     }
-    for (_id, before) in &befores {
-        id_set.insert(before.anchor);
-        for dep in &before.extra_dependencies {
-            id_set.insert(*dep);
-        }
-    }
     for rr in &remove_runs {
         for dep in &rr.first_extra_deps {
             id_set.insert(*dep);
         }
     }
     for (extra_deps, _, _) in &single_run_removes {
-        for dep in *extra_deps {
-            id_set.insert(*dep);
-        }
-    }
-    for (extra_deps, _) in &before_removes {
         for dep in *extra_deps {
             id_set.insert(*dep);
         }
@@ -709,32 +700,15 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         encode_utf8_char(root.ch, &mut buf);
     }
 
-    // Runs
-    //
-    // TODO: a run whose first_extra_deps is empty and whose insert_after is
-    // the last element of another run *could* be folded into that parent run
-    // and emitted as a single longer string. Measured on real editing traces:
-    // ~45% of runs in automerge-paper (4,375 of 9,680) qualify, representing
-    // ~140 KB of avoidable insert_after IDs. Fixing this likely belongs in
-    // HashSeq's run-management (avoid creating the split in the first place)
-    // rather than as a post-pass in the encoder.
-    // HashSeq's internal storage only holds `FirstOp::After` runs (see Run docs),
-    // so the encoded-hashseq format omits the op tag — decode reconstructs via
-    // Run::new which produces After-rooted runs.
-    encode_varint(runs.len(), &mut buf);
-    for run in &runs {
-        debug_assert!(matches!(run.first_op, crate::run::FirstOp::After));
-        encode_idx(&run.anchor, &mut buf);
-        encode_idx_set(&run.first_extra_deps, &mut buf);
-        encode_string(&run.run, &mut buf);
-    }
-
-    // Befores
-    encode_varint(befores.len(), &mut buf);
-    for (_id, before) in &befores {
-        encode_idx_set(&before.extra_dependencies, &mut buf);
-        encode_idx(&before.anchor, &mut buf);
-        encode_utf8_char(before.ch, &mut buf);
+    // Runs: After-anchored, then Before-anchored. The two sections share a shape,
+    // so the op kind is implied by the section rather than a per-run tag.
+    for runs in [&after_runs, &before_runs] {
+        encode_varint(runs.len(), &mut buf);
+        for run in runs.iter() {
+            encode_idx(&run.anchor, &mut buf);
+            encode_idx_set(&run.first_extra_deps, &mut buf);
+            encode_string(&run.run, &mut buf);
+        }
     }
 
     // Remove runs: forward chains, then backward chains (must match decode order).
@@ -754,13 +728,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         encode_idx_set(extra_deps, &mut buf);
         encode_varint(*run_idx, &mut buf);
         encode_varint(*elem_idx, &mut buf);
-    }
-
-    // Before-target standalone removes
-    encode_varint(before_removes.len(), &mut buf);
-    for (extra_deps, before_idx) in &before_removes {
-        encode_idx_set(extra_deps, &mut buf);
-        encode_varint(*before_idx, &mut buf);
     }
 
     // Root-target standalone removes
@@ -845,7 +812,6 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
     let mut seq = HashSeq::default();
     let mut root_ids: Vec<Id> = Vec::new();
     let mut run_element_ids: Vec<Vec<Id>> = Vec::new();
-    let mut before_ids: Vec<Id> = Vec::new();
 
     // Roots
     let (num_roots, size) = decode_varint(&bytes[pos..])?;
@@ -863,46 +829,26 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         seq.apply(node);
     }
 
-    // Runs
-    let (num_runs, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-    for _ in 0..num_runs {
-        let (insert_after, size) = decode_idx_at(&bytes[pos..])?;
+    // Runs: After-anchored section, then Before-anchored section. Both feed
+    // run_element_ids, which the remove sections below index positionally.
+    for first_op in [crate::run::FirstOp::After, crate::run::FirstOp::Before] {
+        let (num_runs, size) = decode_varint(&bytes[pos..])?;
         pos += size;
-        let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-        pos += size;
-        let (run_str, size) = decode_string(&bytes[pos..])?;
-        pos += size;
+        for _ in 0..num_runs {
+            let (anchor, size) = decode_idx_at(&bytes[pos..])?;
+            pos += size;
+            let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+            pos += size;
+            let (run_str, size) = decode_string(&bytes[pos..])?;
+            pos += size;
 
-        let run = Run::from_text(
-            insert_after,
-            crate::run::FirstOp::After,
-            first_extra_deps,
-            &run_str,
-        )
-        .ok_or(DecodeError::EmptyRun)?;
-        run_element_ids.push(run.elements.clone());
-        for node in run.decompress() {
-            seq.apply(node);
+            let run = Run::from_text(anchor, first_op, first_extra_deps, &run_str)
+                .ok_or(DecodeError::EmptyRun)?;
+            run_element_ids.push(run.elements.clone());
+            for node in run.decompress() {
+                seq.apply(node);
+            }
         }
-    }
-
-    // Befores
-    let (num_befores, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-    for _ in 0..num_befores {
-        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-        pos += size;
-        let (anchor, size) = decode_idx_at(&bytes[pos..])?;
-        pos += size;
-        let (ch, size) = decode_utf8_char(&bytes[pos..])?;
-        pos += size;
-        let node = HashNode {
-            extra_dependencies: extra_deps,
-            op: Op::InsertBefore(anchor, ch),
-        };
-        before_ids.push(node.id());
-        seq.apply(node);
     }
 
     // Remove runs: a chain of single-element removes over a contiguous span of a
@@ -975,26 +921,6 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
             .and_then(|e| e.get(elem_idx))
             .copied()
             .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
-
-        seq.apply(HashNode {
-            extra_dependencies: extra_deps,
-            op: Op::Remove(std::iter::once(removed_id).collect()),
-        });
-    }
-
-    // Before-target standalone removes
-    let (num_before_removes, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-    for _ in 0..num_before_removes {
-        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-        pos += size;
-        let (before_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-
-        let removed_id = before_ids
-            .get(before_idx)
-            .copied()
-            .ok_or(DecodeError::InvalidIdIndex(before_idx))?;
 
         seq.apply(HashNode {
             extra_dependencies: extra_deps,

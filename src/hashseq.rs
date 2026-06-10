@@ -99,11 +99,12 @@ pub struct CausalRoot {
 
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
-    // Sequential inserts are coalesced into runs; everything else lives as individual nodes.
+    // All inserts except roots live in runs: sequential typing extends a run,
+    // and a lone insert is just a 1-char run. A run is After- or Before-anchored
+    // (`Run::first_op`); subsequent elements always chain InsertAfter.
     pub runs: IdMap<Run>,
     pub root_nodes: BTreeMap<Id, CausalRoot>,
-    pub before_nodes: IdMap<CausalInsert>,
-    // Reverse index: anchor -> list of nodes inserted before that anchor
+    // Reverse index: anchor -> heads of Before-runs anchored at it
     pub befores_by_anchor: IdMap<BTreeSet<Id>>,
     pub remove_nodes: IdMap<CausalRemove>,
 
@@ -134,7 +135,6 @@ impl HashSeq {
     pub fn contains_node(&self, id: &Id) -> bool {
         // Check run_index first since most nodes are in runs
         self.run_index.contains_key(id)
-            || self.before_nodes.contains_key(id)
             || self.remove_nodes.contains_key(id)
             || self.root_nodes.contains_key(id)
     }
@@ -143,9 +143,6 @@ impl HashSeq {
     pub fn get_node_char(&self, id: &Id) -> char {
         if let Some(root) = self.root_nodes.get(id) {
             return root.ch;
-        }
-        if let Some(before) = self.before_nodes.get(id) {
-            return before.ch;
         }
         let run_pos = &self.run_index[id];
 
@@ -173,10 +170,6 @@ impl HashSeq {
     pub(crate) fn get_id_ref(&self, id: &Id) -> Option<&Id> {
         // Try root_nodes first (BTreeMap gives us key references)
         if let Some((id_ref, _)) = self.root_nodes.get_key_value(id) {
-            return Some(id_ref);
-        }
-        // Try before_nodes
-        if let Some((id_ref, _)) = self.before_nodes.get_key_value(id) {
             return Some(id_ref);
         }
         // Try run_index (covers all run elements)
@@ -507,21 +500,25 @@ impl HashSeq {
             self.index.find(&before.anchor)
         };
 
-        // If the anchor sits mid-run, split so it becomes a run head — anchors
-        // must be at box boundaries for befores_by_anchor to address them.
-        if let Some(run_pos) = self.run_index.get(&before.anchor).copied()
-            && run_pos.position > 0
-        {
-            let right_run_id = self.split_run_at(run_pos.run_id, run_pos.position);
-            debug_assert_eq!(right_run_id, before.anchor);
-        }
+        // The anchor may sit mid-run: no split is needed. Iteration visits the
+        // befores of every run element individually (see HashSeqIter), and unlike
+        // an after-fork there is no sibling ordering to resolve — a Before-run
+        // always lands immediately before its anchor.
+        let new_run = Run::new_before(before.anchor, before.extra_dependencies, before.ch);
+        debug_assert_eq!(new_run.first_id(), id);
+        self.runs.insert(id, new_run);
+        self.run_index.insert(
+            id,
+            RunPosition {
+                run_id: id,
+                position: 0,
+            },
+        );
 
         self.befores_by_anchor
             .entry(before.anchor)
             .or_default()
             .insert(id);
-
-        self.before_nodes.insert(id, before);
 
         let position = position.unwrap_or_else(|| self.position_by_scan(&id));
         self.index.insert(position, id);
@@ -600,19 +597,12 @@ impl HashSeq {
             self.apply(node)
         }
 
+        // Covers both After- and Before-anchored runs: decompress reconstructs
+        // the anchoring first node for either kind.
         for (_run_id, run) in other.runs {
             for node in run.decompress() {
                 self.apply(node);
             }
-        }
-
-        for (id, causal_insert) in other.before_nodes {
-            let node = HashNode {
-                extra_dependencies: causal_insert.extra_dependencies,
-                op: Op::InsertBefore(causal_insert.anchor, causal_insert.ch),
-            };
-            debug_assert_eq!(id, node.id());
-            self.apply(node)
         }
 
         for (id, causal_remove) in other.remove_nodes {
@@ -1014,7 +1004,7 @@ mod test {
         // Verify internal structures are identical
         assert_eq!(seq1.runs, seq2.runs);
         assert_eq!(seq1.root_nodes, seq2.root_nodes);
-        assert_eq!(seq1.before_nodes, seq2.before_nodes);
+        assert_eq!(seq1.befores_by_anchor, seq2.befores_by_anchor);
         assert_eq!(seq1.remove_nodes, seq2.remove_nodes);
         assert_eq!(seq1.tips, seq2.tips);
 

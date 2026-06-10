@@ -215,10 +215,11 @@ impl WasmHashSeq {
 
     /// Dump the structure as JSON for visualization, at run/node granularity.
     ///
-    /// Each "box" is a root char, a run (compressed sequential chars), or a single
-    /// `InsertBefore` char. Every non-root box resolves to exactly one parent box
-    /// via its anchor, with a `rel` of `"after"` (right child) or `"before"`
-    /// (left child) — i.e. the generalized binary tree of FIG. 01.
+    /// Each "box" is a root char, an After-run, or a Before-run (a burst whose
+    /// first char is constrained before its anchor). Every non-root box resolves
+    /// to one parent box via its anchor — which may sit mid-box, since befores can
+    /// anchor at interior run elements — with a `rel` of `"after"` (right child)
+    /// or `"before"` (left child) — i.e. the generalized binary tree of FIG. 01.
     ///
     /// Shape: `{ "tips": [hex...], "nodes": [
     ///   { "id": hex, "kind": "root"|"run"|"before", "text": str,
@@ -226,8 +227,8 @@ impl WasmHashSeq {
     #[wasm_bindgen(js_name = structureJson)]
     pub fn structure_json(&self) -> String {
         let s = &self.inner;
-        // Map any element id to the id of the box (run head / root / before-node) it
-        // belongs to. After run-splitting, anchors always sit at box boundaries.
+        // Map any element id to the id of the box (run head or root) it belongs
+        // to; anchors may point at interior run elements.
         let resolve = |id: &Id| -> Id {
             match s.run_index.get(id) {
                 Some(rp) => rp.run_id,
@@ -309,25 +310,18 @@ impl WasmHashSeq {
             );
         }
         for (run_id, run) in &s.runs {
+            let (kind, rel) = match run.first_op {
+                crate::run::FirstOp::After => ("run", "after"),
+                crate::run::FirstOp::Before => ("before", "before"),
+            };
             emit(
                 run_id,
-                "run",
+                kind,
                 &run.run,
                 Some(resolve(&run.anchor)),
-                Some("after"),
+                Some(rel),
                 s.removed_inserts.contains(run_id),
                 &resolve_deps(&run.first_extra_deps),
-            );
-        }
-        for (id, before) in &s.before_nodes {
-            emit(
-                id,
-                "before",
-                &before.ch.to_string(),
-                Some(resolve(&before.anchor)),
-                Some("before"),
-                s.removed_inserts.contains(id),
-                &resolve_deps(&before.extra_dependencies),
             );
         }
         }

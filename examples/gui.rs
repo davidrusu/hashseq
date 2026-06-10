@@ -494,13 +494,17 @@ mod hashseq_viz {
                     pos.y += push.y;
                 }
 
-                // Process before nodes - stratify concurrent before nodes into lanes
-                for (id, before_node) in seq.before_nodes.iter() {
+                // Process before-runs - stratify concurrent befores into lanes
+                for (id, before_run) in seq
+                    .runs
+                    .iter()
+                    .filter(|(_, r)| matches!(r.first_op, hashseq::FirstOp::Before))
+                {
                     let pos = *self.node_pos.entry(*id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let parent = &before_node.anchor;
+                    let parent = &before_run.anchor;
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &self.node_pos) {
                         // Get all siblings (nodes before the same parent).
                         // befores() yields sorted order already.
@@ -566,8 +570,13 @@ mod hashseq_viz {
                     pos.y += push.y;
                 }
 
-                // Process runs - position each run as a single entity
-                for (run_id, run) in seq.runs.iter() {
+                // Process After-runs - position each run as a single entity.
+                // (Before-runs are positioned by the befores loop above.)
+                for (run_id, run) in seq
+                    .runs
+                    .iter()
+                    .filter(|(_, r)| matches!(r.first_op, hashseq::FirstOp::After))
+                {
                     let pos = *self.node_pos.entry(*run_id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
@@ -758,9 +767,7 @@ mod hashseq_viz {
                                     } else {
                                         0.0
                                     }
-                                } else if self.seq.root_nodes.contains_key(id)
-                                    || self.seq.before_nodes.contains_key(id)
-                                {
+                                } else if self.seq.root_nodes.contains_key(id) {
                                     char_width + padding * 2.0
                                 } else {
                                     0.0 // Point node (no width)
@@ -952,78 +959,6 @@ mod hashseq_viz {
                                     // Render dependencies for root nodes
                                     if self.show_dependencies {
                                         for dep in root.extra_dependencies.iter() {
-                                            if let Some(dep_from) = get_node_pos(dep) {
-                                                let mid = Point {
-                                                    x: (pos.x + dep_from.x) / 2.0,
-                                                    y: (pos.y + dep_from.y) / 2.0 - 20.0,
-                                                };
-                                                let curve = Path::new(|p| {
-                                                    p.move_to(dep_from);
-                                                    p.quadratic_curve_to(mid, *pos);
-                                                });
-
-                                                frame.stroke(
-                                                    &curve,
-                                                    Stroke::default().with_width(1.0).with_color(
-                                                        Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else if let Some(before) = self.seq.before_nodes.get(id) {
-                                    // Render before node as a box with different color
-                                    let is_removed = self.seq.removed_inserts.contains(id);
-                                    let ch_str = format!("{}", before.ch);
-                                    let width = ch_str.chars().count() as f32 * char_width + padding * 2.0;
-                                    let height = text_size + padding * 2.0;
-
-                                    // Draw rectangle background (orange for before nodes, gray if removed)
-                                    let rect_pos = Point {
-                                        x: pos.x - width / 2.0,
-                                        y: pos.y - height / 2.0,
-                                    };
-                                    let bg_color = if is_removed {
-                                        Color::from_rgba(0.5, 0.5, 0.5, 0.5)
-                                    } else {
-                                        Color::from_rgb(0.9, 0.6, 0.2)
-                                    };
-                                    frame.fill(
-                                        &Path::rectangle(rect_pos, Size::new(width, height)),
-                                        Fill::from(bg_color),
-                                    );
-
-                                    // Draw text centered
-                                    let mut text = Text::from(ch_str);
-                                    text.position = Point {
-                                        x: pos.x - char_width / 2.0,
-                                        y: pos.y - text_size / 2.0 + 2.0,
-                                    };
-                                    text.size = text_size;
-                                    text.font = Font::MONOSPACE;
-                                    text.color = if is_removed {
-                                        Color::from_rgba(1.0, 1.0, 1.0, 0.5)
-                                    } else {
-                                        Color::WHITE
-                                    };
-                                    frame.fill_text(text);
-
-                                    // Draw strikethrough if removed
-                                    if is_removed {
-                                        frame.stroke(
-                                            &Path::line(
-                                                Point { x: rect_pos.x, y: pos.y },
-                                                Point { x: rect_pos.x + width, y: pos.y },
-                                            ),
-                                            Stroke::default()
-                                                .with_width(2.0)
-                                                .with_color(Color::from_rgba(1.0, 0.0, 0.0, 0.7)),
-                                        );
-                                    }
-
-                                    // Render dependencies for before nodes
-                                    if self.show_dependencies {
-                                        for dep in before.extra_dependencies.iter() {
                                             if let Some(dep_from) = get_node_pos(dep) {
                                                 let mid = Point {
                                                     x: (pos.x + dep_from.x) / 2.0,

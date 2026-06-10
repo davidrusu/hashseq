@@ -18,10 +18,8 @@ pub enum FirstOp {
 /// The first element is anchored according to `first_op` (After or Before). All
 /// subsequent elements chain `InsertAfter` from the previous element in the run.
 ///
-/// HashSeq's internal storage only contains `FirstOp::After` runs (created by
-/// `Run::new`). `FirstOp::Before` runs are only used at the cursor / wire-format
-/// level — when applied via `apply_op`, the first char goes to `before_nodes` and
-/// the rest form a normal `FirstOp::After` chain anchored at it.
+/// Both kinds live in HashSeq's internal storage: a lone `InsertBefore` is just a
+/// 1-char `FirstOp::Before` run, extended in place as the typing burst continues.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
     /// The node this run is anchored against (semantic role depends on `first_op`).
