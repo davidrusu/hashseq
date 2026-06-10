@@ -127,6 +127,7 @@ struct ByteBreakdown {
     backward_remove_runs: usize,
     single_run_removes: usize,
     root_removes: usize,
+    other_removes: usize,
     orphans: usize,
 }
 
@@ -297,6 +298,28 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     }
     b.root_removes = pos - s;
 
+    // Other removes: varint(num) + num * { idx_set extra_deps, varint n, n * tagged target }
+    let s = pos;
+    let num_other = read_varint(bytes, &mut pos);
+    for _ in 0..num_other {
+        skip_idx_set(bytes, &mut pos, &mut referenced);
+        let n = read_varint(bytes, &mut pos);
+        for _ in 0..n {
+            let tag = bytes[pos];
+            pos += 1;
+            match tag {
+                0x00 => {
+                    skip_varint(bytes, &mut pos); // run_idx
+                    skip_varint(bytes, &mut pos); // elem_idx
+                }
+                0x01 => skip_varint(bytes, &mut pos), // root_idx
+                0x02 => skip_idx(bytes, &mut pos, &mut referenced),
+                other => panic!("unknown remove-target tag: {other:#x}"),
+            }
+        }
+    }
+    b.other_removes = pos - s;
+
     // Orphans: varint(num) + num * tagged HashNode
     let s = pos;
     let num_orphans = read_varint(bytes, &mut pos);
@@ -368,6 +391,51 @@ fn measure_memory(seq: &HashSeq) -> usize {
     after.saturating_sub(before)
 }
 
+// TEMPORARY: per-component memory breakdown. Remove before commit.
+fn measure_alloc<T>(f: impl FnOnce() -> T) -> usize {
+    let before = GLOBAL.stats().bytes_allocated;
+    let v = f();
+    let after = GLOBAL.stats().bytes_allocated;
+    std::hint::black_box(&v);
+    after.saturating_sub(before)
+}
+
+fn memory_breakdown(seq: &HashSeq, total: usize, label: &str) {
+    let runs = measure_alloc(|| seq.runs.clone());
+    let elements = measure_alloc(|| {
+        seq.runs
+            .values()
+            .map(|r| r.elements.clone())
+            .collect::<Vec<_>>()
+    });
+    let run_strings = measure_alloc(|| {
+        seq.runs
+            .values()
+            .map(|r| r.run.clone())
+            .collect::<Vec<_>>()
+    });
+    let run_index = measure_alloc(|| seq.run_index.clone());
+    let befores = measure_alloc(|| seq.befores_by_anchor.clone());
+    let afters = measure_alloc(|| seq.afters.clone());
+    let removed = measure_alloc(|| seq.removed_inserts.clone());
+    let removes = measure_alloc(|| seq.remove_nodes.clone());
+    let remove_runs = measure_alloc(|| seq.remove_runs.clone());
+    let remove_index = measure_alloc(|| seq.remove_index.clone());
+    let roots = measure_alloc(|| seq.root_nodes.clone());
+    let rest = total.saturating_sub(
+        runs + run_index + befores + afters + removed + removes + remove_runs + remove_index
+            + roots,
+    );
+    let n_elems: usize = seq.runs.values().map(|r| r.len()).sum();
+    let n_removes = seq.remove_nodes.len();
+    eprintln!(
+        "MEM {label}: total={total} runs={runs} (elements={elements} text={run_strings}) \
+         run_index={run_index} befores={befores} afters={afters} removed_set={removed} \
+         remove_nodes={removes} remove_runs={remove_runs} remove_index={remove_index} \
+         roots={roots} index+rest={rest} [elems={n_elems} removes={n_removes}]"
+    );
+}
+
 fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let ops = data.op_count();
     let patches = data.patch_count();
@@ -388,6 +456,7 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let (seq, _) = build_seq(data);
     let final_text_bytes = seq.iter().map(|c| c.len_utf8()).sum();
     let memory_bytes = measure_memory(&seq);
+    memory_breakdown(&seq, memory_bytes, "trace");
     let encoded = encode_hashseq(&seq);
     let encoded_bytes = encoded.len();
     let breakdown = byte_breakdown(&encoded);
@@ -496,7 +565,7 @@ fn main() {
 
     println!("\nEncoded byte breakdown by section");
     println!(
-        "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "Trace",
         "Total",
         "Dict",
@@ -508,12 +577,13 @@ fn main() {
         "RmRunB",
         "RmSing",
         "RmRoot",
+        "RmOther",
     );
     println!("{}", "-".repeat(140));
     for (name, stats) in &all_stats {
         let b = &stats.breakdown;
         println!(
-            "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
             name,
             stats.encoded_bytes,
             b.dict_header,
@@ -525,6 +595,7 @@ fn main() {
             b.backward_remove_runs,
             b.single_run_removes,
             b.root_removes,
+            b.other_removes,
         );
     }
     println!(
@@ -534,7 +605,7 @@ fn main() {
 
     println!("\nByte breakdown as % of encoding");
     println!(
-        "{:<25} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "{:<25} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
         "Trace",
         "Dict%",
         "Roots%",
@@ -545,6 +616,7 @@ fn main() {
         "RmRunB%",
         "RmSing%",
         "RmRoot%",
+        "RmOther%",
     );
     println!("{}", "-".repeat(115));
     for (name, stats) in &all_stats {
@@ -552,7 +624,7 @@ fn main() {
         let t = stats.encoded_bytes.max(1) as f64;
         let pct = |x: usize| 100.0 * x as f64 / t;
         println!(
-            "{:<25} {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}%",
+            "{:<25} {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}%",
             name,
             pct(b.dict_header),
             pct(b.roots),
@@ -563,6 +635,7 @@ fn main() {
             pct(b.backward_remove_runs),
             pct(b.single_run_removes),
             pct(b.root_removes),
+            pct(b.other_removes),
         );
     }
 

@@ -223,7 +223,12 @@ impl WasmHashSeq {
     ///
     /// Shape: `{ "tips": [hex...], "nodes": [
     ///   { "id": hex, "kind": "root"|"run"|"before", "text": str,
-    ///     "parent": hex|null, "rel": "after"|"before"|null, "removed": bool } ] }`
+    ///     "parent": hex|null, "parentOffset": int|null,
+    ///     "rel": "after"|"before"|null, "removed": bool } ] }`
+    ///
+    /// `parentOffset` is the anchor's element index within the parent box: a
+    /// `rel:"before"` child sits immediately before that char, a `rel:"after"`
+    /// child immediately after it.
     #[wasm_bindgen(js_name = structureJson)]
     pub fn structure_json(&self) -> String {
         let s = &self.inner;
@@ -258,7 +263,7 @@ impl WasmHashSeq {
             |id: &Id,
              kind: &str,
              text: &str,
-             parent: Option<Id>,
+             parent: Option<(Id, usize)>,
              rel: Option<&str>,
              removed: bool,
              deps: &[Id]| {
@@ -274,7 +279,12 @@ impl WasmHashSeq {
                 push_json_str(&mut out, text);
                 out.push_str(",\"parent\":");
                 match parent {
-                    Some(p) => push_json_str(&mut out, &id_to_hex(&p)),
+                    Some((p, _)) => push_json_str(&mut out, &id_to_hex(&p)),
+                    None => out.push_str("null"),
+                }
+                out.push_str(",\"parentOffset\":");
+                match parent {
+                    Some((_, off)) => out.push_str(&off.to_string()),
                     None => out.push_str("null"),
                 }
                 out.push_str(",\"rel\":");
@@ -314,11 +324,18 @@ impl WasmHashSeq {
                 crate::run::FirstOp::After => ("run", "after"),
                 crate::run::FirstOp::Before => ("before", "before"),
             };
+            // The anchor may be an interior element of the parent box (befores
+            // don't split runs); report its offset so the layout can attach there.
+            let anchor_offset = s
+                .run_index
+                .get(&run.anchor)
+                .map(|rp| rp.position)
+                .unwrap_or(0);
             emit(
                 run_id,
                 kind,
                 &run.run,
-                Some(resolve(&run.anchor)),
+                Some((resolve(&run.anchor), anchor_offset)),
                 Some(rel),
                 s.removed_inserts.contains(run_id),
                 &resolve_deps(&run.first_extra_deps),
@@ -390,5 +407,38 @@ impl WasmHashSeq {
             decode_hashseq(bytes).map_err(|e| JsValue::from_str(&format!("decode error: {e}")))?;
         self.inner.merge(other);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mid-text burst becomes one Before-run box anchored at an interior
+    /// element of its (unsplit) parent run — structureJson must report the
+    /// burst text and the anchor's offset within the parent box.
+    #[test]
+    fn structure_json_reports_interior_anchor_offsets() {
+        let mut seq = WasmHashSeq::new();
+        seq.insert(0, "hello world");
+        seq.insert(5, " brave");
+        assert_eq!(seq.text(), "hello brave world");
+
+        let v: serde_json::Value = serde_json::from_str(&seq.structure_json()).unwrap();
+        let nodes = v["nodes"].as_array().unwrap();
+
+        let before = nodes.iter().find(|n| n["kind"] == "before").unwrap();
+        assert_eq!(before["text"], " brave");
+        // parent run is "ello world" (after the root 'h'); the anchor ' ' sits at
+        // element offset 4 (e=0, l=1, l=2, o=3, ' '=4)
+        assert_eq!(before["parentOffset"], 4);
+        assert_eq!(before["rel"], "before");
+
+        let run = nodes.iter().find(|n| n["kind"] == "run").unwrap();
+        assert_eq!(run["text"], "ello world", "parent run must not be split");
+        assert_eq!(before["parent"], run["id"]);
+
+        let root = nodes.iter().find(|n| n["kind"] == "root").unwrap();
+        assert_eq!(root["parentOffset"], serde_json::Value::Null);
     }
 }

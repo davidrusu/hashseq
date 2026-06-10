@@ -88,7 +88,50 @@ pub struct CausalInsert {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalRemove {
     pub extra_dependencies: BTreeSet<Id>,
-    pub nodes: BTreeSet<Id>,
+    /// Removed element ids, sorted (BTreeSet order). Stored as a slice rather
+    /// than a BTreeSet — batch removes can target thousands of elements and the
+    /// tree's per-node overhead triples the footprint.
+    pub nodes: Box<[Id]>,
+}
+
+/// A coalesced chain of single-target removes: remove `i` deletes `targets[i]`
+/// and causally depends on remove `i-1`; the first link carries
+/// `first_extra_deps`. This is how backspace/delete bursts are stored — the
+/// in-memory mirror of the wire format's remove-run sections, and the remove
+/// analog of insert `Run`s.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RemoveRun {
+    pub first_extra_deps: BTreeSet<Id>,
+    /// Element ids removed, in removal order.
+    pub targets: Vec<Id>,
+    /// Cached ids of the remove nodes themselves; `ids[i]` removes `targets[i]`.
+    pub ids: Vec<Id>,
+}
+
+impl RemoveRun {
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Reconstruct the chain's `HashNode`s (for merge / re-broadcast).
+    pub fn decompress(&self) -> Vec<HashNode> {
+        self.targets
+            .iter()
+            .enumerate()
+            .map(|(i, target)| HashNode {
+                extra_dependencies: if i == 0 {
+                    self.first_extra_deps.clone()
+                } else {
+                    BTreeSet::from_iter([self.ids[i - 1]])
+                },
+                op: Op::Remove(BTreeSet::from_iter([*target])),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -106,7 +149,14 @@ pub struct HashSeq {
     pub root_nodes: BTreeMap<Id, CausalRoot>,
     // Reverse index: anchor -> heads of Before-runs anchored at it
     pub befores_by_anchor: IdMap<BTreeSet<Id>>,
+    // Multi-target removes only (`remove_batch` spanning several chars at once);
+    // single-target removes coalesce into `remove_runs`.
     pub remove_nodes: IdMap<CausalRemove>,
+    // Chained single-target removes (backspace/delete bursts), keyed by the
+    // first remove's id.
+    pub remove_runs: IdMap<RemoveRun>,
+    // remove id -> (remove_runs key, index within the chain)
+    pub remove_index: IdMap<RunPosition>,
 
     // ID resolution index for O(1) lookup of any node
     pub run_index: IdMap<RunPosition>,
@@ -135,6 +185,7 @@ impl HashSeq {
     pub fn contains_node(&self, id: &Id) -> bool {
         // Check run_index first since most nodes are in runs
         self.run_index.contains_key(id)
+            || self.remove_index.contains_key(id)
             || self.remove_nodes.contains_key(id)
             || self.root_nodes.contains_key(id)
     }
@@ -482,6 +533,49 @@ impl HashSeq {
             }
         }
         self.removed_inserts.extend(&remove.nodes);
+
+        // Single-target removes coalesce into RemoveRuns, the delete analog of
+        // sequential typing: if our only extra dep is the current tail of an
+        // existing chain, extend that chain in place.
+        if remove.nodes.len() == 1 {
+            let target = *remove.nodes.first().unwrap();
+            if remove.extra_dependencies.len() == 1 {
+                let dep = *remove.extra_dependencies.first().unwrap();
+                if let Some(pos) = self.remove_index.get(&dep).copied()
+                    && let Some(chain) = self.remove_runs.get_mut(&pos.run_id)
+                    && pos.position + 1 == chain.ids.len()
+                {
+                    chain.targets.push(target);
+                    chain.ids.push(id);
+                    self.remove_index.insert(
+                        id,
+                        RunPosition {
+                            run_id: pos.run_id,
+                            position: pos.position + 1,
+                        },
+                    );
+                    return;
+                }
+            }
+            // Start a new chain (a lone remove is a 1-link chain).
+            self.remove_runs.insert(
+                id,
+                RemoveRun {
+                    first_extra_deps: remove.extra_dependencies,
+                    targets: vec![target],
+                    ids: vec![id],
+                },
+            );
+            self.remove_index.insert(
+                id,
+                RunPosition {
+                    run_id: id,
+                    position: 0,
+                },
+            );
+            return;
+        }
+
         self.remove_nodes.insert(id, remove);
     }
 
@@ -574,7 +668,8 @@ impl HashSeq {
                 id,
                 CausalRemove {
                     extra_dependencies: node.extra_dependencies,
-                    nodes,
+                    // BTreeSet iterates sorted, so the slice stays sorted
+                    nodes: nodes.into_iter().collect(),
                 },
             ),
         }
@@ -605,10 +700,17 @@ impl HashSeq {
             }
         }
 
+        for (_first_id, remove_run) in other.remove_runs {
+            for (i, node) in remove_run.decompress().into_iter().enumerate() {
+                debug_assert_eq!(node.id(), remove_run.ids[i]);
+                self.apply(node);
+            }
+        }
+
         for (id, causal_remove) in other.remove_nodes {
             let node = HashNode {
                 extra_dependencies: causal_remove.extra_dependencies,
-                op: Op::Remove(causal_remove.nodes),
+                op: Op::Remove(causal_remove.nodes.iter().copied().collect()),
             };
             debug_assert_eq!(id, node.id());
             self.apply(node)

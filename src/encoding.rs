@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::hashseq::CausalRemove;
+use crate::hashseq::{CausalRemove, RemoveRun};
 use crate::{HashNode, HashSeq, Id, Op, Run};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +413,11 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<EncodableOp>, DecodeError> {
 const REF_TAG_RUN: u8 = 0x00;
 const REF_TAG_ROOT: u8 = 0x01;
 
+// Target-reference tags in the "other removes" section.
+const RM_TARGET_RUN: u8 = 0x00;
+const RM_TARGET_ROOT: u8 = 0x01;
+const RM_TARGET_DICT: u8 = 0x02;
+
 #[derive(Debug, Clone, Copy)]
 struct OpRef {
     tag: u8,
@@ -431,6 +436,8 @@ struct OpRef {
 /// - [num_backward_runs][...]
 /// - [num_single_run][...]            { idx_set extra_deps, varint run_idx, varint elem_idx }
 /// - [num_root_removes][...]          { idx_set extra_deps, varint root_idx }
+/// - [num_other_removes][...]         { idx_set extra_deps, varint n, n × tagged target }
+///   (multi-target removes; targets tagged run/root/dict — identity-preserving)
 /// - [num_orphans][orphans...]        tagged HashNodes with idx-encoded IDs
 ///
 /// Remove sections address elements by `run_idx` into the concatenated
@@ -465,161 +472,118 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     }
 
-    // --- Remove-chain analysis ---
-    // Detect runs of single-element removes where each remove depends on the
-    // previous (delete-key / backspace bursts) so they can be encoded as ranges.
+    // --- Removes ---
+    // In-memory `RemoveRun` chains are already what the wire wants; each chain is
+    // segmented into maximal spans that are contiguous in the *current* encoded
+    // runs (run splits since removal can break a chain across runs). Spans become
+    // wire remove-runs; isolated links become standalone singles. Segments after
+    // the first synthesize extra_deps = {previous remove id} — exactly the deps
+    // those links carry, so decode reconstructs identical nodes.
 
-    struct RemoveInfo {
-        id: Id,
-        extra_deps: BTreeSet<Id>,
-        run_ref: Option<(usize, usize)>,
-    }
-
-    let mut removes: Vec<(&Id, &CausalRemove)> = seq.remove_nodes.iter().collect();
-    removes.sort_by_key(|(id, _)| **id);
     let mut orphans: Vec<&HashNode> = seq.orphaned.iter().collect();
     orphans.sort_by_key(|n| n.id());
-    let mut remove_infos: Vec<RemoveInfo> = Vec::new();
 
-    for (remove_id, remove) in &removes {
-        let mut run_ref = None;
-        if remove.nodes.len() == 1 {
-            let removed_id = remove.nodes.iter().next().unwrap();
-            if let Some(op_ref) = id_to_ref.get(removed_id)
-                && op_ref.tag == REF_TAG_RUN
-            {
-                run_ref = Some((op_ref.op_idx, op_ref.sub_idx));
-            }
+    /// Where a remove target lives in the encoded layout.
+    enum TargetRef {
+        Run(usize, usize),
+        Root(usize),
+        /// Not positionally addressable (e.g. a remove targeting a remove);
+        /// referenced through the ID dictionary instead.
+        Dict(Id),
+    }
+    let resolve_target = |id: &Id| -> TargetRef {
+        match id_to_ref.get(id) {
+            Some(r) if r.tag == REF_TAG_RUN => TargetRef::Run(r.op_idx, r.sub_idx),
+            Some(r) => TargetRef::Root(r.op_idx),
+            None => TargetRef::Dict(*id),
         }
-        remove_infos.push(RemoveInfo {
-            id: **remove_id,
-            extra_deps: remove.extra_dependencies.clone(),
-            run_ref,
-        });
-    }
+    };
 
-    let mut dep_to_idx: HashMap<Id, usize> = HashMap::new();
-    for (i, info) in remove_infos.iter().enumerate() {
-        if info.extra_deps.len() == 1 && info.run_ref.is_some() {
-            let dep = *info.extra_deps.iter().next().unwrap();
-            dep_to_idx.insert(dep, i);
-        }
-    }
-
-    let mut in_chain: Vec<bool> = vec![false; remove_infos.len()];
-    let mut chain_next: Vec<Option<usize>> = vec![None; remove_infos.len()];
-
-    for (i, info) in remove_infos.iter().enumerate() {
-        if let Some((run_idx, elem_idx)) = info.run_ref
-            && let Some(&next_idx) = dep_to_idx.get(&info.id)
-        {
-            let next_info = &remove_infos[next_idx];
-            if let Some((next_run, next_elem)) = next_info.run_ref
-                && next_run == run_idx
-            {
-                let is_adjacent =
-                    (elem_idx > 0 && next_elem == elem_idx - 1) || next_elem == elem_idx + 1;
-                if is_adjacent {
-                    chain_next[i] = Some(next_idx);
-                }
-            }
-        }
-    }
-
-    let mut has_predecessor: Vec<bool> = vec![false; remove_infos.len()];
-    for next in chain_next.iter().flatten() {
-        has_predecessor[*next] = true;
-    }
-
-    struct RemoveRun {
-        first_extra_deps: BTreeSet<Id>,
+    struct WireRemoveRun {
+        extra_deps: BTreeSet<Id>,
         run_idx: usize,
         start_idx: usize,
         end_idx: usize,
-        backwards: bool,
     }
 
-    let mut remove_runs: Vec<RemoveRun> = Vec::new();
+    let mut forward_runs: Vec<WireRemoveRun> = Vec::new();
+    let mut backward_runs: Vec<WireRemoveRun> = Vec::new();
+    let mut single_run_removes: Vec<(BTreeSet<Id>, usize, usize)> = Vec::new();
+    let mut root_removes: Vec<(BTreeSet<Id>, usize)> = Vec::new();
+    // Identity-preserving section for multi-target removes and exotic targets:
+    // (extra_deps, target refs) — decode rebuilds the exact Op::Remove set.
+    let mut other_removes: Vec<(BTreeSet<Id>, Vec<TargetRef>)> = Vec::new();
 
-    for (i, info) in remove_infos.iter().enumerate() {
-        if has_predecessor[i] || in_chain[i] { continue; }
-        if info.run_ref.is_none() { continue; }
-        if chain_next[i].is_none() { continue; }
+    let mut chains: Vec<&RemoveRun> = seq.remove_runs.values().collect();
+    chains.sort_by_key(|c| c.ids.first().copied());
 
-        let (run_idx, first_elem) = info.run_ref.unwrap();
-        let mut elems_in_order = vec![first_elem];
-        let mut chain_len = 1;
-
-        in_chain[i] = true;
-        let mut current = i;
-        while let Some(next) = chain_next[current] {
-            if in_chain[next] { break; }
-            in_chain[next] = true;
-            if let Some((_, elem)) = remove_infos[next].run_ref {
-                elems_in_order.push(elem);
-            }
-            chain_len += 1;
-            current = next;
-        }
-
-        let min_elem = *elems_in_order.iter().min().unwrap();
-        let max_elem = *elems_in_order.iter().max().unwrap();
-        let expected_len = max_elem - min_elem + 1;
-        let is_contiguous = chain_len == expected_len;
-
-        let last_elem = *elems_in_order.last().unwrap();
-        let backwards = first_elem > last_elem;
-
-        if chain_len > 1 && is_contiguous {
-            remove_runs.push(RemoveRun {
-                first_extra_deps: info.extra_deps.clone(),
-                run_idx,
-                start_idx: first_elem,
-                end_idx: last_elem,
-                backwards,
-            });
-        } else {
-            in_chain[i] = false;
-            let mut cur = i;
-            while let Some(nxt) = chain_next[cur] {
-                if !in_chain[nxt] { break; }
-                in_chain[nxt] = false;
-                cur = nxt;
-            }
-        }
-    }
-
-    let standalone_removes: Vec<_> = removes
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !in_chain[*i])
-        .map(|(_, r)| r)
-        .collect();
-
-    let forward_runs: Vec<_> = remove_runs.iter().filter(|rr| !rr.backwards).collect();
-    let backward_runs: Vec<_> = remove_runs.iter().filter(|rr| rr.backwards).collect();
-
-    let mut single_run_removes: Vec<(&BTreeSet<Id>, usize, usize)> = Vec::new();
-    let mut root_removes: Vec<(&BTreeSet<Id>, usize)> = Vec::new();
-
-    for (_id, remove) in &standalone_removes {
-        for id in &remove.nodes {
-            if let Some(op_ref) = id_to_ref.get(id) {
-                match op_ref.tag {
-                    REF_TAG_RUN => {
-                        single_run_removes.push((
-                            &remove.extra_dependencies,
-                            op_ref.op_idx,
-                            op_ref.sub_idx,
-                        ));
+    for chain in &chains {
+        let mut i = 0;
+        while i < chain.targets.len() {
+            let deps = if i == 0 {
+                chain.first_extra_deps.clone()
+            } else {
+                BTreeSet::from_iter([chain.ids[i - 1]])
+            };
+            match resolve_target(&chain.targets[i]) {
+                TargetRef::Run(run_idx, elem_idx) => {
+                    // Greedy span: stay in the same encoded run, stepping ±1 in a
+                    // consistent direction.
+                    let mut j = i + 1;
+                    let mut backwards = None;
+                    let mut last = elem_idx;
+                    while j < chain.targets.len() {
+                        let TargetRef::Run(r2, e2) = resolve_target(&chain.targets[j]) else {
+                            break;
+                        };
+                        if r2 != run_idx {
+                            break;
+                        }
+                        let step = match backwards {
+                            None if e2 == last + 1 => Some(false),
+                            None if e2 + 1 == last => Some(true),
+                            Some(false) if e2 == last + 1 => Some(false),
+                            Some(true) if e2 + 1 == last => Some(true),
+                            _ => break,
+                        };
+                        backwards = step;
+                        last = e2;
+                        j += 1;
                     }
-                    REF_TAG_ROOT => {
-                        root_removes.push((&remove.extra_dependencies, op_ref.op_idx));
+                    if j - i > 1 {
+                        let wr = WireRemoveRun {
+                            extra_deps: deps,
+                            run_idx,
+                            start_idx: elem_idx,
+                            end_idx: last,
+                        };
+                        if backwards == Some(true) {
+                            backward_runs.push(wr);
+                        } else {
+                            forward_runs.push(wr);
+                        }
+                    } else {
+                        single_run_removes.push((deps, run_idx, elem_idx));
                     }
-                    _ => {}
+                    i = j;
+                }
+                TargetRef::Root(root_idx) => {
+                    root_removes.push((deps, root_idx));
+                    i += 1;
+                }
+                target @ TargetRef::Dict(_) => {
+                    other_removes.push((deps, vec![target]));
+                    i += 1;
                 }
             }
         }
+    }
+
+    let mut multi_removes: Vec<(&Id, &CausalRemove)> = seq.remove_nodes.iter().collect();
+    multi_removes.sort_by_key(|(id, _)| **id);
+    for (_id, remove) in &multi_removes {
+        let targets = remove.nodes.iter().map(&resolve_target).collect();
+        other_removes.push((remove.extra_dependencies.clone(), targets));
     }
 
     // --- Build the ID dictionary ---
@@ -639,19 +603,29 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             id_set.insert(*dep);
         }
     }
-    for rr in &remove_runs {
-        for dep in &rr.first_extra_deps {
+    for rr in forward_runs.iter().chain(backward_runs.iter()) {
+        for dep in &rr.extra_deps {
             id_set.insert(*dep);
         }
     }
     for (extra_deps, _, _) in &single_run_removes {
-        for dep in *extra_deps {
+        for dep in extra_deps {
             id_set.insert(*dep);
         }
     }
     for (extra_deps, _) in &root_removes {
-        for dep in *extra_deps {
+        for dep in extra_deps {
             id_set.insert(*dep);
+        }
+    }
+    for (extra_deps, targets) in &other_removes {
+        for dep in extra_deps {
+            id_set.insert(*dep);
+        }
+        for t in targets {
+            if let TargetRef::Dict(id) = t {
+                id_set.insert(*id);
+            }
         }
     }
     for orphan in &orphans {
@@ -715,7 +689,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     for runs in [&forward_runs, &backward_runs] {
         encode_varint(runs.len(), &mut buf);
         for rr in runs.iter() {
-            encode_idx_set(&rr.first_extra_deps, &mut buf);
+            encode_idx_set(&rr.extra_deps, &mut buf);
             encode_varint(rr.run_idx, &mut buf);
             encode_varint(rr.start_idx, &mut buf);
             encode_varint(rr.end_idx, &mut buf);
@@ -735,6 +709,31 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     for (extra_deps, root_idx) in &root_removes {
         encode_idx_set(extra_deps, &mut buf);
         encode_varint(*root_idx, &mut buf);
+    }
+
+    // Other removes (multi-target / dict-referenced targets), identity-preserving:
+    // decode rebuilds the exact Op::Remove target set so the node id survives.
+    encode_varint(other_removes.len(), &mut buf);
+    for (extra_deps, targets) in &other_removes {
+        encode_idx_set(extra_deps, &mut buf);
+        encode_varint(targets.len(), &mut buf);
+        for t in targets {
+            match t {
+                TargetRef::Run(run_idx, elem_idx) => {
+                    buf.push(RM_TARGET_RUN);
+                    encode_varint(*run_idx, &mut buf);
+                    encode_varint(*elem_idx, &mut buf);
+                }
+                TargetRef::Root(root_idx) => {
+                    buf.push(RM_TARGET_ROOT);
+                    encode_varint(*root_idx, &mut buf);
+                }
+                TargetRef::Dict(id) => {
+                    buf.push(RM_TARGET_DICT);
+                    encode_idx(id, &mut buf);
+                }
+            }
+        }
     }
 
     // Orphans (tagged, with idx-encoded IDs)
@@ -945,6 +944,58 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         seq.apply(HashNode {
             extra_dependencies: extra_deps,
             op: Op::Remove(std::iter::once(removed_id).collect()),
+        });
+    }
+
+    // Other removes (multi-target / dict-referenced targets)
+    let (num_other_removes, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_other_removes {
+        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        pos += size;
+        let (num_targets, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+
+        let mut targets = BTreeSet::new();
+        for _ in 0..num_targets {
+            if pos >= bytes.len() {
+                return Err(DecodeError::UnexpectedEof);
+            }
+            let tag = bytes[pos];
+            pos += 1;
+            let target = match tag {
+                RM_TARGET_RUN => {
+                    let (run_idx, size) = decode_varint(&bytes[pos..])?;
+                    pos += size;
+                    let (elem_idx, size) = decode_varint(&bytes[pos..])?;
+                    pos += size;
+                    run_element_ids
+                        .get(run_idx)
+                        .and_then(|e| e.get(elem_idx))
+                        .copied()
+                        .ok_or(DecodeError::InvalidIdIndex(elem_idx))?
+                }
+                RM_TARGET_ROOT => {
+                    let (root_idx, size) = decode_varint(&bytes[pos..])?;
+                    pos += size;
+                    root_ids
+                        .get(root_idx)
+                        .copied()
+                        .ok_or(DecodeError::InvalidIdIndex(root_idx))?
+                }
+                RM_TARGET_DICT => {
+                    let (id, size) = decode_idx_at(&bytes[pos..])?;
+                    pos += size;
+                    id
+                }
+                _ => return Err(DecodeError::InvalidOpTag(tag)),
+            };
+            targets.insert(target);
+        }
+
+        seq.apply(HashNode {
+            extra_dependencies: extra_deps,
+            op: Op::Remove(targets),
         });
     }
 
@@ -1411,4 +1462,76 @@ mod tests {
         original_str == decoded.iter().collect::<String>() && seq == decoded
     }
 
+}
+
+#[cfg(test)]
+mod remove_roundtrip {
+    use super::*;
+    use quickcheck_macros::quickcheck;
+
+    /// Regression: multi-target removes used to be decomposed into N single
+    /// removes at encode time, changing their node identity — any later op
+    /// depending on the original remove id would orphan forever after decode.
+    #[test]
+    fn test_multi_target_remove_roundtrip_identity() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        seq.remove_batch(0, 2); // one Remove node targeting two elements
+        seq.insert(0, 'x'); // depends on the multi-target remove's id
+
+        let encoded = encode_hashseq(&seq);
+        let decoded = decode_hashseq(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.iter().collect::<String>(),
+            seq.iter().collect::<String>(),
+        );
+        assert_eq!(seq, decoded, "tips must survive the roundtrip");
+    }
+
+    /// Backspace bursts coalesce into a single in-memory RemoveRun.
+    #[test]
+    fn test_backspace_burst_coalesces() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcdefgh".chars());
+        for _ in 0..5 {
+            seq.remove(seq.len() - 1);
+        }
+        assert_eq!(seq.iter().collect::<String>(), "abc");
+        assert_eq!(seq.remove_runs.len(), 1, "one chain for the whole burst");
+        let chain = seq.remove_runs.values().next().unwrap();
+        assert_eq!(chain.len(), 5);
+        assert!(seq.remove_nodes.is_empty(), "no standalone removes");
+
+        // The chain decompresses to the exact nodes a peer would have seen.
+        let mut other = HashSeq::default();
+        other.merge(seq.clone());
+        assert_eq!(other, seq);
+    }
+
+    /// Roundtrip with mixed single and batch removes (exercises remove chains,
+    /// the other-removes section, and ops depending on remove ids).
+    #[quickcheck]
+    fn prop_batch_remove_roundtrip(text: String, edits: Vec<(u8, u8, bool)>) -> bool {
+        let mut seq = HashSeq::default();
+        if !text.is_empty() {
+            seq.insert_batch(0, text.chars());
+        }
+        for (idx, amount, insert_after) in edits {
+            if !seq.is_empty() {
+                let idx = idx as usize % seq.len();
+                let amount = 1 + amount as usize % 5;
+                seq.remove_batch(idx, amount);
+            }
+            if insert_after {
+                let pos = if seq.is_empty() { 0 } else { idx as usize % (seq.len() + 1) };
+                seq.insert(pos, 'x');
+            }
+        }
+
+        let encoded = encode_hashseq(&seq);
+        let decoded = decode_hashseq(&encoded).unwrap();
+
+        decoded.iter().collect::<String>() == seq.iter().collect::<String>() && seq == decoded
+    }
 }
