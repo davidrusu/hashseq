@@ -140,6 +140,11 @@ impl WasmRun {
         self.inner.len()
     }
 
+    #[wasm_bindgen(js_name = isEmpty)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn text(&self) -> String {
         self.inner.run.clone()
     }
@@ -243,7 +248,7 @@ impl WasmHashSeq {
         // before-nodes) they belong to, deduped.
         let resolve_deps = |set: &std::collections::BTreeSet<Id>| -> Vec<Id> {
             let mut seen = std::collections::BTreeSet::new();
-            set.iter().map(|d| resolve(d)).filter(|b| seen.insert(*b)).collect()
+            set.iter().map(&resolve).filter(|b| seen.insert(*b)).collect()
         };
 
         let mut first = true;
@@ -335,16 +340,19 @@ impl WasmHashSeq {
     /// empty-sequence case (caller should `insert` directly to create the root).
     #[wasm_bindgen(js_name = cursorAt)]
     pub fn cursor_at(&self, idx: usize) -> Option<WasmCursor> {
-        self.inner.cursor_at(idx).map(|cursor| {
+        self.inner.cursor_at(idx).and_then(|cursor| {
             let (op, anchor, extra_deps) = match cursor {
                 Cursor::After { anchor, extra_deps } => ("after", anchor, extra_deps),
                 Cursor::Before { anchor, extra_deps } => ("before", anchor, extra_deps),
+                // Runs can't be root-anchored, so there is no WasmRun to build
+                // from a Root cursor; the JS side inserts directly instead.
+                Cursor::Root { .. } => return None,
             };
-            WasmCursor {
+            Some(WasmCursor {
                 op: op.to_string(),
                 anchor: id_to_hex(&anchor),
                 extra_deps: extra_deps.iter().map(id_to_hex).collect(),
-            }
+            })
         })
     }
 

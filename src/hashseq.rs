@@ -21,16 +21,18 @@ pub struct RunPosition {
 
 /// A causal anchor for inserting into a HashSeq.
 ///
-/// Captures both the anchor node and the op kind (`InsertAfter` or `InsertBefore`)
-/// needed to land an insert at the cursor's position deterministically — even when
-/// the local neighborhood is involved in concurrent forks. `extra_deps` snapshots
-/// the tips visible at cursor-placement time (with the anchor itself removed).
+/// Captures everything needed to land an insert at the cursor's position
+/// deterministically — even when the local neighborhood is involved in concurrent
+/// forks: the anchor node, the op kind, and `extra_deps`, a snapshot of the tips
+/// visible at cursor-placement time (with the anchor itself removed).
 ///
-/// A `Run` built from this cursor (`Run::new` for After, `Run::new_before` for
-/// Before) can be applied later — even after concurrent mutations — and will land
-/// in the causally correct position.
+/// This is the canonical insertion path: `insert_batch` is built on it, and a
+/// `Run` built from a cursor (`into_run`) can be applied later — even after
+/// concurrent mutations — and will land in the causally correct position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cursor {
+    /// Insert into an empty sequence (the first char becomes an `InsertRoot`).
+    Root { extra_deps: BTreeSet<Id> },
     /// Insert immediately after `anchor`.
     After {
         anchor: Id,
@@ -46,15 +48,32 @@ pub enum Cursor {
 }
 
 impl Cursor {
-    pub fn anchor(&self) -> Id {
-        match self {
-            Cursor::After { anchor, .. } | Cursor::Before { anchor, .. } => *anchor,
+    /// Build the first `HashNode` of an insertion at this cursor.
+    /// Subsequent chars of a burst chain `InsertAfter` from this node.
+    pub fn first_node(self, ch: char) -> HashNode {
+        let (extra_dependencies, op) = match self {
+            Cursor::Root { extra_deps } => (extra_deps, Op::InsertRoot(ch)),
+            Cursor::After { anchor, extra_deps } => (extra_deps, Op::InsertAfter(anchor, ch)),
+            Cursor::Before { anchor, extra_deps } => (extra_deps, Op::InsertBefore(anchor, ch)),
+        };
+        HashNode {
+            extra_dependencies,
+            op,
         }
     }
 
-    pub fn extra_deps(&self) -> &BTreeSet<Id> {
+    /// Build a `Run` starting at this cursor with `first` as its first character.
+    ///
+    /// Returns `None` for a `Root` cursor: runs are anchored ops, while the first
+    /// char of an empty sequence is a standalone `InsertRoot` (apply it via
+    /// `first_node` instead).
+    pub fn into_run(self, first: char) -> Option<Run> {
         match self {
-            Cursor::After { extra_deps, .. } | Cursor::Before { extra_deps, .. } => extra_deps,
+            Cursor::Root { .. } => None,
+            Cursor::After { anchor, extra_deps } => Some(Run::new(anchor, extra_deps, first)),
+            Cursor::Before { anchor, extra_deps } => {
+                Some(Run::new_before(anchor, extra_deps, first))
+            }
         }
     }
 }
@@ -239,112 +258,32 @@ impl HashSeq {
         self.insert_batch(idx, [value]);
     }
 
+    /// Insert a burst of characters at visible position `idx` (clamped to the end
+    /// of the sequence). The first char lands at the cursor for `idx`; the rest
+    /// chain `InsertAfter` from it.
     pub fn insert_batch(&mut self, idx: usize, batch: impl IntoIterator<Item = char>) {
-        let chars: Vec<char> = batch.into_iter().collect();
-
-        if chars.is_empty() {
+        let mut chars = batch.into_iter();
+        let Some(first_ch) = chars.next() else {
             return;
-        }
+        };
 
-        let (left, right) = self.neighbours(idx);
+        let cursor = self
+            .cursor_at(idx.min(self.len()))
+            .expect("cursor_at is total for idx <= len");
+        let first_node = cursor.first_node(first_ch);
 
-        match (left, right) {
-            (Some(left_id), Some(right_id)) => {
-                let mut chars_iter = chars.into_iter();
-                let first_ch = chars_iter.next().unwrap();
+        let mut prev_id = first_node.id();
+        self.apply_with_id(prev_id, first_node);
 
-                let first_node = if self.is_causally_before(&left_id, &right_id) {
-                    // Using InsertAfter for the first node doesn't work.
-                    // use InsertBefore right_id instead
-                    HashNode {
-                        extra_dependencies: self.tips_minus(&right_id),
-                        op: Op::InsertBefore(right_id, first_ch),
-                    }
-                } else {
-                    HashNode {
-                        extra_dependencies: self.tips_minus(&left_id),
-                        op: Op::InsertAfter(left_id, first_ch),
-                    }
-                };
-
-                let mut prev_id = first_node.id();
-                self.apply_with_id(prev_id, first_node);
-
-                // Subsequent nodes have empty extra_deps
-                for ch in chars_iter {
-                    let node = HashNode {
-                        extra_dependencies: BTreeSet::new(),
-                        op: Op::InsertAfter(prev_id, ch),
-                    };
-                    prev_id = node.id();
-                    self.apply_with_id(prev_id, node);
-                }
-            }
-            (Some(left_id), None) => {
-                // there is no right node, we just chain from left
-                let mut chars_iter = chars.into_iter();
-
-                // First node needs full tips (minus anchor)
-                let first_ch = chars_iter.next().unwrap();
-                let first_node = HashNode {
-                    extra_dependencies: self.tips_minus(&left_id),
-                    op: Op::InsertAfter(left_id, first_ch),
-                };
-                let mut prev_id = first_node.id();
-                self.apply_with_id(prev_id, first_node);
-
-                // Subsequent nodes have empty extra_deps since tips = {prev_id} after first apply
-                for ch in chars_iter {
-                    let node = HashNode {
-                        extra_dependencies: BTreeSet::new(),
-                        op: Op::InsertAfter(prev_id, ch),
-                    };
-                    prev_id = node.id();
-                    self.apply_with_id(prev_id, node);
-                }
-            }
-            (None, Some(right_id)) => {
-                let mut chars_iter = chars.into_iter();
-                let first_node = HashNode {
-                    extra_dependencies: self.tips_minus(&right_id),
-                    op: Op::InsertBefore(right_id, chars_iter.next().unwrap()),
-                };
-
-                let mut prev_id = first_node.id();
-                self.apply_with_id(prev_id, first_node);
-
-                // Subsequent nodes have empty extra_deps
-                for ch in chars_iter {
-                    let node = HashNode {
-                        extra_dependencies: BTreeSet::new(),
-                        op: Op::InsertAfter(prev_id, ch),
-                    };
-                    prev_id = node.id();
-                    self.apply_with_id(prev_id, node);
-                }
-            }
-            (None, None) => {
-                // seq is empty
-                let mut chars_iter = chars.into_iter();
-
-                let first_node = HashNode {
-                    extra_dependencies: self.tips.clone(),
-                    op: Op::InsertRoot(chars_iter.next().unwrap()),
-                };
-
-                let mut prev_id = first_node.id();
-                self.apply_with_id(prev_id, first_node);
-
-                // Subsequent nodes have empty extra_deps
-                for ch in chars_iter {
-                    let node = HashNode {
-                        extra_dependencies: BTreeSet::new(),
-                        op: Op::InsertAfter(prev_id, ch),
-                    };
-                    prev_id = node.id();
-                    self.apply_with_id(prev_id, node);
-                }
-            }
+        // After the first apply, tips == {prev_id}, so the chained nodes carry no
+        // extra deps.
+        for ch in chars {
+            let node = HashNode {
+                extra_dependencies: BTreeSet::new(),
+                op: Op::InsertAfter(prev_id, ch),
+            };
+            prev_id = node.id();
+            self.apply_with_id(prev_id, node);
         }
     }
 
@@ -749,50 +688,44 @@ impl HashSeq {
         &self.tips
     }
 
-    /// Build a `Cursor` for inserting at position `idx`.
+    /// Build a `Cursor` for inserting at position `idx`. This is the op-choice
+    /// logic for all local inserts (`insert_batch` is built on it).
     ///
-    /// Mirrors `insert_batch`'s op-choice logic: if the cursor sits between two
-    /// causally-related neighbors, the cursor uses `InsertBefore(right)` so the
-    /// insert has an explicit ordering constraint and doesn't get hash-ordered into
-    /// a fork. Otherwise it uses `InsertAfter(left)`. At the start of a non-empty
-    /// sequence, returns a `Before(id_at(0))` cursor. Returns `None` only for the
-    /// empty-sequence case (caller must use `InsertRoot` directly).
+    /// If the cursor sits between two causally-related neighbors, it uses
+    /// `InsertBefore(right)` so the insert has an explicit ordering constraint and
+    /// doesn't get hash-ordered into a fork. Otherwise it uses `InsertAfter(left)`.
+    /// At the start of a non-empty sequence, returns a `Before(id_at(0))` cursor.
+    /// In an empty sequence, returns a `Root` cursor. Returns `None` only when
+    /// `idx` is out of bounds (> len).
     pub fn cursor_at(&self, idx: usize) -> Option<Cursor> {
-        let (left, right) = self.neighbours(idx);
-        match (left, right) {
+        if idx > self.len() {
+            return None;
+        }
+        match self.neighbours(idx) {
             (Some(left_id), Some(right_id)) => {
-                let mut extra_deps = self.tips.clone();
                 if self.is_causally_before(&left_id, &right_id) {
-                    extra_deps.remove(&right_id);
                     Some(Cursor::Before {
                         anchor: right_id,
-                        extra_deps,
+                        extra_deps: self.tips_minus(&right_id),
                     })
                 } else {
-                    extra_deps.remove(&left_id);
                     Some(Cursor::After {
                         anchor: left_id,
-                        extra_deps,
+                        extra_deps: self.tips_minus(&left_id),
                     })
                 }
             }
-            (Some(left_id), None) => {
-                let mut extra_deps = self.tips.clone();
-                extra_deps.remove(&left_id);
-                Some(Cursor::After {
-                    anchor: left_id,
-                    extra_deps,
-                })
-            }
-            (None, Some(right_id)) => {
-                let mut extra_deps = self.tips.clone();
-                extra_deps.remove(&right_id);
-                Some(Cursor::Before {
-                    anchor: right_id,
-                    extra_deps,
-                })
-            }
-            (None, None) => None,
+            (Some(left_id), None) => Some(Cursor::After {
+                anchor: left_id,
+                extra_deps: self.tips_minus(&left_id),
+            }),
+            (None, Some(right_id)) => Some(Cursor::Before {
+                anchor: right_id,
+                extra_deps: self.tips_minus(&right_id),
+            }),
+            (None, None) => Some(Cursor::Root {
+                extra_deps: self.tips.clone(),
+            }),
         }
     }
 
@@ -2295,7 +2228,10 @@ mod test {
     #[test]
     fn test_cursor_at_edges() {
         let seq = HashSeq::default();
-        assert!(seq.cursor_at(0).is_none(), "no cursor on empty seq at 0");
+        assert!(
+            matches!(seq.cursor_at(0), Some(Cursor::Root { .. })),
+            "empty seq at 0 yields a Root cursor"
+        );
 
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "hi".chars());
@@ -2398,11 +2334,7 @@ mod test {
         assert_eq!(String::from_iter(seq.iter()), "X hello world");
 
         // Build a Before-run from the cursor — anchored to the original ' '.
-        let (anchor, deps) = match cursor {
-            Cursor::Before { anchor, extra_deps } => (anchor, extra_deps),
-            _ => unreachable!(),
-        };
-        let mut run = Run::new_before(anchor, deps, ',');
+        let mut run = cursor.into_run(',').unwrap();
         run.extend('!');
 
         seq.apply_op(EncodableOp::Run(run));
@@ -2424,11 +2356,7 @@ mod test {
         let cursor = seq.cursor_at(5).unwrap();
         assert!(matches!(cursor, Cursor::Before { .. }));
 
-        let (anchor, deps) = match cursor {
-            Cursor::Before { anchor, extra_deps } => (anchor, extra_deps),
-            _ => unreachable!(),
-        };
-        let mut run = Run::new_before(anchor, deps, ' ');
+        let mut run = cursor.into_run(' ').unwrap();
         for ch in "mighty".chars() {
             run.extend(ch);
         }
