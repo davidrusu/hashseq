@@ -50,6 +50,22 @@ impl Run {
         Self::with_first_op(anchor, FirstOp::Before, first_extra_deps, first)
     }
 
+    /// Reconstruct a run from its anchor and full text: the first char is anchored
+    /// per `first_op`, the rest chain `InsertAfter`. Returns `None` for empty text.
+    pub fn from_text(
+        anchor: Id,
+        first_op: FirstOp,
+        first_extra_deps: BTreeSet<Id>,
+        text: &str,
+    ) -> Option<Self> {
+        let mut chars = text.chars();
+        let mut run = Self::with_first_op(anchor, first_op, first_extra_deps, chars.next()?);
+        for ch in chars {
+            run.extend(ch);
+        }
+        Some(run)
+    }
+
     fn with_first_op(
         anchor: Id,
         first_op: FirstOp,

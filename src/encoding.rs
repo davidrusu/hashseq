@@ -195,17 +195,13 @@ pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
     let (run_str, str_size) = decode_string(&bytes[pos..])?;
     pos += str_size;
 
-    let mut chars = run_str.chars();
-    let first_char = chars.next().ok_or(DecodeError::EmptyRun)?;
-
-    let mut run = match first_op_tag {
-        RUN_OP_AFTER => Run::new(anchor, first_extra_deps, first_char),
-        RUN_OP_BEFORE => Run::new_before(anchor, first_extra_deps, first_char),
+    let first_op = match first_op_tag {
+        RUN_OP_AFTER => crate::run::FirstOp::After,
+        RUN_OP_BEFORE => crate::run::FirstOp::Before,
         _ => return Err(DecodeError::InvalidOpTag(first_op_tag)),
     };
-    for ch in chars {
-        run.extend(ch);
-    }
+    let run = Run::from_text(anchor, first_op, first_extra_deps, &run_str)
+        .ok_or(DecodeError::EmptyRun)?;
 
     Ok((run, pos))
 }
@@ -463,7 +459,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         id_to_ref.insert(**id, OpRef { tag: REF_TAG_BEFORE, op_idx, sub_idx: 0 });
     }
 
-    // --- Chain analysis (mirrors encode_hashseq) ---
+    // --- Remove-chain analysis ---
+    // Detect runs of single-element removes where each remove depends on the
+    // previous (delete-key / backspace bursts) so they can be encoded as ranges.
 
     struct RemoveInfo {
         id: Id,
@@ -739,22 +737,15 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         encode_utf8_char(before.ch, &mut buf);
     }
 
-    // Forward remove runs
-    encode_varint(forward_runs.len(), &mut buf);
-    for rr in &forward_runs {
-        encode_idx_set(&rr.first_extra_deps, &mut buf);
-        encode_varint(rr.run_idx, &mut buf);
-        encode_varint(rr.start_idx, &mut buf);
-        encode_varint(rr.end_idx, &mut buf);
-    }
-
-    // Backward remove runs
-    encode_varint(backward_runs.len(), &mut buf);
-    for rr in &backward_runs {
-        encode_idx_set(&rr.first_extra_deps, &mut buf);
-        encode_varint(rr.run_idx, &mut buf);
-        encode_varint(rr.start_idx, &mut buf);
-        encode_varint(rr.end_idx, &mut buf);
+    // Remove runs: forward chains, then backward chains (must match decode order).
+    for runs in [&forward_runs, &backward_runs] {
+        encode_varint(runs.len(), &mut buf);
+        for rr in runs.iter() {
+            encode_idx_set(&rr.first_extra_deps, &mut buf);
+            encode_varint(rr.run_idx, &mut buf);
+            encode_varint(rr.start_idx, &mut buf);
+            encode_varint(rr.end_idx, &mut buf);
+        }
     }
 
     // Single-run standalone removes
@@ -883,14 +874,14 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         let (run_str, size) = decode_string(&bytes[pos..])?;
         pos += size;
 
-        let mut chars = run_str.chars();
-        let first_char = chars.next().ok_or(DecodeError::EmptyRun)?;
-        let mut run = Run::new(insert_after, first_extra_deps.clone(), first_char);
-        for ch in chars {
-            run.extend(ch);
-        }
-        let elements = run.elements.clone();
-        run_element_ids.push(elements);
+        let run = Run::from_text(
+            insert_after,
+            crate::run::FirstOp::After,
+            first_extra_deps,
+            &run_str,
+        )
+        .ok_or(DecodeError::EmptyRun)?;
+        run_element_ids.push(run.elements.clone());
         for node in run.decompress() {
             seq.apply(node);
         }
@@ -914,85 +905,57 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         seq.apply(node);
     }
 
-    // Forward remove runs
-    let (num_forward_runs, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-    for _ in 0..num_forward_runs {
-        let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+    // Remove runs: a chain of single-element removes over a contiguous span of a
+    // run, each depending on the previous. Encoded as two sections — forward
+    // chains (e.g. delete-key bursts), then backward chains (backspace bursts) —
+    // identical except for the direction the chain walks the span.
+    for backwards in [false, true] {
+        let (num_remove_runs, size) = decode_varint(&bytes[pos..])?;
         pos += size;
-        let (run_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-        let (start_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-        let (end_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
+        for _ in 0..num_remove_runs {
+            let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+            pos += size;
+            let (run_idx, size) = decode_varint(&bytes[pos..])?;
+            pos += size;
+            let (start_idx, size) = decode_varint(&bytes[pos..])?;
+            pos += size;
+            let (end_idx, size) = decode_varint(&bytes[pos..])?;
+            pos += size;
 
-        let run_elements = run_element_ids
-            .get(run_idx)
-            .ok_or(DecodeError::InvalidIdIndex(run_idx))?;
+            let run_elements = run_element_ids
+                .get(run_idx)
+                .ok_or(DecodeError::InvalidIdIndex(run_idx))?;
 
-        let mut prev_remove_id: Option<Id> = None;
-        for elem_idx in start_idx..=end_idx {
-            let removed_id = run_elements
-                .get(elem_idx)
-                .copied()
-                .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
+            let mut prev_remove_id: Option<Id> = None;
+            let mut apply_remove = |elem_idx: usize| -> Result<(), DecodeError> {
+                let removed_id = run_elements
+                    .get(elem_idx)
+                    .copied()
+                    .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
 
-            let extra_deps = if let Some(prev_id) = prev_remove_id {
-                let mut deps = BTreeSet::new();
-                deps.insert(prev_id);
-                deps
+                let extra_deps = match prev_remove_id {
+                    Some(prev_id) => BTreeSet::from_iter([prev_id]),
+                    None => first_extra_deps.clone(),
+                };
+
+                let node = HashNode {
+                    extra_dependencies: extra_deps,
+                    op: Op::Remove(BTreeSet::from_iter([removed_id])),
+                };
+                prev_remove_id = Some(node.id());
+                seq.apply(node);
+                Ok(())
+            };
+
+            if backwards {
+                for elem_idx in (end_idx..=start_idx).rev() {
+                    apply_remove(elem_idx)?;
+                }
             } else {
-                first_extra_deps.clone()
-            };
-
-            let node = HashNode {
-                extra_dependencies: extra_deps,
-                op: Op::Remove(std::iter::once(removed_id).collect()),
-            };
-            prev_remove_id = Some(node.id());
-            seq.apply(node);
-        }
-    }
-
-    // Backward remove runs
-    let (num_backward_runs, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-    for _ in 0..num_backward_runs {
-        let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-        pos += size;
-        let (run_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-        let (start_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-        let (end_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-
-        let run_elements = run_element_ids
-            .get(run_idx)
-            .ok_or(DecodeError::InvalidIdIndex(run_idx))?;
-
-        let mut prev_remove_id: Option<Id> = None;
-        for elem_idx in (end_idx..=start_idx).rev() {
-            let removed_id = run_elements
-                .get(elem_idx)
-                .copied()
-                .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
-
-            let extra_deps = if let Some(prev_id) = prev_remove_id {
-                let mut deps = BTreeSet::new();
-                deps.insert(prev_id);
-                deps
-            } else {
-                first_extra_deps.clone()
-            };
-
-            let node = HashNode {
-                extra_dependencies: extra_deps,
-                op: Op::Remove(std::iter::once(removed_id).collect()),
-            };
-            prev_remove_id = Some(node.id());
-            seq.apply(node);
+                for elem_idx in start_idx..=end_idx {
+                    apply_remove(elem_idx)?;
+                }
+            }
         }
     }
 

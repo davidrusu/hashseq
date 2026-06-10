@@ -383,8 +383,8 @@ impl HashSeq {
                             position: run_pos.position + 1,
                         },
                     );
-                    let position = self.index.find(&after.anchor).map(|p| p + 1);
-                    self.update_position_index(id, position.unwrap());
+                    let position = self.index.find(&after.anchor).unwrap() + 1;
+                    self.index.insert(position, id);
                     return;
                 }
             }
@@ -410,84 +410,79 @@ impl HashSeq {
             self.index.find(&after.anchor).map(|p| p + 1)
         };
 
-        if let Some(run_pos) = self.run_index.get(&after.anchor).copied() {
-            // We are inserting after a node that is in a run.
-            // Run extension case is handled by fast path above, so this is a fork/split
-            {
-                if run_pos.position + 1 < self.runs[&run_pos.run_id].len() {
-                    let run = self.runs.get_mut(&run_pos.run_id).unwrap();
-                    let right_run = run.split_at(run_pos.position + 1);
-                    debug_assert_eq!(run.last_id(), after.anchor);
+        // We are inserting after a node inside a run (the extension case was
+        // handled by the fast path above, so this is a fork). If the anchor isn't
+        // the run's tail, split off everything after it first.
+        if let Some(run_pos) = self.run_index.get(&after.anchor).copied()
+            && run_pos.position + 1 < self.runs[&run_pos.run_id].len()
+        {
+            self.split_run_at(run_pos.run_id, run_pos.position + 1);
+            debug_assert_eq!(self.runs[&run_pos.run_id].last_id(), after.anchor);
+        }
 
-                    let right_run_first_id = right_run.first_id();
-
-                    // re-index the right run using cached elements
-                    for (idx, elem_id) in right_run.elements.iter().enumerate() {
-                        self.run_index.insert(
-                            *elem_id,
-                            RunPosition {
-                                run_id: right_run_first_id,
-                                position: idx,
-                            },
-                        );
-                    }
-
-                    // The split-off portion needs to be tracked in afters
-                    self.afters
-                        .entry(after.anchor)
-                        .or_default()
-                        .insert(right_run_first_id);
-                    self.runs.insert(right_run_first_id, right_run);
-                }
-                let new_run = Run::new(after.anchor, after.extra_dependencies, after.ch);
-                debug_assert_eq!(new_run.first_id(), id);
-                self.runs.insert(id, new_run);
-                self.run_index.insert(
-                    id,
-                    RunPosition {
-                        run_id: id,
-                        position: 0,
-                    },
-                );
-            }
-        } else {
-            // Either anchor is not a run, or we can't extend from it for some reason, start a new run
-            let new_run = Run::new(after.anchor, after.extra_dependencies, after.ch);
-            debug_assert_eq!(new_run.first_id(), id);
-            self.runs.insert(id, new_run);
-            self.run_index.insert(
-                id,
-                RunPosition {
-                    run_id: id,
-                    position: 0,
-                },
-            );
-        };
+        // Start a new run anchored at the anchor node.
+        let new_run = Run::new(after.anchor, after.extra_dependencies, after.ch);
+        debug_assert_eq!(new_run.first_id(), id);
+        self.runs.insert(id, new_run);
+        self.run_index.insert(
+            id,
+            RunPosition {
+                run_id: id,
+                position: 0,
+            },
+        );
 
         // run extension is handled in the fast path above, fork/split updates the afters set
         self.afters.entry(after.anchor).or_default().insert(id);
 
-        let position = position.unwrap_or_else(|| {
-            // fall back to iterating over the entire sequence if the anchor node has been removed
-            // or if next_node is not yet in the index (can happen during merge)
-            let (position, _) = self
-                .iter_ids()
-                .enumerate()
-                .find(|(_, n)| n == &&id)
-                .unwrap();
-            position
-        });
-        self.update_position_index(id, position);
-    }
-
-    fn update_position_index(&mut self, id: Id, position: usize) {
+        let position = position.unwrap_or_else(|| self.position_by_scan(&id));
         self.index.insert(position, id);
     }
 
+    /// Split the run `run_id` at element index `at` (0 < at < len). The right
+    /// portion becomes its own run, re-indexed and tracked in `afters` of the left
+    /// portion's last element. Returns the right run's id.
+    fn split_run_at(&mut self, run_id: Id, at: usize) -> Id {
+        let run = self.runs.get_mut(&run_id).unwrap();
+        let left_last_id = run.elements[at - 1];
+        let right_run = run.split_at(at);
+        let right_run_id = right_run.first_id();
+
+        // re-index the right run using cached elements
+        for (idx, elem_id) in right_run.elements.iter().enumerate() {
+            self.run_index.insert(
+                *elem_id,
+                RunPosition {
+                    run_id: right_run_id,
+                    position: idx,
+                },
+            );
+        }
+
+        self.runs.insert(right_run_id, right_run);
+        // Track the split in afters so iteration can find the right portion
+        self.afters
+            .entry(left_last_id)
+            .or_default()
+            .insert(right_run_id);
+        right_run_id
+    }
+
+    /// Position of `id` by walking the whole sequence — the fallback when the
+    /// anchor-relative lookup fails (anchor removed, or the neighbor isn't in the
+    /// position index yet, which can happen mid-merge).
+    fn position_by_scan(&self, id: &Id) -> usize {
+        let (position, _) = self
+            .iter_ids()
+            .enumerate()
+            .find(|(_, n)| n == &id)
+            .unwrap();
+        position
+    }
+
     fn remove_nodes(&mut self, id: Id, remove: CausalRemove) {
-        // TODO: if self.nodes.get(node) is not an insert op, then drop this remove.
-        //       Are you sure? looks like we would mark this op as an orphan if we hadn't
-        //       seen a node yet.
+        // A remove targeting a non-insert node (e.g. another remove) is harmless:
+        // it's not in the position index, and marking it in removed_inserts is inert.
         for n in remove.nodes.iter() {
             if let Some(p) = self.index.find(n) {
                 self.index.remove(p);
@@ -512,33 +507,13 @@ impl HashSeq {
             self.index.find(&before.anchor)
         };
 
+        // If the anchor sits mid-run, split so it becomes a run head — anchors
+        // must be at box boundaries for befores_by_anchor to address them.
         if let Some(run_pos) = self.run_index.get(&before.anchor).copied()
             && run_pos.position > 0
         {
-            let run = self.runs.get_mut(&run_pos.run_id).unwrap();
-            // Get the last ID of the left portion from run's elements cache
-            let left_last_id = run.elements[run_pos.position - 1];
-            let right_run = run.split_at(run_pos.position);
-            let right_run_id = right_run.first_id();
+            let right_run_id = self.split_run_at(run_pos.run_id, run_pos.position);
             debug_assert_eq!(right_run_id, before.anchor);
-
-            // re-index the right run using cached elements
-            for (idx, elem_id) in right_run.elements.iter().enumerate() {
-                self.run_index.insert(
-                    *elem_id,
-                    RunPosition {
-                        run_id: right_run_id,
-                        position: idx,
-                    },
-                );
-            }
-
-            self.runs.insert(right_run_id, right_run);
-            // Track the split in afters so iteration can find the right portion
-            self.afters
-                .entry(left_last_id)
-                .or_default()
-                .insert(right_run_id);
         }
 
         self.befores_by_anchor
@@ -548,16 +523,8 @@ impl HashSeq {
 
         self.before_nodes.insert(id, before);
 
-        let position = position.unwrap_or_else(|| {
-            // fall back to iterating over the entire sequence if the anchor node has been removed
-            let (position, _) = self
-                .iter_ids()
-                .enumerate()
-                .find(|(_, n)| n == &&id)
-                .unwrap();
-            position
-        });
-        self.update_position_index(id, position);
+        let position = position.unwrap_or_else(|| self.position_by_scan(&id));
+        self.index.insert(position, id);
     }
 
     pub fn apply(&mut self, node: HashNode) {
@@ -669,8 +636,6 @@ impl HashSeq {
 
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
         self.iter_ids().map(|id| self.get_node_char(id))
-
-        // self.index.iter().map(|id| self.get_node_char(&id).unwrap())
     }
 
     /// Return the node ID at visible position `idx`, if any.
@@ -747,6 +712,81 @@ impl HashSeq {
 mod test {
     use super::*;
     use quickcheck_macros::quickcheck;
+
+    /// Drive a HashSeq with (insert?, idx, char) instructions, clamping idx into
+    /// range — the op vocabulary the property tests below are expressed in.
+    fn apply_ops(seq: &mut HashSeq, ops: &[(bool, u8, char)]) {
+        for &(insert, idx, ch) in ops {
+            let idx = idx as usize;
+            if insert {
+                seq.insert(idx.min(seq.len()), ch);
+            } else if !seq.is_empty() {
+                seq.remove(idx.min(seq.len() - 1));
+            }
+        }
+    }
+
+    fn seq_from_ops(ops: &[(bool, u8, char)]) -> HashSeq {
+        let mut seq = HashSeq::default();
+        apply_ops(&mut seq, ops);
+        seq
+    }
+
+    /// Order-stability harness: after merging two editors' sequences, each
+    /// editor's own ordering must survive as a subsequence of the merge. Removes
+    /// performed on either side are re-applied to both before comparing, since a
+    /// merged remove can hide elements the other side still shows.
+    fn check_order_is_stable(a: &[(bool, u8, char)], b: &[(bool, u8, char)]) {
+        fn apply_tracking_removed(
+            seq: &mut HashSeq,
+            ops: &[(bool, u8, char)],
+            removed: &mut BTreeSet<Id>,
+        ) {
+            for &(insert, idx, ch) in ops {
+                let idx = idx as usize;
+                if insert {
+                    seq.insert(idx.min(seq.len()), ch);
+                } else if !seq.is_empty() {
+                    let idx = idx.min(seq.len() - 1);
+                    removed.insert(*seq.iter_ids().nth(idx).unwrap());
+                    seq.remove(idx);
+                }
+            }
+        }
+
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+        let mut removed = BTreeSet::new();
+        apply_tracking_removed(&mut seq_a, a, &mut removed);
+        apply_tracking_removed(&mut seq_b, b, &mut removed);
+
+        let mut merged = seq_a.clone();
+        merged.merge(seq_b.clone());
+
+        for r in removed {
+            let node = HashNode {
+                op: Op::Remove(BTreeSet::from_iter([r])),
+                extra_dependencies: BTreeSet::new(),
+            };
+            seq_a.apply(node.clone());
+            seq_b.apply(node);
+        }
+
+        let mut iter_a = seq_a.iter_ids();
+        let mut iter_b = seq_b.iter_ids();
+        let mut next_a = iter_a.next();
+        let mut next_b = iter_b.next();
+        for id in merged.iter_ids() {
+            if Some(id) == next_a {
+                next_a = iter_a.next();
+            }
+            if Some(id) == next_b {
+                next_b = iter_b.next();
+            }
+        }
+        assert_eq!(next_a, None, "seq_a's order not preserved in merge");
+        assert_eq!(next_b, None, "seq_b's order not preserved in merge");
+    }
 
     #[test]
     fn test_insert_at_end() {
@@ -1315,26 +1355,9 @@ mod test {
 
     #[quickcheck]
     fn prop_reflexive(ops: Vec<(bool, u8, char)>) {
-        let mut seq = HashSeq::default();
-
-        for (insert_or_remove, idx, elem) in ops {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq.insert(idx.min(seq.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq.is_empty() {
-                        seq.remove(idx.min(seq.len() - 1));
-                    }
-                }
-            }
-        }
+        let seq = seq_from_ops(&ops);
 
         // merge(a, a) == a
-
         let mut merge_self = seq.clone();
         merge_self.merge(seq.clone());
 
@@ -1366,16 +1389,9 @@ mod test {
         let mut seq = HashSeq::default();
 
         seq.insert(0, 'a'); // op 1: idx=0, len=0 -> insert at 0
-        dbg!(&seq.run_index, &seq.removed_inserts);
-
         seq.insert(1, 'b'); // op 2: idx=1, len=1 -> insert at 1
-        dbg!(&seq.run_index, &seq.removed_inserts);
-
         seq.remove(0); // op 3: idx=0, len=2 -> remove at 0
-        dbg!(&seq.run_index, &seq.removed_inserts);
-
         seq.insert(1, 'c'); // op 4: idx=1, len=1 -> insert at 1
-        dbg!(&seq.run_index, &seq.removed_inserts);
 
         // merge(a, a) == a
         let mut merge_self = seq.clone();
@@ -1386,40 +1402,8 @@ mod test {
 
     #[quickcheck]
     fn prop_commutative(a: Vec<(bool, u8, char)>, b: Vec<(bool, u8, char)>) {
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-
-        for (insert_or_remove, idx, elem) in a {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq_a.insert(idx.min(seq_a.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq_a.is_empty() {
-                        seq_a.remove(idx.min(seq_a.len() - 1));
-                    }
-                }
-            }
-        }
-
-        for (insert_or_remove, idx, elem) in b {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq_b.insert(idx.min(seq_b.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq_b.is_empty() {
-                        seq_b.remove(idx.min(seq_b.len() - 1));
-                    }
-                }
-            }
-        }
+        let seq_a = seq_from_ops(&a);
+        let seq_b = seq_from_ops(&b);
 
         // merge(a, b) == merge(b, a)
 
@@ -1438,57 +1422,9 @@ mod test {
         b: Vec<(bool, u8, char)>,
         c: Vec<(bool, u8, char)>,
     ) {
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-        let mut seq_c = HashSeq::default();
-
-        for (insert_or_remove, idx, elem) in a {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq_a.insert(idx.min(seq_a.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq_a.is_empty() {
-                        seq_a.remove(idx.min(seq_a.len() - 1));
-                    }
-                }
-            }
-        }
-
-        for (insert_or_remove, idx, elem) in b {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq_b.insert(idx.min(seq_b.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq_b.is_empty() {
-                        seq_b.remove(idx.min(seq_b.len() - 1));
-                    }
-                }
-            }
-        }
-
-        for (insert_or_remove, idx, elem) in c {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq_c.insert(idx.min(seq_c.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq_c.is_empty() {
-                        seq_c.remove(idx.min(seq_c.len() - 1));
-                    }
-                }
-            }
-        }
+        let seq_a = seq_from_ops(&a);
+        let seq_b = seq_from_ops(&b);
+        let seq_c = seq_from_ops(&c);
 
         // merge(merge(a, b), c) == merge(a, merge(b, c))
 
@@ -1736,357 +1672,57 @@ mod test {
 
     #[quickcheck]
     fn prop_order_is_stable(a: Vec<(bool, u8, char)>, b: Vec<(bool, u8, char)>) {
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-        let mut removed = BTreeSet::new();
-
-        for (insert_or_remove, idx, elem) in a {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq_a.insert(idx.min(seq_a.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq_a.is_empty() {
-                        let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
-                        seq_a.remove(idx);
-                    }
-                }
-            }
-        }
-
-        for (insert_or_remove, idx, elem) in b {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    // insert
-                    seq_b.insert(idx.min(seq_b.len()), elem);
-                }
-                false => {
-                    // remove
-                    if !seq_b.is_empty() {
-                        let idx = idx.min(seq_b.len() - 1);
-                        removed.insert(*seq_b.iter_ids().nth(idx).unwrap());
-                        seq_b.remove(idx);
-                    }
-                }
-            }
-        }
-
-        let mut merged = seq_a.clone();
-        merged.merge(seq_b.clone());
-
-        for r in removed {
-            seq_a.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-            seq_b.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-        }
-        let mut iter_a = seq_a.iter_ids();
-        let mut iter_b = seq_b.iter_ids();
-        let mut next_a = iter_a.next();
-        let mut next_b = iter_b.next();
-
-        for id in merged.iter_ids() {
-            if Some(id) == next_a {
-                next_a = iter_a.next();
-            }
-            if Some(id) == next_b {
-                next_b = iter_b.next();
-            }
-        }
-        assert_eq!(next_a, None);
-        assert_eq!(next_b, None);
+        check_order_is_stable(&a, &b);
     }
 
     #[test]
     fn test_order_is_stable_minimal() {
-        // Failing case from quickcheck: a = [], b = [(true, 0, '\0'), (true, 0, '\0'), (true, 2, '\0')]
-        let a: Vec<(bool, u8, char)> = vec![];
-        let b = [(true, 0, '\0'), (true, 0, '\0'), (true, 2, '\0')];
-
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-        let mut removed = BTreeSet::new();
-
-        for (insert_or_remove, idx, elem) in a {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    seq_a.insert(idx.min(seq_a.len()), elem);
-                }
-                false => {
-                    if !seq_a.is_empty() {
-                        let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
-                        seq_a.remove(idx);
-                    }
-                }
-            }
-        }
-
-        for (insert_or_remove, idx, elem) in b.iter() {
-            let idx = *idx as usize;
-            match insert_or_remove {
-                true => {
-                    let insert_idx = idx.min(seq_b.len());
-                    seq_b.insert(insert_idx, *elem);
-                }
-                false => {
-                    if !seq_b.is_empty() {
-                        let idx = idx.min(seq_b.len() - 1);
-                        removed.insert(*seq_b.iter_ids().nth(idx).unwrap());
-                        seq_b.remove(idx);
-                    }
-                }
-            }
-        }
-
-        let mut merged = seq_a.clone();
-        merged.merge(seq_b.clone());
-
-        for r in removed {
-            seq_a.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-            seq_b.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-        }
-
-        let mut iter_a = seq_a.iter_ids();
-        let mut iter_b = seq_b.iter_ids();
-        let mut next_a = iter_a.next();
-        let mut next_b = iter_b.next();
-
-        for id in merged.iter_ids() {
-            if Some(id) == next_a {
-                next_a = iter_a.next();
-            }
-            if Some(id) == next_b {
-                next_b = iter_b.next();
-            }
-        }
-
-        assert_eq!(next_a, None);
-        assert_eq!(next_b, None);
+        // Failing case from quickcheck
+        check_order_is_stable(&[], &[(true, 0, '\0'), (true, 0, '\0'), (true, 2, '\0')]);
     }
 
     #[test]
     fn test_order_is_stable_4_inserts() {
-        // Failing case: a = [], b = [(true, 0, '\0'), (true, 1, '\0'), (true, 1, '\0'), (true, 2, '\0')]
-        let a: Vec<(bool, u8, char)> = vec![];
-        let b = [
-            (true, 0, '\0'),
-            (true, 1, '\0'),
-            (true, 1, '\0'),
-            (true, 2, '\0'),
-        ];
-
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-        let mut removed = BTreeSet::new();
-
-        for (insert_or_remove, idx, elem) in a {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    seq_a.insert(idx.min(seq_a.len()), elem);
-                }
-                false => {
-                    if !seq_a.is_empty() {
-                        let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
-                        seq_a.remove(idx);
-                    }
-                }
-            }
-        }
-
-        for (insert_or_remove, idx, elem) in b.iter() {
-            let idx = *idx as usize;
-            match insert_or_remove {
-                true => {
-                    let insert_idx = idx.min(seq_b.len());
-                    seq_b.insert(insert_idx, *elem);
-                }
-                false => {
-                    if !seq_b.is_empty() {
-                        let idx = idx.min(seq_b.len() - 1);
-                        removed.insert(*seq_b.iter_ids().nth(idx).unwrap());
-                        seq_b.remove(idx);
-                    }
-                }
-            }
-        }
-
-        let mut merged = seq_a.clone();
-        merged.merge(seq_b.clone());
-
-        for r in removed {
-            seq_a.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-            seq_b.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-        }
-
-        let mut iter_a = seq_a.iter_ids();
-        let mut iter_b = seq_b.iter_ids();
-        let mut next_a = iter_a.next();
-        let mut next_b = iter_b.next();
-
-        for id in merged.iter_ids() {
-            if Some(id) == next_a {
-                next_a = iter_a.next();
-            }
-            if Some(id) == next_b {
-                next_b = iter_b.next();
-            }
-        }
-
-        assert_eq!(next_a, None);
-        assert_eq!(next_b, None);
+        // Failing case from quickcheck
+        check_order_is_stable(
+            &[],
+            &[
+                (true, 0, '\0'),
+                (true, 1, '\0'),
+                (true, 1, '\0'),
+                (true, 2, '\0'),
+            ],
+        );
     }
 
     #[test]
     fn test_order_is_stable_remove_then_insert() {
-        // Failing case: a = [], b = [(true, 0, '\0'), (true, 1, '\0'), (true, 2, '\0'), (false, 2, '\0'), (true, 2, '\u{97}')]
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-
-        // seq_a remains empty (a = [])
-
-        // seq_b operations:
-        seq_b.insert(0, '\0');
-        seq_b.insert(1, '\0');
-        seq_b.insert(2, '\0');
-
-        // (false, 2, '\0') - remove at index 2
-        let removed_id = *seq_b.iter_ids().nth(2).unwrap();
-        seq_b.remove(2);
-
-        // (true, 2, '\u{97}') - insert at index 2
-        seq_b.insert(2, '\u{97}');
-
-        let mut merged = seq_a.clone();
-        merged.merge(seq_b.clone());
-
-        seq_a.apply(HashNode {
-            op: Op::Remove(BTreeSet::from_iter([removed_id])),
-            extra_dependencies: BTreeSet::new(),
-        });
-
-        let mut iter_a = seq_a.iter_ids();
-        let mut iter_b = seq_b.iter_ids();
-        let mut next_a = iter_a.next();
-        let mut next_b = iter_b.next();
-
-        for id in merged.iter_ids() {
-            if Some(id) == next_a {
-                next_a = iter_a.next();
-            }
-            if Some(id) == next_b {
-                next_b = iter_b.next();
-            }
-        }
-
-        assert_eq!(next_a, None);
-        assert_eq!(next_b, None);
+        // Failing case from quickcheck
+        check_order_is_stable(
+            &[],
+            &[
+                (true, 0, '\0'),
+                (true, 1, '\0'),
+                (true, 2, '\0'),
+                (false, 2, '\0'),
+                (true, 2, '\u{97}'),
+            ],
+        );
     }
 
     #[test]
     fn test_order_is_stable_with_removes() {
-        // Failing case: a = [], b = [(true, 0, '\0'), (true, 1, '\0'), (true, 1, '\0'), (false, 0, '\0'), (false, 1, '\0')]
-        let a: Vec<(bool, u8, char)> = vec![];
-        let b = [
-            (true, 0, '\0'),
-            (true, 1, '\0'),
-            (true, 1, '\0'),
-            (false, 0, '\0'),
-            (false, 1, '\0'),
-        ];
-
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-        let mut removed = BTreeSet::new();
-
-        for (insert_or_remove, idx, elem) in a {
-            let idx = idx as usize;
-            match insert_or_remove {
-                true => {
-                    seq_a.insert(idx.min(seq_a.len()), elem);
-                }
-                false => {
-                    if !seq_a.is_empty() {
-                        let idx = idx.min(seq_a.len() - 1);
-                        removed.insert(*seq_a.iter_ids().nth(idx).unwrap());
-                        seq_a.remove(idx);
-                    }
-                }
-            }
-        }
-
-        for (insert_or_remove, idx, elem) in b.iter() {
-            let idx = *idx as usize;
-            match insert_or_remove {
-                true => {
-                    let insert_idx = idx.min(seq_b.len());
-                    seq_b.insert(insert_idx, *elem);
-                }
-                false => {
-                    if !seq_b.is_empty() {
-                        let idx = idx.min(seq_b.len() - 1);
-                        let removed_id = seq_b.iter_ids().nth(idx).unwrap();
-                        removed.insert(*removed_id);
-                        seq_b.remove(idx);
-                    }
-                }
-            }
-        }
-
-        let mut merged = seq_a.clone();
-        merged.merge(seq_b.clone());
-
-        for r in removed {
-            seq_a.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-            seq_b.apply(HashNode {
-                op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
-            });
-        }
-
-        let mut iter_a = seq_a.iter_ids();
-        let mut iter_b = seq_b.iter_ids();
-        let mut next_a = iter_a.next();
-        let mut next_b = iter_b.next();
-
-        for id in merged.iter_ids() {
-            if Some(id) == next_a {
-                next_a = iter_a.next();
-            }
-            if Some(id) == next_b {
-                next_b = iter_b.next();
-            }
-        }
-
-        assert_eq!(next_a, None);
-        assert_eq!(next_b, None);
+        // Failing case from quickcheck
+        check_order_is_stable(
+            &[],
+            &[
+                (true, 0, '\0'),
+                (true, 1, '\0'),
+                (true, 1, '\0'),
+                (false, 0, '\0'),
+                (false, 1, '\0'),
+            ],
+        );
     }
 
     #[test]
