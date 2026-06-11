@@ -12,6 +12,49 @@ pub type IdMap<V> = FxHashMap<Id, V>;
 /// HashSet of `Id`. Same FxHash rationale as `IdMap`.
 pub type IdSet = FxHashSet<Id>;
 
+/// The `Id -> NodeIdx` intern map, keyed by the id's u64 prefix instead of the
+/// full 32 bytes. `Id` is BLAKE3 output, so the prefix is effectively a
+/// perfect hash; a prefix hit is verified against `ids[idx]`, which makes
+/// lookups exact — a true prefix collision just fails verification and falls
+/// through to the `spill` map of full-key entries (expected to stay empty:
+/// ~N²/2⁶⁴ chance per pair, and harmless when it does fire).
+#[derive(Debug, Default, Clone)]
+struct IdIndex {
+    prefix: FxHashMap<u64, NodeIdx>,
+    spill: IdMap<NodeIdx>,
+}
+
+fn id_prefix(id: &Id) -> u64 {
+    u64::from_le_bytes(id.0[..8].try_into().expect("Id has 32 bytes"))
+}
+
+impl IdIndex {
+    /// `ids` is the `NodeIdx -> Id` table used to verify prefix hits.
+    fn get(&self, id: &Id, ids: &[Id]) -> Option<NodeIdx> {
+        let idx = *self.prefix.get(&id_prefix(id))?;
+        if ids[idx.0 as usize] == *id {
+            Some(idx)
+        } else {
+            self.spill.get(id).copied()
+        }
+    }
+
+    fn insert(&mut self, id: Id, idx: NodeIdx, ids: &[Id]) {
+        match self.prefix.entry(id_prefix(&id)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(idx);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if ids[e.get().0 as usize] == id {
+                    e.insert(idx);
+                } else {
+                    self.spill.insert(id, idx);
+                }
+            }
+        }
+    }
+}
+
 /// Compact handle for an applied node. Handles are allocated densely in local
 /// apply order, so `Vec`s indexed by `NodeIdx` replace `Id`-keyed maps for
 /// everything but the single interning map.
@@ -210,7 +253,7 @@ pub struct CausalRoot {
 #[derive(Debug, Default, Clone)]
 pub struct HashSeq {
     // ---- id <-> handle interning: the only Id-keyed lookup structure ----
-    id_to_idx: IdMap<NodeIdx>,
+    id_to_idx: IdIndex,
     /// NodeIdx -> Id (append-only).
     pub ids: Vec<Id>,
     /// NodeIdx -> location.
@@ -264,12 +307,17 @@ impl HashSeq {
         self.ids.push(id);
         self.locs.push(loc);
         self.removed.push(false);
-        self.id_to_idx.insert(id, idx);
+        self.id_to_idx.insert(id, idx, &self.ids);
         idx
     }
 
     pub fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
-        self.id_to_idx.get(id).copied()
+        self.id_to_idx.get(id, &self.ids)
+    }
+
+    /// `idx_of` for ids that are known to be interned.
+    fn idx_of_known(&self, id: &Id) -> NodeIdx {
+        self.idx_of(id).expect("id was interned")
     }
 
     pub fn id_of(&self, idx: NodeIdx) -> Id {
@@ -290,7 +338,7 @@ impl HashSeq {
 
     /// Check if a node ID exists (insert, remove, or root) — one map probe.
     pub fn contains_node(&self, id: &Id) -> bool {
-        self.id_to_idx.contains_key(id)
+        self.idx_of(id).is_some()
     }
 
     pub(crate) fn char_at(&self, idx: NodeIdx) -> char {
@@ -335,7 +383,7 @@ impl HashSeq {
         explicit
             .into_iter()
             .flatten()
-            .map(|id| self.id_to_idx[id])
+            .map(|id| self.idx_of_known(id))
             .chain(from_run)
     }
 
@@ -345,7 +393,7 @@ impl HashSeq {
             .get(&idx)
             .into_iter()
             .flatten()
-            .map(|id| self.id_to_idx[id])
+            .map(|id| self.idx_of_known(id))
     }
 
     /// Ids that come after `id`: explicit forks (Id-ordered) or the run
@@ -506,10 +554,10 @@ impl HashSeq {
             .root_nodes
             .keys()
             .filter(|id| *id >= &root_id)
-            .find(|id| !self.removed[self.id_to_idx[*id].0 as usize])
+            .find(|id| !self.removed[self.idx_of_known(id).0 as usize])
         {
             // new root is inserted just before the next biggest root
-            self.index.find(&self.id_to_idx[next_root]).unwrap()
+            self.index.find(&self.idx_of_known(next_root)).unwrap()
         } else {
             // otherwise if there is no bigger root, the new root is
             // inserted at end of list
@@ -521,7 +569,7 @@ impl HashSeq {
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
         // The anchor is a checked dependency, so it is interned.
-        let anchor = self.id_to_idx[&after.anchor];
+        let anchor = self.idx_of_known(&after.anchor);
 
         // Fast path: extend the run whose tail is the anchor.
         if after.extra_dependencies.is_empty()
@@ -546,7 +594,7 @@ impl HashSeq {
         let next_node = if let Some(siblings) = self.afters.get(&anchor) {
             siblings
                 .range(&id..)
-                .map(|aid| self.id_to_idx[aid])
+                .map(|aid| self.idx_of_known(aid))
                 .find(|a| !self.removed[a.0 as usize])
         } else {
             self.afters_of(anchor)
@@ -631,7 +679,7 @@ impl HashSeq {
         // Targets are checked dependencies of the remove, so they are interned.
         // (A remove targeting a non-insert node is harmless: it's not in the
         // position index, and its tombstone bit is inert.)
-        let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.id_to_idx[t]).collect();
+        let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.idx_of_known(t)).collect();
         for t in &targets {
             if let Some(p) = self.index.find(t) {
                 self.index.remove(p);
@@ -682,7 +730,7 @@ impl HashSeq {
 
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
         // The anchor is a checked dependency, so it is interned.
-        let anchor = self.id_to_idx[&before.anchor];
+        let anchor = self.idx_of_known(&before.anchor);
 
         // O(log n) range seek into the underlying BTreeSet, no intermediate allocation.
         let position = if let Some(next_node) = self
@@ -690,7 +738,7 @@ impl HashSeq {
             .get(&anchor)
             .and_then(|s| {
                 s.range(id..)
-                    .map(|n| self.id_to_idx[n])
+                    .map(|n| self.idx_of_known(n))
                     .find(|n| !self.removed[n.0 as usize])
             })
         {
