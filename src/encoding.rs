@@ -436,8 +436,18 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // the first synthesize extra_deps = {previous remove id} — exactly the deps
     // those links carry, so decode reconstructs identical nodes.
 
-    let mut orphans: Vec<&HashNode> = seq.orphaned.iter().collect();
-    orphans.sort_by_key(|n| n.id());
+    // Orphans are parked as (id, node) keyed by missing dep; sort by the
+    // precomputed node id for deterministic bytes (no rehashing).
+    let orphans: Vec<&HashNode> = {
+        let mut parked: Vec<(&Id, &HashNode)> = seq
+            .orphaned
+            .values()
+            .flatten()
+            .map(|(id, node)| (id, node))
+            .collect();
+        parked.sort_by_key(|(id, _)| **id);
+        parked.into_iter().map(|(_, node)| node).collect()
+    };
 
     /// Where a remove target lives in the encoded layout.
     enum TargetRef {

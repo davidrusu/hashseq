@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -275,9 +275,17 @@ pub struct HashSeq {
     pub afters: FxHashMap<NodeIdx, BTreeSet<Id>>,
 
     pub(crate) tips: BTreeSet<Id>,
-    // orphaned uses HashNode as key (not Id), so keep std HashSet — the input is
-    // adversary-controllable and benefits from SipHash's HashDoS protection.
-    pub(crate) orphaned: HashSet<HashNode>,
+    /// Ops waiting on a dependency, keyed by *one* missing dep id (the first
+    /// found): applying that id wakes exactly these waiters — no global
+    /// retries. A waiter still missing more deps is re-parked on the next
+    /// one. Values carry the precomputed node id so wakes don't rehash.
+    ///
+    /// Keys are adversary-chosen bytes (an op can name any id as a dep), so
+    /// this stays a std `HashMap` for SipHash's HashDoS protection — unlike
+    /// `orphan_ids`, whose keys we computed ourselves with BLAKE3.
+    pub(crate) orphaned: HashMap<Id, Vec<(Id, HashNode)>>,
+    /// Ids of all parked orphans: dedups network re-delivery while parked.
+    orphan_ids: IdSet,
     index: RunIndex,
 }
 
@@ -314,7 +322,8 @@ impl HashSeq {
             remove_runs: FxHashMap::default(),
             afters: FxHashMap::default(),
             tips: BTreeSet::new(),
-            orphaned: HashSet::new(),
+            orphaned: HashMap::new(),
+            orphan_ids: IdSet::default(),
             index: RunIndex::default(),
         };
         // The origin is an axiom: present (so anchoring at it always
@@ -397,8 +406,8 @@ impl HashSeq {
         self.index.is_empty()
     }
 
-    pub fn orphans(&self) -> &HashSet<HashNode> {
-        &self.orphaned
+    pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
+        self.orphaned.values().flatten().map(|(_, node)| node)
     }
 
     // ---- causal adjacency (handle space) ----
@@ -610,16 +619,6 @@ impl HashSeq {
         let node_for_return = node.clone();
         self.apply(node);
         Some(node_for_return)
-    }
-
-    fn any_missing_dependencies<'a>(&self, deps: impl IntoIterator<Item = &'a Id>) -> bool {
-        for dep in deps {
-            if !self.contains_node(dep) {
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Insert `idx`'s fresh span directly before node `el` in the index.
@@ -864,15 +863,44 @@ impl HashSeq {
         self.apply_with_id(id, node);
     }
 
-    /// Apply a node with a pre-computed ID (avoids double hashing)
+    /// Apply a node with a pre-computed ID (avoids double hashing).
+    ///
+    /// Iterative worklist, no recursion: applying a node wakes exactly the
+    /// orphans parked on its id (which may re-park on their next missing
+    /// dep), so out-of-order delivery costs each node one park per missing
+    /// dep instead of a global retry per apply.
     fn apply_with_id(&mut self, id: Id, node: HashNode) {
         if self.contains_node(&id) {
             return; // Already processed this node
         }
+        if !self.orphan_ids.is_empty() && self.orphan_ids.contains(&id) {
+            return; // Already parked, waiting on a dependency
+        }
 
-        if self.any_missing_dependencies(node.iter_dependencies()) {
-            self.orphaned.insert(node);
+        // `queue` only allocates when an apply actually wakes parked orphans;
+        // the common case (sequential typing, nothing parked) stays
+        // allocation-free and dispatches `node` directly.
+        let mut queue: Vec<(Id, HashNode)> = Vec::new();
+        self.park_or_dispatch(id, node, &mut queue);
+        while let Some((id, node)) = queue.pop() {
+            self.park_or_dispatch(id, node, &mut queue);
+        }
+    }
+
+    /// One step of the apply worklist: park `node` on its first missing dep,
+    /// or apply it and push any orphans waiting on it onto `queue`.
+    fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
+        let missing = node
+            .iter_dependencies()
+            .find(|d| !self.contains_node(d))
+            .copied();
+        if let Some(missing) = missing {
+            self.orphan_ids.insert(id);
+            self.orphaned.entry(missing).or_default().push((id, node));
             return;
+        }
+        if !self.orphan_ids.is_empty() {
+            self.orphan_ids.remove(&id);
         }
 
         // Update tips before consuming node (insert ops don't depend on tips)
@@ -901,8 +929,11 @@ impl HashSeq {
             Op::Remove(nodes) => self.apply_remove(id, node.extra_dependencies, nodes),
         }
 
-        for orphan in std::mem::take(&mut self.orphaned) {
-            self.apply(orphan);
+        // Wake the orphans waiting on this id.
+        if !self.orphaned.is_empty()
+            && let Some(waiting) = self.orphaned.remove(&id)
+        {
+            queue.extend(waiting);
         }
     }
 
@@ -961,9 +992,9 @@ impl HashSeq {
             self.apply(node)
         }
 
-        // Apply all orphaned nodes
-        for orphan in other.orphaned {
-            self.apply(orphan);
+        // Apply all orphaned nodes (ids were computed when they were parked)
+        for (id, orphan) in other.orphaned.into_values().flatten() {
+            self.apply_with_id(id, orphan);
         }
     }
 
@@ -1531,7 +1562,7 @@ mod test {
             extra_dependencies: BTreeSet::default(),
         });
 
-        assert_eq!(seq.orphans().len(), 1);
+        assert_eq!(seq.orphans().count(), 1);
         assert_eq!(seq.len(), 0);
 
         seq.apply(HashNode {
@@ -1539,12 +1570,12 @@ mod test {
             extra_dependencies: BTreeSet::default(),
         });
 
-        assert_eq!(seq.orphans().len(), 2);
+        assert_eq!(seq.orphans().count(), 2);
         assert_eq!(seq.len(), 0);
 
         seq.apply(insert);
 
-        assert_eq!(seq.orphans().len(), 0);
+        assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.len(), 3);
 
         assert_eq!(&String::from_iter(seq.iter()), "aba");
@@ -1568,9 +1599,9 @@ mod test {
             extra_dependencies: BTreeSet::new(),
         });
 
-        assert_eq!(seq.orphans().len(), 1);
+        assert_eq!(seq.orphans().count(), 1);
         seq.apply(insert);
-        assert_eq!(seq.orphans().len(), 0);
+        assert_eq!(seq.orphans().count(), 0);
         assert_eq!(&String::from_iter(seq.iter()), "");
     }
 
@@ -1787,6 +1818,63 @@ mod test {
         check_index_matches_iter(&seq);
         apply_ops(&mut seq, &after);
         check_index_matches_iter(&seq);
+    }
+
+    /// Orphan buffering is keyed by missing dep with an iterative worklist:
+    /// a long causal chain delivered in reverse must apply without recursion
+    /// (the old retry-everything drain recursed once per chain link) and in
+    /// roughly linear work (it retried every orphan on every apply).
+    #[test]
+    fn reverse_delivered_chain_applies_iteratively() {
+        let n = 10_000;
+        let mut nodes = Vec::with_capacity(n);
+        let mut prev = Id::default();
+        for _ in 0..n {
+            let node = HashNode {
+                extra_dependencies: BTreeSet::new(),
+                op: Op::InsertAfter(prev, 'x'),
+            };
+            prev = node.id();
+            nodes.push(node);
+        }
+
+        let mut seq = HashSeq::default();
+        for node in nodes.into_iter().rev() {
+            seq.apply(node);
+        }
+        assert_eq!(seq.orphans().count(), 0);
+        assert_eq!(seq.len(), n);
+    }
+
+    /// An orphan missing several deps re-parks on the next missing dep as
+    /// they arrive — in either arrival order.
+    #[test]
+    fn orphan_reparks_until_all_deps_arrive() {
+        let a = HashNode {
+            extra_dependencies: BTreeSet::new(),
+            op: Op::InsertAfter(Id::default(), 'a'),
+        };
+        let b = HashNode {
+            extra_dependencies: BTreeSet::new(),
+            op: Op::InsertAfter(Id::default(), 'b'),
+        };
+        // depends on both: anchored at a, extra dep on b
+        let c = HashNode {
+            extra_dependencies: BTreeSet::from_iter([b.id()]),
+            op: Op::InsertAfter(a.id(), 'c'),
+        };
+
+        for (first, second) in [(a.clone(), b.clone()), (b, a)] {
+            let mut seq = HashSeq::default();
+            seq.apply(c.clone());
+            assert_eq!(seq.orphans().count(), 1);
+            seq.apply(first);
+            assert_eq!(seq.orphans().count(), 1, "still missing one dep");
+            seq.apply(second);
+            assert_eq!(seq.orphans().count(), 0);
+            assert_eq!(seq.len(), 3);
+            assert!(seq.iter().collect::<String>().contains('c'));
+        }
     }
 
     /// Regression: a bigger-id sibling applied after a smaller visible sibling
