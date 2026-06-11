@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -66,13 +66,18 @@ impl IdIndex {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeIdx(pub u32);
 
+/// The virtual origin's handle — always the first interned node.
+pub(crate) const ORIGIN_IDX: NodeIdx = NodeIdx(0);
+
 /// Where an applied node lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Loc {
     /// Element of an insert run: (run head, position within the run).
     Run { run: NodeIdx, pos: u32 },
-    /// Root insert (stored in `root_nodes`).
-    Root,
+    /// The document's virtual origin (`NodeIdx(0)`, interned at construction).
+    /// Never visible, never yielded; it exists so ops can anchor at the
+    /// document itself — a "root" insert is just `InsertAfter(origin, ch)`.
+    Origin,
     /// Link in a remove chain: (chain head, position within the chain).
     RemoveChain { chain: NodeIdx, pos: u32 },
     /// Multi-target remove (stored in `remove_nodes`).
@@ -91,9 +96,8 @@ pub enum Loc {
 /// concurrent mutations — and will land in the causally correct position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cursor {
-    /// Insert into an empty sequence (the first char becomes an `InsertRoot`).
-    Root { extra_deps: BTreeSet<Id> },
-    /// Insert immediately after `anchor`.
+    /// Insert immediately after `anchor`. In an empty sequence the anchor is
+    /// the document origin.
     After {
         anchor: Id,
         extra_deps: BTreeSet<Id>,
@@ -112,7 +116,6 @@ impl Cursor {
     /// Subsequent chars of a burst chain `InsertAfter` from this node.
     pub fn first_node(self, ch: char) -> HashNode {
         let (extra_dependencies, op) = match self {
-            Cursor::Root { extra_deps } => (extra_deps, Op::InsertRoot(ch)),
             Cursor::After { anchor, extra_deps } => (extra_deps, Op::InsertAfter(anchor, ch)),
             Cursor::Before { anchor, extra_deps } => (extra_deps, Op::InsertBefore(anchor, ch)),
         };
@@ -123,17 +126,10 @@ impl Cursor {
     }
 
     /// Build a `Run` starting at this cursor with `first` as its first character.
-    ///
-    /// Returns `None` for a `Root` cursor: runs are anchored ops, while the first
-    /// char of an empty sequence is a standalone `InsertRoot` (apply it via
-    /// `first_node` instead).
-    pub fn into_run(self, first: char) -> Option<Run> {
+    pub fn into_run(self, first: char) -> Run {
         match self {
-            Cursor::Root { .. } => None,
-            Cursor::After { anchor, extra_deps } => Some(Run::new(anchor, extra_deps, first)),
-            Cursor::Before { anchor, extra_deps } => {
-                Some(Run::new_before(anchor, extra_deps, first))
-            }
+            Cursor::After { anchor, extra_deps } => Run::new(anchor, extra_deps, first),
+            Cursor::Before { anchor, extra_deps } => Run::new_before(anchor, extra_deps, first),
         }
     }
 }
@@ -244,14 +240,13 @@ impl StoredRun {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct CausalRoot {
-    pub extra_dependencies: BTreeSet<Id>,
-    pub ch: char,
-}
-
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct HashSeq {
+    /// The document's identity: ops anchor at this id to insert at top level.
+    /// All op hashes transitively commit to it, so documents with different
+    /// origins can never merge. Interned as `NodeIdx(0)`, tombstoned (it is
+    /// virtual and never visible).
+    origin: Id,
     // ---- id <-> handle interning: the only Id-keyed lookup structure ----
     id_to_idx: IdIndex,
     /// NodeIdx -> Id (append-only).
@@ -261,12 +256,11 @@ pub struct HashSeq {
     /// NodeIdx -> tombstone.
     pub removed: Vec<bool>,
 
-    // All inserts except roots live in runs: sequential typing extends a run,
-    // and a lone insert is just a 1-char run. A run is After- or Before-anchored
+    // All inserts live in runs: sequential typing extends a run, and a lone
+    // insert is just a 1-char run. A run is After- or Before-anchored
     // (`StoredRun::first_op`); subsequent elements always chain InsertAfter.
+    // Top-level inserts are runs anchored at `origin` like any other.
     pub runs: FxHashMap<NodeIdx, StoredRun>,
-    /// Root inserts, Id-ordered (root order is a convergence concern).
-    pub root_nodes: BTreeMap<Id, CausalRoot>,
     /// Reverse index: anchor -> heads of Before-runs anchored at it. Values are
     /// Id-ordered: sibling order is a convergence concern, so it must not use
     /// replica-local handles.
@@ -295,7 +289,49 @@ impl PartialEq for HashSeq {
 
 impl Eq for HashSeq {}
 
+/// An anonymous document (all-zero origin). Replicas using `default()`
+/// converge with each other, mirroring the pre-origin behavior.
+impl Default for HashSeq {
+    fn default() -> Self {
+        Self::new(Id::default())
+    }
+}
+
 impl HashSeq {
+    /// Create an empty document identified by `doc_id`. The id is the anchor
+    /// for top-level inserts and is committed to by every op hash; replicas
+    /// must construct with the same `doc_id` to converge.
+    pub fn new(doc_id: Id) -> Self {
+        let mut seq = Self {
+            origin: doc_id,
+            id_to_idx: IdIndex::default(),
+            ids: Vec::new(),
+            locs: Vec::new(),
+            removed: Vec::new(),
+            runs: FxHashMap::default(),
+            befores_by_anchor: FxHashMap::default(),
+            remove_nodes: FxHashMap::default(),
+            remove_runs: FxHashMap::default(),
+            afters: FxHashMap::default(),
+            tips: BTreeSet::new(),
+            orphaned: HashSet::new(),
+            index: RunIndex::default(),
+        };
+        // The origin is an axiom: present (so anchoring at it always
+        // satisfies the dependency check) but tombstoned (never visible, and
+        // the iterator skips it like any removed node).
+        let idx = seq.intern(doc_id, Loc::Origin);
+        debug_assert_eq!(idx, ORIGIN_IDX);
+        seq.removed[ORIGIN_IDX.0 as usize] = true;
+        seq.tips.insert(doc_id);
+        seq
+    }
+
+    /// The document's identity (the anchor of top-level inserts).
+    pub fn origin(&self) -> Id {
+        self.origin
+    }
+
     // ---- interning ----
 
     fn next_idx(&self) -> NodeIdx {
@@ -344,7 +380,6 @@ impl HashSeq {
     pub(crate) fn char_at(&self, idx: NodeIdx) -> char {
         match self.loc_of(idx) {
             Loc::Run { run, pos } => self.runs[&run].char_at(pos as usize),
-            Loc::Root => self.root_nodes[self.id_ref(idx)].ch,
             _ => panic!("char_at on a non-insert node"),
         }
     }
@@ -420,12 +455,10 @@ impl HashSeq {
 
     // ---- position index plumbing ----
 
-    /// The index addresses an insert as (span head, element offset): a run
-    /// element is addressed through its run, a root through itself.
+    /// The index addresses an insert as (run head, element offset).
     fn elem_ref(&self, idx: NodeIdx) -> ElemRef {
         match self.loc_of(idx) {
             Loc::Run { run, pos } => (run, pos),
-            Loc::Root => (idx, 0),
             _ => panic!("elem_ref on a non-insert node"),
         }
     }
@@ -433,10 +466,7 @@ impl HashSeq {
     /// The insert node at visible position `pos`.
     fn element_at(&self, pos: usize) -> Option<NodeIdx> {
         let (head, off) = self.index.get(pos)?;
-        Some(match self.loc_of(head) {
-            Loc::Root => head,
-            _ => self.runs[&head].elements[off as usize],
-        })
+        Some(self.runs[&head].elements[off as usize])
     }
 
     /// First element, in document order, of the region rooted at `n`: a node's
@@ -592,21 +622,26 @@ impl HashSeq {
         false
     }
 
-    fn insert_root(&mut self, root_id: Id, root: CausalRoot) {
-        let idx = self.intern(root_id, Loc::Root);
-        // Roots sit in Id order at the top level, each followed by its
-        // subtree: the new root's region starts directly before the next
-        // biggest root's region (removed or not — its region still occupies
-        // positions). With no bigger root, it goes at the very end.
-        match self.root_nodes.range(root_id..).next() {
-            Some((next_root, _)) => {
-                let first = self.region_first(self.idx_of_known(next_root));
+    /// Insert `idx`'s fresh span directly before node `el` in the index.
+    /// `el` may be the virtual origin, whose "position" is the start of its
+    /// afters region (the origin's own befores precede that point).
+    fn index_insert_before_node(&mut self, el: NodeIdx, idx: NodeIdx) {
+        if el != ORIGIN_IDX {
+            let at = self.elem_ref(el);
+            self.index.insert_span_before(at, idx);
+            return;
+        }
+        match self.afters.get(&ORIGIN_IDX).and_then(|s| s.first()) {
+            Some(first) => {
+                let first = self.region_first(self.idx_of_known(first));
                 let at = self.elem_ref(first);
                 self.index.insert_span_before(at, idx);
             }
+            // No top-level inserts yet: everything in the document (befores
+            // of the origin, if any) precedes the origin, so "directly
+            // before the origin" is the very end.
             None => self.index.push_span_back(idx),
         }
-        self.root_nodes.insert(root_id, root);
     }
 
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
@@ -682,10 +717,15 @@ impl HashSeq {
         // Resolve the target element only now: the split above may have
         // relocated it into the right-hand run.
         let (el, before) = target;
-        let at = self.elem_ref(el);
         if before {
-            self.index.insert_span_before(at, idx);
+            self.index_insert_before_node(el, idx);
+        } else if el == ORIGIN_IDX {
+            // subtree_last(origin) returned the origin itself: no top-level
+            // inserts exist yet, so the new span is the last (and first)
+            // visible content after any origin-befores.
+            self.index.push_span_back(idx);
         } else {
+            let at = self.elem_ref(el);
             self.index.insert_span_after(at, idx);
         }
     }
@@ -725,14 +765,9 @@ impl HashSeq {
         // position index, and its tombstone bit is inert.)
         let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.idx_of_known(t)).collect();
         for t in &targets {
-            match self.loc_of(*t) {
-                Loc::Run { run, pos } => {
-                    self.index.remove_element((run, pos));
-                }
-                Loc::Root => {
-                    self.index.remove_element((*t, 0));
-                }
-                _ => {} // removes targeting non-inserts are inert
+            // Removes targeting non-inserts have no index entry and are inert.
+            if let Loc::Run { run, pos } = self.loc_of(*t) {
+                self.index.remove_element((run, pos));
             }
             self.removed[t.0 as usize] = true;
         }
@@ -821,8 +856,7 @@ impl HashSeq {
 
         self.befores_by_anchor.entry(anchor).or_default().insert(id);
 
-        let at = self.elem_ref(target);
-        self.index.insert_span_before(at, idx);
+        self.index_insert_before_node(target, idx);
     }
 
     pub fn apply(&mut self, node: HashNode) {
@@ -848,13 +882,6 @@ impl HashSeq {
         self.tips.insert(id);
 
         match node.op {
-            Op::InsertRoot(ch) => self.insert_root(
-                id,
-                CausalRoot {
-                    extra_dependencies: node.extra_dependencies,
-                    ch,
-                },
-            ),
             Op::InsertAfter(anchor, ch) => self.insert_after(
                 id,
                 CausalInsert {
@@ -899,14 +926,10 @@ impl HashSeq {
         // Simple merge: decompress all nodes from other and apply them
         // The apply function will rebuild runs when possible
 
-        for (id, root) in &other.root_nodes {
-            let node = HashNode {
-                extra_dependencies: root.extra_dependencies.clone(),
-                op: Op::InsertRoot(root.ch),
-            };
-            debug_assert_eq!(*id, node.id());
-            self.apply(node)
-        }
+        assert_eq!(
+            self.origin, other.origin,
+            "cannot merge documents with different origins"
+        );
 
         // Covers both After- and Before-anchored runs: decompress reconstructs
         // the anchoring first node for either kind.
@@ -966,8 +989,7 @@ impl HashSeq {
         let idx = self.idx_of(id)?;
         let at = match self.loc_of(idx) {
             Loc::Run { run, pos } => (run, pos),
-            Loc::Root => (idx, 0),
-            _ => return None, // remove nodes have no position
+            _ => return None, // the origin and remove nodes have no position
         };
         self.index.position_of(at)
     }
@@ -984,8 +1006,8 @@ impl HashSeq {
     /// `InsertBefore(right)` so the insert has an explicit ordering constraint and
     /// doesn't get hash-ordered into a fork. Otherwise it uses `InsertAfter(left)`.
     /// At the start of a non-empty sequence, returns a `Before(id_at(0))` cursor.
-    /// In an empty sequence, returns a `Root` cursor. Returns `None` only when
-    /// `idx` is out of bounds (> len).
+    /// In an empty sequence, returns an `After(origin)` cursor. Returns `None`
+    /// only when `idx` is out of bounds (> len).
     pub fn cursor_at(&self, idx: usize) -> Option<Cursor> {
         if idx > self.len() {
             return None;
@@ -1020,8 +1042,9 @@ impl HashSeq {
                     anchor,
                 })
             }
-            (None, None) => Some(Cursor::Root {
-                extra_deps: self.tips.clone(),
+            (None, None) => Some(Cursor::After {
+                extra_deps: self.tips_minus(&self.origin),
+                anchor: self.origin,
             }),
         }
     }
@@ -1261,18 +1284,11 @@ mod test {
             "tips should be identical after merge"
         );
 
-        // Verify the structure is as expected:
-        // - Should have 1 root node for 'a'
-        assert_eq!(
-            seq_with_abcd.root_nodes.len(),
-            1,
-            "Should have 1 individual node (root 'a')"
-        );
-
-        // - Should have 1 run containing "bcd"
+        // Verify the structure is as expected: one origin-anchored run
+        // containing the whole batch.
         assert_eq!(seq_with_abcd.runs.len(), 1, "Should have 1 run");
         let run = seq_with_abcd.runs.values().next().unwrap();
-        assert_eq!(run.text, "bcd", "Run should contain 'bcd'");
+        assert_eq!(run.text, "abcd", "Run should contain 'abcd'");
 
         // Verify the text is correct
         assert_eq!(seq_with_abcd.iter().collect::<String>(), "abcd");
@@ -1345,7 +1361,6 @@ mod test {
 
         // Verify internal structures are identical
         assert_eq!(seq1.runs, seq2.runs);
-        assert_eq!(seq1.root_nodes, seq2.root_nodes);
         assert_eq!(seq1.befores_by_anchor, seq2.befores_by_anchor);
         assert_eq!(seq1.remove_nodes, seq2.remove_nodes);
         assert_eq!(seq1.tips, seq2.tips);
@@ -1357,19 +1372,17 @@ mod test {
     fn test_run_creation() {
         let mut seq = HashSeq::default();
 
-        // Single characters should create individual nodes
+        // A single character is a 1-char origin-anchored run
         seq.insert(0, 'x');
-        assert_eq!(seq.runs.len(), 0);
-        assert_eq!(seq.root_nodes.len(), 1);
+        assert_eq!(seq.runs.len(), 1);
 
-        // Multi-character batch should create a run
+        // A batch typed after it extends the same run
         seq.insert_batch(1, "abc".chars());
         assert_eq!(seq.runs.len(), 1);
-        assert_eq!(seq.root_nodes.len(), 1);
 
         // Verify the run contains the right data
         let run = seq.runs.values().next().unwrap();
-        assert_eq!(run.text, "abc");
+        assert_eq!(run.text, "xabc");
 
         // Verify the final string
         assert_eq!(&seq.iter().collect::<String>(), "xabc");
@@ -1383,12 +1396,11 @@ mod test {
         let long_string = "The quick brown fox jumps over the lazy dog. ".repeat(10);
         seq.insert_batch(0, long_string.chars());
 
-        // Should create one run
+        // Should create one run holding the entire string
         assert_eq!(seq.runs.len(), 1);
-        assert_eq!(seq.root_nodes.len(), 1);
 
         let run = seq.runs.values().next().unwrap();
-        assert_eq!(run.len(), long_string.len() - 1); // First char becomes a root (not included in run)
+        assert_eq!(run.len(), long_string.len());
 
         // Verify content
         assert_eq!(seq.iter().collect::<String>(), long_string);
@@ -1402,9 +1414,20 @@ mod test {
         seq_a.insert_batch(0, "we wrote".chars());
         seq_b.insert_batch(0, "this together ".chars());
 
-        seq_a.merge(seq_b);
+        let mut merged_ab = seq_a.clone();
+        merged_ab.merge(seq_b.clone());
+        let mut merged_ba = seq_b.clone();
+        merged_ba.merge(seq_a);
 
-        assert_eq!(&seq_a.iter().collect::<String>(), "this together we wrote");
+        // Concurrent top-level runs land whole (no interleaving), in
+        // id-determined order — the same on every replica.
+        let text: String = merged_ab.iter().collect();
+        assert!(
+            text == "we wrotethis together " || text == "this together we wrote",
+            "concurrent runs must not interleave: {text:?}"
+        );
+        assert_eq!(merged_ab, merged_ba);
+        assert_eq!(text, merged_ba.iter().collect::<String>());
     }
 
     #[test]
@@ -1499,7 +1522,7 @@ mod test {
         let mut seq = HashSeq::default();
 
         let insert = HashNode {
-            op: Op::InsertRoot('b'),
+            op: Op::InsertAfter(seq.origin(), 'b'),
             extra_dependencies: BTreeSet::default(),
         };
 
@@ -1536,7 +1559,7 @@ mod test {
         // once we see the insert.
 
         let insert = HashNode {
-            op: Op::InsertRoot('a'),
+            op: Op::InsertAfter(seq.origin(), 'a'),
             extra_dependencies: BTreeSet::new(),
         };
 
@@ -1773,7 +1796,7 @@ mod test {
     fn index_orders_concurrent_siblings_like_the_iterator() {
         let root = HashNode {
             extra_dependencies: BTreeSet::new(),
-            op: Op::InsertRoot('a'),
+            op: Op::InsertAfter(Id::default(), 'a'),
         };
         let a = root.id();
         for (c1, c2) in [('b', 'c'), ('x', 'y')] {
@@ -2214,16 +2237,15 @@ mod test {
     #[test]
     fn test_runs_basic() {
         let mut seq = HashSeq::default();
-        seq.insert(0, 'a'); // This is a root, not in runs
-        seq.insert(1, 'b'); // This starts a run
+        seq.insert(0, 'a'); // This starts an origin-anchored run
+        seq.insert(1, 'b'); // This extends the run
         seq.insert(2, 'c'); // This extends the run
 
-        // First character is a root, remaining two should be in a single run
-        assert_eq!(seq.root_nodes.len(), 1);
+        // All three characters land in a single run
         assert_eq!(seq.runs.len(), 1);
         let run = seq.runs.values().next().unwrap();
-        assert_eq!(run.len(), 2);
-        assert_eq!(run.text, "bc");
+        assert_eq!(run.len(), 3);
+        assert_eq!(run.text, "abc");
         assert_eq!(String::from_iter(seq.iter()), "abc");
     }
 
@@ -2263,8 +2285,8 @@ mod test {
     fn test_cursor_at_edges() {
         let seq = HashSeq::default();
         assert!(
-            matches!(seq.cursor_at(0), Some(Cursor::Root { .. })),
-            "empty seq at 0 yields a Root cursor"
+            matches!(seq.cursor_at(0), Some(Cursor::After { anchor, .. }) if anchor == seq.origin()),
+            "empty seq at 0 yields an After(origin) cursor"
         );
 
         let mut seq = HashSeq::default();
@@ -2370,7 +2392,7 @@ mod test {
         assert_eq!(String::from_iter(seq.iter()), "X hello world");
 
         // Build a Before-run from the cursor — anchored to the original ' '.
-        let mut run = cursor.into_run(',').unwrap();
+        let mut run = cursor.into_run(',');
         run.extend('!');
 
         seq.apply_op(EncodableOp::Run(run));
@@ -2392,7 +2414,7 @@ mod test {
         let cursor = seq.cursor_at(5).unwrap();
         assert!(matches!(cursor, Cursor::Before { .. }));
 
-        let mut run = cursor.into_run(' ').unwrap();
+        let mut run = cursor.into_run(' ');
         for ch in "mighty".chars() {
             run.extend(ch);
         }

@@ -19,15 +19,10 @@ impl<'a> HashSeqIdxIter<'a> {
             waiting_stack: Vec::new(),
         };
 
-        // root_nodes is Id-ordered; reverse so .pop() releases ascending.
-        let roots: Vec<NodeIdx> = seq
-            .root_nodes
-            .keys()
-            .map(|id| seq.idx_of(id).unwrap())
-            .collect();
-        for root in roots.into_iter().rev() {
-            iter.push_waiting(root);
-        }
+        // The traversal is simply the origin's release: its befores come
+        // first, the origin itself is tombstoned (skipped), and its afters
+        // are the top-level runs in Id order.
+        iter.push_waiting(crate::hashseq::ORIGIN_IDX);
 
         iter
     }

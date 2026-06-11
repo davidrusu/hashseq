@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::Id;
 
+/// Inserts anchor at another node's id — or at the document's origin id
+/// (`HashSeq::origin`), which is how a document's first characters are
+/// expressed; there is no separate root op.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub enum Op {
-    InsertRoot(char),
     InsertAfter(Id, char),
     InsertBefore(Id, char),
     Remove(BTreeSet<Id>),
@@ -22,7 +24,6 @@ impl Op {
     /// Returns the primary dependency if this op has one (avoids allocation)
     fn primary_dep(&self) -> Option<&Id> {
         match self {
-            Op::InsertRoot(_) => None,
             Op::InsertAfter(dep, _) | Op::InsertBefore(dep, _) => Some(dep),
             Op::Remove(_) => None,
         }
@@ -40,10 +41,6 @@ impl Op {
 
     fn hash_update(&self, hasher: &mut blake3::Hasher) {
         match self {
-            Op::InsertRoot(c) => {
-                hasher.update(b"root");
-                hasher.update(&(*c as u32).to_le_bytes());
-            }
             Op::InsertAfter(n, c) => {
                 hasher.update(b"after");
                 hasher.update(&n.0);

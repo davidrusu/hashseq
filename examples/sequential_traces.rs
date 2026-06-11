@@ -119,14 +119,12 @@ fn run_size_dist(seq: &HashSeq) -> RunSizeDist {
 #[derive(Default)]
 struct ByteBreakdown {
     dict_header: usize,
-    roots: usize,
     runs: usize,
     runs_text: usize,
     befores: usize,
     forward_remove_runs: usize,
     backward_remove_runs: usize,
     single_run_removes: usize,
-    root_removes: usize,
     other_removes: usize,
     orphans: usize,
 }
@@ -181,10 +179,9 @@ fn build_seq(data: &TestData) -> (HashSeq, std::time::Duration) {
 /// once by the body — an unused entry would mean wasted bytes in the encoder.
 fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     // Tag bytes for orphan ops (must match the constants in src/encoding.rs).
-    const TAG_INSERT_ROOT: u8 = 0x01;
+    const TAG_INSERT_AFTER: u8 = 0x01;
     const TAG_INSERT_BEFORE: u8 = 0x02;
     const TAG_REMOVE: u8 = 0x03;
-    const TAG_INSERT_AFTER: u8 = 0x04;
 
     fn read_varint(bytes: &[u8], pos: &mut usize) -> usize {
         let (v, sz) = decode_varint(&bytes[*pos..]).expect("varint");
@@ -222,21 +219,15 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     let mut b = ByteBreakdown::default();
     let mut pos = 0;
 
-    // Dict header: varint(num_ids) + num_ids * 32.
+    // Header: origin id (32 bytes, implicit dict entry 0), then the dict:
+    // varint(num_ids) + num_ids * 32.
     let dict_start = pos;
+    pos += 32; // origin
     let num_ids = read_varint(bytes, &mut pos);
     pos += num_ids * 32;
     b.dict_header = pos - dict_start;
-    let mut referenced: Vec<bool> = vec![false; num_ids];
-
-    // Roots: varint(num) + num * { idx_set extra_deps, utf8 ch }
-    let s = pos;
-    let num_roots = read_varint(bytes, &mut pos);
-    for _ in 0..num_roots {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
-        skip_utf8_char(bytes, &mut pos);
-    }
-    b.roots = pos - s;
+    let mut referenced: Vec<bool> = vec![false; num_ids + 1];
+    referenced[0] = true; // the origin is referenced by definition
 
     // After-runs then Before-runs, both shaped:
     // varint(num) + num * { idx anchor, idx_set first_extra_deps, string run_text }
@@ -289,15 +280,6 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     }
     b.single_run_removes = pos - s;
 
-    // Root-target standalone removes: varint(num) + num * { idx_set extra_deps, varint root_idx }
-    let s = pos;
-    let num_root_rm = read_varint(bytes, &mut pos);
-    for _ in 0..num_root_rm {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
-        skip_varint(bytes, &mut pos); // root_idx (positional)
-    }
-    b.root_removes = pos - s;
-
     // Other removes: varint(num) + num * { idx_set extra_deps, varint n, n * tagged target }
     let s = pos;
     let num_other = read_varint(bytes, &mut pos);
@@ -312,8 +294,7 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
                     skip_varint(bytes, &mut pos); // run_idx
                     skip_varint(bytes, &mut pos); // elem_idx
                 }
-                0x01 => skip_varint(bytes, &mut pos), // root_idx
-                0x02 => skip_idx(bytes, &mut pos, &mut referenced),
+                0x01 => skip_idx(bytes, &mut pos, &mut referenced),
                 other => panic!("unknown remove-target tag: {other:#x}"),
             }
         }
@@ -327,10 +308,6 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
         let tag = bytes[pos];
         pos += 1;
         match tag {
-            TAG_INSERT_ROOT => {
-                skip_idx_set(bytes, &mut pos, &mut referenced);
-                skip_utf8_char(bytes, &mut pos);
-            }
             TAG_INSERT_AFTER | TAG_INSERT_BEFORE => {
                 skip_idx_set(bytes, &mut pos, &mut referenced);
                 skip_idx(bytes, &mut pos, &mut referenced);
@@ -421,16 +398,14 @@ fn memory_breakdown(seq: &HashSeq, total: usize, label: &str) {
     let removes = measure_alloc(|| seq.remove_nodes.clone());
     let remove_runs = measure_alloc(|| seq.remove_runs.clone());
 
-    let roots = measure_alloc(|| seq.root_nodes.clone());
-    let rest =
-        total.saturating_sub(runs + intern + befores + afters + removes + remove_runs + roots);
+    let rest = total.saturating_sub(runs + intern + befores + afters + removes + remove_runs);
     let n_elems: usize = seq.runs.values().map(|r| r.len()).sum();
     let n_removes = seq.remove_nodes.len();
     eprintln!(
         "MEM {label}: total={total} runs={runs} (elements={elements} text={run_strings}) \
          intern_vecs={intern} befores={befores} afters={afters} \
          remove_nodes={removes} remove_runs={remove_runs} \
-         roots={roots} id_map+index+rest={rest} [elems={n_elems} removes={n_removes}]"
+         id_map+index+rest={rest} [elems={n_elems} removes={n_removes}]"
     );
 }
 
@@ -563,36 +538,32 @@ fn main() {
 
     println!("\nEncoded byte breakdown by section");
     println!(
-        "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
         "Trace",
         "Total",
         "Dict",
-        "Roots",
         "Runs",
         "RunText",
         "Befores",
         "RmRunF",
         "RmRunB",
         "RmSing",
-        "RmRoot",
         "RmOther",
     );
-    println!("{}", "-".repeat(140));
+    println!("{}", "-".repeat(120));
     for (name, stats) in &all_stats {
         let b = &stats.breakdown;
         println!(
-            "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "{:<25} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
             name,
             stats.encoded_bytes,
             b.dict_header,
-            b.roots,
             b.runs,
             b.runs_text,
             b.befores,
             b.forward_remove_runs,
             b.backward_remove_runs,
             b.single_run_removes,
-            b.root_removes,
             b.other_removes,
         );
     }
@@ -603,36 +574,24 @@ fn main() {
 
     println!("\nByte breakdown as % of encoding");
     println!(
-        "{:<25} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
-        "Trace",
-        "Dict%",
-        "Roots%",
-        "Runs%",
-        "Text%",
-        "Bef%",
-        "RmRunF%",
-        "RmRunB%",
-        "RmSing%",
-        "RmRoot%",
-        "RmOther%",
+        "{:<25} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "Trace", "Dict%", "Runs%", "Text%", "Bef%", "RmRunF%", "RmRunB%", "RmSing%", "RmOther%",
     );
-    println!("{}", "-".repeat(115));
+    println!("{}", "-".repeat(100));
     for (name, stats) in &all_stats {
         let b = &stats.breakdown;
         let t = stats.encoded_bytes.max(1) as f64;
         let pct = |x: usize| 100.0 * x as f64 / t;
         println!(
-            "{:<25} {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}%",
+            "{:<25} {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}% {:>6.1}%",
             name,
             pct(b.dict_header),
-            pct(b.roots),
             pct(b.runs),
             pct(b.runs_text),
             pct(b.befores),
             pct(b.forward_remove_runs),
             pct(b.backward_remove_runs),
             pct(b.single_run_removes),
-            pct(b.root_removes),
             pct(b.other_removes),
         );
     }

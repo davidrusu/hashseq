@@ -310,20 +310,13 @@ impl WasmHashSeq {
                 out.push_str("]}");
             };
 
-            for (id, root) in &s.root_nodes {
-                emit(
-                    id,
-                    "root",
-                    &root.ch.to_string(),
-                    None,
-                    None,
-                    s.is_removed_id(id),
-                    &resolve_deps(&root.extra_dependencies),
-                );
-            }
             for (head, run) in &s.runs {
                 let head_id = s.id_of(*head);
+                // Origin-anchored runs are the document's top level — emitted
+                // with no anchor, like the old standalone root nodes.
+                let is_top_level = run.anchor == s.origin();
                 let (kind, rel) = match run.first_op {
+                    _ if is_top_level => ("root", "after"),
                     crate::run::FirstOp::After => ("run", "after"),
                     crate::run::FirstOp::Before => ("before", "before"),
                 };
@@ -333,12 +326,17 @@ impl WasmHashSeq {
                     Some(Loc::Run { pos, .. }) => pos as usize,
                     _ => 0,
                 };
+                let anchor = if is_top_level {
+                    None
+                } else {
+                    Some((resolve(&run.anchor), anchor_offset))
+                };
                 emit(
                     &head_id,
                     kind,
                     &run.text,
-                    Some((resolve(&run.anchor), anchor_offset)),
-                    Some(rel),
+                    anchor,
+                    (!is_top_level).then_some(rel),
                     s.is_removed(*head),
                     &resolve_deps(&run.first_extra_deps),
                 );
@@ -349,23 +347,21 @@ impl WasmHashSeq {
         out
     }
 
-    /// Build a `WasmCursor` for inserting at position `idx`, or undefined for the
-    /// empty-sequence case (caller should `insert` directly to create the root).
+    /// Build a `WasmCursor` for inserting at position `idx`, or undefined when
+    /// `idx` is out of bounds. In an empty document the cursor is
+    /// After(origin), so it is always run-buildable.
     #[wasm_bindgen(js_name = cursorAt)]
     pub fn cursor_at(&self, idx: usize) -> Option<WasmCursor> {
-        self.inner.cursor_at(idx).and_then(|cursor| {
+        self.inner.cursor_at(idx).map(|cursor| {
             let (op, anchor, extra_deps) = match cursor {
                 Cursor::After { anchor, extra_deps } => ("after", anchor, extra_deps),
                 Cursor::Before { anchor, extra_deps } => ("before", anchor, extra_deps),
-                // Runs can't be root-anchored, so there is no WasmRun to build
-                // from a Root cursor; the JS side inserts directly instead.
-                Cursor::Root { .. } => return None,
             };
-            Some(WasmCursor {
+            WasmCursor {
                 op: op.to_string(),
                 anchor: id_to_hex(&anchor),
                 extra_deps: extra_deps.iter().map(id_to_hex).collect(),
-            })
+            }
         })
     }
 
@@ -431,16 +427,15 @@ mod tests {
 
         let before = nodes.iter().find(|n| n["kind"] == "before").unwrap();
         assert_eq!(before["text"], " brave");
-        // parent run is "ello world" (after the root 'h'); the anchor ' ' sits at
-        // element offset 4 (e=0, l=1, l=2, o=3, ' '=4)
-        assert_eq!(before["parentOffset"], 4);
+        // parent run is the whole origin-anchored "hello world"; the anchor
+        // ' ' sits at element offset 5
+        assert_eq!(before["parentOffset"], 5);
         assert_eq!(before["rel"], "before");
 
-        let run = nodes.iter().find(|n| n["kind"] == "run").unwrap();
-        assert_eq!(run["text"], "ello world", "parent run must not be split");
-        assert_eq!(before["parent"], run["id"]);
-
+        // The top-level run is reported as a root box: whole, unanchored.
         let root = nodes.iter().find(|n| n["kind"] == "root").unwrap();
-        assert_eq!(root["parentOffset"], serde_json::Value::Null);
+        assert_eq!(root["text"], "hello world", "parent run must not be split");
+        assert_eq!(before["parent"], root["id"]);
+        assert_eq!(root["parent"], serde_json::Value::Null);
     }
 }

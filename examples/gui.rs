@@ -382,16 +382,6 @@ mod hashseq_viz {
                         y: center.y,
                     });
                 }
-                // Check if id is a root node
-                if seq.root_nodes.contains_key(id)
-                    && let Some(center) = nodes.get(id)
-                {
-                    let width = char_width + padding * 2.0;
-                    return Some(Point {
-                        x: center.x + width / 2.0,
-                        y: center.y,
-                    });
-                }
                 // For other individual nodes, use center position
                 get_node_pos(id, nodes)
             };
@@ -415,16 +405,6 @@ mod hashseq_viz {
                     && let Some(center) = nodes.get(&seq.id_of(head))
                 {
                     let width = run.text.chars().count() as f32 * char_width + padding * 2.0;
-                    return Some(Point {
-                        x: center.x - width / 2.0,
-                        y: center.y,
-                    });
-                }
-                // Check if id is a root node
-                if seq.root_nodes.contains_key(id)
-                    && let Some(center) = nodes.get(id)
-                {
-                    let width = char_width + padding * 2.0;
                     return Some(Point {
                         x: center.x - width / 2.0,
                         y: center.y,
@@ -474,12 +454,21 @@ mod hashseq_viz {
                 let mut net_change = 0.0;
 
                 // Process root nodes - stratify concurrent roots into lanes
-                let roots: Vec<Id> = seq.root_nodes.keys().copied().collect();
+                let roots: Vec<Id> = {
+                    let mut r: Vec<Id> = seq
+                        .runs
+                        .iter()
+                        .filter(|(_, run)| run.anchor == seq.origin())
+                        .map(|(head, _)| seq.id_of(*head))
+                        .collect();
+                    r.sort();
+                    r
+                };
                 let num_roots = roots.len();
                 let mut sorted_roots = roots.clone();
                 sorted_roots.sort();
 
-                for id in seq.root_nodes.keys() {
+                for id in &roots {
                     let pos = *self.node_pos.entry(*id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
@@ -496,7 +485,7 @@ mod hashseq_viz {
                         0.0
                     };
 
-                    let roots_vec: Vec<&Id> = seq.root_nodes.keys().collect();
+                    let roots_vec: Vec<&Id> = roots.iter().collect();
                     let target_pos = match pos_in_set(*id, roots_vec, &self.node_pos) {
                         Some(p) => Point {
                             x: p.x,
@@ -688,6 +677,9 @@ mod hashseq_viz {
         state: &'a State,
         seq_seq: usize,
         seq: &'a HashSeq,
+        // Dependency-curve rendering for top-level runs went away with the
+        // origin unification; keep the toggle plumbed for when it returns.
+        #[allow(dead_code)]
         show_dependencies: bool,
     }
 
@@ -800,8 +792,6 @@ mod hashseq_viz {
                         {
                             // ID is inside a run - get the run's width
                             self.seq.runs[&run].text.chars().count() as f32 * char_width
-                        } else if self.seq.root_nodes.contains_key(id) {
-                            char_width + padding * 2.0
                         } else {
                             0.0 // Point node (no width)
                         }
@@ -946,84 +936,6 @@ mod hashseq_viz {
                                             .with_width(2.0)
                                             .with_color(Color::from_rgba(1.0, 0.0, 0.0, 0.8)),
                                     );
-                                }
-                            }
-                        } else if let Some(root) = self.seq.root_nodes.get(id) {
-                            // Render root node as a box (like runs) with different color
-                            let is_removed = self.seq.is_removed_id(id);
-                            let ch_str = format!("{}", root.ch);
-                            let width = ch_str.chars().count() as f32 * char_width + padding * 2.0;
-                            let height = text_size + padding * 2.0;
-
-                            // Draw rectangle background (green for roots, gray if removed)
-                            let rect_pos = Point {
-                                x: pos.x - width / 2.0,
-                                y: pos.y - height / 2.0,
-                            };
-                            let bg_color = if is_removed {
-                                Color::from_rgba(0.5, 0.5, 0.5, 0.5)
-                            } else {
-                                Color::from_rgb(0.2, 0.7, 0.3)
-                            };
-                            frame.fill(
-                                &Path::rectangle(rect_pos, Size::new(width, height)),
-                                Fill::from(bg_color),
-                            );
-
-                            // Draw text centered
-                            let mut text = Text::from(ch_str);
-                            text.position = Point {
-                                x: pos.x - char_width / 2.0,
-                                y: pos.y - text_size / 2.0 + 2.0,
-                            };
-                            text.size = text_size;
-                            text.font = Font::MONOSPACE;
-                            text.color = if is_removed {
-                                Color::from_rgba(1.0, 1.0, 1.0, 0.5)
-                            } else {
-                                Color::WHITE
-                            };
-                            frame.fill_text(text);
-
-                            // Draw strikethrough if removed
-                            if is_removed {
-                                frame.stroke(
-                                    &Path::line(
-                                        Point {
-                                            x: rect_pos.x,
-                                            y: pos.y,
-                                        },
-                                        Point {
-                                            x: rect_pos.x + width,
-                                            y: pos.y,
-                                        },
-                                    ),
-                                    Stroke::default()
-                                        .with_width(2.0)
-                                        .with_color(Color::from_rgba(1.0, 0.0, 0.0, 0.7)),
-                                );
-                            }
-
-                            // Render dependencies for root nodes
-                            if self.show_dependencies {
-                                for dep in root.extra_dependencies.iter() {
-                                    if let Some(dep_from) = get_node_pos(dep) {
-                                        let mid = Point {
-                                            x: (pos.x + dep_from.x) / 2.0,
-                                            y: (pos.y + dep_from.y) / 2.0 - 20.0,
-                                        };
-                                        let curve = Path::new(|p| {
-                                            p.move_to(dep_from);
-                                            p.quadratic_curve_to(mid, *pos);
-                                        });
-
-                                        frame.stroke(
-                                            &curve,
-                                            Stroke::default()
-                                                .with_width(1.0)
-                                                .with_color(Color::from_rgba(0.0, 0.0, 0.0, 0.5)),
-                                        );
-                                    }
                                 }
                             }
                         } else if self

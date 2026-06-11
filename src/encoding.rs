@@ -32,10 +32,9 @@ impl std::error::Error for DecodeError {}
 
 // Operation type tags (used for batch encoding and orphans)
 const TAG_RUN: u8 = 0x00;
-const TAG_INSERT_ROOT: u8 = 0x01;
+const TAG_INSERT_AFTER: u8 = 0x01;
 const TAG_INSERT_BEFORE: u8 = 0x02;
 const TAG_REMOVE: u8 = 0x03;
-const TAG_INSERT_AFTER: u8 = 0x04;
 
 // --- Varint (LEB128) encoding/decoding ---
 
@@ -208,15 +207,10 @@ pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
     Ok((run, pos))
 }
 
-// --- HashNode (InsertRoot, InsertBefore, Remove) encoding/decoding ---
+// --- HashNode (InsertAfter, InsertBefore, Remove) encoding/decoding ---
 
 pub fn encode_hash_node(node: &HashNode, buf: &mut Vec<u8>) {
     match &node.op {
-        Op::InsertRoot(ch) => {
-            buf.push(TAG_INSERT_ROOT);
-            encode_id_set(&node.extra_dependencies, buf);
-            encode_utf8_char(*ch, buf);
-        }
         Op::InsertAfter(id, ch) => {
             buf.push(TAG_INSERT_AFTER);
             encode_id_set(&node.extra_dependencies, buf);
@@ -256,24 +250,6 @@ fn decode_insert_after(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
         HashNode {
             extra_dependencies: extra_deps,
             op: Op::InsertAfter(after_id, ch),
-        },
-        pos,
-    ))
-}
-
-fn decode_insert_root(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
-    let mut pos = 0;
-
-    let (extra_deps, deps_size) = decode_id_set(bytes)?;
-    pos += deps_size;
-
-    let (ch, ch_size) = decode_utf8_char(&bytes[pos..])?;
-    pos += ch_size;
-
-    Ok((
-        HashNode {
-            extra_dependencies: extra_deps,
-            op: Op::InsertRoot(ch),
         },
         pos,
     ))
@@ -356,10 +332,6 @@ pub fn decode_op(bytes: &[u8]) -> Result<(EncodableOp, usize), DecodeError> {
             let (run, size) = decode_run(bytes)?;
             Ok((EncodableOp::Run(run), 1 + size))
         }
-        TAG_INSERT_ROOT => {
-            let (node, size) = decode_insert_root(bytes)?;
-            Ok((EncodableOp::Node(node), 1 + size))
-        }
         TAG_INSERT_BEFORE => {
             let (node, size) = decode_insert_before(bytes)?;
             Ok((EncodableOp::Node(node), 1 + size))
@@ -408,36 +380,32 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<EncodableOp>, DecodeError> {
 // each unique ID only takes 32 bytes once and is referenced by varint
 // index thereafter.
 //
-// Format: [id_dict][roots][after-runs][before-runs][removes][orphans]
+// Format: [origin][id_dict][after-runs][before-runs][removes][orphans]
 
 // Target-reference tags in the "other removes" section.
 const RM_TARGET_RUN: u8 = 0x00;
-const RM_TARGET_ROOT: u8 = 0x01;
-const RM_TARGET_DICT: u8 = 0x02;
+const RM_TARGET_DICT: u8 = 0x01;
 
 /// Encode a HashSeq to a compact byte representation.
 ///
 /// Format:
-/// - [num_ids: varint][id_0..id_n: 32 bytes each]
-/// - [num_roots][roots...]            roots: { idx_set extra_deps, utf8 ch }
+/// - [origin: 32 bytes]               the document id (implicit dict entry 0)
+/// - [num_ids: varint][id_1..id_n: 32 bytes each]
 /// - [num_after_runs][runs...]        run:   { idx anchor, idx_set first_extra_deps, string }
 /// - [num_before_runs][runs...]       same shape; first char anchors InsertBefore
 /// - [num_forward_runs][...]          rmrun: { idx_set first_extra_deps, varint run_idx, varint start, varint end }
 /// - [num_backward_runs][...]
 /// - [num_single_run][...]            { idx_set extra_deps, varint run_idx, varint elem_idx }
-/// - [num_root_removes][...]          { idx_set extra_deps, varint root_idx }
 /// - [num_other_removes][...]         { idx_set extra_deps, varint n, n × tagged target }
-///   (multi-target removes; targets tagged run/root/dict — identity-preserving)
+///   (multi-target removes; targets tagged run/dict — identity-preserving)
 /// - [num_orphans][orphans...]        tagged HashNodes with idx-encoded IDs
 ///
 /// Remove sections address elements by `run_idx` into the concatenated
 /// after-runs ++ before-runs list.
 pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
-    // root_nodes is a BTreeMap, so its iteration order is already deterministic.
     // runs/remove_nodes are HashMaps with a randomized iteration order; we sort
     // by ID so the encoded bytes are byte-identical across processes (handles
     // are replica-local and never drive ordering).
-    let roots: Vec<_> = seq.root_nodes.iter().collect();
     let mut after_runs: Vec<(NodeIdx, &StoredRun)> = Vec::new();
     let mut before_runs: Vec<(NodeIdx, &StoredRun)> = Vec::new();
     for (head, run) in &seq.runs {
@@ -458,11 +426,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // Map storage handles to positions in the encoded layout.
     let run_pos: FxHashMap<NodeIdx, usize> =
         runs.iter().enumerate().map(|(i, (h, _))| (*h, i)).collect();
-    let root_pos: FxHashMap<NodeIdx, usize> = roots
-        .iter()
-        .enumerate()
-        .map(|(i, (id, _))| (seq.idx_of(id).unwrap(), i))
-        .collect();
 
     // --- Removes ---
     // In-memory `RemoveRun` chains are already what the wire wants; each chain is
@@ -478,7 +441,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     /// Where a remove target lives in the encoded layout.
     enum TargetRef {
         Run(usize, usize),
-        Root(usize),
         /// Not positionally addressable (e.g. a remove targeting a remove);
         /// referenced through the ID dictionary instead.
         Dict(Id),
@@ -486,7 +448,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let resolve_target = |idx: NodeIdx| -> TargetRef {
         match seq.loc_of(idx) {
             Loc::Run { run, pos } => TargetRef::Run(run_pos[&run], pos as usize),
-            Loc::Root => TargetRef::Root(root_pos[&idx]),
             _ => TargetRef::Dict(seq.id_of(idx)),
         }
     };
@@ -501,7 +462,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let mut forward_runs: Vec<WireRemoveRun> = Vec::new();
     let mut backward_runs: Vec<WireRemoveRun> = Vec::new();
     let mut single_run_removes: Vec<(BTreeSet<Id>, usize, usize)> = Vec::new();
-    let mut root_removes: Vec<(BTreeSet<Id>, usize)> = Vec::new();
     // Identity-preserving section for multi-target removes and exotic targets:
     // (extra_deps, target refs) — decode rebuilds the exact Op::Remove set.
     let mut other_removes: Vec<(BTreeSet<Id>, Vec<TargetRef>)> = Vec::new();
@@ -559,10 +519,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     }
                     i = j;
                 }
-                TargetRef::Root(root_idx) => {
-                    root_removes.push((deps, root_idx));
-                    i += 1;
-                }
                 target @ TargetRef::Dict(_) => {
                     other_removes.push((deps, vec![target]));
                     i += 1;
@@ -591,22 +547,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             id_set.insert(*id);
         }
     }
-    for (_id, root) in &roots {
-        for dep in &root.extra_dependencies {
-            id_set.insert(*dep);
-        }
-    }
     for rr in forward_runs.iter().chain(backward_runs.iter()) {
         for dep in &rr.extra_deps {
             id_set.insert(*dep);
         }
     }
     for (extra_deps, _, _) in &single_run_removes {
-        for dep in extra_deps {
-            id_set.insert(*dep);
-        }
-    }
-    for (extra_deps, _) in &root_removes {
         for dep in extra_deps {
             id_set.insert(*dep);
         }
@@ -626,7 +572,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             id_set.insert(*dep);
         }
         match &orphan.op {
-            Op::InsertRoot(_) => {}
             Op::InsertAfter(id, _) | Op::InsertBefore(id, _) => {
                 id_set.insert(*id);
             }
@@ -638,15 +583,21 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     }
 
-    let id_list: Vec<Id> = id_set.into_iter().collect();
+    // The origin is the implicit first dictionary entry: it's written once in
+    // the header, and anchors referencing it (most top-level runs) cost a
+    // 1-byte index instead of repeating 32 bytes.
+    let origin = seq.origin();
+    id_set.remove(&origin);
+    let id_list: Vec<Id> = std::iter::once(origin).chain(id_set).collect();
     let id_to_idx: HashMap<Id, usize> =
         id_list.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
     // --- Emit ---
     let mut buf = Vec::new();
 
-    encode_varint(id_list.len(), &mut buf);
-    for id in &id_list {
+    encode_id(&origin, &mut buf);
+    encode_varint(id_list.len() - 1, &mut buf);
+    for id in &id_list[1..] {
         encode_id(id, &mut buf);
     }
 
@@ -659,13 +610,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             encode_varint(id_to_idx[id], buf);
         }
     };
-
-    // Roots
-    encode_varint(roots.len(), &mut buf);
-    for (_id, root) in &roots {
-        encode_idx_set(&root.extra_dependencies, &mut buf);
-        encode_utf8_char(root.ch, &mut buf);
-    }
 
     // Runs: After-anchored, then Before-anchored. The two sections share a shape,
     // so the op kind is implied by the section rather than a per-run tag.
@@ -697,13 +641,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         encode_varint(*elem_idx, &mut buf);
     }
 
-    // Root-target standalone removes
-    encode_varint(root_removes.len(), &mut buf);
-    for (extra_deps, root_idx) in &root_removes {
-        encode_idx_set(extra_deps, &mut buf);
-        encode_varint(*root_idx, &mut buf);
-    }
-
     // Other removes (multi-target / dict-referenced targets), identity-preserving:
     // decode rebuilds the exact Op::Remove target set so the node id survives.
     encode_varint(other_removes.len(), &mut buf);
@@ -717,10 +654,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     encode_varint(*run_idx, &mut buf);
                     encode_varint(*elem_idx, &mut buf);
                 }
-                TargetRef::Root(root_idx) => {
-                    buf.push(RM_TARGET_ROOT);
-                    encode_varint(*root_idx, &mut buf);
-                }
                 TargetRef::Dict(id) => {
                     buf.push(RM_TARGET_DICT);
                     encode_idx(id, &mut buf);
@@ -733,11 +666,6 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     encode_varint(orphans.len(), &mut buf);
     for orphan in &orphans {
         match &orphan.op {
-            Op::InsertRoot(ch) => {
-                buf.push(TAG_INSERT_ROOT);
-                encode_idx_set(&orphan.extra_dependencies, &mut buf);
-                encode_utf8_char(*ch, &mut buf);
-            }
             Op::InsertAfter(id, ch) => {
                 buf.push(TAG_INSERT_AFTER);
                 encode_idx_set(&orphan.extra_dependencies, &mut buf);
@@ -768,11 +696,16 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
 pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
     let mut pos = 0;
 
-    // Read dictionary
-    let (num_ids, size) = decode_varint(bytes)?;
+    // Origin header (also the implicit first dictionary entry)
+    let (origin, size) = decode_id(bytes)?;
     pos += size;
 
-    let mut id_list: Vec<Id> = Vec::with_capacity(num_ids);
+    // Read dictionary
+    let (num_ids, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+
+    let mut id_list: Vec<Id> = Vec::with_capacity(num_ids + 1);
+    id_list.push(origin);
     for _ in 0..num_ids {
         let (id, size) = decode_id(&bytes[pos..])?;
         id_list.push(id);
@@ -801,25 +734,8 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         Ok((ids, total))
     };
 
-    let mut seq = HashSeq::default();
-    let mut root_ids: Vec<Id> = Vec::new();
+    let mut seq = HashSeq::new(origin);
     let mut run_element_ids: Vec<Vec<Id>> = Vec::new();
-
-    // Roots
-    let (num_roots, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-    for _ in 0..num_roots {
-        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-        pos += size;
-        let (ch, size) = decode_utf8_char(&bytes[pos..])?;
-        pos += size;
-        let node = HashNode {
-            extra_dependencies: extra_deps,
-            op: Op::InsertRoot(ch),
-        };
-        root_ids.push(node.id());
-        seq.apply(node);
-    }
 
     // Runs: After-anchored section, then Before-anchored section. Both feed
     // run_element_ids, which the remove sections below index positionally.
@@ -920,26 +836,6 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         });
     }
 
-    // Root-target standalone removes
-    let (num_root_removes, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-    for _ in 0..num_root_removes {
-        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-        pos += size;
-        let (root_idx, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-
-        let removed_id = root_ids
-            .get(root_idx)
-            .copied()
-            .ok_or(DecodeError::InvalidIdIndex(root_idx))?;
-
-        seq.apply(HashNode {
-            extra_dependencies: extra_deps,
-            op: Op::Remove(std::iter::once(removed_id).collect()),
-        });
-    }
-
     // Other removes (multi-target / dict-referenced targets)
     let (num_other_removes, size) = decode_varint(&bytes[pos..])?;
     pos += size;
@@ -968,14 +864,6 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                         .copied()
                         .ok_or(DecodeError::InvalidIdIndex(elem_idx))?
                 }
-                RM_TARGET_ROOT => {
-                    let (root_idx, size) = decode_varint(&bytes[pos..])?;
-                    pos += size;
-                    root_ids
-                        .get(root_idx)
-                        .copied()
-                        .ok_or(DecodeError::InvalidIdIndex(root_idx))?
-                }
                 RM_TARGET_DICT => {
                     let (id, size) = decode_idx_at(&bytes[pos..])?;
                     pos += size;
@@ -1002,16 +890,6 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         let tag = bytes[pos];
         pos += 1;
         match tag {
-            TAG_INSERT_ROOT => {
-                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-                pos += size;
-                let (ch, size) = decode_utf8_char(&bytes[pos..])?;
-                pos += size;
-                seq.apply(HashNode {
-                    extra_dependencies: extra_deps,
-                    op: Op::InsertRoot(ch),
-                });
-            }
             TAG_INSERT_AFTER => {
                 let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
                 pos += size;
@@ -1149,10 +1027,10 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_root_roundtrip() {
+    fn test_origin_anchored_insert_roundtrip() {
         let node = HashNode {
             extra_dependencies: BTreeSet::new(),
-            op: Op::InsertRoot('a'),
+            op: Op::InsertAfter(Id::default(), 'a'),
         };
 
         let mut buf = Vec::new();
@@ -1210,7 +1088,7 @@ mod tests {
         let ops = vec![
             EncodableOp::Node(HashNode {
                 extra_dependencies: BTreeSet::new(),
-                op: Op::InsertRoot('a'),
+                op: Op::InsertAfter(Id::default(), 'a'),
             }),
             EncodableOp::Run(run),
             EncodableOp::Node(HashNode {
