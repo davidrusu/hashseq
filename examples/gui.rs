@@ -1,6 +1,9 @@
 use hashseq::HashSeq;
 use iced::widget::{button, checkbox, column, container, row, scrollable, text};
-use iced::{Alignment, Application, Command, Element, Font, Length, Point, Rectangle, Settings, Subscription, Theme};
+use iced::{
+    Alignment, Application, Command, Element, Font, Length, Point, Rectangle, Settings,
+    Subscription, Theme,
+};
 
 pub fn main() -> iced::Result {
     Demo::run(Settings {
@@ -60,7 +63,11 @@ impl Example {
             }
             Example::CommonPrefix => {
                 // Both users start typing the same thing, then diverge
-                type_at(&mut seq_a, 0, "Dear Alice, I hope this message finds you well.");
+                type_at(
+                    &mut seq_a,
+                    0,
+                    "Dear Alice, I hope this message finds you well.",
+                );
                 type_at(&mut seq_b, 0, "Dear Alice, I wanted to tell you something.");
             }
             Example::InsertBefore => {
@@ -243,7 +250,12 @@ impl Application for Demo {
             // Hidden frame counter to force iced to redraw (size 1 makes it invisible)
             text(format!("{}", self.redraw_counter)).size(1),
             self.seq_a_viz
-                .view(self.seq_seq, self.redraw_counter, &self.seq_a, self.show_dependencies)
+                .view(
+                    self.seq_seq,
+                    self.redraw_counter,
+                    &self.seq_a,
+                    self.show_dependencies
+                )
                 .map(Message::SeqA),
             row![
                 button("merge down").padding(8).on_press(Message::MergeAtoB),
@@ -252,7 +264,12 @@ impl Application for Demo {
             ]
             .spacing(20),
             self.seq_b_viz
-                .view(self.seq_seq, self.redraw_counter, &self.seq_b, self.show_dependencies)
+                .view(
+                    self.seq_seq,
+                    self.redraw_counter,
+                    &self.seq_b,
+                    self.show_dependencies
+                )
                 .map(Message::SeqB),
             row![
                 button("Clear").padding(8).on_press(Message::Clear),
@@ -269,9 +286,7 @@ impl Application for Demo {
         .align_items(Alignment::Center)
         .width(Length::Fill);
 
-        row![sidebar, main_content]
-            .height(Length::Fill)
-            .into()
+        row![sidebar, main_content].height(Length::Fill).into()
     }
 }
 
@@ -425,7 +440,13 @@ mod hashseq_viz {
                     let mut sorted_set: Vec<Id> = set.iter().map(|&i| *i).collect();
                     sorted_set.sort();
                     let pos = sorted_set.iter().position(|i| *i == id);
-                    let before_id = pos.and_then(|p| if p > 0 { sorted_set.get(p - 1).cloned() } else { None });
+                    let before_id = pos.and_then(|p| {
+                        if p > 0 {
+                            sorted_set.get(p - 1).cloned()
+                        } else {
+                            None
+                        }
+                    });
                     let after_id = pos.and_then(|p| sorted_set.get(p + 1).cloned());
                     let before_pos = before_id.and_then(|id| get_node_pos(&id, nodes));
                     let after_pos = after_id.and_then(|id| get_node_pos(&id, nodes));
@@ -477,8 +498,14 @@ mod hashseq_viz {
 
                     let roots_vec: Vec<&Id> = seq.root_nodes.keys().collect();
                     let target_pos = match pos_in_set(*id, roots_vec, &self.node_pos) {
-                        Some(p) => Point { x: p.x, y: p.y + lane_offset },
-                        None => Point { x: pos.x, y: bounds.height / 2.0 + lane_offset },
+                        Some(p) => Point {
+                            x: p.x,
+                            y: p.y + lane_offset,
+                        },
+                        None => Point {
+                            x: pos.x,
+                            y: bounds.height / 2.0 + lane_offset,
+                        },
                     };
 
                     let delta = Vector::<f32> {
@@ -543,7 +570,8 @@ mod hashseq_viz {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let targets: Vec<Id> = remove_node.nodes.iter().map(|t| seq.id_of(*t)).collect();
+                    let targets: Vec<Id> =
+                        remove_node.nodes.iter().map(|t| seq.id_of(*t)).collect();
                     let target_pos = if !targets.is_empty() {
                         let p: Vector = targets
                             .iter()
@@ -595,7 +623,10 @@ mod hashseq_viz {
                             // afters() yields sorted order already.
                             let sorted_siblings: Vec<Id> = seq.afters(&parent).collect();
                             let num_siblings = sorted_siblings.len();
-                            let sibling_idx = sorted_siblings.iter().position(|id| id == run_id).unwrap_or(0);
+                            let sibling_idx = sorted_siblings
+                                .iter()
+                                .position(|id| id == run_id)
+                                .unwrap_or(0);
 
                             // Calculate vertical offset to spread siblings into lanes
                             let lane_offset = if num_siblings > 1 {
@@ -742,248 +773,267 @@ mod hashseq_viz {
             {
                 let mut frame = Frame::new(renderer, bounds.size());
                 {
-                            let text_size = 14.0;
-                            let char_width = text_size * 0.6;
-                            let padding = 4.0;
+                    let text_size = 14.0;
+                    let char_width = text_size * 0.6;
+                    let padding = 4.0;
 
-                            // Helper to get center position of any node
-                            let get_node_pos = |id: &Id| -> Option<Point> {
-                                if let Some(pos) = self.state.node_pos.get(id) {
-                                    return Some(*pos);
-                                }
-                                // Check if this ID is inside a run
-                                if let Some(hashseq::Loc::Run { run, .. }) =
-                                    self.seq.idx_of(id).map(|i| self.seq.loc_of(i))
-                                {
-                                    return self.state.node_pos.get(&self.seq.id_of(run)).copied();
-                                }
-                                None
+                    // Helper to get center position of any node
+                    let get_node_pos = |id: &Id| -> Option<Point> {
+                        if let Some(pos) = self.state.node_pos.get(id) {
+                            return Some(*pos);
+                        }
+                        // Check if this ID is inside a run
+                        if let Some(hashseq::Loc::Run { run, .. }) =
+                            self.seq.idx_of(id).map(|i| self.seq.loc_of(i))
+                        {
+                            return self.state.node_pos.get(&self.seq.id_of(run)).copied();
+                        }
+                        None
+                    };
+
+                    // Helper to get the width of a node's bounding box (includes removed chars)
+                    let get_node_width = |id: &Id| -> f32 {
+                        if let Some(run) = self.seq.idx_of(id).and_then(|i| self.seq.runs.get(&i)) {
+                            run.text.chars().count() as f32 * char_width
+                        } else if let Some(hashseq::Loc::Run { run, .. }) =
+                            self.seq.idx_of(id).map(|i| self.seq.loc_of(i))
+                        {
+                            // ID is inside a run - get the run's width
+                            self.seq.runs[&run].text.chars().count() as f32 * char_width
+                        } else if self.seq.root_nodes.contains_key(id) {
+                            char_width + padding * 2.0
+                        } else {
+                            0.0 // Point node (no width)
+                        }
+                    };
+
+                    // Helper to get left edge center of a node (for incoming edges)
+                    let get_node_left_edge = |id: &Id| -> Option<Point> {
+                        let center = get_node_pos(id)?;
+                        let width = get_node_width(id);
+                        if width > 0.0 {
+                            Some(Point {
+                                x: center.x - width / 2.0,
+                                y: center.y,
+                            })
+                        } else {
+                            Some(center)
+                        }
+                    };
+
+                    // Helper to get right edge center of a node (for outgoing edges)
+                    let get_node_right_edge = |id: &Id| -> Option<Point> {
+                        let center = get_node_pos(id)?;
+                        let width = get_node_width(id);
+                        if width > 0.0 {
+                            Some(Point {
+                                x: center.x + width / 2.0,
+                                y: center.y,
+                            })
+                        } else {
+                            Some(center)
+                        }
+                    };
+
+                    let string = String::from_iter(self.seq.iter());
+                    let cursor_pos = state.cursor.min(string.chars().count());
+                    let before_cursor = String::from_iter(string.chars().take(cursor_pos));
+                    let after_cursor = String::from_iter(string.chars().skip(cursor_pos));
+                    let mut text = Text::from(format!("{before_cursor}|{after_cursor}"));
+                    text.size = 20.0;
+                    text.font = Font::MONOSPACE;
+                    frame.fill_text(text);
+
+                    // Draw "after" edges (green) - from right edge to left edge
+                    for (idx, afters) in self.seq.afters.iter() {
+                        let Some(from) = get_node_right_edge(&self.seq.id_of(*idx)) else {
+                            continue;
+                        };
+                        for after in afters.iter() {
+                            let Some(to) = get_node_left_edge(after) else {
+                                continue;
                             };
+                            frame.stroke(
+                                &Path::line(from, to),
+                                Stroke::default().with_color(Color::from_rgb(0.0, 1.0, 0.0)),
+                            );
+                        }
+                    }
+                    // Draw "before" edges (red) - from left edge to center of before node
+                    for (idx, befores) in self.seq.befores_by_anchor.iter() {
+                        let Some(from) = get_node_left_edge(&self.seq.id_of(*idx)) else {
+                            continue;
+                        };
+                        for before in befores {
+                            let Some(to) = get_node_pos(before) else {
+                                continue;
+                            };
+                            frame.stroke(
+                                &Path::line(from, to),
+                                Stroke::default().with_color(Color::from_rgb(1.0, 0.0, 0.0)),
+                            );
+                        }
+                    }
 
-                            // Helper to get the width of a node's bounding box (includes removed chars)
-                            let get_node_width = |id: &Id| -> f32 {
-                                if let Some(run) = self.seq.idx_of(id).and_then(|i| self.seq.runs.get(&i)) {
-                                    run.text.chars().count() as f32 * char_width
-                                } else if let Some(hashseq::Loc::Run { run, .. }) =
-                                    self.seq.idx_of(id).map(|i| self.seq.loc_of(i))
-                                {
-                                    // ID is inside a run - get the run's width
-                                    self.seq.runs[&run].text.chars().count() as f32 * char_width
-                                } else if self.seq.root_nodes.contains_key(id) {
-                                    char_width + padding * 2.0
+                    // Render all nodes (both individual and runs)
+                    for (id, pos) in self.state.node_pos.iter() {
+                        // Check if this ID corresponds to a run
+                        if let Some(run) = self.seq.idx_of(id).and_then(|i| self.seq.runs.get(&i)) {
+                            // Decompress to get individual character nodes
+                            let nodes = run.to_run().decompress();
+                            let num_chars = nodes.len();
+
+                            let total_width = num_chars as f32 * char_width;
+                            let height = text_size + padding * 2.0;
+                            let start_x = pos.x - total_width / 2.0;
+
+                            // Draw individual character boxes
+                            for (i, node) in nodes.iter().enumerate() {
+                                let is_removed = self.seq.is_removed_id(&node.id());
+                                let char_x = start_x + i as f32 * char_width;
+
+                                // Draw character background
+                                let bg_color = if is_removed {
+                                    Color::from_rgba(0.5, 0.5, 0.5, 0.7) // Gray for removed
                                 } else {
-                                    0.0 // Point node (no width)
-                                }
-                            };
+                                    Color::from_rgb(0.0, 0.5, 1.0) // Normal blue
+                                };
 
-                            // Helper to get left edge center of a node (for incoming edges)
-                            let get_node_left_edge = |id: &Id| -> Option<Point> {
-                                let center = get_node_pos(id)?;
-                                let width = get_node_width(id);
-                                if width > 0.0 {
-                                    Some(Point { x: center.x - width / 2.0, y: center.y })
+                                frame.fill(
+                                    &Path::rectangle(
+                                        Point {
+                                            x: char_x,
+                                            y: pos.y - height / 2.0,
+                                        },
+                                        Size::new(char_width, height),
+                                    ),
+                                    Fill::from(bg_color),
+                                );
+
+                                // Draw character
+                                let ch = match &node.op {
+                                    hashseq::Op::InsertAfter(_, c) => *c,
+                                    _ => '?',
+                                };
+                                let mut text = Text::from(ch.to_string());
+                                text.position = Point {
+                                    x: char_x,
+                                    y: pos.y - text_size / 2.0 + 2.0,
+                                };
+                                text.size = text_size;
+                                text.font = Font::MONOSPACE;
+                                text.color = if is_removed {
+                                    Color::from_rgba(1.0, 1.0, 1.0, 0.5)
                                 } else {
-                                    Some(center)
-                                }
-                            };
+                                    Color::WHITE
+                                };
+                                frame.fill_text(text);
 
-                            // Helper to get right edge center of a node (for outgoing edges)
-                            let get_node_right_edge = |id: &Id| -> Option<Point> {
-                                let center = get_node_pos(id)?;
-                                let width = get_node_width(id);
-                                if width > 0.0 {
-                                    Some(Point { x: center.x + width / 2.0, y: center.y })
-                                } else {
-                                    Some(center)
+                                // Draw strikethrough for removed characters
+                                if is_removed {
+                                    frame.stroke(
+                                        &Path::line(
+                                            Point {
+                                                x: char_x,
+                                                y: pos.y,
+                                            },
+                                            Point {
+                                                x: char_x + char_width,
+                                                y: pos.y,
+                                            },
+                                        ),
+                                        Stroke::default()
+                                            .with_width(2.0)
+                                            .with_color(Color::from_rgba(1.0, 0.0, 0.0, 0.8)),
+                                    );
                                 }
-                            };
+                            }
+                        } else if let Some(root) = self.seq.root_nodes.get(id) {
+                            // Render root node as a box (like runs) with different color
+                            let is_removed = self.seq.is_removed_id(id);
+                            let ch_str = format!("{}", root.ch);
+                            let width = ch_str.chars().count() as f32 * char_width + padding * 2.0;
+                            let height = text_size + padding * 2.0;
 
-                            let string = String::from_iter(self.seq.iter());
-                            let cursor_pos = state.cursor.min(string.chars().count());
-                            let before_cursor =
-                                String::from_iter(string.chars().take(cursor_pos));
-                            let after_cursor = String::from_iter(string.chars().skip(cursor_pos));
-                            let mut text = Text::from(format!("{before_cursor}|{after_cursor}"));
-                            text.size = 20.0;
+                            // Draw rectangle background (green for roots, gray if removed)
+                            let rect_pos = Point {
+                                x: pos.x - width / 2.0,
+                                y: pos.y - height / 2.0,
+                            };
+                            let bg_color = if is_removed {
+                                Color::from_rgba(0.5, 0.5, 0.5, 0.5)
+                            } else {
+                                Color::from_rgb(0.2, 0.7, 0.3)
+                            };
+                            frame.fill(
+                                &Path::rectangle(rect_pos, Size::new(width, height)),
+                                Fill::from(bg_color),
+                            );
+
+                            // Draw text centered
+                            let mut text = Text::from(ch_str);
+                            text.position = Point {
+                                x: pos.x - char_width / 2.0,
+                                y: pos.y - text_size / 2.0 + 2.0,
+                            };
+                            text.size = text_size;
                             text.font = Font::MONOSPACE;
+                            text.color = if is_removed {
+                                Color::from_rgba(1.0, 1.0, 1.0, 0.5)
+                            } else {
+                                Color::WHITE
+                            };
                             frame.fill_text(text);
 
-                            // Draw "after" edges (green) - from right edge to left edge
-                            for (idx, afters) in self.seq.afters.iter() {
-                                let Some(from) = get_node_right_edge(&self.seq.id_of(*idx)) else {
-                                    continue;
-                                };
-                                for after in afters.iter() {
-                                    let Some(to) = get_node_left_edge(after) else {
-                                        continue;
-                                    };
-                                    frame.stroke(
-                                        &Path::line(from, to),
-                                        Stroke::default()
-                                            .with_color(Color::from_rgb(0.0, 1.0, 0.0)),
-                                    );
-                                }
-                            }
-                            // Draw "before" edges (red) - from left edge to center of before node
-                            for (idx, befores) in self.seq.befores_by_anchor.iter() {
-                                let Some(from) = get_node_left_edge(&self.seq.id_of(*idx)) else {
-                                    continue;
-                                };
-                                for before in befores {
-                                    let Some(to) = get_node_pos(before) else {
-                                        continue;
-                                    };
-                                    frame.stroke(
-                                        &Path::line(from, to),
-                                        Stroke::default()
-                                            .with_color(Color::from_rgb(1.0, 0.0, 0.0)),
-                                    );
-                                }
+                            // Draw strikethrough if removed
+                            if is_removed {
+                                frame.stroke(
+                                    &Path::line(
+                                        Point {
+                                            x: rect_pos.x,
+                                            y: pos.y,
+                                        },
+                                        Point {
+                                            x: rect_pos.x + width,
+                                            y: pos.y,
+                                        },
+                                    ),
+                                    Stroke::default()
+                                        .with_width(2.0)
+                                        .with_color(Color::from_rgba(1.0, 0.0, 0.0, 0.7)),
+                                );
                             }
 
-                            // Render all nodes (both individual and runs)
-                            for (id, pos) in self.state.node_pos.iter() {
-                                // Check if this ID corresponds to a run
-                                if let Some(run) = self.seq.idx_of(id).and_then(|i| self.seq.runs.get(&i)) {
-                                    // Decompress to get individual character nodes
-                                    let nodes = run.to_run().decompress();
-                                    let num_chars = nodes.len();
-
-                                    let total_width = num_chars as f32 * char_width;
-                                    let height = text_size + padding * 2.0;
-                                    let start_x = pos.x - total_width / 2.0;
-
-                                    // Draw individual character boxes
-                                    for (i, node) in nodes.iter().enumerate() {
-                                        let is_removed = self.seq.is_removed_id(&node.id());
-                                        let char_x = start_x + i as f32 * char_width;
-
-                                        // Draw character background
-                                        let bg_color = if is_removed {
-                                            Color::from_rgba(0.5, 0.5, 0.5, 0.7) // Gray for removed
-                                        } else {
-                                            Color::from_rgb(0.0, 0.5, 1.0) // Normal blue
+                            // Render dependencies for root nodes
+                            if self.show_dependencies {
+                                for dep in root.extra_dependencies.iter() {
+                                    if let Some(dep_from) = get_node_pos(dep) {
+                                        let mid = Point {
+                                            x: (pos.x + dep_from.x) / 2.0,
+                                            y: (pos.y + dep_from.y) / 2.0 - 20.0,
                                         };
+                                        let curve = Path::new(|p| {
+                                            p.move_to(dep_from);
+                                            p.quadratic_curve_to(mid, *pos);
+                                        });
 
-                                        frame.fill(
-                                            &Path::rectangle(
-                                                Point {
-                                                    x: char_x,
-                                                    y: pos.y - height / 2.0,
-                                                },
-                                                Size::new(char_width, height),
-                                            ),
-                                            Fill::from(bg_color),
-                                        );
-
-                                        // Draw character
-                                        let ch = match &node.op {
-                                            hashseq::Op::InsertAfter(_, c) => *c,
-                                            _ => '?',
-                                        };
-                                        let mut text = Text::from(ch.to_string());
-                                        text.position = Point {
-                                            x: char_x,
-                                            y: pos.y - text_size / 2.0 + 2.0,
-                                        };
-                                        text.size = text_size;
-                                        text.font = Font::MONOSPACE;
-                                        text.color = if is_removed {
-                                            Color::from_rgba(1.0, 1.0, 1.0, 0.5)
-                                        } else {
-                                            Color::WHITE
-                                        };
-                                        frame.fill_text(text);
-
-                                        // Draw strikethrough for removed characters
-                                        if is_removed {
-                                            frame.stroke(
-                                                &Path::line(
-                                                    Point { x: char_x, y: pos.y },
-                                                    Point { x: char_x + char_width, y: pos.y },
-                                                ),
-                                                Stroke::default()
-                                                    .with_width(2.0)
-                                                    .with_color(Color::from_rgba(1.0, 0.0, 0.0, 0.8)),
-                                            );
-                                        }
-                                    }
-                                } else if let Some(root) = self.seq.root_nodes.get(id) {
-                                    // Render root node as a box (like runs) with different color
-                                    let is_removed = self.seq.is_removed_id(id);
-                                    let ch_str = format!("{}", root.ch);
-                                    let width = ch_str.chars().count() as f32 * char_width + padding * 2.0;
-                                    let height = text_size + padding * 2.0;
-
-                                    // Draw rectangle background (green for roots, gray if removed)
-                                    let rect_pos = Point {
-                                        x: pos.x - width / 2.0,
-                                        y: pos.y - height / 2.0,
-                                    };
-                                    let bg_color = if is_removed {
-                                        Color::from_rgba(0.5, 0.5, 0.5, 0.5)
-                                    } else {
-                                        Color::from_rgb(0.2, 0.7, 0.3)
-                                    };
-                                    frame.fill(
-                                        &Path::rectangle(rect_pos, Size::new(width, height)),
-                                        Fill::from(bg_color),
-                                    );
-
-                                    // Draw text centered
-                                    let mut text = Text::from(ch_str);
-                                    text.position = Point {
-                                        x: pos.x - char_width / 2.0,
-                                        y: pos.y - text_size / 2.0 + 2.0,
-                                    };
-                                    text.size = text_size;
-                                    text.font = Font::MONOSPACE;
-                                    text.color = if is_removed {
-                                        Color::from_rgba(1.0, 1.0, 1.0, 0.5)
-                                    } else {
-                                        Color::WHITE
-                                    };
-                                    frame.fill_text(text);
-
-                                    // Draw strikethrough if removed
-                                    if is_removed {
                                         frame.stroke(
-                                            &Path::line(
-                                                Point { x: rect_pos.x, y: pos.y },
-                                                Point { x: rect_pos.x + width, y: pos.y },
-                                            ),
+                                            &curve,
                                             Stroke::default()
-                                                .with_width(2.0)
-                                                .with_color(Color::from_rgba(1.0, 0.0, 0.0, 0.7)),
+                                                .with_width(1.0)
+                                                .with_color(Color::from_rgba(0.0, 0.0, 0.0, 0.5)),
                                         );
                                     }
-
-                                    // Render dependencies for root nodes
-                                    if self.show_dependencies {
-                                        for dep in root.extra_dependencies.iter() {
-                                            if let Some(dep_from) = get_node_pos(dep) {
-                                                let mid = Point {
-                                                    x: (pos.x + dep_from.x) / 2.0,
-                                                    y: (pos.y + dep_from.y) / 2.0 - 20.0,
-                                                };
-                                                let curve = Path::new(|p| {
-                                                    p.move_to(dep_from);
-                                                    p.quadratic_curve_to(mid, *pos);
-                                                });
-
-                                                frame.stroke(
-                                                    &curve,
-                                                    Stroke::default().with_width(1.0).with_color(
-                                                        Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                    }
-                                } else if self.seq.idx_of(id).is_some_and(|i| self.seq.remove_nodes.contains_key(&i)) {
-                                    // Skip rendering remove nodes - removals are shown via strikethrough on affected chars
                                 }
                             }
+                        } else if self
+                            .seq
+                            .idx_of(id)
+                            .is_some_and(|i| self.seq.remove_nodes.contains_key(&i))
+                        {
+                            // Skip rendering remove nodes - removals are shown via strikethrough on affected chars
+                        }
+                    }
                 }
                 stack.push(frame.into_geometry());
             }

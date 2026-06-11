@@ -571,11 +571,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     }
 
-    let mut multi_removes: Vec<(NodeIdx, &CausalRemove)> = seq
-        .remove_nodes
-        .iter()
-        .map(|(i, r)| (*i, r))
-        .collect();
+    let mut multi_removes: Vec<(NodeIdx, &CausalRemove)> =
+        seq.remove_nodes.iter().map(|(i, r)| (*i, r)).collect();
     multi_removes.sort_by_key(|(idx, _)| seq.id_of(*idx));
     for (_idx, remove) in &multi_removes {
         let targets = remove.nodes.iter().map(|t| resolve_target(*t)).collect();
@@ -1283,7 +1280,10 @@ mod tests {
         let encoded = encode_hashseq(&seq);
         let decoded = decode_hashseq(&encoded).unwrap();
 
-        assert_eq!(seq.iter().collect::<String>(), decoded.iter().collect::<String>());
+        assert_eq!(
+            seq.iter().collect::<String>(),
+            decoded.iter().collect::<String>()
+        );
         assert_eq!(seq, decoded);
     }
 
@@ -1374,7 +1374,11 @@ mod tests {
         for (is_insert, idx, ch) in ops {
             let idx = idx as usize;
             if is_insert {
-                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                let insert_idx = if seq.is_empty() {
+                    0
+                } else {
+                    idx % (seq.len() + 1)
+                };
                 seq.insert(insert_idx, ch);
             } else if !seq.is_empty() {
                 let remove_idx = idx % seq.len();
@@ -1397,7 +1401,11 @@ mod tests {
         for (is_insert, idx, ch) in ops {
             let idx = idx as usize;
             if is_insert {
-                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                let insert_idx = if seq.is_empty() {
+                    0
+                } else {
+                    idx % (seq.len() + 1)
+                };
                 seq.insert(insert_idx, ch);
             } else if !seq.is_empty() {
                 let remove_idx = idx % seq.len();
@@ -1421,7 +1429,11 @@ mod tests {
         for (is_insert, idx, ch) in ops {
             let idx = idx as usize;
             if is_insert {
-                let insert_idx = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                let insert_idx = if seq.is_empty() {
+                    0
+                } else {
+                    idx % (seq.len() + 1)
+                };
                 seq.insert(insert_idx, ch);
             } else if !seq.is_empty() {
                 let remove_idx = idx % seq.len();
@@ -1457,7 +1469,6 @@ mod tests {
 
         original_str == decoded.iter().collect::<String>() && seq == decoded
     }
-
 }
 
 #[cfg(test)]
@@ -1520,7 +1531,11 @@ mod remove_roundtrip {
                 seq.remove_batch(idx, amount);
             }
             if insert_after {
-                let pos = if seq.is_empty() { 0 } else { idx as usize % (seq.len() + 1) };
+                let pos = if seq.is_empty() {
+                    0
+                } else {
+                    idx as usize % (seq.len() + 1)
+                };
                 seq.insert(pos, 'x');
             }
         }

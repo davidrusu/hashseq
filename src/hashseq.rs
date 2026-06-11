@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use associative_positional_list::AssociativePositionalList;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::run_index::{ElemRef, RunIndex};
 use crate::{EncodableOp, FirstOp, HashNode, HashSeqIter, Id, Op, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
@@ -284,7 +284,7 @@ pub struct HashSeq {
     // orphaned uses HashNode as key (not Id), so keep std HashSet — the input is
     // adversary-controllable and benefits from SipHash's HashDoS protection.
     pub(crate) orphaned: HashSet<HashNode>,
-    index: AssociativePositionalList<NodeIdx>,
+    index: RunIndex,
 }
 
 impl PartialEq for HashSeq {
@@ -418,6 +418,52 @@ impl HashSeq {
         self.idx_of(id).is_some_and(|i| self.is_removed(i))
     }
 
+    // ---- position index plumbing ----
+
+    /// The index addresses an insert as (span head, element offset): a run
+    /// element is addressed through its run, a root through itself.
+    fn elem_ref(&self, idx: NodeIdx) -> ElemRef {
+        match self.loc_of(idx) {
+            Loc::Run { run, pos } => (run, pos),
+            Loc::Root => (idx, 0),
+            _ => panic!("elem_ref on a non-insert node"),
+        }
+    }
+
+    /// The insert node at visible position `pos`.
+    fn element_at(&self, pos: usize) -> Option<NodeIdx> {
+        let (head, off) = self.index.get(pos)?;
+        Some(match self.loc_of(head) {
+            Loc::Root => head,
+            _ => self.runs[&head].elements[off as usize],
+        })
+    }
+
+    /// First element, in document order, of the region rooted at `n`: a node's
+    /// before-runs precede it, recursively.
+    fn region_first(&self, mut n: NodeIdx) -> NodeIdx {
+        while let Some(first) = self.befores_by_anchor.get(&n).and_then(|s| s.first()) {
+            n = self.idx_of_known(first);
+        }
+        n
+    }
+
+    /// Last element, in document order, of the subtree hanging off `n`:
+    /// follow the run to its tail, then the largest after-fork, repeatedly.
+    /// (Befores precede their anchors, so they never contribute the last
+    /// element; run interiors never carry explicit afters — forks split.)
+    fn subtree_last(&self, mut n: NodeIdx) -> NodeIdx {
+        loop {
+            if let Loc::Run { run, .. } = self.loc_of(n) {
+                n = self.runs[&run].last();
+            }
+            match self.afters.get(&n).and_then(|s| s.last()) {
+                Some(id) => n = self.idx_of_known(id),
+                None => return n,
+            }
+        }
+    }
+
     /// Check if node `a` is causally before node `b`.
     ///
     /// Walks handle space: the common case (run-chain neighbors) follows
@@ -443,10 +489,8 @@ impl HashSeq {
     fn neighbours(&self, idx: usize) -> (Option<NodeIdx>, Option<NodeIdx>) {
         let left = idx
             .checked_sub(1)
-            .and_then(|prev_idx| self.index.get(prev_idx).copied());
-
-        let right = self.index.get(idx).copied();
-
+            .and_then(|prev_idx| self.element_at(prev_idx));
+        let right = self.element_at(idx);
         (left, right)
     }
 
@@ -514,8 +558,8 @@ impl HashSeq {
 
         let mut to_remove = BTreeSet::new();
         for pos in idx..(idx + amount) {
-            if let Some(i) = self.index.get(pos) {
-                to_remove.insert(self.id_of(*i));
+            if let Some(i) = self.element_at(pos) {
+                to_remove.insert(self.id_of(i));
             } else {
                 break;
             }
@@ -550,20 +594,18 @@ impl HashSeq {
 
     fn insert_root(&mut self, root_id: Id, root: CausalRoot) {
         let idx = self.intern(root_id, Loc::Root);
-        let position = if let Some(next_root) = self
-            .root_nodes
-            .keys()
-            .filter(|id| *id >= &root_id)
-            .find(|id| !self.removed[self.idx_of_known(id).0 as usize])
-        {
-            // new root is inserted just before the next biggest root
-            self.index.find(&self.idx_of_known(next_root)).unwrap()
-        } else {
-            // otherwise if there is no bigger root, the new root is
-            // inserted at end of list
-            self.len()
-        };
-        self.index.insert(position, idx);
+        // Roots sit in Id order at the top level, each followed by its
+        // subtree: the new root's region starts directly before the next
+        // biggest root's region (removed or not — its region still occupies
+        // positions). With no bigger root, it goes at the very end.
+        match self.root_nodes.range(root_id..).next() {
+            Some((next_root, _)) => {
+                let first = self.region_first(self.idx_of_known(next_root));
+                let at = self.elem_ref(first);
+                self.index.insert_span_before(at, idx);
+            }
+            None => self.index.push_span_back(idx),
+        }
         self.root_nodes.insert(root_id, root);
     }
 
@@ -582,31 +624,32 @@ impl HashSeq {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
                 self.runs.get_mut(&run).unwrap().extend(idx, after.ch);
-                let position = self.index.find(&anchor).unwrap() + 1;
-                self.index.insert(position, idx);
+                self.index.extend_run(run, pos + 1);
                 return;
             }
         }
 
-        // Slow path: find the smallest afters node >= id and not removed.
+        // Slow path: this insert forks. Find the smallest afters node >= id.
         // Explicit-afters case: O(log n) range seek into the BTreeSet.
         // Run-fallback case: at most one candidate, just check it.
         let next_node = if let Some(siblings) = self.afters.get(&anchor) {
             siblings
                 .range(&id..)
+                .next()
                 .map(|aid| self.idx_of_known(aid))
-                .find(|a| !self.removed[a.0 as usize])
         } else {
             self.afters_of(anchor)
-                .find(|a| self.ids[a.0 as usize] >= id && !self.removed[a.0 as usize])
+                .find(|a| self.ids[a.0 as usize] >= id)
         };
-        let position = if let Some(next_node) = next_node {
-            // new node is inserted just before the other node after our anchor node that is
-            // bigger than the new node
-            self.index.find(&next_node)
-        } else {
-            // otherwise the new node is inserted after our anchor node (unless it has been removed)
-            self.index.find(&anchor).map(|p| p + 1)
+        // The iterator releases siblings in Id order, each preceded by its
+        // before-runs and trailed by its subtree. So the new node lands
+        // directly before the next bigger sibling's region — or, when it is
+        // the biggest sibling, directly after everything hanging off the
+        // anchor. Tombstones don't matter here: a removed element's region
+        // still occupies its place in document order.
+        let target = match next_node {
+            Some(next) => (self.region_first(next), true),
+            None => (self.subtree_last(anchor), false),
         };
 
         // We are inserting after a node inside a run (the extension case was
@@ -636,8 +679,15 @@ impl HashSeq {
         // run extension is handled in the fast path above, fork/split updates the afters set
         self.afters.entry(anchor).or_default().insert(id);
 
-        let position = position.unwrap_or_else(|| self.position_by_scan(idx));
-        self.index.insert(position, idx);
+        // Resolve the target element only now: the split above may have
+        // relocated it into the right-hand run.
+        let (el, before) = target;
+        let at = self.elem_ref(el);
+        if before {
+            self.index.insert_span_before(at, idx);
+        } else {
+            self.index.insert_span_after(at, idx);
+        }
     }
 
     /// Split the run `run` at element index `at` (0 < at < len). The right
@@ -660,6 +710,7 @@ impl HashSeq {
 
         let right_head_id = self.ids[right_head.0 as usize];
         self.runs.insert(right_head, right_run);
+        self.index.split_run(run, at as u32, right_head);
         // Track the split in afters so iteration can find the right portion
         self.afters
             .entry(left_last)
@@ -668,21 +719,20 @@ impl HashSeq {
         right_head
     }
 
-    /// Position of `idx` by walking the whole sequence — the fallback when the
-    /// anchor-relative lookup fails (anchor removed, or the neighbor isn't in the
-    /// position index yet, which can happen mid-merge).
-    fn position_by_scan(&self, idx: NodeIdx) -> usize {
-        self.iter_idxs().position(|n| n == idx).unwrap()
-    }
-
     fn apply_remove(&mut self, id: Id, extra_deps: BTreeSet<Id>, target_ids: BTreeSet<Id>) {
         // Targets are checked dependencies of the remove, so they are interned.
         // (A remove targeting a non-insert node is harmless: it's not in the
         // position index, and its tombstone bit is inert.)
         let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.idx_of_known(t)).collect();
         for t in &targets {
-            if let Some(p) = self.index.find(t) {
-                self.index.remove(p);
+            match self.loc_of(*t) {
+                Loc::Run { run, pos } => {
+                    self.index.remove_element((run, pos));
+                }
+                Loc::Root => {
+                    self.index.remove_element((*t, 0));
+                }
+                _ => {} // removes targeting non-inserts are inert
             }
             self.removed[t.0 as usize] = true;
         }
@@ -697,7 +747,13 @@ impl HashSeq {
                     && let Loc::RemoveChain { chain, pos } = self.loc_of(dep)
                     && pos as usize + 1 == self.remove_runs[&chain].links.len()
                 {
-                    let idx = self.intern(id, Loc::RemoveChain { chain, pos: pos + 1 });
+                    let idx = self.intern(
+                        id,
+                        Loc::RemoveChain {
+                            chain,
+                            pos: pos + 1,
+                        },
+                    );
                     let rr = self.remove_runs.get_mut(&chain).unwrap();
                     rr.targets.push(target);
                     rr.links.push(idx);
@@ -732,22 +788,18 @@ impl HashSeq {
         // The anchor is a checked dependency, so it is interned.
         let anchor = self.idx_of_known(&before.anchor);
 
-        // O(log n) range seek into the underlying BTreeSet, no intermediate allocation.
-        let position = if let Some(next_node) = self
+        // Before-siblings are released in Id order, directly before their
+        // anchor: the new node lands before the next bigger sibling's region,
+        // or — as the biggest — directly before the anchor element itself.
+        // (O(log n) range seek into the BTreeSet, no tombstone filtering:
+        // removed elements still anchor their regions.)
+        let target = match self
             .befores_by_anchor
             .get(&anchor)
-            .and_then(|s| {
-                s.range(id..)
-                    .map(|n| self.idx_of_known(n))
-                    .find(|n| !self.removed[n.0 as usize])
-            })
+            .and_then(|s| s.range(id..).next())
         {
-            // new node is inserted just before the other node before our anchor node that is
-            // bigger than the new node
-            Some(self.index.find(&next_node).unwrap())
-        } else {
-            // otherwise the new node is inserted before our anchor node
-            self.index.find(&anchor)
+            Some(next) => self.region_first(self.idx_of_known(next)),
+            None => anchor,
         };
 
         // The anchor may sit mid-run: no split is needed. Iteration visits the
@@ -767,13 +819,10 @@ impl HashSeq {
             },
         );
 
-        self.befores_by_anchor
-            .entry(anchor)
-            .or_default()
-            .insert(id);
+        self.befores_by_anchor.entry(anchor).or_default().insert(id);
 
-        let position = position.unwrap_or_else(|| self.position_by_scan(idx));
-        self.index.insert(position, idx);
+        let at = self.elem_ref(target);
+        self.index.insert_span_before(at, idx);
     }
 
     pub fn apply(&mut self, node: HashNode) {
@@ -877,7 +926,13 @@ impl HashSeq {
         for (idx, causal_remove) in &other.remove_nodes {
             let node = HashNode {
                 extra_dependencies: causal_remove.extra_dependencies.clone(),
-                op: Op::Remove(causal_remove.nodes.iter().map(|i| other.id_of(*i)).collect()),
+                op: Op::Remove(
+                    causal_remove
+                        .nodes
+                        .iter()
+                        .map(|i| other.id_of(*i))
+                        .collect(),
+                ),
             };
             debug_assert_eq!(other.id_of(*idx), node.id());
             self.apply(node)
@@ -903,12 +958,18 @@ impl HashSeq {
 
     /// Return the node ID at visible position `idx`, if any.
     pub fn id_at(&self, idx: usize) -> Option<Id> {
-        self.index.get(idx).map(|i| self.id_of(*i))
+        self.element_at(idx).map(|i| self.id_of(i))
     }
 
     /// Return the current visible position of `id`, if it is present and not removed.
     pub fn position_of(&self, id: &Id) -> Option<usize> {
-        self.index.find(&self.idx_of(id)?)
+        let idx = self.idx_of(id)?;
+        let at = match self.loc_of(idx) {
+            Loc::Run { run, pos } => (run, pos),
+            Loc::Root => (idx, 0),
+            _ => return None, // remove nodes have no position
+        };
+        self.index.position_of(at)
     }
 
     /// The current causal tips (heads of the causal DAG).
@@ -1671,6 +1732,72 @@ mod test {
         assert_eq!(merge_self, seq);
     }
 
+    /// The position index must agree with the document iterator — the
+    /// iterator is the source of truth for order. Checked on a merged seq
+    /// (merging is what creates sibling forks) plus more local edits on top.
+    fn check_index_matches_iter(seq: &HashSeq) {
+        let iter_ids: Vec<Id> = seq.iter_ids().copied().collect();
+        assert_eq!(seq.len(), iter_ids.len());
+        for (pos, id) in iter_ids.iter().enumerate() {
+            assert_eq!(
+                seq.id_at(pos),
+                Some(*id),
+                "id_at({pos}) disagrees with iterator"
+            );
+            assert_eq!(
+                seq.position_of(id),
+                Some(pos),
+                "position_of disagrees with iterator"
+            );
+        }
+        assert_eq!(seq.id_at(seq.len()), None);
+    }
+
+    #[quickcheck]
+    fn prop_index_matches_iterator(
+        a: Vec<(bool, u8, char)>,
+        b: Vec<(bool, u8, char)>,
+        after: Vec<(bool, u8, char)>,
+    ) {
+        let mut seq = seq_from_ops(&a);
+        seq.merge(seq_from_ops(&b));
+        check_index_matches_iter(&seq);
+        apply_ops(&mut seq, &after);
+        check_index_matches_iter(&seq);
+    }
+
+    /// Regression: a bigger-id sibling applied after a smaller visible sibling
+    /// used to land at `find(anchor)+1` in the index, before the smaller
+    /// sibling — while the iterator orders siblings ascending by id.
+    #[test]
+    fn index_orders_concurrent_siblings_like_the_iterator() {
+        let root = HashNode {
+            extra_dependencies: BTreeSet::new(),
+            op: Op::InsertRoot('a'),
+        };
+        let a = root.id();
+        for (c1, c2) in [('b', 'c'), ('x', 'y')] {
+            let n1 = HashNode {
+                extra_dependencies: BTreeSet::new(),
+                op: Op::InsertAfter(a, c1),
+            };
+            let n2 = HashNode {
+                extra_dependencies: BTreeSet::new(),
+                op: Op::InsertAfter(a, c2),
+            };
+            let (small, big) = if n1.id() < n2.id() {
+                (n1, n2)
+            } else {
+                (n2, n1)
+            };
+            let mut seq = HashSeq::default();
+            seq.apply(root.clone());
+            seq.apply(small);
+            seq.apply(big);
+            check_index_matches_iter(&seq);
+        }
+    }
+
     #[quickcheck]
     fn prop_commutative(a: Vec<(bool, u8, char)>, b: Vec<(bool, u8, char)>) {
         let seq_a = seq_from_ops(&a);
@@ -2160,7 +2287,9 @@ mod test {
                 assert_eq!(Some(anchor), seq.id_at(1));
                 assert!(!extra_deps.contains(&anchor));
             }
-            other => panic!("expected Before cursor at idx 1 (causally related neighbors), got {other:?}"),
+            other => panic!(
+                "expected Before cursor at idx 1 (causally related neighbors), got {other:?}"
+            ),
         }
 
         // idx == len: no right neighbor → After(last).

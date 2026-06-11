@@ -254,19 +254,21 @@ impl WasmHashSeq {
         // before-nodes) they belong to, deduped.
         let resolve_deps = |set: &std::collections::BTreeSet<Id>| -> Vec<Id> {
             let mut seen = std::collections::BTreeSet::new();
-            set.iter().map(&resolve).filter(|b| seen.insert(*b)).collect()
+            set.iter()
+                .map(&resolve)
+                .filter(|b| seen.insert(*b))
+                .collect()
         };
 
         let mut first = true;
         {
-        let mut emit =
-            |id: &Id,
-             kind: &str,
-             text: &str,
-             parent: Option<(Id, usize)>,
-             rel: Option<&str>,
-             removed: bool,
-             deps: &[Id]| {
+            let mut emit = |id: &Id,
+                            kind: &str,
+                            text: &str,
+                            parent: Option<(Id, usize)>,
+                            rel: Option<&str>,
+                            removed: bool,
+                            deps: &[Id]| {
                 if !first {
                     out.push(',');
                 }
@@ -308,39 +310,39 @@ impl WasmHashSeq {
                 out.push_str("]}");
             };
 
-        for (id, root) in &s.root_nodes {
-            emit(
-                id,
-                "root",
-                &root.ch.to_string(),
-                None,
-                None,
-                s.is_removed_id(id),
-                &resolve_deps(&root.extra_dependencies),
-            );
-        }
-        for (head, run) in &s.runs {
-            let head_id = s.id_of(*head);
-            let (kind, rel) = match run.first_op {
-                crate::run::FirstOp::After => ("run", "after"),
-                crate::run::FirstOp::Before => ("before", "before"),
-            };
-            // The anchor may be an interior element of the parent box (befores
-            // don't split runs); report its offset so the layout can attach there.
-            let anchor_offset = match s.idx_of(&run.anchor).map(|i| s.loc_of(i)) {
-                Some(Loc::Run { pos, .. }) => pos as usize,
-                _ => 0,
-            };
-            emit(
-                &head_id,
-                kind,
-                &run.text,
-                Some((resolve(&run.anchor), anchor_offset)),
-                Some(rel),
-                s.is_removed(*head),
-                &resolve_deps(&run.first_extra_deps),
-            );
-        }
+            for (id, root) in &s.root_nodes {
+                emit(
+                    id,
+                    "root",
+                    &root.ch.to_string(),
+                    None,
+                    None,
+                    s.is_removed_id(id),
+                    &resolve_deps(&root.extra_dependencies),
+                );
+            }
+            for (head, run) in &s.runs {
+                let head_id = s.id_of(*head);
+                let (kind, rel) = match run.first_op {
+                    crate::run::FirstOp::After => ("run", "after"),
+                    crate::run::FirstOp::Before => ("before", "before"),
+                };
+                // The anchor may be an interior element of the parent box (befores
+                // don't split runs); report its offset so the layout can attach there.
+                let anchor_offset = match s.idx_of(&run.anchor).map(|i| s.loc_of(i)) {
+                    Some(Loc::Run { pos, .. }) => pos as usize,
+                    _ => 0,
+                };
+                emit(
+                    &head_id,
+                    kind,
+                    &run.text,
+                    Some((resolve(&run.anchor), anchor_offset)),
+                    Some(rel),
+                    s.is_removed(*head),
+                    &resolve_deps(&run.first_extra_deps),
+                );
+            }
         }
 
         out.push_str("]}");

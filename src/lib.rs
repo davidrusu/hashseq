@@ -3,10 +3,11 @@ pub mod hash_node;
 pub mod hashseq;
 pub mod hashseq_iter;
 pub mod run;
+mod run_index;
 pub mod wasm;
 
 pub use self::encoding::{
-    decode_batch, decode_hashseq, encode_batch, encode_hashseq, DecodeError, EncodableOp,
+    DecodeError, EncodableOp, decode_batch, decode_hashseq, encode_batch, encode_hashseq,
 };
 pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};
