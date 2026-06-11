@@ -30,11 +30,12 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-// Operation type tags (used for batch encoding and orphans)
+// Operation type tags (used for batch encoding, orphans, and — via
+// `HashNode::id` — the node-id hash preimage; see hash_node.rs).
 const TAG_RUN: u8 = 0x00;
-const TAG_INSERT_AFTER: u8 = 0x01;
-const TAG_INSERT_BEFORE: u8 = 0x02;
-const TAG_REMOVE: u8 = 0x03;
+pub(crate) const TAG_INSERT_AFTER: u8 = 0x01;
+pub(crate) const TAG_INSERT_BEFORE: u8 = 0x02;
+pub(crate) const TAG_REMOVE: u8 = 0x03;
 
 // --- Varint (LEB128) encoding/decoding ---
 
