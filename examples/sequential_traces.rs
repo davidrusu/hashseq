@@ -194,21 +194,23 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
         let (_, sz) = decode_varint(&bytes[*pos..]).expect("varint");
         *pos += sz;
     }
-    /// Skip a varint that *is* a reference into the ID dictionary, and mark it.
-    fn skip_idx(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
-        let (idx, sz) = decode_varint(&bytes[*pos..]).expect("idx");
-        assert!(
-            idx < referenced.len(),
-            "dict index {idx} out of bounds (dict has {} entries)",
-            referenced.len()
-        );
-        referenced[idx] = true;
+    /// Skip a tagged ref: low bit 1 = positional (run_idx, elem_idx) — one
+    /// more varint follows; low bit 0 = dict index — mark it referenced.
+    fn skip_ref(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
+        let (v, sz) = decode_varint(&bytes[*pos..]).expect("ref");
         *pos += sz;
+        if v & 1 == 1 {
+            skip_varint(bytes, pos); // elem_idx
+        } else {
+            let idx = v >> 1;
+            assert!(idx < referenced.len(), "dict ref {idx} out of bounds");
+            referenced[idx] = true;
+        }
     }
-    fn skip_idx_set(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
+    fn skip_ref_set(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
         let n = read_varint(bytes, pos);
         for _ in 0..n {
-            skip_idx(bytes, pos, referenced);
+            skip_ref(bytes, pos, referenced);
         }
     }
     fn skip_utf8_char(bytes: &[u8], pos: &mut usize) {
@@ -229,36 +231,42 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     let mut referenced: Vec<bool> = vec![false; num_ids + 1];
     referenced[0] = true; // the origin is referenced by definition
 
-    // After-runs then Before-runs, both shaped:
-    // varint(num) + num * { idx anchor, idx_set first_extra_deps, string run_text }
-    for backwards in [false, true] {
-        let s = pos;
+    // Runs: one dependency-ordered section, per-run first_op tag.
+    // { u8 tag, ref anchor, ref_set first_extra_deps, string, interior deps }
+    {
+        let runs_start = pos;
         let num_runs = read_varint(bytes, &mut pos);
         for _ in 0..num_runs {
-            skip_idx(bytes, &mut pos, &mut referenced);
-            skip_idx_set(bytes, &mut pos, &mut referenced);
+            let s = pos;
+            let tag = bytes[pos];
+            pos += 1;
+            skip_ref(bytes, &mut pos, &mut referenced);
+            skip_ref_set(bytes, &mut pos, &mut referenced);
             let (run_text, sz) = decode_string(&bytes[pos..]).expect("string");
             pos += sz;
             b.runs_text += run_text.len();
-            // interior extra-deps: count + (offset, idx_set)
+            // interior extra-deps: count + (offset, ref_set)
             let n_interior = read_varint(bytes, &mut pos);
             for _ in 0..n_interior {
                 skip_varint(bytes, &mut pos); // offset (positional)
-                skip_idx_set(bytes, &mut pos, &mut referenced);
+                skip_ref_set(bytes, &mut pos, &mut referenced);
+            }
+            // attribute to the runs/befores columns by tag (0x01 = before)
+            if tag == 0x01 {
+                b.befores += pos - s;
+            } else {
+                b.runs += pos - s;
             }
         }
-        if backwards {
-            b.befores = pos - s;
-        } else {
-            b.runs = pos - s;
-        }
+        // the section-count varint itself goes unattributed (couple of bytes)
+        let _ = runs_start;
     }
 
     // Forward remove runs: varint(num) + num * { idx_set first_extra_deps, varint run_idx, varint start, varint end }
     let s = pos;
     let num_forward = read_varint(bytes, &mut pos);
     for _ in 0..num_forward {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_ref_set(bytes, &mut pos, &mut referenced);
         skip_varint(bytes, &mut pos); // run_idx (positional)
         skip_varint(bytes, &mut pos); // start_idx (positional)
         skip_varint(bytes, &mut pos); // end_idx (positional)
@@ -269,7 +277,7 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     let s = pos;
     let num_backward = read_varint(bytes, &mut pos);
     for _ in 0..num_backward {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_ref_set(bytes, &mut pos, &mut referenced);
         skip_varint(bytes, &mut pos); // run_idx
         skip_varint(bytes, &mut pos); // start_idx
         skip_varint(bytes, &mut pos); // end_idx
@@ -280,7 +288,7 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     let s = pos;
     let num_single = read_varint(bytes, &mut pos);
     for _ in 0..num_single {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_ref_set(bytes, &mut pos, &mut referenced);
         skip_varint(bytes, &mut pos); // run_idx
         skip_varint(bytes, &mut pos); // elem_idx
     }
@@ -290,19 +298,10 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     let s = pos;
     let num_other = read_varint(bytes, &mut pos);
     for _ in 0..num_other {
-        skip_idx_set(bytes, &mut pos, &mut referenced);
+        skip_ref_set(bytes, &mut pos, &mut referenced);
         let n = read_varint(bytes, &mut pos);
         for _ in 0..n {
-            let tag = bytes[pos];
-            pos += 1;
-            match tag {
-                0x00 => {
-                    skip_varint(bytes, &mut pos); // run_idx
-                    skip_varint(bytes, &mut pos); // elem_idx
-                }
-                0x01 => skip_idx(bytes, &mut pos, &mut referenced),
-                other => panic!("unknown remove-target tag: {other:#x}"),
-            }
+            skip_ref(bytes, &mut pos, &mut referenced); // target
         }
     }
     b.other_removes = pos - s;
@@ -315,15 +314,15 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
         pos += 1;
         match tag {
             TAG_INSERT_AFTER | TAG_INSERT_BEFORE => {
-                skip_idx_set(bytes, &mut pos, &mut referenced);
-                skip_idx(bytes, &mut pos, &mut referenced);
+                skip_ref_set(bytes, &mut pos, &mut referenced);
+                skip_ref(bytes, &mut pos, &mut referenced);
                 skip_utf8_char(bytes, &mut pos);
             }
             TAG_REMOVE => {
-                skip_idx_set(bytes, &mut pos, &mut referenced);
+                skip_ref_set(bytes, &mut pos, &mut referenced);
                 let n = read_varint(bytes, &mut pos);
                 for _ in 0..n {
-                    skip_idx(bytes, &mut pos, &mut referenced);
+                    skip_ref(bytes, &mut pos, &mut referenced);
                 }
             }
             other => panic!("unknown orphan tag: {other:#x}"),

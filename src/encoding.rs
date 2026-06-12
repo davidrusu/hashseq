@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hashseq::{CausalRemove, Loc, RemoveRun};
 use crate::{HashNode, HashSeq, Id, NodeIdx, Op, Run, StoredRun};
@@ -220,8 +220,14 @@ pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
         RUN_OP_BEFORE => crate::run::FirstOp::Before,
         _ => return Err(DecodeError::InvalidOpTag(first_op_tag)),
     };
-    let run = Run::from_text(anchor, first_op, first_extra_deps, &run_str, interior_extra_deps)
-        .ok_or(DecodeError::EmptyRun)?;
+    let run = Run::from_text(
+        anchor,
+        first_op,
+        first_extra_deps,
+        &run_str,
+        interior_extra_deps,
+    )
+    .ok_or(DecodeError::EmptyRun)?;
 
     Ok((run, pos))
 }
@@ -401,51 +407,124 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<EncodableOp>, DecodeError> {
 //
 // Format: [origin][id_dict][after-runs][before-runs][removes][orphans]
 
-// Target-reference tags in the "other removes" section.
-const RM_TARGET_RUN: u8 = 0x00;
-const RM_TARGET_DICT: u8 = 0x01;
-
 /// Encode a HashSeq to a compact byte representation.
 ///
 /// Format:
 /// - [origin: 32 bytes]               the document id (implicit dict entry 0)
 /// - [num_ids: varint][id_1..id_n: 32 bytes each]
-/// - [num_after_runs][runs...]        run:   { idx anchor, idx_set first_extra_deps, string,
-///   varint n, n × (varint offset, idx_set) interior deps }
-/// - [num_before_runs][runs...]       same shape; first char anchors InsertBefore
-/// - [num_forward_runs][...]          rmrun: { idx_set first_extra_deps, varint run_idx, varint start, varint end }
+/// - [num_runs][runs...]              run: { u8 first_op, ref anchor, ref_set first_extra_deps,
+///   string, varint n, n × (varint offset, ref_set) interior deps }
+/// - [num_forward_runs][...]          rmrun: { ref_set first_extra_deps, varint run_idx, varint start, varint end }
 /// - [num_backward_runs][...]
-/// - [num_single_run][...]            { idx_set extra_deps, varint run_idx, varint elem_idx }
-/// - [num_other_removes][...]         { idx_set extra_deps, varint n, n × tagged target }
-///   (multi-target removes; targets tagged run/dict — identity-preserving)
-/// - [num_orphans][orphans...]        tagged HashNodes with idx-encoded IDs
+/// - [num_single_run][...]            { ref_set extra_deps, varint run_idx, varint elem_idx }
+/// - [num_other_removes][...]         { ref_set extra_deps, varint n, n × ref target }
+/// - [num_orphans][orphans...]        tagged HashNodes with ref-encoded IDs
 ///
-/// Remove sections address elements by `run_idx` into the concatenated
-/// after-runs ++ before-runs list.
+/// A `ref` is a varint whose low bit selects the form: `(dict_idx << 1)` is a
+/// dictionary reference; `(run_idx << 1) | 1` followed by a varint `elem_idx`
+/// is a positional reference to an element of an earlier-encoded run. Most
+/// anchors and extra-deps are elements of encoded runs, so they cost a few
+/// bytes instead of a 32-byte dictionary entry.
+///
+/// Runs are emitted in dependency order (Kahn's algorithm over "references an
+/// element of" edges, min-id tie-break) so positional refs always point
+/// backward. Run-level cycles are possible even though the element DAG is
+/// acyclic (concurrent typists whose runs reference each other's elements);
+/// the smallest-id blocked run is then force-emitted and its unresolved refs
+/// fall back to the dictionary.
 pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
-    // runs/remove_nodes are HashMaps with a randomized iteration order; we sort
+    // runs/remove_nodes are HashMaps with a randomized iteration order; sort
     // by ID so the encoded bytes are byte-identical across processes (handles
     // are replica-local and never drive ordering).
-    let mut after_runs: Vec<(NodeIdx, &StoredRun)> = Vec::new();
-    let mut before_runs: Vec<(NodeIdx, &StoredRun)> = Vec::new();
-    for (head, run) in &seq.runs {
-        match run.first_op {
-            crate::run::FirstOp::After => after_runs.push((*head, run)),
-            crate::run::FirstOp::Before => before_runs.push((*head, run)),
-        }
-    }
-    after_runs.sort_by_key(|(h, _)| seq.id_of(*h));
-    before_runs.sort_by_key(|(h, _)| seq.id_of(*h));
-    // Removes address run elements by index into this concatenated list.
-    let runs: Vec<(NodeIdx, &StoredRun)> = after_runs
+    let mut all_runs: Vec<(NodeIdx, &StoredRun)> = seq.runs.iter().map(|(h, r)| (*h, r)).collect();
+    all_runs.sort_by_key(|(h, _)| seq.id_of(*h));
+    let n = all_runs.len();
+    let head_to_i: FxHashMap<NodeIdx, usize> = all_runs
         .iter()
-        .chain(before_runs.iter())
-        .copied()
+        .enumerate()
+        .map(|(i, (h, _))| (*h, i))
         .collect();
 
-    // Map storage handles to positions in the encoded layout.
-    let run_pos: FxHashMap<NodeIdx, usize> =
-        runs.iter().enumerate().map(|(i, (h, _))| (*h, i)).collect();
+    // (run head, elem offset) of an id, if it is an element of some run.
+    let elem_loc = |id: &Id| -> Option<(NodeIdx, usize)> {
+        match seq.idx_of(id).map(|i| seq.loc_of(i)) {
+            Some(Loc::Run { run, pos }) => Some((run, pos as usize)),
+            _ => None,
+        }
+    };
+
+    // --- Dependency-order the runs ---
+    let mut indeg = vec![0usize; n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    {
+        let mut parents: FxHashSet<usize> = FxHashSet::default();
+        for (i, (head, run)) in all_runs.iter().enumerate() {
+            parents.clear();
+            let note = |id: &Id, parents: &mut FxHashSet<usize>| {
+                if let Some((r, _)) = elem_loc(id)
+                    && r != *head
+                {
+                    parents.insert(head_to_i[&r]);
+                }
+            };
+            note(&run.anchor, &mut parents);
+            for id in &run.first_extra_deps {
+                note(id, &mut parents);
+            }
+            for deps in run.interior_extra_deps.values() {
+                for id in deps {
+                    note(id, &mut parents);
+                }
+            }
+            indeg[i] = parents.len();
+            for &p in &parents {
+                children[p].push(i);
+            }
+        }
+    }
+
+    // `all_runs` is id-sorted, so ordering indices by value == ordering by
+    // head id: BTreeSet<usize> frontiers are deterministic.
+    let mut run_pos: Vec<usize> = vec![usize::MAX; n]; // all_runs index -> emit position
+    let mut order: Vec<usize> = Vec::with_capacity(n); // emit position -> all_runs index
+    {
+        let mut ready: BTreeSet<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+        let mut blocked: BTreeSet<usize> = (0..n).filter(|&i| indeg[i] != 0).collect();
+        while order.len() < n {
+            let i = match ready.pop_first() {
+                Some(i) => i,
+                // A run-level cycle blocks everything left: force-emit the
+                // smallest-id run; its unresolved refs go through the dict.
+                None => blocked
+                    .pop_first()
+                    .expect("runs remain while order is short"),
+            };
+            run_pos[i] = order.len();
+            order.push(i);
+            for &c in &children[i] {
+                if run_pos[c] != usize::MAX {
+                    continue;
+                }
+                indeg[c] -= 1;
+                if indeg[c] == 0 && blocked.remove(&c) {
+                    ready.insert(c);
+                }
+            }
+        }
+    }
+    let runs: Vec<(NodeIdx, &StoredRun)> = order.iter().map(|&i| all_runs[i]).collect();
+    // head -> emit position (remove targets and ref resolution).
+    let run_emit: FxHashMap<NodeIdx, usize> =
+        runs.iter().enumerate().map(|(p, (h, _))| (*h, p)).collect();
+
+    /// Sections after the runs may reference any element.
+    const NO_LIMIT: usize = usize::MAX;
+    // Resolve an id to an element of a run emitted before `limit`.
+    let resolve_elem = |id: &Id, limit: usize| -> Option<(usize, usize)> {
+        let (r, off) = elem_loc(id)?;
+        let rp = *run_emit.get(&r)?;
+        (rp < limit).then_some((rp, off))
+    };
 
     // --- Removes ---
     // In-memory `RemoveRun` chains are already what the wire wants; each chain is
@@ -468,17 +547,10 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         parked.into_iter().map(|(_, node)| node).collect()
     };
 
-    /// Where a remove target lives in the encoded layout.
-    enum TargetRef {
-        Run(usize, usize),
-        /// Not positionally addressable (e.g. a remove targeting a remove);
-        /// referenced through the ID dictionary instead.
-        Dict(Id),
-    }
-    let resolve_target = |idx: NodeIdx| -> TargetRef {
+    let elem_of = |idx: NodeIdx| -> Option<(usize, usize)> {
         match seq.loc_of(idx) {
-            Loc::Run { run, pos } => TargetRef::Run(run_pos[&run], pos as usize),
-            _ => TargetRef::Dict(seq.id_of(idx)),
+            Loc::Run { run, pos } => Some((run_emit[&run], pos as usize)),
+            _ => None,
         }
     };
 
@@ -493,8 +565,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let mut backward_runs: Vec<WireRemoveRun> = Vec::new();
     let mut single_run_removes: Vec<(BTreeSet<Id>, usize, usize)> = Vec::new();
     // Identity-preserving section for multi-target removes and exotic targets:
-    // (extra_deps, target refs) — decode rebuilds the exact Op::Remove set.
-    let mut other_removes: Vec<(BTreeSet<Id>, Vec<TargetRef>)> = Vec::new();
+    // (extra_deps, target ids encoded as refs) — decode rebuilds the exact
+    // Op::Remove set.
+    let mut other_removes: Vec<(BTreeSet<Id>, Vec<Id>)> = Vec::new();
 
     let mut chains: Vec<&RemoveRun> = seq.remove_runs.values().collect();
     chains.sort_by_key(|c| c.links.first().map(|l| seq.id_of(*l)));
@@ -507,15 +580,15 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             } else {
                 BTreeSet::from_iter([seq.id_of(chain.links[i - 1])])
             };
-            match resolve_target(chain.targets[i]) {
-                TargetRef::Run(run_idx, elem_idx) => {
+            match elem_of(chain.targets[i]) {
+                Some((run_idx, elem_idx)) => {
                     // Greedy span: stay in the same encoded run, stepping ±1 in a
                     // consistent direction.
                     let mut j = i + 1;
                     let mut backwards = None;
                     let mut last = elem_idx;
                     while j < chain.targets.len() {
-                        let TargetRef::Run(r2, e2) = resolve_target(chain.targets[j]) else {
+                        let Some((r2, e2)) = elem_of(chain.targets[j]) else {
                             break;
                         };
                         if r2 != run_idx {
@@ -549,8 +622,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     }
                     i = j;
                 }
-                target @ TargetRef::Dict(_) => {
-                    other_removes.push((deps, vec![target]));
+                None => {
+                    other_removes.push((deps, vec![seq.id_of(chain.targets[i])]));
                     i += 1;
                 }
             }
@@ -561,66 +634,69 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         seq.remove_nodes.iter().map(|(i, r)| (*i, r)).collect();
     multi_removes.sort_by_key(|(idx, _)| seq.id_of(*idx));
     for (_idx, remove) in &multi_removes {
-        let targets = remove.nodes.iter().map(|t| resolve_target(*t)).collect();
+        let targets = remove.nodes.iter().map(|t| seq.id_of(*t)).collect();
         other_removes.push((remove.extra_dependencies.clone(), targets));
     }
 
     // --- Build the ID dictionary ---
-    // Includes every ID that will be encoded as a varint index in the body below.
-    // Notably excludes: removed-element IDs targeted by RemoveRuns or by the standalone
-    // single_run/before/root sections, since those use positional refs.
+    // Only ids that some ref cannot resolve positionally: non-element ids
+    // (remove ops, unknown orphan deps), cycle-broken forward refs, and
+    // same-run refs.
     let mut id_set: BTreeSet<Id> = BTreeSet::new();
-
-    for (_, run) in &runs {
-        id_set.insert(run.anchor);
-        for id in &run.first_extra_deps {
-            id_set.insert(*id);
-        }
-        for deps in run.interior_extra_deps.values() {
-            for id in deps {
+    {
+        let note = |id: &Id, limit: usize, id_set: &mut BTreeSet<Id>| {
+            if resolve_elem(id, limit).is_none() {
                 id_set.insert(*id);
             }
-        }
-    }
-    for rr in forward_runs.iter().chain(backward_runs.iter()) {
-        for dep in &rr.extra_deps {
-            id_set.insert(*dep);
-        }
-    }
-    for (extra_deps, _, _) in &single_run_removes {
-        for dep in extra_deps {
-            id_set.insert(*dep);
-        }
-    }
-    for (extra_deps, targets) in &other_removes {
-        for dep in extra_deps {
-            id_set.insert(*dep);
-        }
-        for t in targets {
-            if let TargetRef::Dict(id) = t {
-                id_set.insert(*id);
+        };
+        for (p, (_, run)) in runs.iter().enumerate() {
+            note(&run.anchor, p, &mut id_set);
+            for id in &run.first_extra_deps {
+                note(id, p, &mut id_set);
+            }
+            for deps in run.interior_extra_deps.values() {
+                for id in deps {
+                    note(id, p, &mut id_set);
+                }
             }
         }
-    }
-    for orphan in &orphans {
-        for dep in &orphan.extra_dependencies {
-            id_set.insert(*dep);
-        }
-        match &orphan.op {
-            Op::InsertAfter(id, _) | Op::InsertBefore(id, _) => {
-                id_set.insert(*id);
+        for rr in forward_runs.iter().chain(backward_runs.iter()) {
+            for dep in &rr.extra_deps {
+                note(dep, NO_LIMIT, &mut id_set);
             }
-            Op::Remove(ids) => {
-                for id in ids {
-                    id_set.insert(*id);
+        }
+        for (extra_deps, _, _) in &single_run_removes {
+            for dep in extra_deps {
+                note(dep, NO_LIMIT, &mut id_set);
+            }
+        }
+        for (extra_deps, targets) in &other_removes {
+            for dep in extra_deps {
+                note(dep, NO_LIMIT, &mut id_set);
+            }
+            for t in targets {
+                note(t, NO_LIMIT, &mut id_set);
+            }
+        }
+        for orphan in &orphans {
+            for dep in &orphan.extra_dependencies {
+                note(dep, NO_LIMIT, &mut id_set);
+            }
+            match &orphan.op {
+                Op::InsertAfter(id, _) | Op::InsertBefore(id, _) => {
+                    note(id, NO_LIMIT, &mut id_set);
+                }
+                Op::Remove(ids) => {
+                    for id in ids {
+                        note(id, NO_LIMIT, &mut id_set);
+                    }
                 }
             }
         }
     }
 
     // The origin is the implicit first dictionary entry: it's written once in
-    // the header, and anchors referencing it (most top-level runs) cost a
-    // 1-byte index instead of repeating 32 bytes.
+    // the header, and refs to it cost a 1-byte dict ref.
     let origin = seq.origin();
     id_set.remove(&origin);
     let id_list: Vec<Id> = std::iter::once(origin).chain(id_set).collect();
@@ -636,38 +712,44 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         encode_id(id, &mut buf);
     }
 
-    let encode_idx = |id: &Id, buf: &mut Vec<u8>| {
-        encode_varint(id_to_idx[id], buf);
+    let encode_ref = |id: &Id, limit: usize, buf: &mut Vec<u8>| {
+        if let Some((rp, off)) = resolve_elem(id, limit) {
+            encode_varint((rp << 1) | 1, buf);
+            encode_varint(off, buf);
+        } else {
+            encode_varint(id_to_idx[id] << 1, buf);
+        }
     };
-    let encode_idx_set = |ids: &BTreeSet<Id>, buf: &mut Vec<u8>| {
+    let encode_ref_set = |ids: &BTreeSet<Id>, limit: usize, buf: &mut Vec<u8>| {
         encode_varint(ids.len(), buf);
         for id in ids {
-            encode_varint(id_to_idx[id], buf);
+            encode_ref(id, limit, buf);
         }
     };
 
-    // Runs: After-anchored, then Before-anchored. The two sections share a shape,
-    // so the op kind is implied by the section rather than a per-run tag.
-    for runs in [&after_runs, &before_runs] {
-        encode_varint(runs.len(), &mut buf);
-        for (_, run) in runs.iter() {
-            encode_idx(&run.anchor, &mut buf);
-            encode_idx_set(&run.first_extra_deps, &mut buf);
-            encode_string(&run.text, &mut buf);
-            // Interior extra-deps: count + (offset, idx_set), ascending offsets.
-            encode_varint(run.interior_extra_deps.len(), &mut buf);
-            for (offset, deps) in &run.interior_extra_deps {
-                encode_varint(*offset, &mut buf);
-                encode_idx_set(deps, &mut buf);
-            }
+    // Runs: one section in dependency order, first_op tagged per run.
+    encode_varint(runs.len(), &mut buf);
+    for (p, (_, run)) in runs.iter().enumerate() {
+        buf.push(match run.first_op {
+            crate::run::FirstOp::After => RUN_OP_AFTER,
+            crate::run::FirstOp::Before => RUN_OP_BEFORE,
+        });
+        encode_ref(&run.anchor, p, &mut buf);
+        encode_ref_set(&run.first_extra_deps, p, &mut buf);
+        encode_string(&run.text, &mut buf);
+        // Interior extra-deps: count + (offset, ref_set), ascending offsets.
+        encode_varint(run.interior_extra_deps.len(), &mut buf);
+        for (offset, deps) in &run.interior_extra_deps {
+            encode_varint(*offset, &mut buf);
+            encode_ref_set(deps, p, &mut buf);
         }
     }
 
     // Remove runs: forward chains, then backward chains (must match decode order).
-    for runs in [&forward_runs, &backward_runs] {
-        encode_varint(runs.len(), &mut buf);
-        for rr in runs.iter() {
-            encode_idx_set(&rr.extra_deps, &mut buf);
+    for rruns in [&forward_runs, &backward_runs] {
+        encode_varint(rruns.len(), &mut buf);
+        for rr in rruns.iter() {
+            encode_ref_set(&rr.extra_deps, NO_LIMIT, &mut buf);
             encode_varint(rr.run_idx, &mut buf);
             encode_varint(rr.start_idx, &mut buf);
             encode_varint(rr.end_idx, &mut buf);
@@ -677,60 +759,89 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // Single-run standalone removes
     encode_varint(single_run_removes.len(), &mut buf);
     for (extra_deps, run_idx, elem_idx) in &single_run_removes {
-        encode_idx_set(extra_deps, &mut buf);
+        encode_ref_set(extra_deps, NO_LIMIT, &mut buf);
         encode_varint(*run_idx, &mut buf);
         encode_varint(*elem_idx, &mut buf);
     }
 
-    // Other removes (multi-target / dict-referenced targets), identity-preserving:
+    // Other removes (multi-target / non-element targets), identity-preserving:
     // decode rebuilds the exact Op::Remove target set so the node id survives.
     encode_varint(other_removes.len(), &mut buf);
     for (extra_deps, targets) in &other_removes {
-        encode_idx_set(extra_deps, &mut buf);
+        encode_ref_set(extra_deps, NO_LIMIT, &mut buf);
         encode_varint(targets.len(), &mut buf);
         for t in targets {
-            match t {
-                TargetRef::Run(run_idx, elem_idx) => {
-                    buf.push(RM_TARGET_RUN);
-                    encode_varint(*run_idx, &mut buf);
-                    encode_varint(*elem_idx, &mut buf);
-                }
-                TargetRef::Dict(id) => {
-                    buf.push(RM_TARGET_DICT);
-                    encode_idx(id, &mut buf);
-                }
-            }
+            encode_ref(t, NO_LIMIT, &mut buf);
         }
     }
 
-    // Orphans (tagged, with idx-encoded IDs)
+    // Orphans (tagged, with ref-encoded IDs)
     encode_varint(orphans.len(), &mut buf);
     for orphan in &orphans {
         match &orphan.op {
             Op::InsertAfter(id, ch) => {
                 buf.push(TAG_INSERT_AFTER);
-                encode_idx_set(&orphan.extra_dependencies, &mut buf);
-                encode_idx(id, &mut buf);
+                encode_ref_set(&orphan.extra_dependencies, NO_LIMIT, &mut buf);
+                encode_ref(id, NO_LIMIT, &mut buf);
                 encode_utf8_char(*ch, &mut buf);
             }
             Op::InsertBefore(id, ch) => {
                 buf.push(TAG_INSERT_BEFORE);
-                encode_idx_set(&orphan.extra_dependencies, &mut buf);
-                encode_idx(id, &mut buf);
+                encode_ref_set(&orphan.extra_dependencies, NO_LIMIT, &mut buf);
+                encode_ref(id, NO_LIMIT, &mut buf);
                 encode_utf8_char(*ch, &mut buf);
             }
             Op::Remove(ids) => {
                 buf.push(TAG_REMOVE);
-                encode_idx_set(&orphan.extra_dependencies, &mut buf);
+                encode_ref_set(&orphan.extra_dependencies, NO_LIMIT, &mut buf);
                 encode_varint(ids.len(), &mut buf);
                 for id in ids {
-                    encode_idx(id, &mut buf);
+                    encode_ref(id, NO_LIMIT, &mut buf);
                 }
             }
         }
     }
 
     buf
+}
+
+/// Resolve a wire `ref`: low bit 1 = positional (run_idx, elem_idx) into the
+/// already-decoded run elements; low bit 0 = dictionary index.
+fn decode_ref(bytes: &[u8], id_list: &[Id], elems: &[Vec<Id>]) -> Result<(Id, usize), DecodeError> {
+    let (v, mut size) = decode_varint(bytes)?;
+    if v & 1 == 1 {
+        let run_idx = v >> 1;
+        let (off, s) = decode_varint(&bytes[size..])?;
+        size += s;
+        let id = elems
+            .get(run_idx)
+            .and_then(|e| e.get(off))
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(run_idx))?;
+        Ok((id, size))
+    } else {
+        let idx = v >> 1;
+        let id = id_list
+            .get(idx)
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(idx))?;
+        Ok((id, size))
+    }
+}
+
+fn decode_ref_set(
+    bytes: &[u8],
+    id_list: &[Id],
+    elems: &[Vec<Id>],
+) -> Result<(BTreeSet<Id>, usize), DecodeError> {
+    let (count, mut pos) = decode_varint(bytes)?;
+    let mut ids = BTreeSet::new();
+    for _ in 0..count {
+        let (id, size) = decode_ref(&bytes[pos..], id_list, elems)?;
+        ids.insert(id);
+        pos += size;
+    }
+    Ok((ids, pos))
 }
 
 /// Decode a HashSeq from its byte representation.
@@ -753,67 +864,53 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         pos += size;
     }
 
-    let lookup_id = |idx: usize| -> Result<Id, DecodeError> {
-        id_list
-            .get(idx)
-            .copied()
-            .ok_or(DecodeError::InvalidIdIndex(idx))
-    };
-    let decode_idx_at = |bytes: &[u8]| -> Result<(Id, usize), DecodeError> {
-        let (idx, size) = decode_varint(bytes)?;
-        Ok((lookup_id(idx)?, size))
-    };
-    let decode_idx_set_at = |bytes: &[u8]| -> Result<(BTreeSet<Id>, usize), DecodeError> {
-        let (count, size) = decode_varint(bytes)?;
-        let mut total = size;
-        let mut ids = BTreeSet::new();
-        for _ in 0..count {
-            let (idx, size) = decode_varint(&bytes[total..])?;
-            ids.insert(lookup_id(idx)?);
-            total += size;
-        }
-        Ok((ids, total))
-    };
-
     let mut seq = HashSeq::new(origin);
     let mut run_element_ids: Vec<Vec<Id>> = Vec::new();
 
-    // Runs: After-anchored section, then Before-anchored section. Both feed
-    // run_element_ids, which the remove sections below index positionally.
-    for first_op in [crate::run::FirstOp::After, crate::run::FirstOp::Before] {
-        let (num_runs, size) = decode_varint(&bytes[pos..])?;
+    // Runs: one section in dependency order — positional refs (anchor, deps)
+    // only point at already-decoded runs.
+    let (num_runs, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    for _ in 0..num_runs {
+        if pos >= bytes.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        let first_op = match bytes[pos] {
+            RUN_OP_AFTER => crate::run::FirstOp::After,
+            RUN_OP_BEFORE => crate::run::FirstOp::Before,
+            other => return Err(DecodeError::InvalidOpTag(other)),
+        };
+        pos += 1;
+
+        let (anchor, size) = decode_ref(&bytes[pos..], &id_list, &run_element_ids)?;
         pos += size;
-        for _ in 0..num_runs {
-            let (anchor, size) = decode_idx_at(&bytes[pos..])?;
-            pos += size;
-            let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
-            pos += size;
-            let (run_str, size) = decode_string(&bytes[pos..])?;
-            pos += size;
+        let (first_extra_deps, size) = decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
+        pos += size;
+        let (run_str, size) = decode_string(&bytes[pos..])?;
+        pos += size;
 
-            let (num_interior, size) = decode_varint(&bytes[pos..])?;
+        let (num_interior, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+        let mut interior_extra_deps = BTreeMap::new();
+        for _ in 0..num_interior {
+            let (offset, size) = decode_varint(&bytes[pos..])?;
             pos += size;
-            let mut interior_extra_deps = BTreeMap::new();
-            for _ in 0..num_interior {
-                let (offset, size) = decode_varint(&bytes[pos..])?;
-                pos += size;
-                let (deps, size) = decode_idx_set_at(&bytes[pos..])?;
-                pos += size;
-                interior_extra_deps.insert(offset, deps);
-            }
+            let (deps, size) = decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
+            pos += size;
+            interior_extra_deps.insert(offset, deps);
+        }
 
-            let run = Run::from_text(
-                anchor,
-                first_op,
-                first_extra_deps,
-                &run_str,
-                interior_extra_deps,
-            )
-            .ok_or(DecodeError::EmptyRun)?;
-            run_element_ids.push(run.elements.clone());
-            for node in run.decompress() {
-                seq.apply(node);
-            }
+        let run = Run::from_text(
+            anchor,
+            first_op,
+            first_extra_deps,
+            &run_str,
+            interior_extra_deps,
+        )
+        .ok_or(DecodeError::EmptyRun)?;
+        run_element_ids.push(run.elements.clone());
+        for node in run.decompress() {
+            seq.apply(node);
         }
     }
 
@@ -825,7 +922,8 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         let (num_remove_runs, size) = decode_varint(&bytes[pos..])?;
         pos += size;
         for _ in 0..num_remove_runs {
-            let (first_extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+            let (first_extra_deps, size) =
+                decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
             pos += size;
             let (run_idx, size) = decode_varint(&bytes[pos..])?;
             pos += size;
@@ -875,7 +973,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
     let (num_single_run, size) = decode_varint(&bytes[pos..])?;
     pos += size;
     for _ in 0..num_single_run {
-        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        let (extra_deps, size) = decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
         pos += size;
         let (run_idx, size) = decode_varint(&bytes[pos..])?;
         pos += size;
@@ -894,42 +992,20 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         });
     }
 
-    // Other removes (multi-target / dict-referenced targets)
+    // Other removes (multi-target / non-element targets)
     let (num_other_removes, size) = decode_varint(&bytes[pos..])?;
     pos += size;
     for _ in 0..num_other_removes {
-        let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+        let (extra_deps, size) = decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
         pos += size;
         let (num_targets, size) = decode_varint(&bytes[pos..])?;
         pos += size;
 
         let mut targets = BTreeSet::new();
         for _ in 0..num_targets {
-            if pos >= bytes.len() {
-                return Err(DecodeError::UnexpectedEof);
-            }
-            let tag = bytes[pos];
-            pos += 1;
-            let target = match tag {
-                RM_TARGET_RUN => {
-                    let (run_idx, size) = decode_varint(&bytes[pos..])?;
-                    pos += size;
-                    let (elem_idx, size) = decode_varint(&bytes[pos..])?;
-                    pos += size;
-                    run_element_ids
-                        .get(run_idx)
-                        .and_then(|e| e.get(elem_idx))
-                        .copied()
-                        .ok_or(DecodeError::InvalidIdIndex(elem_idx))?
-                }
-                RM_TARGET_DICT => {
-                    let (id, size) = decode_idx_at(&bytes[pos..])?;
-                    pos += size;
-                    id
-                }
-                _ => return Err(DecodeError::InvalidOpTag(tag)),
-            };
-            targets.insert(target);
+            let (id, size) = decode_ref(&bytes[pos..], &id_list, &run_element_ids)?;
+            pos += size;
+            targets.insert(id);
         }
 
         seq.apply(HashNode {
@@ -949,9 +1025,9 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         pos += 1;
         match tag {
             TAG_INSERT_AFTER => {
-                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                let (extra_deps, size) = decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
                 pos += size;
-                let (id, size) = decode_idx_at(&bytes[pos..])?;
+                let (id, size) = decode_ref(&bytes[pos..], &id_list, &run_element_ids)?;
                 pos += size;
                 let (ch, size) = decode_utf8_char(&bytes[pos..])?;
                 pos += size;
@@ -961,9 +1037,9 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 });
             }
             TAG_INSERT_BEFORE => {
-                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                let (extra_deps, size) = decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
                 pos += size;
-                let (id, size) = decode_idx_at(&bytes[pos..])?;
+                let (id, size) = decode_ref(&bytes[pos..], &id_list, &run_element_ids)?;
                 pos += size;
                 let (ch, size) = decode_utf8_char(&bytes[pos..])?;
                 pos += size;
@@ -973,13 +1049,13 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 });
             }
             TAG_REMOVE => {
-                let (extra_deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                let (extra_deps, size) = decode_ref_set(&bytes[pos..], &id_list, &run_element_ids)?;
                 pos += size;
                 let (count, size) = decode_varint(&bytes[pos..])?;
                 pos += size;
                 let mut removed_ids = BTreeSet::new();
                 for _ in 0..count {
-                    let (id, size) = decode_idx_at(&bytes[pos..])?;
+                    let (id, size) = decode_ref(&bytes[pos..], &id_list, &run_element_ids)?;
                     pos += size;
                     removed_ids.insert(id);
                 }
@@ -988,7 +1064,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     op: Op::Remove(removed_ids),
                 });
             }
-            _ => return Err(DecodeError::InvalidOpTag(tag)),
+            other => return Err(DecodeError::InvalidOpTag(other)),
         }
     }
 
@@ -1301,6 +1377,73 @@ mod tests {
 
         assert_eq!(decoded.iter().collect::<String>(), original_str);
         assert_eq!(seq, decoded);
+    }
+
+    /// Two replicas editing concurrently with periodic cross-merges: each
+    /// side's runs carry deps on the other's elements, producing exactly the
+    /// run-level reference cycles the encoder's dependency ordering must
+    /// break deterministically (force-emit + dict fallback).
+    #[quickcheck]
+    fn prop_roundtrip_after_merge(a: Vec<(bool, u8, char)>, b: Vec<(bool, u8, char)>) -> bool {
+        fn apply(seq: &mut HashSeq, ops: &[(bool, u8, char)]) {
+            for &(is_insert, idx, ch) in ops {
+                let idx = idx as usize;
+                if is_insert {
+                    seq.insert(idx.min(seq.len()), ch);
+                } else if !seq.is_empty() {
+                    seq.remove(idx.min(seq.len() - 1));
+                }
+            }
+        }
+        let mut seq_a = HashSeq::default();
+        let mut seq_b = HashSeq::default();
+        for (chunk_a, chunk_b) in a.chunks(3).zip(b.chunks(3)) {
+            apply(&mut seq_a, chunk_a);
+            apply(&mut seq_b, chunk_b);
+            seq_a.merge(seq_b.clone());
+            seq_b.merge(seq_a.clone());
+        }
+
+        let encoded = encode_hashseq(&seq_a);
+        let decoded = decode_hashseq(&encoded).unwrap();
+        // Note: re-encoding `decoded` may produce *different bytes* — chain
+        // and run storage are arrival-order dependent under concurrency
+        // (e.g. two removes claiming the same parent), so byte-canonical
+        // encoding is not a property the format has. Logical state must
+        // roundtrip exactly, and a second roundtrip must be logically stable.
+        let encoded2 = encode_hashseq(&decoded);
+        let decoded2 = decode_hashseq(&encoded2).unwrap();
+        decoded == seq_a
+            && decoded.iter().collect::<String>() == seq_a.iter().collect::<String>()
+            && decoded2 == seq_a
+            && decoded2.iter().collect::<String>() == seq_a.iter().collect::<String>()
+    }
+
+    /// Deterministic cycle shape: two concurrent runs that each extend with
+    /// an interior dep on the other's element.
+    #[test]
+    fn roundtrip_with_run_level_dep_cycle() {
+        let mut a = HashSeq::default();
+        let mut b = HashSeq::default();
+        a.insert(0, 'a');
+        b.insert(0, 'b');
+        a.merge(b.clone());
+        b.merge(a.clone());
+        assert_eq!(a, b);
+
+        // Extend the trailing run with a dep on the other run's tip (insert
+        // at end), then extend the leading run likewise (insert at pos 1).
+        a.insert(2, 'x');
+        a.insert(1, 'y');
+
+        let encoded = encode_hashseq(&a);
+        let decoded = decode_hashseq(&encoded).unwrap();
+        assert_eq!(decoded, a);
+        assert_eq!(
+            decoded.iter().collect::<String>(),
+            a.iter().collect::<String>()
+        );
+        assert_eq!(encode_hashseq(&decoded), encoded);
     }
 
     #[quickcheck]

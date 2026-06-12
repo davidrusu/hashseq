@@ -1867,9 +1867,7 @@ mod test {
         );
         // the deps landed as interior deps on some run
         assert!(
-            seq.runs
-                .values()
-                .any(|r| !r.interior_extra_deps.is_empty()),
+            seq.runs.values().any(|r| !r.interior_extra_deps.is_empty()),
             "remove dep should be stored as interior extra-deps"
         );
         // and the encoding roundtrips identically
