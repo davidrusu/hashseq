@@ -870,7 +870,7 @@ mod hashseq_viz {
                         // Check if this ID corresponds to a run
                         if let Some(run) = self.seq.idx_of(id).and_then(|i| self.seq.runs.get(&i)) {
                             // Decompress to get individual character nodes
-                            let nodes = run.to_run().decompress();
+                            let nodes = run.to_run(&self.seq.ids).decompress();
                             let num_chars = nodes.len();
 
                             let total_width = num_chars as f32 * char_width;

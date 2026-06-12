@@ -245,16 +245,17 @@ impl StoredRun {
         }
     }
 
-    /// Reconstruct the wire-level run (recomputes element ids by hashing).
-    pub fn to_run(&self) -> Run {
-        Run::from_text(
-            self.anchor,
-            self.first_op,
-            self.first_extra_deps.clone(),
-            &self.text,
-            self.interior_extra_deps.clone(),
-        )
-        .expect("stored runs are never empty")
+    /// Reconstruct the wire-level run. Element ids are copied from the seq's
+    /// id table (`ids[elements[i]]`) — no rehashing.
+    pub fn to_run(&self, ids: &[Id]) -> Run {
+        Run {
+            anchor: self.anchor,
+            first_op: self.first_op,
+            first_extra_deps: self.first_extra_deps.clone(),
+            interior_extra_deps: self.interior_extra_deps.clone(),
+            run: self.text.clone(),
+            elements: self.elements.iter().map(|e| ids[e.0 as usize]).collect(),
+        }
     }
 }
 
@@ -888,13 +889,17 @@ impl HashSeq {
         self.apply_with_id(id, node);
     }
 
-    /// Apply a node with a pre-computed ID (avoids double hashing).
+    /// Apply a node with a pre-computed ID (avoids double hashing). The id
+    /// must be the node's true hash — callers either just computed it
+    /// (`apply`) or copied it from a locally-computed cache (`merge`, decode);
+    /// the wire never supplies ids directly.
     ///
     /// Iterative worklist, no recursion: applying a node wakes exactly the
     /// orphans parked on its id (which may re-park on their next missing
     /// dep), so out-of-order delivery costs each node one park per missing
     /// dep instead of a global retry per apply.
-    fn apply_with_id(&mut self, id: Id, node: HashNode) {
+    pub(crate) fn apply_with_id(&mut self, id: Id, node: HashNode) {
+        debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
         if self.contains_node(&id) {
             return; // Already processed this node
         }
@@ -988,17 +993,17 @@ impl HashSeq {
         );
 
         // Covers both After- and Before-anchored runs: decompress reconstructs
-        // the anchoring first node for either kind.
+        // the anchoring first node for either kind. Ids come from `other`'s
+        // id table — no rehashing on the merge path.
         for run in other.runs.values() {
-            for node in run.to_run().decompress() {
-                self.apply(node);
+            for (id, node) in run.to_run(&other.ids).decompress_with_ids() {
+                self.apply_with_id(id, node);
             }
         }
 
         for remove_run in other.remove_runs.values() {
             for (i, node) in other.remove_run_nodes(remove_run).into_iter().enumerate() {
-                debug_assert_eq!(node.id(), other.id_of(remove_run.links[i]));
-                self.apply(node);
+                self.apply_with_id(other.id_of(remove_run.links[i]), node);
             }
         }
 
@@ -1013,8 +1018,7 @@ impl HashSeq {
                         .collect(),
                 ),
             };
-            debug_assert_eq!(other.id_of(*idx), node.id());
-            self.apply(node)
+            self.apply_with_id(other.id_of(*idx), node)
         }
 
         // Apply all orphaned nodes (ids were computed when they were parked)

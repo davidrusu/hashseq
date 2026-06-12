@@ -909,8 +909,10 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         )
         .ok_or(DecodeError::EmptyRun)?;
         run_element_ids.push(run.elements.clone());
-        for node in run.decompress() {
-            seq.apply(node);
+        // `from_text` above computed the element ids from the wire content —
+        // that's the authoritative derivation, so apply without rehashing.
+        for (id, node) in run.decompress_with_ids() {
+            seq.apply_with_id(id, node);
         }
     }
 
@@ -952,8 +954,9 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     extra_dependencies: extra_deps,
                     op: Op::Remove(BTreeSet::from_iter([removed_id])),
                 };
-                prev_remove_id = Some(node.id());
-                seq.apply(node);
+                let id = node.id();
+                prev_remove_id = Some(id);
+                seq.apply_with_id(id, node);
                 Ok(())
             };
 

@@ -110,12 +110,26 @@ impl Run {
     /// Decompress the run into individual HashNodes
     /// This reconstructs the full node information for each character
     pub fn decompress(&self) -> Vec<HashNode> {
-        let mut nodes = Vec::with_capacity(self.run.len());
+        self.decompress_with_ids()
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect()
+    }
+
+    /// Decompress with each node's (cached) id — the chain anchors and the
+    /// returned ids come from `self.elements`, so no hashing happens here.
+    ///
+    /// The ids are only as trustworthy as `self.elements`: runs built by this
+    /// module (`new`/`extend`/`from_text`) compute them from content, so
+    /// internal callers (merge, decode) may apply without rehashing; anything
+    /// else should verify (applying via `HashSeq::apply` re-derives ids).
+    pub fn decompress_with_ids(&self) -> Vec<(Id, HashNode)> {
+        let mut nodes = Vec::with_capacity(self.elements.len());
 
         let mut chars = self.run.chars();
 
         let first = chars.next().unwrap(); // we always have at least one char in the run
-        nodes.push(self.first_node_with_char(first));
+        nodes.push((self.elements[0], self.first_node_with_char(first)));
 
         for (i, ch) in chars.enumerate() {
             let extra_dependencies = self
@@ -123,10 +137,13 @@ impl Run {
                 .get(&(i + 1))
                 .cloned()
                 .unwrap_or_default();
-            nodes.push(HashNode {
-                extra_dependencies,
-                op: Op::InsertAfter(nodes[nodes.len() - 1].id(), ch),
-            });
+            nodes.push((
+                self.elements[i + 1],
+                HashNode {
+                    extra_dependencies,
+                    op: Op::InsertAfter(self.elements[i], ch),
+                },
+            ));
         }
 
         nodes
