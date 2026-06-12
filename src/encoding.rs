@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustc_hash::FxHashMap;
 
@@ -178,6 +178,13 @@ pub fn encode_run(run: &Run, buf: &mut Vec<u8>) {
     encode_id(&run.anchor, buf);
     encode_id_set(&run.first_extra_deps, buf);
     encode_string(&run.run, buf);
+    // Interior extra-deps: varint count + (varint offset, id_set) entries,
+    // ascending offsets (BTreeMap iteration order).
+    encode_varint(run.interior_extra_deps.len(), buf);
+    for (offset, deps) in &run.interior_extra_deps {
+        encode_varint(*offset, buf);
+        encode_id_set(deps, buf);
+    }
 }
 
 pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
@@ -197,12 +204,23 @@ pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
     let (run_str, str_size) = decode_string(&bytes[pos..])?;
     pos += str_size;
 
+    let (num_interior, size) = decode_varint(&bytes[pos..])?;
+    pos += size;
+    let mut interior_extra_deps = BTreeMap::new();
+    for _ in 0..num_interior {
+        let (offset, size) = decode_varint(&bytes[pos..])?;
+        pos += size;
+        let (deps, size) = decode_id_set(&bytes[pos..])?;
+        pos += size;
+        interior_extra_deps.insert(offset, deps);
+    }
+
     let first_op = match first_op_tag {
         RUN_OP_AFTER => crate::run::FirstOp::After,
         RUN_OP_BEFORE => crate::run::FirstOp::Before,
         _ => return Err(DecodeError::InvalidOpTag(first_op_tag)),
     };
-    let run = Run::from_text(anchor, first_op, first_extra_deps, &run_str)
+    let run = Run::from_text(anchor, first_op, first_extra_deps, &run_str, interior_extra_deps)
         .ok_or(DecodeError::EmptyRun)?;
 
     Ok((run, pos))
@@ -392,7 +410,8 @@ const RM_TARGET_DICT: u8 = 0x01;
 /// Format:
 /// - [origin: 32 bytes]               the document id (implicit dict entry 0)
 /// - [num_ids: varint][id_1..id_n: 32 bytes each]
-/// - [num_after_runs][runs...]        run:   { idx anchor, idx_set first_extra_deps, string }
+/// - [num_after_runs][runs...]        run:   { idx anchor, idx_set first_extra_deps, string,
+///   varint n, n × (varint offset, idx_set) interior deps }
 /// - [num_before_runs][runs...]       same shape; first char anchors InsertBefore
 /// - [num_forward_runs][...]          rmrun: { idx_set first_extra_deps, varint run_idx, varint start, varint end }
 /// - [num_backward_runs][...]
@@ -557,6 +576,11 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         for id in &run.first_extra_deps {
             id_set.insert(*id);
         }
+        for deps in run.interior_extra_deps.values() {
+            for id in deps {
+                id_set.insert(*id);
+            }
+        }
     }
     for rr in forward_runs.iter().chain(backward_runs.iter()) {
         for dep in &rr.extra_deps {
@@ -630,6 +654,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             encode_idx(&run.anchor, &mut buf);
             encode_idx_set(&run.first_extra_deps, &mut buf);
             encode_string(&run.text, &mut buf);
+            // Interior extra-deps: count + (offset, idx_set), ascending offsets.
+            encode_varint(run.interior_extra_deps.len(), &mut buf);
+            for (offset, deps) in &run.interior_extra_deps {
+                encode_varint(*offset, &mut buf);
+                encode_idx_set(deps, &mut buf);
+            }
         }
     }
 
@@ -761,8 +791,25 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
             let (run_str, size) = decode_string(&bytes[pos..])?;
             pos += size;
 
-            let run = Run::from_text(anchor, first_op, first_extra_deps, &run_str)
-                .ok_or(DecodeError::EmptyRun)?;
+            let (num_interior, size) = decode_varint(&bytes[pos..])?;
+            pos += size;
+            let mut interior_extra_deps = BTreeMap::new();
+            for _ in 0..num_interior {
+                let (offset, size) = decode_varint(&bytes[pos..])?;
+                pos += size;
+                let (deps, size) = decode_idx_set_at(&bytes[pos..])?;
+                pos += size;
+                interior_extra_deps.insert(offset, deps);
+            }
+
+            let run = Run::from_text(
+                anchor,
+                first_op,
+                first_extra_deps,
+                &run_str,
+                interior_extra_deps,
+            )
+            .ok_or(DecodeError::EmptyRun)?;
             run_element_ids.push(run.elements.clone());
             for node in run.decompress() {
                 seq.apply(node);

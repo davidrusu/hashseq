@@ -240,6 +240,12 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
             let (run_text, sz) = decode_string(&bytes[pos..]).expect("string");
             pos += sz;
             b.runs_text += run_text.len();
+            // interior extra-deps: count + (offset, idx_set)
+            let n_interior = read_varint(bytes, &mut pos);
+            for _ in 0..n_interior {
+                skip_varint(bytes, &mut pos); // offset (positional)
+                skip_idx_set(bytes, &mut pos, &mut referenced);
+            }
         }
         if backwards {
             b.befores = pos - s;

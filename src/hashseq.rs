@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -182,6 +182,10 @@ pub struct StoredRun {
     pub anchor: Id,
     pub first_op: FirstOp,
     pub first_extra_deps: BTreeSet<Id>,
+    /// Extra deps of interior elements (offset >= 1), sparse — see
+    /// [`Run::interior_extra_deps`]. Lets a typing burst extend its run
+    /// across a remove instead of starting a new run per burst.
+    pub interior_extra_deps: BTreeMap<usize, BTreeSet<Id>>,
     pub text: String,
     pub elements: Vec<NodeIdx>,
 }
@@ -207,7 +211,11 @@ impl StoredRun {
         *self.elements.last().unwrap()
     }
 
-    fn extend(&mut self, idx: NodeIdx, ch: char) {
+    fn extend(&mut self, idx: NodeIdx, ch: char, extra_deps: BTreeSet<Id>) {
+        if !extra_deps.is_empty() {
+            self.interior_extra_deps
+                .insert(self.elements.len(), extra_deps);
+        }
         self.text.push(ch);
         self.elements.push(idx);
     }
@@ -219,10 +227,19 @@ impl StoredRun {
         let right_elements = self.elements.split_off(at);
         let byte_pos = self.text.char_indices().nth(at).unwrap().0;
         let right_text = self.text.split_off(byte_pos);
+        // Deps at the split point become the right run's first deps (its
+        // head keeps its id); later offsets rebase.
+        let mut right_interior = self.interior_extra_deps.split_off(&at);
+        let right_first_deps = right_interior.remove(&at).unwrap_or_default();
+        let right_interior: BTreeMap<usize, BTreeSet<Id>> = right_interior
+            .into_iter()
+            .map(|(k, v)| (k - at, v))
+            .collect();
         StoredRun {
             anchor: right_anchor,
             first_op: FirstOp::After,
-            first_extra_deps: BTreeSet::new(),
+            first_extra_deps: right_first_deps,
+            interior_extra_deps: right_interior,
             text: right_text,
             elements: right_elements,
         }
@@ -235,6 +252,7 @@ impl StoredRun {
             self.first_op,
             self.first_extra_deps.clone(),
             &self.text,
+            self.interior_extra_deps.clone(),
         )
         .expect("stored runs are never empty")
     }
@@ -647,17 +665,22 @@ impl HashSeq {
         // The anchor is a checked dependency, so it is interned.
         let anchor = self.idx_of_known(&after.anchor);
 
-        // Fast path: extend the run whose tail is the anchor.
-        if after.extra_dependencies.is_empty()
-            && let Loc::Run { run, pos } = self.loc_of(anchor)
-        {
+        // Fast path: extend the run whose tail is the anchor. Extra deps on
+        // the new element (e.g. `{remove_id}` when typing resumes after a
+        // delete) don't block extension — they're stored sparsely at the
+        // element's offset and participate in its id, so the chain still
+        // reconstructs exactly.
+        if let Loc::Run { run, pos } = self.loc_of(anchor) {
             // Check for explicit forks first (cheap u32-keyed lookup)
             let has_explicit_afters = self.afters.get(&anchor).is_some_and(|ns| !ns.is_empty());
 
             if !has_explicit_afters && pos as usize + 1 == self.runs[&run].len() {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
-                self.runs.get_mut(&run).unwrap().extend(idx, after.ch);
+                self.runs
+                    .get_mut(&run)
+                    .unwrap()
+                    .extend(idx, after.ch, after.extra_dependencies);
                 self.index.extend_run(run, pos + 1);
                 return;
             }
@@ -705,6 +728,7 @@ impl HashSeq {
                 anchor: after.anchor,
                 first_op: FirstOp::After,
                 first_extra_deps: after.extra_dependencies,
+                interior_extra_deps: BTreeMap::new(),
                 text: after.ch.to_string(),
                 elements: vec![idx],
             },
@@ -848,6 +872,7 @@ impl HashSeq {
                 anchor: before.anchor,
                 first_op: FirstOp::Before,
                 first_extra_deps: before.extra_dependencies,
+                interior_extra_deps: BTreeMap::new(),
                 text: before.ch.to_string(),
                 elements: vec![idx],
             },
@@ -1818,6 +1843,41 @@ mod test {
         check_index_matches_iter(&seq);
         apply_ops(&mut seq, &after);
         check_index_matches_iter(&seq);
+    }
+
+    /// Typing across a delete must extend the run, not start a new one: the
+    /// first char after the remove carries `extra_deps = {remove_id}`, which
+    /// is now stored as interior deps instead of forcing a fork.
+    #[test]
+    fn burst_after_delete_extends_run() {
+        // Delete-ahead shape: type a burst, delete the char just after it,
+        // resume typing. The resumed char anchors at the burst's tail with
+        // extra_deps = {remove_id} — extendable since interior deps landed.
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "XY".chars());
+        seq.insert_batch(0, "ab".chars()); // before-run "ab" at the front
+        let runs_before = seq.runs.len();
+        seq.remove(2); // delete 'X' (just after the burst)
+        seq.insert_batch(2, "cd".chars()); // resume typing where we were
+        assert_eq!(String::from_iter(seq.iter()), "abcdY");
+        assert_eq!(
+            seq.runs.len(),
+            runs_before,
+            "burst after a delete must extend its run, not fork a new one"
+        );
+        // the deps landed as interior deps on some run
+        assert!(
+            seq.runs
+                .values()
+                .any(|r| !r.interior_extra_deps.is_empty()),
+            "remove dep should be stored as interior extra-deps"
+        );
+        // and the encoding roundtrips identically
+        let encoded = crate::encoding::encode_hashseq(&seq);
+        let decoded = crate::encoding::decode_hashseq(&encoded).unwrap();
+        assert_eq!(decoded, seq);
+        assert_eq!(String::from_iter(decoded.iter()), "abcdY");
+        assert_eq!(crate::encoding::encode_hashseq(&decoded), encoded);
     }
 
     /// Orphan buffering is keyed by missing dep with an iterative worklist:

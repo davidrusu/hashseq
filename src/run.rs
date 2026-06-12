@@ -1,6 +1,6 @@
 use crate::{HashNode, Id, Op};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How the first element of a run is anchored relative to its `anchor` node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +29,11 @@ pub struct Run {
     /// Extra dependencies for the first element of the run
     /// This is needed to correctly reconstruct the node's hash when decompressing
     pub first_extra_deps: BTreeSet<Id>,
+    /// Extra dependencies of interior elements (offset >= 1), sparse: only
+    /// non-empty sets are stored. This is what lets a typing burst keep
+    /// extending its run across a remove elsewhere — the next char carries
+    /// `extra_deps = {remove_id}` without starting a new run.
+    pub interior_extra_deps: BTreeMap<usize, BTreeSet<Id>>,
     /// The string content of this run
     pub run: String,
     /// Cached element IDs for O(1) lookup (avoids recomputing hashes)
@@ -49,17 +54,21 @@ impl Run {
     }
 
     /// Reconstruct a run from its anchor and full text: the first char is anchored
-    /// per `first_op`, the rest chain `InsertAfter`. Returns `None` for empty text.
+    /// per `first_op`, the rest chain `InsertAfter`, carrying any interior extra
+    /// deps at their offsets (which participate in each element's id).
+    /// Returns `None` for empty text.
     pub fn from_text(
         anchor: Id,
         first_op: FirstOp,
         first_extra_deps: BTreeSet<Id>,
         text: &str,
+        mut interior_extra_deps: BTreeMap<usize, BTreeSet<Id>>,
     ) -> Option<Self> {
         let mut chars = text.chars();
         let mut run = Self::with_first_op(anchor, first_op, first_extra_deps, chars.next()?);
-        for ch in chars {
-            run.extend(ch);
+        for (i, ch) in chars.enumerate() {
+            let deps = interior_extra_deps.remove(&(i + 1)).unwrap_or_default();
+            run.extend_with_deps(ch, deps);
         }
         Some(run)
     }
@@ -82,6 +91,7 @@ impl Run {
             anchor,
             first_op,
             first_extra_deps,
+            interior_extra_deps: BTreeMap::new(),
             run: first.to_string(),
             elements: vec![first_id],
         }
@@ -107,9 +117,14 @@ impl Run {
         let first = chars.next().unwrap(); // we always have at least one char in the run
         nodes.push(self.first_node_with_char(first));
 
-        for ch in chars {
+        for (i, ch) in chars.enumerate() {
+            let extra_dependencies = self
+                .interior_extra_deps
+                .get(&(i + 1))
+                .cloned()
+                .unwrap_or_default();
             nodes.push(HashNode {
-                extra_dependencies: BTreeSet::new(),
+                extra_dependencies,
                 op: Op::InsertAfter(nodes[nodes.len() - 1].id(), ch),
             });
         }
@@ -155,12 +170,22 @@ impl Run {
     /// Extend this run by appending a character and return the new element's ID
     /// The new character will be InsertAfter(current_last_character, ch)
     pub fn extend(&mut self, ch: char) -> Id {
+        self.extend_with_deps(ch, BTreeSet::new())
+    }
+
+    /// Extend with extra dependencies on the new element (they participate in
+    /// its id and are stored sparsely at its offset).
+    pub fn extend_with_deps(&mut self, ch: char, deps: BTreeSet<Id>) -> Id {
         let prev_id = *self.elements.last().unwrap();
         let new_node = HashNode {
-            extra_dependencies: BTreeSet::new(),
+            extra_dependencies: deps,
             op: Op::InsertAfter(prev_id, ch),
         };
         let new_id = new_node.id();
+        if !new_node.extra_dependencies.is_empty() {
+            self.interior_extra_deps
+                .insert(self.elements.len(), new_node.extra_dependencies);
+        }
         self.extend_with_id(new_id, ch);
         new_id
     }
@@ -189,10 +214,20 @@ impl Run {
         let byte_pos = self.run.char_indices().nth(position).unwrap().0;
         let right_str = self.run.split_off(byte_pos);
 
+        // Interior deps at the split point become the right run's first deps
+        // (preserving the element's id); later offsets rebase.
+        let mut right_interior = self.interior_extra_deps.split_off(&position);
+        let right_first_deps = right_interior.remove(&position).unwrap_or_default();
+        let right_interior: BTreeMap<usize, BTreeSet<Id>> = right_interior
+            .into_iter()
+            .map(|(k, v)| (k - position, v))
+            .collect();
+
         Run {
             anchor: right_anchor,
             first_op: FirstOp::After,
-            first_extra_deps: BTreeSet::new(),
+            first_extra_deps: right_first_deps,
+            interior_extra_deps: right_interior,
             run: right_str,
             elements: right_elements,
         }
@@ -232,12 +267,69 @@ mod tests {
             // Create the run with the first character
             let mut run = Run::new(Id(insert_after), BTreeSet::new(), chars[0]);
 
-            // Extend with remaining characters
+            // Extend with remaining characters; sprinkle interior extra-deps
+            // (the burst-across-a-delete shape) on ~1 in 4 elements.
             for &ch in &chars[1..] {
-                run.extend(ch);
+                if u8::arbitrary(g) % 4 == 0 {
+                    let mut dep = [0u8; 32];
+                    for byte in &mut dep {
+                        *byte = u8::arbitrary(g);
+                    }
+                    run.extend_with_deps(ch, BTreeSet::from_iter([Id(dep)]));
+                } else {
+                    run.extend(ch);
+                }
             }
 
             run
+        }
+    }
+
+    /// Interior deps participate in element ids and survive decompress.
+    #[test]
+    fn test_interior_deps_decompress() {
+        let dep = test_id(7);
+        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
+        run.extend('b');
+        run.extend_with_deps('c', BTreeSet::from_iter([dep]));
+        run.extend('d');
+
+        let nodes = run.decompress();
+        assert_eq!(nodes[2].extra_dependencies, BTreeSet::from_iter([dep]));
+        assert_eq!(nodes[3].extra_dependencies, BTreeSet::new());
+        // element ids match the cached ones (deps are in the preimage)
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(node.id(), run.elements[i]);
+        }
+        // and from_text with the same interior map reconstructs identically
+        let rebuilt = Run::from_text(
+            run.anchor,
+            run.first_op,
+            run.first_extra_deps.clone(),
+            &run.run,
+            run.interior_extra_deps.clone(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, run);
+    }
+
+    /// Splitting at or around an interior-deps offset preserves ids: deps at
+    /// the split point become the right run's first deps.
+    #[test]
+    fn test_split_at_interior_deps_boundary() {
+        let dep = test_id(9);
+        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
+        run.extend('b');
+        run.extend_with_deps('c', BTreeSet::from_iter([dep]));
+        run.extend('d');
+        let original = run.decompress();
+
+        for at in 1..run.len() {
+            let mut left = run.clone();
+            let right = left.split_at(at);
+            let mut combined = left.decompress();
+            combined.extend(right.decompress());
+            assert_eq!(combined, original, "split at {at} changed identities");
         }
     }
 
