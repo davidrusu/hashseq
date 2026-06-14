@@ -189,11 +189,47 @@ pub struct CausalInsert {
     pub ch: char,
 }
 
+/// A set-once extra-dependency set, stored as `Box<[NodeIdx]>` in `Id` order
+/// (4 B/entry, 16 B inline — like `BTreeSet<Id>` — but a fraction of the heap:
+/// a 1-element `BTreeSet<Id>` allocates a ~400 B B-tree node for one 32 B id,
+/// while these sets are almost always 1–3 tips). Used for the deps of applied
+/// runs and removes. Order is by `Id` (convergence-safe); the handle is the
+/// compact payload, and the `BTreeSet<Id>` is rebuilt for the wire / hashing at
+/// encode and decompress time.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IdxSet(Box<[NodeIdx]>);
+
+impl IdxSet {
+    /// Build from an already-`Id`-sorted set, mapping each id to its handle.
+    /// `BTreeSet` iterates in `Id` order, so the handles land `Id`-sorted.
+    pub(crate) fn from_id_set(set: &BTreeSet<Id>, to_handle: impl FnMut(&Id) -> NodeIdx) -> Self {
+        IdxSet(set.iter().map(to_handle).collect())
+    }
+
+    /// Rebuild the `Id` set (for the wire format / hashing).
+    pub fn to_id_set(&self, ids: &[Id]) -> BTreeSet<Id> {
+        self.0.iter().map(|h| ids[h.0 as usize]).collect()
+    }
+
+    /// Iterate the member ids in `Id` order.
+    pub fn iter_ids<'a>(&'a self, ids: &'a [Id]) -> impl Iterator<Item = Id> + 'a {
+        self.0.iter().map(move |h| ids[h.0 as usize])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// Storage form of a multi-target remove (`remove_batch` spanning several
 /// chars). Single-target removes live in `RemoveRun` chains instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalRemove {
-    pub extra_dependencies: BTreeSet<Id>,
+    pub extra_dependencies: IdxSet,
     /// Removed element handles, in Id order.
     pub nodes: Box<[NodeIdx]>,
 }
@@ -205,7 +241,7 @@ pub struct CausalRemove {
 /// analog of insert runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoveRun {
-    pub first_extra_deps: BTreeSet<Id>,
+    pub first_extra_deps: IdxSet,
     /// Element handles removed, in removal order.
     pub targets: Vec<NodeIdx>,
     /// Handles of the remove nodes themselves; `links[i]` removes `targets[i]`.
@@ -229,11 +265,11 @@ impl RemoveRun {
 pub struct StoredRun {
     pub anchor: Id,
     pub first_op: FirstOp,
-    pub first_extra_deps: BTreeSet<Id>,
+    pub first_extra_deps: IdxSet,
     /// Extra deps of interior elements (offset >= 1), sparse — see
     /// [`Run::interior_extra_deps`]. Lets a typing burst extend its run
     /// across a remove instead of starting a new run per burst.
-    pub interior_extra_deps: BTreeMap<usize, BTreeSet<Id>>,
+    pub interior_extra_deps: BTreeMap<usize, IdxSet>,
     pub text: String,
     pub elements: Vec<NodeIdx>,
 }
@@ -259,7 +295,7 @@ impl StoredRun {
         *self.elements.last().unwrap()
     }
 
-    fn extend(&mut self, idx: NodeIdx, ch: char, extra_deps: BTreeSet<Id>) {
+    fn extend(&mut self, idx: NodeIdx, ch: char, extra_deps: IdxSet) {
         if !extra_deps.is_empty() {
             self.interior_extra_deps
                 .insert(self.elements.len(), extra_deps);
@@ -279,7 +315,7 @@ impl StoredRun {
         // head keeps its id); later offsets rebase.
         let mut right_interior = self.interior_extra_deps.split_off(&at);
         let right_first_deps = right_interior.remove(&at).unwrap_or_default();
-        let right_interior: BTreeMap<usize, BTreeSet<Id>> = right_interior
+        let right_interior: BTreeMap<usize, IdxSet> = right_interior
             .into_iter()
             .map(|(k, v)| (k - at, v))
             .collect();
@@ -299,11 +335,87 @@ impl StoredRun {
         Run {
             anchor: self.anchor,
             first_op: self.first_op,
-            first_extra_deps: self.first_extra_deps.clone(),
-            interior_extra_deps: self.interior_extra_deps.clone(),
+            first_extra_deps: self.first_extra_deps.to_id_set(ids),
+            interior_extra_deps: self
+                .interior_extra_deps
+                .iter()
+                .map(|(off, deps)| (*off, deps.to_id_set(ids)))
+                .collect(),
             run: self.text.clone(),
             elements: self.elements.iter().map(|e| ids[e.0 as usize]).collect(),
         }
+    }
+}
+
+/// A set of node handles kept sorted by their `Id`, stored as `Vec<NodeIdx>`
+/// (4 bytes/entry) instead of `BTreeSet<Id>` (32 bytes/entry plus a tree node
+/// each). Used for the `afters` / `befores_by_anchor` sibling sets.
+///
+/// The order is by `Id` — never by handle — because sibling order is a
+/// convergence concern and handles are replica-local (see the interning
+/// invariant). The handle is only the compact payload; every Id comparison
+/// dereferences through the caller-supplied `ids` table, so methods that need
+/// ordering take `ids: &[Id]` (where `ids[h.0]` is `h`'s id).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SortedIdVec(Vec<NodeIdx>);
+
+impl SortedIdVec {
+    /// Index of the handle whose id equals `id` (`Ok`) or where it would be
+    /// inserted to stay sorted (`Err`).
+    #[inline]
+    fn search(&self, id: &Id, ids: &[Id]) -> Result<usize, usize> {
+        self.0.binary_search_by(|h| ids[h.0 as usize].cmp(id))
+    }
+
+    /// Insert `handle` keyed by its id; a no-op if an equal id is already
+    /// present (set semantics, like the `BTreeSet<Id>` it replaces).
+    pub fn insert(&mut self, handle: NodeIdx, ids: &[Id]) {
+        let id = ids[handle.0 as usize];
+        if let Err(pos) = self.search(&id, ids) {
+            self.0.insert(pos, handle);
+        }
+    }
+
+    /// Handle with the smallest id.
+    #[inline]
+    pub fn first(&self) -> Option<NodeIdx> {
+        self.0.first().copied()
+    }
+
+    /// Handle with the largest id.
+    #[inline]
+    pub fn last(&self) -> Option<NodeIdx> {
+        self.0.last().copied()
+    }
+
+    /// Handle with the smallest id `>= id` (the `range(id..).next()` seek).
+    pub fn first_ge(&self, id: &Id, ids: &[Id]) -> Option<NodeIdx> {
+        let pos = match self.search(id, ids) {
+            Ok(p) | Err(p) => p,
+        };
+        self.0.get(pos).copied()
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
+        self.0.iter().copied()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a> IntoIterator for &'a SortedIdVec {
+    type Item = NodeIdx;
+    type IntoIter = std::iter::Copied<std::slice::Iter<'a, NodeIdx>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().copied()
     }
 }
 
@@ -329,17 +441,17 @@ pub struct HashSeq {
     // Top-level inserts are runs anchored at `origin` like any other.
     pub runs: FxHashMap<NodeIdx, StoredRun>,
     /// Reverse index: anchor -> heads of Before-runs anchored at it. Values are
-    /// Id-ordered: sibling order is a convergence concern, so it must not use
-    /// replica-local handles.
-    pub befores_by_anchor: FxHashMap<NodeIdx, BTreeSet<Id>>,
+    /// Id-ordered (a [`SortedIdVec`]): sibling order is a convergence concern,
+    /// so it must not use replica-local handles.
+    pub befores_by_anchor: FxHashMap<NodeIdx, SortedIdVec>,
     /// Multi-target removes only; single-target removes coalesce into chains.
     pub remove_nodes: FxHashMap<NodeIdx, CausalRemove>,
     /// Chained single-target removes (backspace/delete bursts), keyed by the
     /// first remove's handle.
     pub remove_runs: FxHashMap<NodeIdx, RemoveRun>,
-    /// Fork tracking: anchor -> ids that fork from it (Id-ordered, see
+    /// Fork tracking: anchor -> handles that fork from it (Id-ordered, see
     /// `befores_by_anchor`).
-    pub afters: FxHashMap<NodeIdx, BTreeSet<Id>>,
+    pub afters: FxHashMap<NodeIdx, SortedIdVec>,
 
     pub(crate) tips: BTreeSet<Id>,
     /// Ops waiting on a dependency, keyed by *one* missing dep id (the first
@@ -491,20 +603,12 @@ impl HashSeq {
         } else {
             None
         };
-        explicit
-            .into_iter()
-            .flatten()
-            .map(|id| self.idx_of_known(id))
-            .chain(from_run)
+        explicit.into_iter().flatten().chain(from_run)
     }
 
     /// Before-run heads anchored at `idx`, in Id order.
     pub(crate) fn befores_of(&self, idx: NodeIdx) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
-        self.befores_by_anchor
-            .get(&idx)
-            .into_iter()
-            .flatten()
-            .map(|id| self.idx_of_known(id))
+        self.befores_by_anchor.get(&idx).into_iter().flatten()
     }
 
     /// Ids that come after `id`: explicit forks (Id-ordered) or the run
@@ -549,7 +653,7 @@ impl HashSeq {
     /// before-runs precede it, recursively.
     fn region_first(&self, mut n: NodeIdx) -> NodeIdx {
         while let Some(first) = self.befores_by_anchor.get(&n).and_then(|s| s.first()) {
-            n = self.idx_of_known(first);
+            n = first;
         }
         n
     }
@@ -564,7 +668,7 @@ impl HashSeq {
                 n = self.runs[&run].last();
             }
             match self.afters.get(&n).and_then(|s| s.last()) {
-                Some(id) => n = self.idx_of_known(id),
+                Some(next) => n = next,
                 None => return n,
             }
         }
@@ -699,7 +803,7 @@ impl HashSeq {
         }
         match self.afters.get(&ORIGIN_IDX).and_then(|s| s.first()) {
             Some(first) => {
-                let first = self.region_first(self.idx_of_known(first));
+                let first = self.region_first(first);
                 let at = self.elem_ref(first);
                 self.index.insert_span_before(at, idx);
             }
@@ -726,10 +830,11 @@ impl HashSeq {
             if !has_explicit_afters && pos as usize + 1 == self.runs[&run].len() {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
+                let deps = IdxSet::from_id_set(&after.extra_dependencies, |d| self.idx_of_known(d));
                 self.runs
                     .get_mut(&run)
                     .unwrap()
-                    .extend(idx, after.ch, after.extra_dependencies);
+                    .extend(idx, after.ch, deps);
                 self.index.extend_run(run, pos + 1);
                 return;
             }
@@ -739,10 +844,7 @@ impl HashSeq {
         // Explicit-afters case: O(log n) range seek into the BTreeSet.
         // Run-fallback case: at most one candidate, just check it.
         let next_node = if let Some(siblings) = self.afters.get(&anchor) {
-            siblings
-                .range(&id..)
-                .next()
-                .map(|aid| self.idx_of_known(aid))
+            siblings.first_ge(&id, &self.ids)
         } else {
             self.afters_of(anchor)
                 .find(|a| self.ids[a.0 as usize] >= id)
@@ -771,12 +873,13 @@ impl HashSeq {
         // Start a new run anchored at the anchor node.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
+        let first_extra_deps = IdxSet::from_id_set(&after.extra_dependencies, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
                 anchor: after.anchor,
                 first_op: FirstOp::After,
-                first_extra_deps: after.extra_dependencies,
+                first_extra_deps,
                 interior_extra_deps: BTreeMap::new(),
                 text: after.ch.to_string(),
                 elements: vec![idx],
@@ -784,7 +887,7 @@ impl HashSeq {
         );
 
         // run extension is handled in the fast path above, fork/split updates the afters set
-        self.afters.entry(anchor).or_default().insert(id);
+        self.afters.entry(anchor).or_default().insert(idx, &self.ids);
 
         // Resolve the target element only now: the split above may have
         // relocated it into the right-hand run.
@@ -821,14 +924,13 @@ impl HashSeq {
             .into();
         }
 
-        let right_head_id = self.ids[right_head.0 as usize];
         self.runs.insert(right_head, right_run);
         self.index.split_run(run, at as u32, right_head);
         // Track the split in afters so iteration can find the right portion
         self.afters
             .entry(left_last)
             .or_default()
-            .insert(right_head_id);
+            .insert(right_head, &self.ids);
         right_head
     }
 
@@ -871,10 +973,11 @@ impl HashSeq {
             // Start a new chain (a lone remove is a 1-link chain).
             let idx = self.next_idx();
             self.intern(id, Loc::RemoveChain { chain: idx, pos: 0 });
+            let first_extra_deps = IdxSet::from_id_set(&extra_deps, |d| self.idx_of_known(d));
             self.remove_runs.insert(
                 idx,
                 RemoveRun {
-                    first_extra_deps: extra_deps,
+                    first_extra_deps,
                     targets: vec![target],
                     links: vec![idx],
                 },
@@ -883,10 +986,11 @@ impl HashSeq {
         }
 
         let idx = self.intern(id, Loc::MultiRemove);
+        let extra_dependencies = IdxSet::from_id_set(&extra_deps, |d| self.idx_of_known(d));
         self.remove_nodes.insert(
             idx,
             CausalRemove {
-                extra_dependencies: extra_deps,
+                extra_dependencies,
                 nodes: targets.into(),
             },
         );
@@ -899,14 +1003,14 @@ impl HashSeq {
         // Before-siblings are released in Id order, directly before their
         // anchor: the new node lands before the next bigger sibling's region,
         // or — as the biggest — directly before the anchor element itself.
-        // (O(log n) range seek into the BTreeSet, no tombstone filtering:
-        // removed elements still anchor their regions.)
+        // (O(log n) Id-binary-search seek, no tombstone filtering: removed
+        // elements still anchor their regions.)
         let target = match self
             .befores_by_anchor
             .get(&anchor)
-            .and_then(|s| s.range(id..).next())
+            .and_then(|s| s.first_ge(&id, &self.ids))
         {
-            Some(next) => self.region_first(self.idx_of_known(next)),
+            Some(next) => self.region_first(next),
             None => anchor,
         };
 
@@ -916,19 +1020,23 @@ impl HashSeq {
         // always lands immediately before its anchor.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
+        let first_extra_deps = IdxSet::from_id_set(&before.extra_dependencies, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
                 anchor: before.anchor,
                 first_op: FirstOp::Before,
-                first_extra_deps: before.extra_dependencies,
+                first_extra_deps,
                 interior_extra_deps: BTreeMap::new(),
                 text: before.ch.to_string(),
                 elements: vec![idx],
             },
         );
 
-        self.befores_by_anchor.entry(anchor).or_default().insert(id);
+        self.befores_by_anchor
+            .entry(anchor)
+            .or_default()
+            .insert(idx, &self.ids);
 
         self.index_insert_before_node(target, idx);
     }
@@ -1023,7 +1131,7 @@ impl HashSeq {
             .enumerate()
             .map(|(i, target)| HashNode {
                 extra_dependencies: if i == 0 {
-                    rr.first_extra_deps.clone()
+                    rr.first_extra_deps.to_id_set(&self.ids)
                 } else {
                     BTreeSet::from_iter([self.id_of(rr.links[i - 1])])
                 },
@@ -1058,7 +1166,7 @@ impl HashSeq {
 
         for (idx, causal_remove) in &other.remove_nodes {
             let node = HashNode {
-                extra_dependencies: causal_remove.extra_dependencies.clone(),
+                extra_dependencies: causal_remove.extra_dependencies.to_id_set(&other.ids),
                 op: Op::Remove(
                     causal_remove
                         .nodes

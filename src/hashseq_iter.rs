@@ -54,12 +54,8 @@ impl<'a> Iterator for HashSeqIdxIter<'a> {
                 // This node is free to be released, but first
                 // queue up any nodes who come after this one
                 if let Some(afters) = self.seq.afters.get(&n) {
-                    // BTreeSet iterates in Id order; reverse for stack push.
-                    let afters: Vec<NodeIdx> = afters
-                        .iter()
-                        .rev()
-                        .map(|id| self.seq.idx_of(id).unwrap())
-                        .collect();
+                    // Iterates in Id order; reverse for stack push.
+                    let afters: Vec<NodeIdx> = afters.iter().rev().collect();
                     for s in afters {
                         self.push_waiting(s);
                     }

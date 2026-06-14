@@ -512,7 +512,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         let mut i = 0;
         while i < chain.targets.len() {
             let deps = if i == 0 {
-                chain.first_extra_deps.clone()
+                chain.first_extra_deps.to_id_set(&seq.ids)
             } else {
                 BTreeSet::from_iter([seq.id_of(chain.links[i - 1])])
             };
@@ -595,7 +595,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             head_id: id,
             exposed: vec![id],
             payload: Payload::Other {
-                extra_deps: remove.extra_dependencies.clone(),
+                extra_deps: remove.extra_dependencies.to_id_set(&seq.ids),
                 targets,
             },
         });
@@ -662,12 +662,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 Payload::Run(head) => {
                     let run = &seq.runs[head];
                     note(&mut soft, &producer, b, &run.anchor);
-                    for id in &run.first_extra_deps {
-                        note(&mut soft, &producer, b, id);
+                    for id in run.first_extra_deps.iter_ids(&seq.ids) {
+                        note(&mut soft, &producer, b, &id);
                     }
                     for deps in run.interior_extra_deps.values() {
-                        for id in deps {
-                            note(&mut soft, &producer, b, id);
+                        for id in deps.iter_ids(&seq.ids) {
+                            note(&mut soft, &producer, b, &id);
                         }
                     }
                 }
@@ -815,12 +815,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 Payload::Run(head) => {
                     let run = &seq.runs[head];
                     note(&run.anchor, limit, &mut id_set);
-                    for id in &run.first_extra_deps {
-                        note(id, limit, &mut id_set);
+                    for id in run.first_extra_deps.iter_ids(&seq.ids) {
+                        note(&id, limit, &mut id_set);
                     }
                     for deps in run.interior_extra_deps.values() {
-                        for id in deps {
-                            note(id, limit, &mut id_set);
+                        for id in deps.iter_ids(&seq.ids) {
+                            note(&id, limit, &mut id_set);
                         }
                     }
                 }
@@ -912,12 +912,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     crate::run::FirstOp::Before => BLK_RUN_BEFORE,
                 });
                 encode_ref(&run.anchor, pe, &mut buf);
-                encode_ref_set(&run.first_extra_deps, pe, &mut buf);
+                encode_ref_set(&run.first_extra_deps.to_id_set(&seq.ids), pe, &mut buf);
                 encode_string(&run.text, &mut buf);
                 encode_varint(run.interior_extra_deps.len(), &mut buf);
                 for (offset, deps) in &run.interior_extra_deps {
                     encode_varint(*offset, &mut buf);
-                    encode_ref_set(deps, pe, &mut buf);
+                    encode_ref_set(&deps.to_id_set(&seq.ids), pe, &mut buf);
                 }
             }
             Payload::RemoveSpan {

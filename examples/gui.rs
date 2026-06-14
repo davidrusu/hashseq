@@ -840,7 +840,7 @@ mod hashseq_viz {
                             continue;
                         };
                         for after in afters.iter() {
-                            let Some(to) = get_node_left_edge(after) else {
+                            let Some(to) = get_node_left_edge(&self.seq.id_of(after)) else {
                                 continue;
                             };
                             frame.stroke(
@@ -855,7 +855,7 @@ mod hashseq_viz {
                             continue;
                         };
                         for before in befores {
-                            let Some(to) = get_node_pos(before) else {
+                            let Some(to) = get_node_pos(&self.seq.id_of(before)) else {
                                 continue;
                             };
                             frame.stroke(

@@ -10,22 +10,23 @@ reproduced here).
 
 Min build times (per the hygiene note below — averages carry right-tail
 machine noise), measured 2026-06-14 after positional remove references, the
-`removed` bitset, and the packed `Loc`.
+`removed` bitset, the packed `Loc`, the `SortedIdVec` sibling sets, and the
+`IdxSet` deps sets.
 
 | Trace               | Build time (min) | Throughput  | Memory  | Encoded  |
 |---------------------|------------------|-------------|---------|----------|
-| automerge-paper     | 121 ms           | 2.12M ops/s | 29.0 MB | 447 KB   |
-| rustcode            | 323 ms           | 2.96M ops/s | 54.4 MB | 2,712 KB |
-| sveltecomponent     | 48 ms            | 3.49M ops/s | 12.2 MB | 487 KB   |
-| seph-blog1          | 124 ms           | 2.94M ops/s | 29.7 MB | 1,133 KB |
-| clownschool\_flat   | 8.8 ms           | 2.72M ops/s | 4.4 MB  | 132 KB   |
-| friendsforever_flat | 10.1 ms          | 2.50M ops/s | 4.2 MB  | 115 KB   |
-| json-crdt-blog-post | 15.1 ms          | 3.31M ops/s | 5.0 MB  | 116 KB   |
+| automerge-paper     | 123 ms           | 2.09M ops/s | 24.0 MB | 447 KB   |
+| rustcode            | 326 ms           | 2.94M ops/s | 48.1 MB | 2,712 KB |
+| sveltecomponent     | 48 ms            | 3.47M ops/s | 9.1 MB  | 487 KB   |
+| seph-blog1          | 123 ms           | 2.94M ops/s | 20.8 MB | 1,133 KB |
+| clownschool\_flat   | 9.0 ms           | 2.67M ops/s | 2.4 MB  | 132 KB   |
+| friendsforever_flat | 10.3 ms          | 2.51M ops/s | 2.5 MB  | 115 KB   |
+| json-crdt-blog-post | 15.1 ms          | 3.33M ops/s | 3.8 MB  | 116 KB   |
 
 (Encoded reflects positional remove references; Memory reflects the `removed`
-bitset and the packed `Loc` — all below. Build time / throughput are within
-machine noise of the prior baseline, if anything a hair faster — the narrower
-`locs` Vec buys cache locality that offsets the unpack.)
+bitset, the packed `Loc`, the `SortedIdVec` sibling sets, and the `IdxSet` deps
+sets — all below. Build time / throughput are within machine noise of the prior
+baseline.)
 
 What got us here (in order): Cursor as the single insertion path; before nodes
 became Before-runs and `insert_before` stopped splitting runs (boxes −40%);
@@ -264,15 +265,35 @@ for span-shaped batch deletes.
   total memory −0.7..0.8% (automerge 30.29 → 30.07 MB, rustcode 56.97 →
   56.50 MB). `HashSeq` equality is tips-only so the type swap is invisible to
   the merge laws; covered by `matches_vec_bool_under_random_ops`.
-- **`afters`/`befores_by_anchor` values** as Id-sorted `Vec<NodeIdx>`
-  (binary-search compare through `ids[h]`) instead of `BTreeSet<Id>` — saves
-  the per-set tree allocs (~2.4 MB automerge, ~2.8 MB clownschool where
-  `afters` is oddly large — worth investigating why clownschool has so many
-  afters entries at all).
-- **`Id` interning for deps sets**: `first_extra_deps`/`extra_dependencies`
-  BTreeSets store full 32-byte ids; most reference applied nodes and could be
-  Id-sorted `Vec<NodeIdx>` (rebuild `BTreeSet<Id>` at decompress/encode time).
-  Ordering must be by `Id`, never by handle.
+- **`afters`/`befores_by_anchor` values** as Id-sorted `Vec<NodeIdx>` instead
+  of `BTreeSet<Id>` — DONE (2026-06-14). `SortedIdVec` in hashseq.rs: a
+  `Vec<NodeIdx>` (4 B/entry, no per-node tree alloc) kept in `Id` order;
+  ordering methods (`insert`, `first_ge`) binary-search through a passed `&[Id]`
+  so order stays in convergence-safe Id space while the payload is the compact
+  handle. Iterating yields handles directly, so the consumers also drop a
+  per-sibling `idx_of` hash lookup. Memory −3.3..9.3% (automerge 29.0 →
+  27.2 MB, seph 29.7 → 26.9 MB, rustcode 54.4 → 52.6 MB); build/iter times
+  unchanged (fork sets are tiny, so the O(n) Vec insert never bites). Order
+  correctness covered by the merge laws + `prop_order_is_stable` /
+  `prop_index_matches_iterator` (run at 30k cases). Note: the predicted
+  "clownschool has oddly large afters" no longer holds — its afters map is
+  small now (the interior-deps run-coalescing cut its fork count); clownschool
+  saved only ~245 KB here, the big wins were automerge/seph/rustcode.
+- **`Id` interning for deps sets** — DONE (2026-06-14). `IdxSet(Box<[NodeIdx]>)`
+  in hashseq.rs, replacing the `BTreeSet<Id>` deps on `StoredRun`
+  (`first_extra_deps` + `interior_extra_deps` values), `RemoveRun`, and
+  `CausalRemove`. Built once at apply time from the (already Id-sorted) op deps
+  via `idx_of_known`; rebuilt to `BTreeSet<Id>` for the wire / hashing at
+  `to_run` / encode / merge. **Much bigger than this note guessed** — these sets
+  are almost always 1–3 tips, and a 1-element `BTreeSet<Id>` allocates a ~400 B
+  B-tree node for one 32 B id, so `Box<[NodeIdx]>` (4 B/entry, 16 B inline like
+  the BTreeSet) is a ~100× cut on each. Memory −8.6..41.8%: automerge 27.2 →
+  24.0 MB, seph 26.9 → 20.8 MB (−6.1 MB), rustcode 52.6 → 48.1 MB; the
+  delete-heavy flats win most because the remove deps (`RemoveRun` /
+  `CausalRemove`) dominate them — clownschool 4.1 → 2.4 MB (−42%),
+  friendsforever 3.8 → 2.5 MB (−34%). Build/iter times unchanged. Order stays in
+  convergence-safe `Id` space (handles are just the payload); covered by the
+  merge laws + roundtrip/determinism props at 30k cases.
 
 ### 4. The floor, if it's ever needed
 

@@ -338,7 +338,7 @@ impl WasmHashSeq {
                     anchor,
                     (!is_top_level).then_some(rel),
                     s.is_removed(*head),
-                    &resolve_deps(&run.first_extra_deps),
+                    &resolve_deps(&run.first_extra_deps.to_id_set(&s.ids)),
                 );
             }
         }
