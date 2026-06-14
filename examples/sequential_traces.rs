@@ -297,11 +297,23 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
                 b.single_run_removes += pos - s;
             }
             BLK_REMOVE_OTHER => {
-                // ref_set extra_deps, varint n, n * ref target
+                // ref_set extra_deps, varint n_segments, segments — each head
+                // reuses the ref low bits: run-element range (off+count),
+                // dict singleton, or remove-op singleton (off).
                 skip_ref_set(bytes, &mut pos, &mut referenced);
                 let n = read_varint(bytes, &mut pos);
                 for _ in 0..n {
-                    skip_ref(bytes, &mut pos, &mut referenced);
+                    let head = read_varint(bytes, &mut pos);
+                    if head & 1 == 1 {
+                        skip_varint(bytes, &mut pos); // off
+                        skip_varint(bytes, &mut pos); // count
+                    } else if head & 2 == 0 {
+                        let idx = head >> 2;
+                        assert!(idx < referenced.len(), "dict ref {idx} out of bounds");
+                        referenced[idx] = true;
+                    } else {
+                        skip_varint(bytes, &mut pos); // off
+                    }
                 }
                 b.other_removes += pos - s;
             }

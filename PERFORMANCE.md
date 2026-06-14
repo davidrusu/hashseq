@@ -10,23 +10,23 @@ reproduced here).
 
 Min build times (per the hygiene note below — averages carry right-tail
 machine noise), measured 2026-06-14 after positional remove references, the
-`removed` bitset, the packed `Loc`, the `SortedIdVec` sibling sets, and the
-`IdxSet` deps sets.
+`removed` bitset, the packed `Loc`, the `SortedIdVec` sibling sets, the
+`IdxSet` deps sets, and multi-target-remove range compression.
 
 | Trace               | Build time (min) | Throughput  | Memory  | Encoded  |
 |---------------------|------------------|-------------|---------|----------|
 | automerge-paper     | 123 ms           | 2.09M ops/s | 24.0 MB | 447 KB   |
-| rustcode            | 326 ms           | 2.94M ops/s | 48.1 MB | 2,712 KB |
-| sveltecomponent     | 48 ms            | 3.47M ops/s | 9.1 MB  | 487 KB   |
-| seph-blog1          | 123 ms           | 2.94M ops/s | 20.8 MB | 1,133 KB |
-| clownschool\_flat   | 9.0 ms           | 2.67M ops/s | 2.4 MB  | 132 KB   |
+| rustcode            | 326 ms           | 2.94M ops/s | 48.1 MB | 834 KB   |
+| sveltecomponent     | 48 ms            | 3.47M ops/s | 9.1 MB  | 247 KB   |
+| seph-blog1          | 123 ms           | 2.94M ops/s | 20.8 MB | 659 KB   |
+| clownschool\_flat   | 9.0 ms           | 2.67M ops/s | 2.4 MB  | 130 KB   |
 | friendsforever_flat | 10.3 ms          | 2.51M ops/s | 2.5 MB  | 115 KB   |
-| json-crdt-blog-post | 15.1 ms          | 3.33M ops/s | 3.8 MB  | 116 KB   |
+| json-crdt-blog-post | 15.1 ms          | 3.33M ops/s | 3.8 MB  | 91 KB    |
 
-(Encoded reflects positional remove references; Memory reflects the `removed`
-bitset, the packed `Loc`, the `SortedIdVec` sibling sets, and the `IdxSet` deps
-sets — all below. Build time / throughput are within machine noise of the prior
-baseline.)
+(Encoded reflects positional remove references + multi-target-remove range
+compression; Memory reflects the `removed` bitset, the packed `Loc`, the
+`SortedIdVec` sibling sets, and the `IdxSet` deps sets — all below. Build time /
+throughput are within machine noise of the prior baseline.)
 
 What got us here (in order): Cursor as the single insertion path; before nodes
 became Before-runs and `insert_before` stopped splitting runs (boxes −40%);
@@ -236,15 +236,24 @@ wasted. Estimate ~5–10% on the dict-heavy traces. Does nothing for the
 `dict_in_run` pile; that needs the analogous run↔run split, which is murkier
 (a run's anchor, not just an interior dep, can be the back-reference).
 
-### 2. rustcode's multi-target removes (encoding)
+### 2. rustcode's multi-target removes (encoding) — DONE (2026-06-14)
 
-rustcode's encoding is 68% the "other removes" section (2.4 MB): big
-`remove_batch` calls, one tagged `(run_idx, elem_idx)` pair per target
-(~4–6 B/target — already positional, the volume is just the target count).
-Idea: range-compress contiguous target spans within a multi-target remove
-(`(run_idx, start, end)` instead of per-element pairs). Decode must rebuild the
-exact target set, which ranges preserve. Should cut that section by ~5–10×
-for span-shaped batch deletes.
+A `remove_batch` deletes a contiguous span, so its targets are mostly
+consecutive elements of a run — but they used to cost one positional ref each.
+The `REMOVE_OTHER` block now coalesces them into `(run_rank, start, count)`
+ranges: at encode the targets (a set — order is free) are resolved to
+`(run_rank, off)`, sorted, and runs of consecutive offsets become one segment;
+remove-op and non-element targets stay singletons. A segment's head reuses the
+ref low bits (`r1` run-element range + a count varint / `00` dict / `10`
+remove), so decode rebuilds the *exact* target set and the node id survives.
+
+Way past the predicted 5–10×: `RmOther` −90..97% (rustcode 1,936 → 59 KB, ~33×;
+seph 544 → 69 KB; svelte 269 → 29 KB). Totals: **rustcode 2,712 → 834 KB
+(−69%)**, svelte 487 → 247 (−49%), seph 1,133 → 659 (−42%), json 116 → 91
+(−21%); automerge/friendsforever unchanged (no multi-target removes). Build/
+memory untouched (wire-only). Covered by `test_multi_target_remove_roundtrip_identity`
++ `prop_batch_remove_roundtrip` + `prop_encoding_is_deterministic` (50k cases) —
+identity preservation and deterministic segment ordering are the two risks.
 
 ### 3. Smaller / opportunistic
 

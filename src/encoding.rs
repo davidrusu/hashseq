@@ -433,8 +433,11 @@ const BLK_REMOVE_OTHER: u8 = 5;
 ///     varint start, varint end } — a chain of single removes over a contiguous
 ///     span of that run's elements; exposes the link ids.
 ///   - REMOVE_SINGLE: { ref_set extra_deps, ref target }; exposes the link id.
-///   - REMOVE_OTHER: { ref_set extra_deps, varint n, n × ref target } —
-///     multi-target / non-element removes; exposes the remove-op id.
+///   - REMOVE_OTHER: { ref_set extra_deps, varint n_segments, segments } —
+///     multi-target removes; exposes the remove-op id. Each segment's head
+///     reuses the ref low bits: `r1` run-element range (rank, off, +count varint)
+///     coalescing the consecutive elements a `remove_batch` deletes; `00` dict
+///     singleton; `10` remove-op singleton.
 /// - [num_orphans][orphans...]        tagged HashNodes with ref-encoded IDs
 ///
 /// A `ref` is a varint whose low bits select the form, keeping the common
@@ -947,9 +950,46 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             Payload::Other { extra_deps, targets } => {
                 buf.push(BLK_REMOVE_OTHER);
                 encode_ref_set(extra_deps, pe, &mut buf);
-                encode_varint(targets.len(), &mut buf);
+                // Targets are a set (order is free), and a `remove_batch` deletes
+                // a contiguous span — so most targets are consecutive elements of
+                // one run. Coalesce those into (run_rank, start, count) ranges;
+                // remove-op and non-element targets stay singletons. Sort each
+                // group for determinism and contiguity.
+                let mut elems: Vec<(usize, usize)> = Vec::new(); // (run_rank, off)
+                let mut remove_singles: Vec<(usize, usize)> = Vec::new(); // (rank, off)
+                let mut dicts: Vec<usize> = Vec::new();
                 for t in targets {
-                    encode_ref(t, pe, &mut buf);
+                    match resolve(t, pe) {
+                        Some((true, rank, off)) => elems.push((rank, off)),
+                        Some((false, rank, off)) => remove_singles.push((rank, off)),
+                        None => dicts.push(id_to_idx[t]),
+                    }
+                }
+                elems.sort_unstable();
+                remove_singles.sort_unstable();
+                dicts.sort_unstable();
+                // (run_rank, start_off, count) ranges over consecutive elements.
+                let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+                for (rank, off) in elems {
+                    match ranges.last_mut() {
+                        Some(last) if last.0 == rank && last.1 + last.2 == off => last.2 += 1,
+                        _ => ranges.push((rank, off, 1)),
+                    }
+                }
+                encode_varint(ranges.len() + remove_singles.len() + dicts.len(), &mut buf);
+                // Each segment's head reuses the ref low bits; run-element heads
+                // carry a trailing count (decode mirrors this).
+                for (rank, start, count) in &ranges {
+                    encode_varint((rank << 1) | 1, &mut buf);
+                    encode_varint(*start, &mut buf);
+                    encode_varint(*count, &mut buf);
+                }
+                for (rank, off) in &remove_singles {
+                    encode_varint((rank << 2) | 0b10, &mut buf);
+                    encode_varint(*off, &mut buf);
+                }
+                for idx in &dicts {
+                    encode_varint(idx << 2, &mut buf);
                 }
             }
         }
@@ -1183,13 +1223,46 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 let (extra_deps, size) =
                     decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
                 pos += size;
-                let (num_targets, size) = decode_varint(&bytes[pos..])?;
+                let (num_segments, size) = decode_varint(&bytes[pos..])?;
                 pos += size;
                 let mut targets = BTreeSet::new();
-                for _ in 0..num_targets {
-                    let (id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
+                // Each segment's head reuses the ref low bits (mirrors emit):
+                // `xxx1` run-element range (rank, off, count); `xx00` dict
+                // singleton; `xx10` remove-op singleton.
+                for _ in 0..num_segments {
+                    let (head, size) = decode_varint(&bytes[pos..])?;
                     pos += size;
-                    targets.insert(id);
+                    if head & 1 == 1 {
+                        let rank = head >> 1;
+                        let (off, size) = decode_varint(&bytes[pos..])?;
+                        pos += size;
+                        let (count, size) = decode_varint(&bytes[pos..])?;
+                        pos += size;
+                        let run = run_elems
+                            .get(rank)
+                            .ok_or(DecodeError::InvalidIdIndex(rank))?;
+                        for i in off..off + count {
+                            targets.insert(
+                                run.get(i).copied().ok_or(DecodeError::InvalidIdIndex(i))?,
+                            );
+                        }
+                    } else if head & 2 == 0 {
+                        let idx = head >> 2;
+                        targets.insert(
+                            id_list.get(idx).copied().ok_or(DecodeError::InvalidIdIndex(idx))?,
+                        );
+                    } else {
+                        let rank = head >> 2;
+                        let (off, size) = decode_varint(&bytes[pos..])?;
+                        pos += size;
+                        targets.insert(
+                            remove_ids
+                                .get(rank)
+                                .and_then(|e| e.get(off))
+                                .copied()
+                                .ok_or(DecodeError::InvalidIdIndex(rank))?,
+                        );
+                    }
                 }
                 let node = HashNode {
                     extra_dependencies: extra_deps,
