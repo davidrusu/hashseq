@@ -304,6 +304,43 @@ identity preservation and deterministic segment ordering are the two risks.
   convergence-safe `Id` space (handles are just the payload); covered by the
   merge laws + roundtrip/determinism props at 30k cases.
 
+### 3b. Consolidate remove chains on the wire (`RmSing`)
+
+Forward/backward remove-runs are already ranges (`start..end`). The remaining
+`RmSing` bytes (automerge 18 KB, rustcode 11 KB) are chain links that couldn't
+join a span — a chain gets split into one wire block per run-boundary and per
+non-adjacent step, and every piece after the first **re-encodes its dependency
+on the previous piece** (`{prev link id}`). Fix: collapse a whole chain into one
+`RemoveChain` block — `first_extra_deps` once, then targets *in chain order* as a
+segment list (forward/backward ranges where contiguous, singles otherwise) that
+crosses runs freely; links chain implicitly, so the per-piece deps refs vanish.
+Subsumes `RemoveSpan` + `Single`. Modest (~1–2% of the encoding, concentrated on
+scatter-delete traces) and fiddlier than #2 (chain order must be preserved,
+ranges need a direction bit, decode reconstructs across runs). Below #1b.
+
+### 3c. Range-compress the in-memory remove structures (parked)
+
+Measured handle-contiguity of the `Vec<NodeIdx>` payloads in `RemoveRun` /
+`CausalRemove`:
+
+- **`RemoveRun.links` is 100% contiguous** (every trace) and in fact
+  *derivable*: removes intern sequentially, so `links[pos] = chain_head + pos`.
+  Replace `links: Vec<NodeIdx>` with `LinkSeq::Contiguous { count }` (+ a
+  `List(Vec)` fallback for out-of-order delivery, which can break the run).
+  Drops ~half of `remove_runs` — ~0.8 MB automerge, ~0.5 MB seph; zero risk.
+  But nothing for rustcode (whose `remove_runs` is only 0.5 MB).
+- **`CausalRemove.nodes` / `RemoveRun.targets` hold the big memory** (rustcode
+  nodes = 3.3 MB) but are only 0.2–18% contiguous *by handle* — yet they
+  range-compress 33× on the wire, because the wire ranges by element *position*
+  (`run_rank, off`), and a batch delete is position-contiguous even when the
+  interning order is scrambled. To capture that in memory you'd store
+  `(run_head, start_pos, count)` instead of handles — but `split_run_at`
+  relocates/fragments a span's positions, so it needs a reverse index (run →
+  removes targeting it) updated on every split. Real overhead and bug surface;
+  parked alongside #4. (automerge's `targets` are genuinely scattered — 18%
+  contiguous, which is exactly why they're wire singles — so not compressible in
+  either space.)
+
 ### 4. The floor, if it's ever needed
 
 `ids: Vec<Id>` (32 B per node ever applied, ~10.8 MB automerge) is the

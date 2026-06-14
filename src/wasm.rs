@@ -224,7 +224,18 @@ impl WasmHashSeq {
     /// Shape: `{ "tips": [hex...], "nodes": [
     ///   { "id": hex, "kind": "root"|"run"|"before", "text": str,
     ///     "parent": hex|null, "parentOffset": int|null,
-    ///     "rel": "after"|"before"|null, "removed": bool } ] }`
+    ///     "rel": "after"|"before"|null, "removed": bool,
+    ///     "removedMask": str,
+    ///     "deps": [{ "box": hex, "off": int }] } ] }`
+    ///
+    /// `deps` are extra causal dependencies beyond the anchor, each resolved to
+    /// the box it lands in and the element offset within it (so a mid-run insert
+    /// depending on the run's tip points at that tip char, not just the box).
+    ///
+    /// `removed` is true only when *every* element of the run is tombstoned (so
+    /// the box reads as fully deleted); `removedMask` is one `'0'`/`'1'` per
+    /// character (per run element) giving the per-char tombstone state, so a run
+    /// with only some chars deleted can be rendered char-by-char.
     ///
     /// `parentOffset` is the anchor's element index within the parent box: a
     /// `rel:"before"` child sits immediately before that char, a `rel:"after"`
@@ -250,13 +261,23 @@ impl WasmHashSeq {
         }
         out.push_str("],\"nodes\":[");
 
-        // Resolve a set of dependency ids to the boxes (run heads / roots /
-        // before-nodes) they belong to, deduped.
-        let resolve_deps = |set: &std::collections::BTreeSet<Id>| -> Vec<Id> {
+        // Resolve a set of dependency ids to (box, offset-within-box) — an
+        // anchor may point at an interior run element, and so may an extra-dep
+        // (e.g. a mid-run insert depends on the run's *tip*, a different element
+        // of the same box than its anchor). Keeping the offset lets the edge
+        // attach to the right character instead of being mistaken for the
+        // anchor edge and dropped. Deduped by (box, offset).
+        let resolve_with_off = |id: &Id| -> (Id, usize) {
+            match s.idx_of(id).map(|i| s.loc_of(i)) {
+                Some(Loc::Run { run, pos }) => (s.id_of(run), pos as usize),
+                _ => (*id, 0),
+            }
+        };
+        let resolve_deps = |set: &std::collections::BTreeSet<Id>| -> Vec<(Id, usize)> {
             let mut seen = std::collections::BTreeSet::new();
             set.iter()
-                .map(&resolve)
-                .filter(|b| seen.insert(*b))
+                .map(&resolve_with_off)
+                .filter(|bo| seen.insert(*bo))
                 .collect()
         };
 
@@ -268,7 +289,8 @@ impl WasmHashSeq {
                             parent: Option<(Id, usize)>,
                             rel: Option<&str>,
                             removed: bool,
-                            deps: &[Id]| {
+                            removed_mask: &str,
+                            deps: &[(Id, usize)]| {
                 if !first {
                     out.push(',');
                 }
@@ -300,12 +322,18 @@ impl WasmHashSeq {
                 }
                 out.push_str(",\"removed\":");
                 out.push_str(if removed { "true" } else { "false" });
+                out.push_str(",\"removedMask\":");
+                push_json_str(&mut out, removed_mask);
                 out.push_str(",\"deps\":[");
-                for (i, d) in deps.iter().enumerate() {
+                for (i, (box_id, off)) in deps.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
-                    push_json_str(&mut out, &id_to_hex(d));
+                    out.push_str("{\"box\":");
+                    push_json_str(&mut out, &id_to_hex(box_id));
+                    out.push_str(",\"off\":");
+                    out.push_str(&off.to_string());
+                    out.push('}');
                 }
                 out.push_str("]}");
             };
@@ -331,13 +359,24 @@ impl WasmHashSeq {
                 } else {
                     Some((resolve(&run.anchor), anchor_offset))
                 };
+                // Per-element tombstone state — one '0'/'1' per char, aligned
+                // with `run.text` (one element per char). `removed` (box-level)
+                // is true only when the whole run is gone.
+                let mut removed_mask = String::with_capacity(run.elements.len());
+                let mut all_removed = true;
+                for e in &run.elements {
+                    let r = s.is_removed(*e);
+                    removed_mask.push(if r { '1' } else { '0' });
+                    all_removed &= r;
+                }
                 emit(
                     &head_id,
                     kind,
                     &run.text,
                     anchor,
                     (!is_top_level).then_some(rel),
-                    s.is_removed(*head),
+                    all_removed,
+                    &removed_mask,
                     &resolve_deps(&run.first_extra_deps.to_id_set(&s.ids)),
                 );
             }
@@ -437,5 +476,79 @@ mod tests {
         assert_eq!(root["text"], "hello world", "parent run must not be split");
         assert_eq!(before["parent"], root["id"]);
         assert_eq!(root["parent"], serde_json::Value::Null);
+    }
+
+    /// Deleting some characters of a run must surface per-element tombstone
+    /// state in `removedMask` (aligned with `text`), and `removed` (box-level)
+    /// must stay false until the whole run is gone.
+    #[test]
+    fn structure_json_reports_per_char_tombstones() {
+        let mut seq = WasmHashSeq::new();
+        seq.insert(0, "abcdef");
+        seq.remove(1, 2); // delete 'b','c' -> visible "adef"
+        assert_eq!(seq.text(), "adef");
+
+        let v: serde_json::Value = serde_json::from_str(&seq.structure_json()).unwrap();
+        let nodes = v["nodes"].as_array().unwrap();
+        // One run still holding all six elements (tombstones don't compact it).
+        let run = nodes.iter().find(|n| n["text"] == "abcdef").unwrap();
+        assert_eq!(run["removedMask"], "011000", "b,c tombstoned; rest live");
+        assert_eq!(run["removed"], false, "run is only partially deleted");
+
+        // Delete the rest -> the box reads as fully removed.
+        seq.remove(0, 4);
+        assert_eq!(seq.text(), "");
+        let v: serde_json::Value = serde_json::from_str(&seq.structure_json()).unwrap();
+        let run = v["nodes"].as_array().unwrap()[0].clone();
+        assert_eq!(run["removedMask"], "111111");
+        assert_eq!(run["removed"], true);
+    }
+
+    /// A concurrent after-fork splits a run: "ab" + a sibling "c" forked after
+    /// 'a' breaks [a,b] into a left run "a" and a right run "b" re-anchored
+    /// (after) 'a'. structureJson must report that right run's after-edge.
+    #[test]
+    fn structure_json_reports_split_continuation_edge() {
+        let mut a = WasmHashSeq::new();
+        a.insert(0, "a");
+        let mut b = WasmHashSeq::new();
+        b.merge_encoded(&a.encode()).unwrap();
+        a.insert(1, "b"); // "ab"
+        b.insert(1, "c"); // "ac" — concurrent fork after 'a'
+        a.merge_encoded(&b.encode()).unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&a.structure_json()).unwrap();
+        let nodes = v["nodes"].as_array().unwrap();
+        eprintln!("SPLIT STRUCTURE: {}", serde_json::to_string_pretty(&nodes).unwrap());
+
+        let left = nodes.iter().find(|n| n["text"] == "a").unwrap();
+        // Both forked continuations re-anchor (after) 'a'.
+        let b_run = nodes.iter().find(|n| n["text"] == "b").unwrap();
+        let c_run = nodes.iter().find(|n| n["text"] == "c").unwrap();
+        assert_eq!(b_run["parent"], left["id"], "b must anchor at the left run");
+        assert_eq!(b_run["rel"], "after");
+        assert_eq!(c_run["parent"], left["id"]);
+        assert_eq!(c_run["rel"], "after");
+    }
+
+    /// A mid-run insert depends on the run's *tip* (a different element of the
+    /// anchor's box than its anchor); structureJson must report that dep with
+    /// its element offset so the visualizer can draw the edge to the tip char.
+    #[test]
+    fn structure_json_reports_dep_offset_within_anchor_box() {
+        let mut seq = WasmHashSeq::new();
+        seq.insert(0, "hello");
+        seq.insert(2, "X"); // before 'l' (offset 2); tip is 'o' (offset 4)
+        assert_eq!(seq.text(), "heXllo");
+
+        let v: serde_json::Value = serde_json::from_str(&seq.structure_json()).unwrap();
+        let nodes = v["nodes"].as_array().unwrap();
+        let run = nodes.iter().find(|n| n["text"] == "hello").unwrap();
+        let x = nodes.iter().find(|n| n["text"] == "X").unwrap();
+        assert_eq!(x["parentOffset"], 2, "anchored before 'l'");
+        let deps = x["deps"].as_array().unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0]["box"], run["id"], "dep lands in the run's box");
+        assert_eq!(deps[0]["off"], 4, "...at the tip 'o', not the anchor offset");
     }
 }
