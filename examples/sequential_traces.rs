@@ -67,6 +67,8 @@ fn load_testing_data(filename: &str) -> TestData {
 
 struct RunStats {
     times_ms: Vec<f64>,
+    /// Full-text iteration time (`seq.iter().collect::<String>()`), per build.
+    iter_times_ms: Vec<f64>,
     correct: bool,
     run_count: usize,
     ops: usize,
@@ -145,6 +147,13 @@ impl RunStats {
         self.times_ms.iter().cloned().fold(f64::INFINITY, f64::min)
     }
 
+    fn min_iter_ms(&self) -> f64 {
+        self.iter_times_ms
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min)
+    }
+
     fn max_ms(&self) -> f64 {
         self.times_ms
             .iter()
@@ -194,17 +203,21 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
         let (_, sz) = decode_varint(&bytes[*pos..]).expect("varint");
         *pos += sz;
     }
-    /// Skip a tagged ref: low bit 1 = positional (run_idx, elem_idx) — one
-    /// more varint follows; low bit 0 = dict index — mark it referenced.
+    /// Skip a tagged ref (must match `decode_ref` in src/encoding.rs):
+    /// `xxx1` = run element (rank, offset) — an offset varint follows;
+    /// `xx00` = dict index — mark it referenced;
+    /// `xx10` = remove (rank, offset) — an offset varint follows.
     fn skip_ref(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
         let (v, sz) = decode_varint(&bytes[*pos..]).expect("ref");
         *pos += sz;
         if v & 1 == 1 {
-            skip_varint(bytes, pos); // elem_idx
-        } else {
-            let idx = v >> 1;
+            skip_varint(bytes, pos); // run element offset
+        } else if v & 2 == 0 {
+            let idx = v >> 2;
             assert!(idx < referenced.len(), "dict ref {idx} out of bounds");
             referenced[idx] = true;
+        } else {
+            skip_varint(bytes, pos); // remove offset
         }
     }
     fn skip_ref_set(bytes: &[u8], pos: &mut usize, referenced: &mut [bool]) {
@@ -231,80 +244,70 @@ fn byte_breakdown(bytes: &[u8]) -> ByteBreakdown {
     let mut referenced: Vec<bool> = vec![false; num_ids + 1];
     referenced[0] = true; // the origin is referenced by definition
 
-    // Runs: one dependency-ordered section, per-run first_op tag.
-    // { u8 tag, ref anchor, ref_set first_extra_deps, string, interior deps }
-    {
-        let runs_start = pos;
-        let num_runs = read_varint(bytes, &mut pos);
-        for _ in 0..num_runs {
-            let s = pos;
-            let tag = bytes[pos];
-            pos += 1;
-            skip_ref(bytes, &mut pos, &mut referenced);
-            skip_ref_set(bytes, &mut pos, &mut referenced);
-            let (run_text, sz) = decode_string(&bytes[pos..]).expect("string");
-            pos += sz;
-            b.runs_text += run_text.len();
-            // interior extra-deps: count + (offset, ref_set)
-            let n_interior = read_varint(bytes, &mut pos);
-            for _ in 0..n_interior {
-                skip_varint(bytes, &mut pos); // offset (positional)
+    // Blocks: one dependency-ordered section of tagged runs and removes
+    // (must match the BLK_* constants in src/encoding.rs). Each block is
+    // attributed to a column by its tag.
+    const BLK_RUN_AFTER: u8 = 0;
+    const BLK_RUN_BEFORE: u8 = 1;
+    const BLK_REMOVE_FWD: u8 = 2;
+    const BLK_REMOVE_BWD: u8 = 3;
+    const BLK_REMOVE_SINGLE: u8 = 4;
+    const BLK_REMOVE_OTHER: u8 = 5;
+
+    let num_blocks = read_varint(bytes, &mut pos);
+    for _ in 0..num_blocks {
+        let s = pos;
+        let tag = bytes[pos];
+        pos += 1;
+        match tag {
+            BLK_RUN_AFTER | BLK_RUN_BEFORE => {
+                // ref anchor, ref_set first_extra_deps, string, interior deps
+                skip_ref(bytes, &mut pos, &mut referenced);
                 skip_ref_set(bytes, &mut pos, &mut referenced);
+                let (run_text, sz) = decode_string(&bytes[pos..]).expect("string");
+                pos += sz;
+                b.runs_text += run_text.len();
+                let n_interior = read_varint(bytes, &mut pos);
+                for _ in 0..n_interior {
+                    skip_varint(bytes, &mut pos); // offset (positional)
+                    skip_ref_set(bytes, &mut pos, &mut referenced);
+                }
+                if tag == BLK_RUN_BEFORE {
+                    b.befores += pos - s;
+                } else {
+                    b.runs += pos - s;
+                }
             }
-            // attribute to the runs/befores columns by tag (0x01 = before)
-            if tag == 0x01 {
-                b.befores += pos - s;
-            } else {
-                b.runs += pos - s;
+            BLK_REMOVE_FWD | BLK_REMOVE_BWD => {
+                // ref_set first_extra_deps, varint target_block, varint start, varint end
+                skip_ref_set(bytes, &mut pos, &mut referenced);
+                skip_varint(bytes, &mut pos); // target_block (positional)
+                skip_varint(bytes, &mut pos); // start_idx (positional)
+                skip_varint(bytes, &mut pos); // end_idx (positional)
+                if tag == BLK_REMOVE_BWD {
+                    b.backward_remove_runs += pos - s;
+                } else {
+                    b.forward_remove_runs += pos - s;
+                }
             }
-        }
-        // the section-count varint itself goes unattributed (couple of bytes)
-        let _ = runs_start;
-    }
-
-    // Forward remove runs: varint(num) + num * { idx_set first_extra_deps, varint run_idx, varint start, varint end }
-    let s = pos;
-    let num_forward = read_varint(bytes, &mut pos);
-    for _ in 0..num_forward {
-        skip_ref_set(bytes, &mut pos, &mut referenced);
-        skip_varint(bytes, &mut pos); // run_idx (positional)
-        skip_varint(bytes, &mut pos); // start_idx (positional)
-        skip_varint(bytes, &mut pos); // end_idx (positional)
-    }
-    b.forward_remove_runs = pos - s;
-
-    // Backward remove runs: same shape
-    let s = pos;
-    let num_backward = read_varint(bytes, &mut pos);
-    for _ in 0..num_backward {
-        skip_ref_set(bytes, &mut pos, &mut referenced);
-        skip_varint(bytes, &mut pos); // run_idx
-        skip_varint(bytes, &mut pos); // start_idx
-        skip_varint(bytes, &mut pos); // end_idx
-    }
-    b.backward_remove_runs = pos - s;
-
-    // Single-run standalone removes: varint(num) + num * { idx_set extra_deps, varint run_idx, varint elem_idx }
-    let s = pos;
-    let num_single = read_varint(bytes, &mut pos);
-    for _ in 0..num_single {
-        skip_ref_set(bytes, &mut pos, &mut referenced);
-        skip_varint(bytes, &mut pos); // run_idx
-        skip_varint(bytes, &mut pos); // elem_idx
-    }
-    b.single_run_removes = pos - s;
-
-    // Other removes: varint(num) + num * { idx_set extra_deps, varint n, n * tagged target }
-    let s = pos;
-    let num_other = read_varint(bytes, &mut pos);
-    for _ in 0..num_other {
-        skip_ref_set(bytes, &mut pos, &mut referenced);
-        let n = read_varint(bytes, &mut pos);
-        for _ in 0..n {
-            skip_ref(bytes, &mut pos, &mut referenced); // target
+            BLK_REMOVE_SINGLE => {
+                // ref_set extra_deps, ref target
+                skip_ref_set(bytes, &mut pos, &mut referenced);
+                skip_ref(bytes, &mut pos, &mut referenced);
+                b.single_run_removes += pos - s;
+            }
+            BLK_REMOVE_OTHER => {
+                // ref_set extra_deps, varint n, n * ref target
+                skip_ref_set(bytes, &mut pos, &mut referenced);
+                let n = read_varint(bytes, &mut pos);
+                for _ in 0..n {
+                    skip_ref(bytes, &mut pos, &mut referenced);
+                }
+                b.other_removes += pos - s;
+            }
+            other => panic!("unknown block tag: {other:#x}"),
         }
     }
-    b.other_removes = pos - s;
 
     // Orphans: varint(num) + num * tagged HashNode
     let s = pos;
@@ -419,13 +422,16 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
     let patches = data.patch_count();
 
     let mut times_ms = Vec::with_capacity(iterations);
+    let mut iter_times_ms = Vec::with_capacity(iterations);
     let mut correct = true;
     let mut run_count = 0;
 
     for _ in 0..iterations {
         let (seq, elapsed) = build_seq(data);
         times_ms.push(elapsed.as_secs_f64() * 1000.0);
+        let iter_start = Instant::now();
         let result: String = seq.iter().collect();
+        iter_times_ms.push(iter_start.elapsed().as_secs_f64() * 1000.0);
         correct = correct && result == data.end_content;
         run_count = seq.runs.len();
     }
@@ -445,6 +451,7 @@ fn run_trace(data: &TestData, iterations: usize) -> RunStats {
 
     RunStats {
         times_ms,
+        iter_times_ms,
         correct,
         run_count,
         ops,
@@ -477,18 +484,19 @@ fn main() {
 
     println!("Performance");
     println!(
-        "{:<25} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>12} {:>12}",
+        "{:<25} {:>10} {:>10} {:>10} {:>10} {:>9} {:>8} {:>10} {:>12} {:>12}",
         "Trace",
         "Avg(ms)",
         "StdDev%",
         "Min(ms)",
         "Max(ms)",
+        "Iter(ms)",
         "Correct",
         "Runs",
         "Ops/sec",
         "Patches/sec"
     );
-    println!("{}", "-".repeat(117));
+    println!("{}", "-".repeat(127));
 
     let mut all_stats: Vec<(&str, RunStats)> = Vec::new();
 
@@ -500,12 +508,13 @@ fn main() {
             let stats = run_trace(&data, iterations);
 
             println!(
-                "{:<25} {:>10.2} {:>9.1}% {:>10.2} {:>10.2} {:>8} {:>10} {:>12.0} {:>12.0}",
+                "{:<25} {:>10.2} {:>9.1}% {:>10.2} {:>10.2} {:>9.2} {:>8} {:>10} {:>12.0} {:>12.0}",
                 display_name,
                 stats.avg_ms(),
                 stats.std_dev_percent(),
                 stats.min_ms(),
                 stats.max_ms(),
+                stats.min_iter_ms(),
                 if stats.correct { "T" } else { "F" },
                 stats.run_count,
                 stats.ops_per_sec(),

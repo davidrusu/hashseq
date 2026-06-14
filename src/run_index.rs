@@ -210,9 +210,100 @@ impl Default for RunIndex {
 /// elements are (their own handle, 0).
 pub(crate) type ElemRef = (NodeIdx, u32);
 
+/// A fragment as seen by document-order iteration: a contiguous element
+/// range of one run plus its visibility bits.
+#[derive(Clone, Copy)]
+pub(crate) struct FragView<'a> {
+    frag: &'a Frag,
+}
+
+impl FragView<'_> {
+    pub(crate) fn head(&self) -> NodeIdx {
+        self.frag.head
+    }
+
+    pub(crate) fn start(&self) -> u32 {
+        self.frag.start
+    }
+
+    pub(crate) fn len(&self) -> u32 {
+        self.frag.len
+    }
+
+    /// Visibility of the element at fragment-local offset `k`.
+    pub(crate) fn visible_at(&self, k: u32) -> bool {
+        self.frag.bit(k)
+    }
+
+    /// All elements in this fragment are visible (no per-element bit tests
+    /// needed by the caller).
+    pub(crate) fn fully_visible(&self) -> bool {
+        self.frag.visible == self.frag.len
+    }
+}
+
+/// In-order treap walk — fragments in document order, skipping fragments
+/// with no visible elements. No allocation; parent pointers do the climbing.
+pub(crate) struct FragsInOrder<'a> {
+    index: &'a RunIndex,
+    next: u32,
+}
+
+impl<'a> Iterator for FragsInOrder<'a> {
+    type Item = FragView<'a>;
+
+    fn next(&mut self) -> Option<FragView<'a>> {
+        while self.next != NIL {
+            let cur = self.next;
+            self.next = self.index.successor(cur);
+            let frag = &self.index.frags[cur as usize];
+            if frag.visible > 0 {
+                return Some(FragView { frag });
+            }
+        }
+        None
+    }
+}
+
 impl RunIndex {
     pub(crate) fn len(&self) -> usize {
         self.subtree(self.root)
+    }
+
+    /// Fragments in document order (the in-order traversal of the treap —
+    /// verified equal to the causal iterator by `prop_index_matches_iterator`).
+    pub(crate) fn frags_in_order(&self) -> FragsInOrder<'_> {
+        FragsInOrder {
+            index: self,
+            next: self.leftmost(self.root),
+        }
+    }
+
+    fn leftmost(&self, mut n: u32) -> u32 {
+        if n == NIL {
+            return NIL;
+        }
+        while self.frags[n as usize].left != NIL {
+            n = self.frags[n as usize].left;
+        }
+        n
+    }
+
+    fn successor(&self, mut n: u32) -> u32 {
+        let right = self.frags[n as usize].right;
+        if right != NIL {
+            return self.leftmost(right);
+        }
+        loop {
+            let p = self.frags[n as usize].parent;
+            if p == NIL {
+                return NIL;
+            }
+            if self.frags[p as usize].left == n {
+                return p;
+            }
+            n = p;
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {

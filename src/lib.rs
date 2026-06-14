@@ -11,7 +11,6 @@ pub use self::encoding::{
 };
 pub use self::hash_node::{HashNode, Op};
 pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};
-pub use self::hashseq_iter::HashSeqIter;
 pub use self::run::{FirstOp, Run};
 
 #[derive(

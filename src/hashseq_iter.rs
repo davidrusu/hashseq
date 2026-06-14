@@ -1,17 +1,21 @@
-use crate::{
-    Id,
-    hashseq::{HashSeq, Loc, NodeIdx},
-};
+use crate::hashseq::{HashSeq, Loc, NodeIdx};
 
 /// Core in-order traversal, in handle space: run interiors walk `elements`
 /// directly (no hashing); explicit forks and befores resolve their Id-ordered
 /// sibling sets through the interning map.
+///
+/// This is the *semantic definition* of document order. Production iteration
+/// rides the run index's fragment walk instead (`HashSeq::iter_idxs`);
+/// `prop_index_matches_iterator` keeps the two equal, which is why this stays
+/// compiled even though only tests call it.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct HashSeqIdxIter<'a> {
     seq: &'a HashSeq,
     waiting_stack: Vec<(NodeIdx, Vec<NodeIdx>)>,
 }
 
+#[allow(dead_code)]
 impl<'a> HashSeqIdxIter<'a> {
     pub(crate) fn new(seq: &'a HashSeq) -> Self {
         let mut iter = Self {
@@ -81,29 +85,5 @@ impl<'a> Iterator for HashSeqIdxIter<'a> {
                 }
             }
         }
-    }
-}
-
-/// Public iterator over node ids in document order.
-#[derive(Debug, Clone)]
-pub struct HashSeqIter<'a> {
-    seq: &'a HashSeq,
-    inner: HashSeqIdxIter<'a>,
-}
-
-impl<'a> HashSeqIter<'a> {
-    pub(crate) fn new(seq: &'a HashSeq) -> Self {
-        Self {
-            seq,
-            inner: HashSeqIdxIter::new(seq),
-        }
-    }
-}
-
-impl<'a> Iterator for HashSeqIter<'a> {
-    type Item = &'a Id;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|idx| self.seq.id_ref(idx))
     }
 }

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::run_index::{ElemRef, RunIndex};
-use crate::{EncodableOp, FirstOp, HashNode, HashSeqIter, Id, Op, Run};
+use crate::{EncodableOp, FirstOp, HashNode, Id, Op, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
 /// already a BLAKE3 hash, so adversaries cannot craft colliding keys without
@@ -1027,16 +1027,44 @@ impl HashSeq {
         }
     }
 
-    pub fn iter_ids(&self) -> HashSeqIter<'_> {
-        HashSeqIter::new(self)
+    pub fn iter_ids(&self) -> impl Iterator<Item = &Id> {
+        self.iter_idxs().map(|idx| self.id_ref(idx))
     }
 
+    /// Document-order handles via the run index: an in-order fragment walk,
+    /// O(visible + fragments) — tombstones skip in bulk and no per-element
+    /// hashmap probes. The causal traversal (`iter_idxs_causal`) remains the
+    /// semantic reference; `prop_index_matches_iterator` keeps them equal.
     pub(crate) fn iter_idxs(&self) -> impl Iterator<Item = NodeIdx> + '_ {
+        self.index.frags_in_order().flat_map(move |fv| {
+            let elements = &self.runs[&fv.head()].elements;
+            (0..fv.len())
+                .filter(move |k| fv.fully_visible() || fv.visible_at(*k))
+                .map(move |k| elements[(fv.start() + k) as usize])
+        })
+    }
+
+    /// Document-order handles by walking the causal structure (origin
+    /// release, Id-ordered siblings, run chains). This is the *definition*
+    /// of document order; production iteration rides the index instead, and
+    /// the props hold the two equal (hence test-only callers).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn iter_idxs_causal(&self) -> impl Iterator<Item = NodeIdx> + '_ {
         crate::hashseq_iter::HashSeqIdxIter::new(self)
     }
 
+    /// The document text. Walks run text per fragment — linear in fragment
+    /// text (no per-element `char_at`).
     pub fn iter(&self) -> impl Iterator<Item = char> + '_ {
-        self.iter_idxs().map(|idx| self.char_at(idx))
+        self.index.frags_in_order().flat_map(move |fv| {
+            let text = &self.runs[&fv.head()].text;
+            text.chars()
+                .skip(fv.start() as usize)
+                .take(fv.len() as usize)
+                .enumerate()
+                .filter(move |(k, _)| fv.fully_visible() || fv.visible_at(*k as u32))
+                .map(|(_, ch)| ch)
+        })
     }
 
     /// Return the node ID at visible position `idx`, if any.
@@ -1815,12 +1843,22 @@ mod test {
         assert_eq!(merge_self, seq);
     }
 
-    /// The position index must agree with the document iterator — the
-    /// iterator is the source of truth for order. Checked on a merged seq
-    /// (merging is what creates sibling forks) plus more local edits on top.
+    /// The position index must agree with the causal iterator — the causal
+    /// traversal is the semantic definition of document order, and everything
+    /// index-derived (id_at, position_of, and the production fragment-walk
+    /// iterators) must match it. Checked on a merged seq (merging is what
+    /// creates sibling forks) plus more local edits on top.
     fn check_index_matches_iter(seq: &HashSeq) {
-        let iter_ids: Vec<Id> = seq.iter_ids().copied().collect();
+        let iter_ids: Vec<Id> = seq.iter_idxs_causal().map(|i| seq.id_of(i)).collect();
         assert_eq!(seq.len(), iter_ids.len());
+        let index_ids: Vec<Id> = seq.iter_ids().copied().collect();
+        assert_eq!(
+            index_ids, iter_ids,
+            "fragment-walk iteration disagrees with the causal iterator"
+        );
+        let causal_text: String = seq.iter_idxs_causal().map(|i| seq.char_at(i)).collect();
+        let index_text: String = seq.iter().collect();
+        assert_eq!(index_text, causal_text);
         for (pos, id) in iter_ids.iter().enumerate() {
             assert_eq!(
                 seq.id_at(pos),
