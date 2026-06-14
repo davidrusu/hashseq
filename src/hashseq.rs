@@ -85,6 +85,53 @@ pub enum Loc {
     MultiRemove,
 }
 
+/// `Loc` packed into 8 bytes for the per-node `locs` Vec (the enum is 12).
+/// Layout: 2-bit kind | 32-bit handle | 30-bit position. The handle keeps the
+/// full `NodeIdx` (u32) range; `pos` is a within-run/-chain offset, so 30 bits
+/// (~1.07B) is far beyond any real run length (the longest in the test corpus
+/// is ~69k).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedLoc(u64);
+
+impl PackedLoc {
+    const KIND_RUN: u64 = 0;
+    const KIND_ORIGIN: u64 = 1;
+    const KIND_REMOVE_CHAIN: u64 = 2;
+    const KIND_MULTI_REMOVE: u64 = 3;
+
+    #[inline]
+    fn pack(handle: NodeIdx, pos: u32, kind: u64) -> Self {
+        debug_assert!(pos < (1 << 30), "Loc position {pos} exceeds 30 bits");
+        PackedLoc(kind | (handle.0 as u64) << 2 | (pos as u64) << 34)
+    }
+
+    #[inline]
+    fn unpack(self) -> Loc {
+        let handle = NodeIdx((self.0 >> 2) as u32);
+        let pos = (self.0 >> 34) as u32;
+        match self.0 & 0b11 {
+            Self::KIND_RUN => Loc::Run { run: handle, pos },
+            Self::KIND_ORIGIN => Loc::Origin,
+            Self::KIND_REMOVE_CHAIN => Loc::RemoveChain { chain: handle, pos },
+            _ => Loc::MultiRemove,
+        }
+    }
+}
+
+impl From<Loc> for PackedLoc {
+    #[inline]
+    fn from(loc: Loc) -> Self {
+        match loc {
+            Loc::Run { run, pos } => PackedLoc::pack(run, pos, PackedLoc::KIND_RUN),
+            Loc::Origin => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_ORIGIN),
+            Loc::RemoveChain { chain, pos } => {
+                PackedLoc::pack(chain, pos, PackedLoc::KIND_REMOVE_CHAIN)
+            }
+            Loc::MultiRemove => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MULTI_REMOVE),
+        }
+    }
+}
+
 /// A causal anchor for inserting into a HashSeq.
 ///
 /// Captures everything needed to land an insert at the cursor's position
@@ -271,8 +318,8 @@ pub struct HashSeq {
     id_to_idx: IdIndex,
     /// NodeIdx -> Id (append-only).
     pub ids: Vec<Id>,
-    /// NodeIdx -> location.
-    pub locs: Vec<Loc>,
+    /// NodeIdx -> location (8 bytes each; see [`PackedLoc`]).
+    pub locs: Vec<PackedLoc>,
     /// NodeIdx -> tombstone (one bit per handle).
     pub removed: BitSet,
 
@@ -370,7 +417,7 @@ impl HashSeq {
     fn intern(&mut self, id: Id, loc: Loc) -> NodeIdx {
         let idx = self.next_idx();
         self.ids.push(id);
-        self.locs.push(loc);
+        self.locs.push(loc.into());
         self.removed.push(false);
         self.id_to_idx.insert(id, idx, &self.ids);
         idx
@@ -394,7 +441,7 @@ impl HashSeq {
     }
 
     pub fn loc_of(&self, idx: NodeIdx) -> Loc {
-        self.locs[idx.0 as usize]
+        self.locs[idx.0 as usize].unpack()
     }
 
     pub fn is_removed(&self, idx: NodeIdx) -> bool {
@@ -770,7 +817,8 @@ impl HashSeq {
             self.locs[e.0 as usize] = Loc::Run {
                 run: right_head,
                 pos: i as u32,
-            };
+            }
+            .into();
         }
 
         let right_head_id = self.ids[right_head.0 as usize];
@@ -1156,6 +1204,28 @@ impl HashSeq {
 mod test {
     use super::*;
     use quickcheck_macros::quickcheck;
+
+    /// `PackedLoc` must round-trip every `Loc`, including handles and positions
+    /// near their bit-field boundaries (full u32 handle, 30-bit position).
+    #[quickcheck]
+    fn prop_packed_loc_roundtrips(handle: u32, pos: u32) -> bool {
+        let pos = pos & ((1 << 30) - 1); // pos is a within-run offset (30 bits)
+        let cases = [
+            Loc::Run {
+                run: NodeIdx(handle),
+                pos,
+            },
+            Loc::RemoveChain {
+                chain: NodeIdx(handle),
+                pos,
+            },
+            Loc::Origin,
+            Loc::MultiRemove,
+        ];
+        cases
+            .into_iter()
+            .all(|loc| PackedLoc::from(loc).unpack() == loc)
+    }
 
     /// Drive a HashSeq with (insert?, idx, char) instructions, clamping idx into
     /// range — the op vocabulary the property tests below are expressed in.

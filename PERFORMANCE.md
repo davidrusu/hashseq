@@ -9,23 +9,23 @@ reproduced here).
 ## Where we are
 
 Min build times (per the hygiene note below — averages carry right-tail
-machine noise), measured 2026-06-14 after positional remove references and the
-`removed` bitset.
+machine noise), measured 2026-06-14 after positional remove references, the
+`removed` bitset, and the packed `Loc`.
 
 | Trace               | Build time (min) | Throughput  | Memory  | Encoded  |
 |---------------------|------------------|-------------|---------|----------|
-| automerge-paper     | 125 ms           | 2.05M ops/s | 30.1 MB | 447 KB   |
-| rustcode            | 327 ms           | 2.94M ops/s | 56.5 MB | 2,712 KB |
-| sveltecomponent     | 49 ms            | 3.39M ops/s | 12.5 MB | 487 KB   |
-| seph-blog1          | 126 ms           | 2.78M ops/s | 30.6 MB | 1,133 KB |
-| clownschool\_flat   | 9.0 ms           | 2.53M ops/s | 4.4 MB  | 132 KB   |
-| friendsforever_flat | 10.4 ms          | 2.48M ops/s | 4.3 MB  | 115 KB   |
-| json-crdt-blog-post | 15.1 ms          | 3.35M ops/s | 5.1 MB  | 116 KB   |
+| automerge-paper     | 121 ms           | 2.12M ops/s | 29.0 MB | 447 KB   |
+| rustcode            | 323 ms           | 2.96M ops/s | 54.4 MB | 2,712 KB |
+| sveltecomponent     | 48 ms            | 3.49M ops/s | 12.2 MB | 487 KB   |
+| seph-blog1          | 124 ms           | 2.94M ops/s | 29.7 MB | 1,133 KB |
+| clownschool\_flat   | 8.8 ms           | 2.72M ops/s | 4.4 MB  | 132 KB   |
+| friendsforever_flat | 10.1 ms          | 2.50M ops/s | 4.2 MB  | 115 KB   |
+| json-crdt-blog-post | 15.1 ms          | 3.31M ops/s | 5.0 MB  | 116 KB   |
 
 (Encoded reflects positional remove references; Memory reflects the `removed`
-bitset — both below. Build time and throughput are within machine noise of the
-prior baseline; this round of work touched only the wire format and one
-in-memory byte→bit packing.)
+bitset and the packed `Loc` — all below. Build time / throughput are within
+machine noise of the prior baseline, if anything a hair faster — the narrower
+`locs` Vec buys cache locality that offsets the unpack.)
 
 What got us here (in order): Cursor as the single insertion path; before nodes
 became Before-runs and `insert_before` stopped splitting runs (boxes −40%);
@@ -247,8 +247,15 @@ for span-shaped batch deletes.
 
 ### 3. Smaller / opportunistic
 
-- **Pack `Loc`** into 8 bytes (2-bit kind + 30-bit run handle + 32-bit pos)
-  vs the current 12-byte enum — saves ~1.3 MB on automerge, trivial.
+- **Pack `Loc`** into 8 bytes vs the 12-byte enum — DONE (2026-06-14).
+  `PackedLoc(u64)` = 2-bit kind | 32-bit handle | 30-bit pos (full `NodeIdx`
+  range kept; `pos` is a within-run offset, ~69k max in the corpus vs the 1.07B
+  ceiling). Stored as `locs: Vec<PackedLoc>`; the public `Loc` enum and every
+  match/construction site are unchanged — `loc_of` unpacks, `intern` packs via
+  `From<Loc>`. Memory −3.5% (automerge 30.07 → 29.03 MB, rustcode 56.50 →
+  54.39 MB), and build/iter times are if anything a hair faster (narrower Vec →
+  better cache locality). Covered by `prop_packed_loc_roundtrips` plus every
+  existing test, which all go through `loc_of`.
 - **`removed: Vec<bool>` → bitset** — DONE (2026-06-14). `src/bitset.rs`:
   append-only `Vec<u64>` packing, `push`/`set`/`get`, panics on OOB like
   `Vec<bool>` did. `removed` stays the global tombstone truth (the iterator and
