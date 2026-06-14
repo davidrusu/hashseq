@@ -1,3 +1,4 @@
+pub mod bitset;
 pub mod encoding;
 pub mod hash_node;
 pub mod hashseq;

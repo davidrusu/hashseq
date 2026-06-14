@@ -9,20 +9,23 @@ reproduced here).
 ## Where we are
 
 Min build times (per the hygiene note below — averages carry right-tail
-machine noise), measured 2026-06-11 after the positional-anchor-refs change.
+machine noise), measured 2026-06-14 after positional remove references and the
+`removed` bitset.
 
 | Trace               | Build time (min) | Throughput  | Memory  | Encoded  |
 |---------------------|------------------|-------------|---------|----------|
-| automerge-paper     | 124 ms           | 2.09M ops/s | 30.3 MB | 447 KB   |
-| rustcode            | 333 ms           | 2.94M ops/s | 57.0 MB | 2,712 KB |
-| sveltecomponent     | 49 ms            | 3.46M ops/s | 12.6 MB | 487 KB   |
-| seph-blog1          | 126 ms           | 2.92M ops/s | 30.8 MB | 1,133 KB |
-| clownschool\_flat   | 9.0 ms           | 2.72M ops/s | 4.5 MB  | 132 KB   |
-| friendsforever_flat | 10.3 ms          | 2.49M ops/s | 4.4 MB  | 115 KB   |
-| json-crdt-blog-post | 15.2 ms          | 3.35M ops/s | 5.2 MB  | 116 KB   |
+| automerge-paper     | 125 ms           | 2.05M ops/s | 30.1 MB | 447 KB   |
+| rustcode            | 327 ms           | 2.94M ops/s | 56.5 MB | 2,712 KB |
+| sveltecomponent     | 49 ms            | 3.39M ops/s | 12.5 MB | 487 KB   |
+| seph-blog1          | 126 ms           | 2.78M ops/s | 30.6 MB | 1,133 KB |
+| clownschool\_flat   | 9.0 ms           | 2.53M ops/s | 4.4 MB  | 132 KB   |
+| friendsforever_flat | 10.4 ms          | 2.48M ops/s | 4.3 MB  | 115 KB   |
+| json-crdt-blog-post | 15.1 ms          | 3.35M ops/s | 5.1 MB  | 116 KB   |
 
-(Encoded column reflects positional remove references, below; build time,
-throughput, and memory are in-memory metrics and unchanged by that wire change.)
+(Encoded reflects positional remove references; Memory reflects the `removed`
+bitset — both below. Build time and throughput are within machine noise of the
+prior baseline; this round of work touched only the wire format and one
+in-memory byte→bit packing.)
 
 What got us here (in order): Cursor as the single insertion path; before nodes
 became Before-runs and `insert_before` stopped splitting runs (boxes −40%);
@@ -246,10 +249,14 @@ for span-shaped batch deletes.
 
 - **Pack `Loc`** into 8 bytes (2-bit kind + 30-bit run handle + 32-bit pos)
   vs the current 12-byte enum — saves ~1.3 MB on automerge, trivial.
-- **`removed: Vec<bool>` → bitset** (8× smaller). The run-granular index keeps
-  its own per-fragment visibility bitmaps; `removed` stays as the global
-  tombstone truth because the iterator and sibling scans want O(1) per-handle
-  access. A bitset would shave ~N/8 bytes; small.
+- **`removed: Vec<bool>` → bitset** — DONE (2026-06-14). `src/bitset.rs`:
+  append-only `Vec<u64>` packing, `push`/`set`/`get`, panics on OOB like
+  `Vec<bool>` did. `removed` stays the global tombstone truth (the iterator and
+  sibling scans want O(1) per-handle access; the run-granular index keeps its
+  own per-fragment bitmaps). As predicted, small: the structure is 8× smaller,
+  total memory −0.7..0.8% (automerge 30.29 → 30.07 MB, rustcode 56.97 →
+  56.50 MB). `HashSeq` equality is tips-only so the type swap is invisible to
+  the merge laws; covered by `matches_vec_bool_under_random_ops`.
 - **`afters`/`befores_by_anchor` values** as Id-sorted `Vec<NodeIdx>`
   (binary-search compare through `ids[h]`) instead of `BTreeSet<Id>` — saves
   the per-set tree allocs (~2.4 MB automerge, ~2.8 MB clownschool where

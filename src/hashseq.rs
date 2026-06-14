@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::bitset::BitSet;
 use crate::run_index::{ElemRef, RunIndex};
 use crate::{EncodableOp, FirstOp, HashNode, Id, Op, Run};
 
@@ -272,8 +273,8 @@ pub struct HashSeq {
     pub ids: Vec<Id>,
     /// NodeIdx -> location.
     pub locs: Vec<Loc>,
-    /// NodeIdx -> tombstone.
-    pub removed: Vec<bool>,
+    /// NodeIdx -> tombstone (one bit per handle).
+    pub removed: BitSet,
 
     // All inserts live in runs: sequential typing extends a run, and a lone
     // insert is just a 1-char run. A run is After- or Before-anchored
@@ -334,7 +335,7 @@ impl HashSeq {
             id_to_idx: IdIndex::default(),
             ids: Vec::new(),
             locs: Vec::new(),
-            removed: Vec::new(),
+            removed: BitSet::default(),
             runs: FxHashMap::default(),
             befores_by_anchor: FxHashMap::default(),
             remove_nodes: FxHashMap::default(),
@@ -350,7 +351,7 @@ impl HashSeq {
         // the iterator skips it like any removed node).
         let idx = seq.intern(doc_id, Loc::Origin);
         debug_assert_eq!(idx, ORIGIN_IDX);
-        seq.removed[ORIGIN_IDX.0 as usize] = true;
+        seq.removed.set(ORIGIN_IDX.0 as usize);
         seq.tips.insert(doc_id);
         seq
     }
@@ -397,7 +398,7 @@ impl HashSeq {
     }
 
     pub fn is_removed(&self, idx: NodeIdx) -> bool {
-        self.removed[idx.0 as usize]
+        self.removed.get(idx.0 as usize)
     }
 
     /// Check if a node ID exists (insert, remove, or root) — one map probe.
@@ -793,7 +794,7 @@ impl HashSeq {
             if let Loc::Run { run, pos } = self.loc_of(*t) {
                 self.index.remove_element((run, pos));
             }
-            self.removed[t.0 as usize] = true;
+            self.removed.set(t.0 as usize);
         }
 
         // Single-target removes coalesce into RemoveRuns, the delete analog of
