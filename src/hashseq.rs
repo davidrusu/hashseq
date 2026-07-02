@@ -83,12 +83,14 @@ pub enum Loc {
     RemoveChain { chain: NodeIdx, pos: u32 },
     /// Multi-target remove (stored in `remove_nodes`).
     MultiRemove,
+    /// A placement-register move op (stored in `move_nodes`).
+    MoveOp,
 }
 
 /// `Loc` packed into 8 bytes for the per-node `locs` Vec (the enum is 12).
-/// Layout: 2-bit kind | 32-bit handle | 30-bit position. The handle keeps the
-/// full `NodeIdx` (u32) range; `pos` is a within-run/-chain offset, so 30 bits
-/// (~1.07B) is far beyond any real run length (the longest in the test corpus
+/// Layout: 3-bit kind | 32-bit handle | 29-bit position. The handle keeps the
+/// full `NodeIdx` (u32) range; `pos` is a within-run/-chain offset, so 29 bits
+/// (~536M) is far beyond any real run length (the longest in the test corpus
 /// is ~69k).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedLoc(u64);
@@ -98,21 +100,23 @@ impl PackedLoc {
     const KIND_ORIGIN: u64 = 1;
     const KIND_REMOVE_CHAIN: u64 = 2;
     const KIND_MULTI_REMOVE: u64 = 3;
+    const KIND_MOVE_OP: u64 = 4;
 
     #[inline]
     fn pack(handle: NodeIdx, pos: u32, kind: u64) -> Self {
-        debug_assert!(pos < (1 << 30), "Loc position {pos} exceeds 30 bits");
-        PackedLoc(kind | (handle.0 as u64) << 2 | (pos as u64) << 34)
+        debug_assert!(pos < (1 << 29), "Loc position {pos} exceeds 29 bits");
+        PackedLoc(kind | (handle.0 as u64) << 3 | (pos as u64) << 35)
     }
 
     #[inline]
     fn unpack(self) -> Loc {
-        let handle = NodeIdx((self.0 >> 2) as u32);
-        let pos = (self.0 >> 34) as u32;
-        match self.0 & 0b11 {
+        let handle = NodeIdx((self.0 >> 3) as u32);
+        let pos = (self.0 >> 35) as u32;
+        match self.0 & 0b111 {
             Self::KIND_RUN => Loc::Run { run: handle, pos },
             Self::KIND_ORIGIN => Loc::Origin,
             Self::KIND_REMOVE_CHAIN => Loc::RemoveChain { chain: handle, pos },
+            Self::KIND_MOVE_OP => Loc::MoveOp,
             _ => Loc::MultiRemove,
         }
     }
@@ -128,6 +132,7 @@ impl From<Loc> for PackedLoc {
                 PackedLoc::pack(chain, pos, PackedLoc::KIND_REMOVE_CHAIN)
             }
             Loc::MultiRemove => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MULTI_REMOVE),
+            Loc::MoveOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MOVE_OP),
         }
     }
 }
@@ -229,6 +234,20 @@ pub struct CausalRemove {
     pub pins: IdxSet,
     /// Removed element handles, in Id order.
     pub nodes: Box<[NodeIdx]>,
+}
+
+/// Storage form of an applied move op (the placement projection,
+/// HASHSEQ_SPEC.md `Move`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMove {
+    pub target: NodeIdx,
+    /// Destination glued point: side + anchor handle.
+    pub to_before: bool,
+    pub to_anchor: NodeIdx,
+    /// Superseded move ops (the register's overwrites edges), in Id order.
+    pub overwrites: IdxSet,
+    /// Frontier pins, in Id order.
+    pub pins: IdxSet,
 }
 
 /// A coalesced chain of single-target removes: remove `i` deletes `targets[i]`
@@ -373,6 +392,13 @@ impl SortedIdVec {
         }
     }
 
+    /// Remove the handle whose id equals `id`, if present.
+    pub fn remove(&mut self, id: &Id, ids: &[Id]) {
+        if let Ok(pos) = self.search(id, ids) {
+            self.0.remove(pos);
+        }
+    }
+
     /// Handle with the smallest id.
     #[inline]
     pub fn first(&self) -> Option<NodeIdx> {
@@ -443,6 +469,12 @@ pub struct HashSeq {
     pub befores_by_anchor: FxHashMap<NodeIdx, SortedIdVec>,
     /// Multi-target removes only; single-target removes coalesce into chains.
     pub remove_nodes: FxHashMap<NodeIdx, CausalRemove>,
+    /// Applied move ops, by their own handle (the placement-register
+    /// history: `overwrites` edges are walked by the last-agreed rule).
+    pub move_nodes: FxHashMap<NodeIdx, StoredMove>,
+    /// Placement registers: target element -> live move heads, in Id order
+    /// (convergence-safe; never replica-local order).
+    pub moves: FxHashMap<NodeIdx, SortedIdVec>,
     /// Chained single-target removes (backspace/delete bursts), keyed by the
     /// first remove's handle.
     pub remove_runs: FxHashMap<NodeIdx, RemoveRun>,
@@ -503,6 +535,8 @@ impl HashSeq {
             runs: FxHashMap::default(),
             befores_by_anchor: FxHashMap::default(),
             remove_nodes: FxHashMap::default(),
+            move_nodes: FxHashMap::default(),
+            moves: FxHashMap::default(),
             remove_runs: FxHashMap::default(),
             afters: FxHashMap::default(),
             tips: BTreeSet::new(),
@@ -938,6 +972,193 @@ impl HashSeq {
         right_head
     }
 
+    /// Apply a move: O(1) register bookkeeping, no replay. The rendered
+    /// relocation in the position index is not wired up yet — `placement_of`
+    /// is the read-time placement (register semantics are complete and
+    /// convergent; the treap overlay with origin ghosts is the follow-up).
+    fn apply_move(
+        &mut self,
+        id: Id,
+        pins: BTreeSet<Id>,
+        target: Id,
+        to: Anchor,
+        overwrites: BTreeSet<Id>,
+    ) {
+        let target_idx = self.idx_of_known(&target);
+        let idx = self.intern(id, Loc::MoveOp);
+        let (to_before, to_id) = match to {
+            Anchor::Before(a) => (true, a),
+            Anchor::After(a) => (false, a),
+        };
+        let to_anchor = self.idx_of_known(&to_id);
+
+        // heads(x) = heads(x) − overwrites ∪ {u}. The same-register filter is
+        // structural: we only remove ids present in THIS target's head list,
+        // so overwrites naming moves of other targets (or non-moves) are
+        // ignored, never errors.
+        let reg = self.moves.entry(target_idx).or_default();
+        for o in &overwrites {
+            reg.remove(o, &self.ids);
+        }
+        reg.insert(idx, &self.ids);
+
+        let stored = StoredMove {
+            target: target_idx,
+            to_before,
+            to_anchor,
+            overwrites: IdxSet::from_id_set(&overwrites, |d| {
+                self.id_to_idx.get(d, &self.ids).expect("ref was interned")
+            }),
+            pins: IdxSet::from_id_set(&pins, |d| {
+                self.id_to_idx.get(d, &self.ids).expect("ref was interned")
+            }),
+        };
+        self.move_nodes.insert(idx, stored);
+    }
+
+    /// Reconstruct a move op's `HashNode` (for merge / re-broadcast).
+    pub fn move_node(&self, idx: NodeIdx, mv: &StoredMove) -> HashNode {
+        let _ = idx;
+        let to_id = self.id_of(mv.to_anchor);
+        HashNode {
+            pins: mv.pins.to_id_set(&self.ids),
+            op: Op::Move {
+                target: self.id_of(mv.target),
+                to: if mv.to_before {
+                    Anchor::Before(to_id)
+                } else {
+                    Anchor::After(to_id)
+                },
+                overwrites: mv.overwrites.to_id_set(&self.ids),
+            },
+        }
+    }
+
+    // ---- placement reads (arbitration happens here, per Law II) ----
+
+    /// The live move heads of `target` (move-op ids, in id order).
+    pub fn move_heads(&self, target: &Id) -> Vec<Id> {
+        self.idx_of(target)
+            .and_then(|t| self.moves.get(&t))
+            .map(|reg| reg.iter().map(|i| self.id_of(i)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether `target`'s placement register is contested (`|heads| > 1`) —
+    /// the surfaced conflict flag.
+    pub fn placement_conflicted(&self, target: &Id) -> bool {
+        self.idx_of(target)
+            .and_then(|t| self.moves.get(&t))
+            .is_some_and(|reg| reg.len() > 1)
+    }
+
+    /// The rendered placement of `target`: `None` = the creation placement
+    /// (its base slot), or the element is tombstoned (remove beats move —
+    /// an absorption rule, the register is moot).
+    ///
+    /// Freeze, don't flip: a contested register renders at the **last
+    /// agreed** placement — recurse on the maximal move ops every head
+    /// transitively overwrites; the creation placement is the implicit root,
+    /// so the recursion is total. No winner is ever picked by id.
+    pub fn placement_of(&self, target: &Id) -> Option<Anchor> {
+        let t = self.idx_of(target)?;
+        if self.is_removed(t) {
+            return None;
+        }
+        let reg = self.moves.get(&t)?;
+        let heads: Vec<NodeIdx> = reg.iter().collect();
+        self.resolve_placement(heads)
+    }
+
+    fn move_anchor(&self, m: NodeIdx) -> Anchor {
+        let mv = &self.move_nodes[&m];
+        let a = self.id_of(mv.to_anchor);
+        if mv.to_before {
+            Anchor::Before(a)
+        } else {
+            Anchor::After(a)
+        }
+    }
+
+    /// Transitive overwrites of `m` within the register history (same-target
+    /// moves only — the definitional filter).
+    fn move_ancestors(&self, m: NodeIdx, target: NodeIdx) -> FxHashSet<NodeIdx> {
+        let mut seen: FxHashSet<NodeIdx> = FxHashSet::default();
+        let mut stack: Vec<NodeIdx> = vec![m];
+        while let Some(n) = stack.pop() {
+            let Some(mv) = self.move_nodes.get(&n) else {
+                continue; // not a move op — filtered
+            };
+            if mv.target != target {
+                continue; // another register — filtered
+            }
+            for o in mv.overwrites.0.iter() {
+                if seen.insert(*o) {
+                    stack.push(*o);
+                }
+            }
+        }
+        seen
+    }
+
+    fn resolve_placement(&self, heads: Vec<NodeIdx>) -> Option<Anchor> {
+        match heads.as_slice() {
+            [] => None, // the creation placement — the implicit root
+            [one] => Some(self.move_anchor(*one)),
+            many => {
+                let target = self.move_nodes[&many[0]].target;
+                // Intersection of every head's transitive overwrites.
+                let mut iter = many.iter();
+                let mut common = self.move_ancestors(*iter.next().unwrap(), target);
+                for h in iter {
+                    let anc = self.move_ancestors(*h, target);
+                    common.retain(|c| anc.contains(c));
+                    if common.is_empty() {
+                        break;
+                    }
+                }
+                if common.is_empty() {
+                    return None; // bottoms out at creation
+                }
+                // Maximal elements: drop anything transitively overwritten by
+                // another member of the set.
+                let members: Vec<NodeIdx> = common.iter().copied().collect();
+                let mut maximal: Vec<NodeIdx> = Vec::new();
+                for &c in &members {
+                    let dominated = members
+                        .iter()
+                        .any(|&d| d != c && self.move_ancestors(d, target).contains(&c));
+                    if !dominated {
+                        maximal.push(c);
+                    }
+                }
+                // Deterministic order (by id) for the recursion.
+                maximal.sort_by_key(|i| self.id_of(*i));
+                self.resolve_placement(maximal)
+            }
+        }
+    }
+
+    /// Author a move of the element at `target` to the glued point `to`,
+    /// superseding the heads this replica sees. Returns the applied node.
+    pub fn move_element(&mut self, target: Id, to: Anchor) -> HashNode {
+        let overwrites: BTreeSet<Id> = self.move_heads(&target).into_iter().collect();
+        let mut named: BTreeSet<Id> = overwrites.clone();
+        named.insert(target);
+        named.insert(*to.id());
+        let pins: BTreeSet<Id> = self.tips.difference(&named).cloned().collect();
+        let node = HashNode {
+            pins,
+            op: Op::Move {
+                target,
+                to,
+                overwrites,
+            },
+        };
+        self.apply(node.clone());
+        node
+    }
+
     fn apply_remove(&mut self, id: Id, extra_deps: BTreeSet<Id>, target_ids: BTreeSet<Id>) {
         // Targets are checked dependencies of the remove, so they are interned.
         // (A remove targeting a non-insert node is harmless: it's not in the
@@ -1100,13 +1321,28 @@ impl HashSeq {
         // The apply-time gate: ops this projection does not admit are
         // quarantined before touching tips or the index. They never intern,
         // so dependents stay parked (the correct edge-table semantics).
-        let admitted = matches!(
-            &node.op,
+        let admitted = match &node.op {
             Op::Insert {
                 payload: Payload::Char(_),
                 ..
-            } | Op::Remove(_)
-        );
+            }
+            | Op::Remove(_) => true,
+            // The Move rows of the edge table (all stable — every input is a
+            // hash-committed fact about already-applied referents):
+            // target must be an element of THIS seq; the destination must be
+            // a glued point on an element or the origin (move-op splice
+            // anchors are not yet admitted); self-moves gate.
+            Op::Move { target, to, .. } => {
+                let target_ok = self
+                    .idx_of(target)
+                    .is_some_and(|t| matches!(self.loc_of(t), Loc::Run { .. }));
+                let anchor_ok = self.idx_of(to.id()).is_some_and(|a| {
+                    matches!(self.loc_of(a), Loc::Run { .. } | Loc::Origin)
+                });
+                target_ok && anchor_ok && to.id() != target
+            }
+            _ => false,
+        };
         if !admitted {
             self.gated.insert(id, node);
             return;
@@ -1142,6 +1378,11 @@ impl HashSeq {
                 },
             ),
             Op::Remove(nodes) => self.apply_remove(id, node.pins, nodes),
+            Op::Move {
+                target,
+                to,
+                overwrites,
+            } => self.apply_move(id, node.pins, target, to, overwrites),
             _ => unreachable!("gated above"),
         }
 
@@ -1205,6 +1446,13 @@ impl HashSeq {
                 ),
             };
             self.apply_with_id(other.id_of(*idx), node)
+        }
+
+        // Move ops (placement registers). They reference targets/anchors, so
+        // the orphan machinery orders them after their runs arrive.
+        for (idx, mv) in &other.move_nodes {
+            let node = other.move_node(*idx, mv);
+            self.apply_with_id(other.id_of(*idx), node);
         }
 
         // Apply all orphaned nodes (ids were computed when they were parked)
@@ -1352,7 +1600,7 @@ mod test {
     /// near their bit-field boundaries (full u32 handle, 30-bit position).
     #[quickcheck]
     fn prop_packed_loc_roundtrips(handle: u32, pos: u32) -> bool {
-        let pos = pos & ((1 << 30) - 1); // pos is a within-run offset (30 bits)
+        let pos = pos & ((1 << 29) - 1); // pos is a within-run offset (29 bits)
         let cases = [
             Loc::Run {
                 run: NodeIdx(handle),
@@ -1364,6 +1612,7 @@ mod test {
             },
             Loc::Origin,
             Loc::MultiRemove,
+            Loc::MoveOp,
         ];
         cases
             .into_iter()
@@ -2829,4 +3078,179 @@ mod test {
         // deterministically — not after " world" via hash ordering.
         assert_eq!(String::from_iter(seq.iter()), "hello mighty world");
     }
+    // ---- placement registers (the Move projection) ----
+
+    #[test]
+    fn move_single_head_places_at_destination() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+
+        seq.move_element(a, Anchor::After(c));
+        assert_eq!(seq.placement_of(&a), Some(Anchor::After(c)));
+        assert!(!seq.placement_conflicted(&a));
+        // base order is untouched — moves never reorder the base
+        assert_eq!(seq.iter().collect::<String>(), "abc");
+    }
+
+    #[test]
+    fn sequential_moves_supersede() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+        let c = seq.id_at(2).unwrap();
+
+        seq.move_element(a, Anchor::After(b));
+        seq.move_element(a, Anchor::After(c));
+        assert_eq!(seq.placement_of(&a), Some(Anchor::After(c)));
+        assert_eq!(seq.move_heads(&a).len(), 1);
+    }
+
+    #[test]
+    fn concurrent_moves_freeze_to_last_agreed() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "abc".chars());
+        let a = base.id_at(0).unwrap();
+        let b = base.id_at(1).unwrap();
+        let c = base.id_at(2).unwrap();
+
+        // Both replicas agree on an initial placement, then race.
+        base.move_element(a, Anchor::After(b));
+        let agreed = Anchor::After(b);
+
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.move_element(a, Anchor::After(c));
+        r2.move_element(a, Anchor::Before(b));
+
+        let mut merged = r1.clone();
+        merged.merge(r2.clone());
+        // Contested: two heads, surfaced; placement freezes at the last
+        // agreed value — never a max-id winner.
+        assert!(merged.placement_conflicted(&a));
+        assert_eq!(merged.placement_of(&a), Some(agreed));
+
+        // Symmetric merge agrees (commutativity of the read).
+        let mut merged2 = r2.clone();
+        merged2.merge(r1.clone());
+        assert_eq!(merged2.placement_of(&a), merged.placement_of(&a));
+        assert_eq!(
+            merged2.move_heads(&a),
+            merged.move_heads(&a),
+            "head sets converge"
+        );
+
+        // The next move naming both heads dominates and resolves.
+        merged.move_element(a, Anchor::After(c));
+        assert!(!merged.placement_conflicted(&a));
+        assert_eq!(merged.placement_of(&a), Some(Anchor::After(c)));
+    }
+
+    #[test]
+    fn concurrent_moves_with_no_agreement_freeze_to_creation() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "abc".chars());
+        let a = base.id_at(0).unwrap();
+        let b = base.id_at(1).unwrap();
+        let c = base.id_at(2).unwrap();
+
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.move_element(a, Anchor::After(c));
+        r2.move_element(a, Anchor::Before(b));
+
+        let mut merged = r1;
+        merged.merge(r2);
+        assert!(merged.placement_conflicted(&a));
+        // No common overwritten ancestor: bottoms out at the creation
+        // placement (None = render at the base slot).
+        assert_eq!(merged.placement_of(&a), None);
+    }
+
+    #[test]
+    fn remove_beats_move() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+
+        seq.move_element(a, Anchor::After(c));
+        seq.remove(0); // tombstone a
+        assert_eq!(seq.placement_of(&a), None, "register is moot once dead");
+    }
+
+    #[test]
+    fn self_move_gates() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+
+        let node = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Move {
+                target: a,
+                to: Anchor::After(a),
+                overwrites: BTreeSet::new(),
+            },
+        };
+        seq.apply(node);
+        assert_eq!(seq.gated.len(), 1);
+        assert_eq!(seq.placement_of(&a), None);
+    }
+
+    #[test]
+    fn move_of_non_element_gates() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+        // Remove b, then craft a move whose target is the REMOVE op (not an
+        // element) — an edge-table violation.
+        let remove = seq.remove_batch(1, 1).unwrap();
+        let node = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Move {
+                target: remove.id(),
+                to: Anchor::After(a),
+                overwrites: BTreeSet::new(),
+            },
+        };
+        seq.apply(node);
+        assert_eq!(seq.gated.len(), 1);
+        let _ = b;
+    }
+
+    #[test]
+    fn moves_survive_doc_encode_decode() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+        seq.move_element(a, Anchor::After(c));
+
+        let bytes = crate::encode_hashseq(&seq);
+        let decoded = crate::decode_hashseq(&bytes).expect("decodes");
+        assert_eq!(decoded.placement_of(&a), Some(Anchor::After(c)));
+        assert_eq!(decoded.tips(), seq.tips());
+    }
+
+    #[test]
+    fn moves_merge_through_orphan_buffering() {
+        // Deliver the move before its target exists: it parks, then applies.
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+        let mut other = seq.clone();
+        let mv = other.move_element(a, Anchor::After(c));
+
+        let mut fresh = HashSeq::default();
+        fresh.apply(mv); // parks: target unknown
+        assert_eq!(fresh.orphans().count(), 1);
+        fresh.merge(seq);
+        assert_eq!(fresh.placement_of(&a), Some(Anchor::After(c)));
+    }
+
 }

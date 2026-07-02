@@ -974,17 +974,25 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     };
 
-    // Orphans are parked as (id, node) keyed by missing dep; sort by the
-    // precomputed node id for deterministic bytes (no rehashing).
-    let orphans: Vec<&HashNode> = {
-        let mut parked: Vec<(&Id, &HashNode)> = seq
+    // The trailing node section carries everything that is not a block:
+    // parked orphans, applied move ops (placement registers), and gated
+    // (quarantined) nodes — all as tagged nodes with ref-encoded ids,
+    // sorted by node id for deterministic bytes.
+    let orphans: Vec<HashNode> = {
+        let mut nodes: Vec<(Id, HashNode)> = seq
             .orphaned
             .values()
             .flatten()
-            .map(|(id, node)| (id, node))
+            .map(|(id, node)| (*id, node.clone()))
             .collect();
-        parked.sort_by_key(|(id, _)| **id);
-        parked.into_iter().map(|(_, node)| node).collect()
+        for (idx, mv) in &seq.move_nodes {
+            nodes.push((seq.id_of(*idx), seq.move_node(*idx, mv)));
+        }
+        for (id, node) in &seq.gated {
+            nodes.push((*id, node.clone()));
+        }
+        nodes.sort_by_key(|(id, _)| *id);
+        nodes.into_iter().map(|(_, node)| node).collect()
     };
 
     // --- Build the ID dictionary ---

@@ -1,6 +1,7 @@
 pub mod bitset;
 pub mod encoding;
 pub mod hash_node;
+pub mod hashkv;
 pub mod hashseq;
 pub mod hashseq_iter;
 pub mod run;
@@ -12,6 +13,7 @@ pub use self::encoding::{
     DecodeError, EncodableOp, decode_batch, decode_hashseq, encode_batch, encode_hashseq,
 };
 pub use self::hash_node::{Anchor, HashNode, Op, Payload};
+pub use self::hashkv::{HashKv, Read};
 pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};
 pub use self::run::{FirstOp, Run};
 pub use self::value::{Value, object_id};
