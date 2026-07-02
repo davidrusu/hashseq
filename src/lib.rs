@@ -5,14 +5,16 @@ pub mod hashseq;
 pub mod hashseq_iter;
 pub mod run;
 mod run_index;
+pub mod value;
 pub mod wasm;
 
 pub use self::encoding::{
     DecodeError, EncodableOp, decode_batch, decode_hashseq, encode_batch, encode_hashseq,
 };
-pub use self::hash_node::{HashNode, Op};
+pub use self::hash_node::{Anchor, HashNode, Op, Payload};
 pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};
 pub use self::run::{FirstOp, Run};
+pub use self::value::{Value, object_id};
 
 #[derive(
     Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,

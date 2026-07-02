@@ -80,10 +80,10 @@ impl Run {
         first: char,
     ) -> Self {
         let first_node = HashNode {
-            extra_dependencies: first_extra_deps.clone(),
+            pins: first_extra_deps.clone(),
             op: match first_op {
-                FirstOp::After => Op::InsertAfter(anchor, first),
-                FirstOp::Before => Op::InsertBefore(anchor, first),
+                FirstOp::After => Op::insert_after(anchor, first),
+                FirstOp::Before => Op::insert_before(anchor, first),
             },
         };
         let first_id = first_node.id();
@@ -140,8 +140,8 @@ impl Run {
             nodes.push((
                 self.elements[i + 1],
                 HashNode {
-                    extra_dependencies,
-                    op: Op::InsertAfter(self.elements[i], ch),
+                    pins: extra_dependencies,
+                    op: Op::insert_after(self.elements[i], ch),
                 },
             ));
         }
@@ -156,10 +156,10 @@ impl Run {
 
     fn first_node_with_char(&self, first: char) -> HashNode {
         HashNode {
-            extra_dependencies: self.first_extra_deps.clone(),
+            pins: self.first_extra_deps.clone(),
             op: match self.first_op {
-                FirstOp::After => Op::InsertAfter(self.anchor, first),
-                FirstOp::Before => Op::InsertBefore(self.anchor, first),
+                FirstOp::After => Op::insert_after(self.anchor, first),
+                FirstOp::Before => Op::insert_before(self.anchor, first),
             },
         }
     }
@@ -195,13 +195,13 @@ impl Run {
     pub fn extend_with_deps(&mut self, ch: char, deps: BTreeSet<Id>) -> Id {
         let prev_id = *self.elements.last().unwrap();
         let new_node = HashNode {
-            extra_dependencies: deps,
-            op: Op::InsertAfter(prev_id, ch),
+            pins: deps,
+            op: Op::insert_after(prev_id, ch),
         };
         let new_id = new_node.id();
-        if !new_node.extra_dependencies.is_empty() {
+        if !new_node.pins.is_empty() {
             self.interior_extra_deps
-                .insert(self.elements.len(), new_node.extra_dependencies);
+                .insert(self.elements.len(), new_node.pins);
         }
         self.extend_with_id(new_id, ch);
         new_id
@@ -312,8 +312,8 @@ mod tests {
         run.extend('d');
 
         let nodes = run.decompress();
-        assert_eq!(nodes[2].extra_dependencies, BTreeSet::from_iter([dep]));
-        assert_eq!(nodes[3].extra_dependencies, BTreeSet::new());
+        assert_eq!(nodes[2].pins, BTreeSet::from_iter([dep]));
+        assert_eq!(nodes[3].pins, BTreeSet::new());
         // element ids match the cached ones (deps are in the preimage)
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.id(), run.elements[i]);
@@ -374,14 +374,14 @@ mod tests {
 
         // Verify each node is correct
         let expected_node_a = HashNode {
-            extra_dependencies: BTreeSet::new(),
-            op: Op::InsertAfter(anchor, 'a'),
+            pins: BTreeSet::new(),
+            op: Op::insert_after(anchor, 'a'),
         };
         assert_eq!(nodes[0], expected_node_a);
 
         let expected_node_b = HashNode {
-            extra_dependencies: BTreeSet::new(),
-            op: Op::InsertAfter(nodes[0].id(), 'b'),
+            pins: BTreeSet::new(),
+            op: Op::insert_after(nodes[0].id(), 'b'),
         };
         assert_eq!(nodes[1], expected_node_b);
     }

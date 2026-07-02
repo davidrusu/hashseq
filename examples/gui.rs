@@ -902,7 +902,10 @@ mod hashseq_viz {
 
                                 // Draw character
                                 let ch = match &node.op {
-                                    hashseq::Op::InsertAfter(_, c) => *c,
+                                    hashseq::Op::Insert {
+                                        payload: hashseq::Payload::Char(c),
+                                        ..
+                                    } => *c,
                                     _ => '?',
                                 };
                                 let mut text = Text::from(ch.to_string());

@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
 use crate::run_index::{ElemRef, RunIndex};
-use crate::{EncodableOp, FirstOp, HashNode, Id, Op, Run};
+use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
 /// already a BLAKE3 hash, so adversaries cannot craft colliding keys without
@@ -163,14 +163,11 @@ impl Cursor {
     /// Build the first `HashNode` of an insertion at this cursor.
     /// Subsequent chars of a burst chain `InsertAfter` from this node.
     pub fn first_node(self, ch: char) -> HashNode {
-        let (extra_dependencies, op) = match self {
-            Cursor::After { anchor, extra_deps } => (extra_deps, Op::InsertAfter(anchor, ch)),
-            Cursor::Before { anchor, extra_deps } => (extra_deps, Op::InsertBefore(anchor, ch)),
+        let (pins, op) = match self {
+            Cursor::After { anchor, extra_deps } => (extra_deps, Op::insert_after(anchor, ch)),
+            Cursor::Before { anchor, extra_deps } => (extra_deps, Op::insert_before(anchor, ch)),
         };
-        HashNode {
-            extra_dependencies,
-            op,
-        }
+        HashNode { pins, op }
     }
 
     /// Build a `Run` starting at this cursor with `first` as its first character.
@@ -184,7 +181,7 @@ impl Cursor {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalInsert {
-    pub extra_dependencies: BTreeSet<Id>,
+    pub pins: BTreeSet<Id>,
     pub anchor: Id,
     pub ch: char,
 }
@@ -229,7 +226,7 @@ impl IdxSet {
 /// chars). Single-target removes live in `RemoveRun` chains instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalRemove {
-    pub extra_dependencies: IdxSet,
+    pub pins: IdxSet,
     /// Removed element handles, in Id order.
     pub nodes: Box<[NodeIdx]>,
 }
@@ -465,6 +462,14 @@ pub struct HashSeq {
     pub(crate) orphaned: HashMap<Id, Vec<(Id, HashNode)>>,
     /// Ids of all parked orphans: dedups network re-delivery while parked.
     orphan_ids: IdSet,
+    /// Permanently quarantined nodes (the apply-time gate, HASHWEB_SPEC.md
+    /// "The edge table"): ops this projection does not admit — today `Move`
+    /// (placement registers land with the move projection), `Put` (a map op
+    /// in a seq), and non-char insert payloads (the value column
+    /// generalization). Gated nodes never intern and never enter tips, so
+    /// anything referencing them stays parked — exactly the spec's
+    /// quarantine semantics. Kept so merge/encode re-present them.
+    pub(crate) gated: IdMap<HashNode>,
     index: RunIndex,
 }
 
@@ -503,6 +508,7 @@ impl HashSeq {
             tips: BTreeSet::new(),
             orphaned: HashMap::new(),
             orphan_ids: IdSet::default(),
+            gated: IdMap::default(),
             index: RunIndex::default(),
         };
         // The origin is an axiom: present (so anchoring at it always
@@ -744,8 +750,8 @@ impl HashSeq {
         // extra deps.
         for ch in chars {
             let node = HashNode {
-                extra_dependencies: BTreeSet::new(),
-                op: Op::InsertAfter(prev_id, ch),
+                pins: BTreeSet::new(),
+                op: Op::insert_after(prev_id, ch),
             };
             prev_id = node.id();
             self.apply_with_id(prev_id, node);
@@ -779,12 +785,10 @@ impl HashSeq {
             return None;
         }
 
-        let extra_dependencies = BTreeSet::from_iter(self.tips.difference(&to_remove).cloned());
-        let op = Op::Remove(to_remove);
-
+        let pins = BTreeSet::from_iter(self.tips.difference(&to_remove).cloned());
         let node = HashNode {
-            extra_dependencies,
-            op,
+            pins,
+            op: Op::Remove(to_remove),
         };
 
         let node_for_return = node.clone();
@@ -830,7 +834,7 @@ impl HashSeq {
             if !has_explicit_afters && pos as usize + 1 == self.runs[&run].len() {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
-                let deps = IdxSet::from_id_set(&after.extra_dependencies, |d| self.idx_of_known(d));
+                let deps = IdxSet::from_id_set(&after.pins, |d| self.idx_of_known(d));
                 self.runs
                     .get_mut(&run)
                     .unwrap()
@@ -873,7 +877,7 @@ impl HashSeq {
         // Start a new run anchored at the anchor node.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
-        let first_extra_deps = IdxSet::from_id_set(&after.extra_dependencies, |d| self.idx_of_known(d));
+        let first_extra_deps = IdxSet::from_id_set(&after.pins, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
@@ -986,11 +990,11 @@ impl HashSeq {
         }
 
         let idx = self.intern(id, Loc::MultiRemove);
-        let extra_dependencies = IdxSet::from_id_set(&extra_deps, |d| self.idx_of_known(d));
+        let pins = IdxSet::from_id_set(&extra_deps, |d| self.idx_of_known(d));
         self.remove_nodes.insert(
             idx,
             CausalRemove {
-                extra_dependencies,
+                pins,
                 nodes: targets.into(),
             },
         );
@@ -1020,7 +1024,7 @@ impl HashSeq {
         // always lands immediately before its anchor.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
-        let first_extra_deps = IdxSet::from_id_set(&before.extra_dependencies, |d| self.idx_of_known(d));
+        let first_extra_deps = IdxSet::from_id_set(&before.pins, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
@@ -1063,6 +1067,9 @@ impl HashSeq {
         if !self.orphan_ids.is_empty() && self.orphan_ids.contains(&id) {
             return; // Already parked, waiting on a dependency
         }
+        if !self.gated.is_empty() && self.gated.contains_key(&id) {
+            return; // Permanently quarantined
+        }
 
         // `queue` only allocates when an apply actually wakes parked orphans;
         // the common case (sequential typing, nothing parked) stays
@@ -1078,7 +1085,7 @@ impl HashSeq {
     /// or apply it and push any orphans waiting on it onto `queue`.
     fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
         let missing = node
-            .iter_dependencies()
+            .iter_refs()
             .find(|d| !self.contains_node(d))
             .copied();
         if let Some(missing) = missing {
@@ -1090,30 +1097,52 @@ impl HashSeq {
             self.orphan_ids.remove(&id);
         }
 
+        // The apply-time gate: ops this projection does not admit are
+        // quarantined before touching tips or the index. They never intern,
+        // so dependents stay parked (the correct edge-table semantics).
+        let admitted = matches!(
+            &node.op,
+            Op::Insert {
+                payload: Payload::Char(_),
+                ..
+            } | Op::Remove(_)
+        );
+        if !admitted {
+            self.gated.insert(id, node);
+            return;
+        }
+
         // Update tips before consuming node (insert ops don't depend on tips)
-        for tip in node.iter_dependencies() {
+        for tip in node.iter_refs() {
             self.tips.remove(tip);
         }
         self.tips.insert(id);
 
         match node.op {
-            Op::InsertAfter(anchor, ch) => self.insert_after(
+            Op::Insert {
+                at: Anchor::After(anchor),
+                payload: Payload::Char(ch),
+            } => self.insert_after(
                 id,
                 CausalInsert {
-                    extra_dependencies: node.extra_dependencies,
+                    pins: node.pins,
                     anchor,
                     ch,
                 },
             ),
-            Op::InsertBefore(anchor, ch) => self.insert_before(
+            Op::Insert {
+                at: Anchor::Before(anchor),
+                payload: Payload::Char(ch),
+            } => self.insert_before(
                 id,
                 CausalInsert {
-                    extra_dependencies: node.extra_dependencies,
+                    pins: node.pins,
                     anchor,
                     ch,
                 },
             ),
-            Op::Remove(nodes) => self.apply_remove(id, node.extra_dependencies, nodes),
+            Op::Remove(nodes) => self.apply_remove(id, node.pins, nodes),
+            _ => unreachable!("gated above"),
         }
 
         // Wake the orphans waiting on this id.
@@ -1130,7 +1159,7 @@ impl HashSeq {
             .iter()
             .enumerate()
             .map(|(i, target)| HashNode {
-                extra_dependencies: if i == 0 {
+                pins: if i == 0 {
                     rr.first_extra_deps.to_id_set(&self.ids)
                 } else {
                     BTreeSet::from_iter([self.id_of(rr.links[i - 1])])
@@ -1166,7 +1195,7 @@ impl HashSeq {
 
         for (idx, causal_remove) in &other.remove_nodes {
             let node = HashNode {
-                extra_dependencies: causal_remove.extra_dependencies.to_id_set(&other.ids),
+                pins: causal_remove.pins.to_id_set(&other.ids),
                 op: Op::Remove(
                     causal_remove
                         .nodes
@@ -1181,6 +1210,12 @@ impl HashSeq {
         // Apply all orphaned nodes (ids were computed when they were parked)
         for (id, orphan) in other.orphaned.into_values().flatten() {
             self.apply_with_id(id, orphan);
+        }
+
+        // Re-present the other side's quarantined nodes: applying re-gates
+        // them here (deterministically), keeping merge lossless.
+        for (id, node) in other.gated {
+            self.apply_with_id(id, node);
         }
     }
 
@@ -1388,7 +1423,7 @@ mod test {
         for r in removed {
             let node = HashNode {
                 op: Op::Remove(BTreeSet::from_iter([r])),
-                extra_dependencies: BTreeSet::new(),
+                pins: BTreeSet::new(),
             };
             seq_a.apply(node.clone());
             seq_b.apply(node);
@@ -1737,7 +1772,10 @@ mod test {
         seq_a.merge(seq_b);
 
         let merged = seq_a.iter().collect::<String>();
-        assert_eq!(merged, "aaabc");
+        // 'b' and 'c' are concurrent siblings in one gap: their mutual order
+        // is id-determined (either is a legal outcome; the concrete value
+        // locks determinism under the current preimage grammar).
+        assert_eq!(merged, "aaacb");
     }
 
     #[test]
@@ -1789,21 +1827,21 @@ mod test {
         let mut seq = HashSeq::default();
 
         let insert = HashNode {
-            op: Op::InsertAfter(seq.origin(), 'b'),
-            extra_dependencies: BTreeSet::default(),
+            op: Op::insert_after(seq.origin(), 'b'),
+            pins: BTreeSet::default(),
         };
 
         seq.apply(HashNode {
-            op: Op::InsertAfter(insert.id(), 'a'),
-            extra_dependencies: BTreeSet::default(),
+            op: Op::insert_after(insert.id(), 'a'),
+            pins: BTreeSet::default(),
         });
 
         assert_eq!(seq.orphans().count(), 1);
         assert_eq!(seq.len(), 0);
 
         seq.apply(HashNode {
-            op: Op::InsertBefore(insert.id(), 'a'),
-            extra_dependencies: BTreeSet::default(),
+            op: Op::insert_before(insert.id(), 'a'),
+            pins: BTreeSet::default(),
         });
 
         assert_eq!(seq.orphans().count(), 2);
@@ -1826,13 +1864,13 @@ mod test {
         // once we see the insert.
 
         let insert = HashNode {
-            op: Op::InsertAfter(seq.origin(), 'a'),
-            extra_dependencies: BTreeSet::new(),
+            op: Op::insert_after(seq.origin(), 'a'),
+            pins: BTreeSet::new(),
         };
 
         seq.apply(HashNode {
             op: Op::Remove(BTreeSet::from_iter([insert.id()])),
-            extra_dependencies: BTreeSet::new(),
+            pins: BTreeSet::new(),
         });
 
         assert_eq!(seq.orphans().count(), 1);
@@ -2110,8 +2148,8 @@ mod test {
         let mut prev = Id::default();
         for _ in 0..n {
             let node = HashNode {
-                extra_dependencies: BTreeSet::new(),
-                op: Op::InsertAfter(prev, 'x'),
+                pins: BTreeSet::new(),
+                op: Op::insert_after(prev, 'x'),
             };
             prev = node.id();
             nodes.push(node);
@@ -2130,17 +2168,17 @@ mod test {
     #[test]
     fn orphan_reparks_until_all_deps_arrive() {
         let a = HashNode {
-            extra_dependencies: BTreeSet::new(),
-            op: Op::InsertAfter(Id::default(), 'a'),
+            pins: BTreeSet::new(),
+            op: Op::insert_after(Id::default(), 'a'),
         };
         let b = HashNode {
-            extra_dependencies: BTreeSet::new(),
-            op: Op::InsertAfter(Id::default(), 'b'),
+            pins: BTreeSet::new(),
+            op: Op::insert_after(Id::default(), 'b'),
         };
         // depends on both: anchored at a, extra dep on b
         let c = HashNode {
-            extra_dependencies: BTreeSet::from_iter([b.id()]),
-            op: Op::InsertAfter(a.id(), 'c'),
+            pins: BTreeSet::from_iter([b.id()]),
+            op: Op::insert_after(a.id(), 'c'),
         };
 
         for (first, second) in [(a.clone(), b.clone()), (b, a)] {
@@ -2162,18 +2200,18 @@ mod test {
     #[test]
     fn index_orders_concurrent_siblings_like_the_iterator() {
         let root = HashNode {
-            extra_dependencies: BTreeSet::new(),
-            op: Op::InsertAfter(Id::default(), 'a'),
+            pins: BTreeSet::new(),
+            op: Op::insert_after(Id::default(), 'a'),
         };
         let a = root.id();
         for (c1, c2) in [('b', 'c'), ('x', 'y')] {
             let n1 = HashNode {
-                extra_dependencies: BTreeSet::new(),
-                op: Op::InsertAfter(a, c1),
+                pins: BTreeSet::new(),
+                op: Op::insert_after(a, c1),
             };
             let n2 = HashNode {
-                extra_dependencies: BTreeSet::new(),
-                op: Op::InsertAfter(a, c2),
+                pins: BTreeSet::new(),
+                op: Op::insert_after(a, c2),
             };
             let (small, big) = if n1.id() < n2.id() {
                 (n1, n2)
@@ -2423,7 +2461,7 @@ mod test {
 
         seq.apply(HashNode {
             op: Op::Remove(BTreeSet::from_iter([removed])),
-            extra_dependencies: BTreeSet::new(),
+            pins: BTreeSet::new(),
         });
 
         assert_eq!(String::from_iter(seq.iter()), "b");
@@ -2700,8 +2738,8 @@ mod test {
         let mut seq_b = seq_a.clone();
 
         let node = HashNode {
-            extra_dependencies: BTreeSet::new(),
-            op: Op::InsertAfter(seq_a.id_at(0).unwrap(), 'y'),
+            pins: BTreeSet::new(),
+            op: Op::insert_after(seq_a.id_at(0).unwrap(), 'y'),
         };
 
         seq_a.apply(node.clone());
