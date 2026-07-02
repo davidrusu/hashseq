@@ -179,8 +179,16 @@ pub struct HashNode {
     pub op: Op,
 }
 
-static NODE_HASHER: LazyLock<blake3::Hasher> =
-    LazyLock::new(|| blake3::Hasher::new_derive_key(NODE_CONTEXT));
+/// Pre-hashed node context key (see `value.rs` — output is identical to
+/// `Hasher::new_derive_key(NODE_CONTEXT)`, construction is much cheaper).
+static NODE_KEY: LazyLock<blake3::hazmat::ContextKey> =
+    LazyLock::new(|| blake3::hazmat::hash_derive_key_context(NODE_CONTEXT));
+
+#[inline]
+fn node_hasher() -> blake3::Hasher {
+    use blake3::hazmat::HasherExt;
+    blake3::Hasher::new_from_context_key(&NODE_KEY)
+}
 
 pub(crate) fn update_varint(hasher: &mut blake3::Hasher, mut value: usize) {
     // LEB128, identical to `encoding::encode_varint`, minimal form.
@@ -248,7 +256,7 @@ impl HashNode {
             "pins must be normalized: refs ∖ named"
         );
 
-        let mut hasher = NODE_HASHER.clone();
+        let mut hasher = node_hasher();
 
         // Fast path — the typing chain: an insert whose only ref is its
         // anchor. refs = [anchor], anchor ref_idx = 0; every length is a

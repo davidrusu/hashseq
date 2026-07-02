@@ -31,15 +31,20 @@ pub const VK_F64: u8 = 6;
 pub const VK_NEW_SEQ: u8 = 7;
 pub const VK_NEW_MAP: u8 = 8;
 
-static VALUE_HASHER: LazyLock<blake3::Hasher> =
-    LazyLock::new(|| blake3::Hasher::new_derive_key(VALUE_CONTEXT));
+// Pre-hashed derive-key context keys: `Hasher::new_from_context_key` yields
+// output identical to `Hasher::new_derive_key(ctx)` (same derive_key
+// construction) but skips both re-hashing the context and cloning a ~1.9 KB
+// template hasher — measured ~20 ns/op on the id hot path.
+static VALUE_KEY: LazyLock<blake3::hazmat::ContextKey> =
+    LazyLock::new(|| blake3::hazmat::hash_derive_key_context(VALUE_CONTEXT));
 
-static OBJECT_HASHER: LazyLock<blake3::Hasher> =
-    LazyLock::new(|| blake3::Hasher::new_derive_key(OBJECT_CONTEXT));
+static OBJECT_KEY: LazyLock<blake3::hazmat::ContextKey> =
+    LazyLock::new(|| blake3::hazmat::hash_derive_key_context(OBJECT_CONTEXT));
 
 /// `value_id` of raw canonical artifact bytes (tag ‖ payload).
 pub fn value_id_of_bytes(artifact: &[u8]) -> Id {
-    let mut hasher = VALUE_HASHER.clone();
+    use blake3::hazmat::HasherExt;
+    let mut hasher = blake3::Hasher::new_from_context_key(&VALUE_KEY);
     hasher.update(artifact);
     Id(*hasher.finalize().as_bytes())
 }
@@ -50,7 +55,8 @@ pub fn value_id_of_bytes(artifact: &[u8]) -> Id {
 /// role: refs to `X` mean the parent element, refs to `object_id(X)` mean the
 /// child object.
 pub fn object_id(creation_op: &Id) -> Id {
-    let mut hasher = OBJECT_HASHER.clone();
+    use blake3::hazmat::HasherExt;
+    let mut hasher = blake3::Hasher::new_from_context_key(&OBJECT_KEY);
     hasher.update(&creation_op.0);
     Id(*hasher.finalize().as_bytes())
 }

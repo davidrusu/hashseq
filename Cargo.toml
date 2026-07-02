@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-blake3 = "1.5.0"
+blake3 = "1.8"  # hazmat: pre-hashed context keys on the id hot path
 hex = "0.4"
 wasm-bindgen = "0.2"
 getrandom = { version = "0.2", features = ["js"] }
