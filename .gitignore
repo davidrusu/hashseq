@@ -1,3 +1,7 @@
 /target
 *-fg.svg
 .DS_Store
+.claude/
+diagrams/
+web/traces/
+.#*
