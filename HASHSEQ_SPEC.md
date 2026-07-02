@@ -73,11 +73,11 @@ replica-local layout choice, not a wire or identity one. Known gaps, gated
 payloads (the value-column generalization), and inserts anchored on move-op
 splice points. Move's rendered index relocation is wired per "Apply" below:
 origin ghosts (base slots live forever), one relocation per rendered-
-placement change, glued blocks id-ordered and skipped by the insert/extend
-paths; `prop_index_matches_iterator_with_moves` pins the index to the
-definitional iterator. Cursors still anchor at base slots — inserting at a
-rendered position adjacent to a moved-in element lands at the element's
-ghost until splice-point anchors are admitted.
+placement change, the deciding move op an ordinary insert sibling in its
+anchor's fork order; `prop_index_matches_iterator_with_moves` pins the
+index to the definitional iterator. Cursors still anchor at base slots —
+inserting at a rendered position adjacent to a moved-in element lands at
+the element's ghost until splice-point anchors are admitted.
 
 ## Payload
 
@@ -229,19 +229,21 @@ O(1) bookkeeping, no replay (nothing is order-dependent):
 - move → `heads(x) = heads(x) − overwrites(u) ∪ {u}` (O(1)); if the
   *rendered* placement changed, one index relocation — excise at origin
   (clear the visibility bit, **keeping the origin ghost: the base slot is
-  never removed**), insert as a singleton fragment at the newly rendered
-  point (the arriving head's destination on the single-head path; the
-  last-agreed placement when the arrival creates a conflict). A re-move
-  deletes the stale destination fragment unless content anchored to that
-  move op's splice point — splice ghosts materialize lazily, only when
-  anchored-to, bounding index growth to live placements plus anchored
-  splice points. **Moved-in elements sit exactly at the glued point**:
-  after `u`, before all of `u`'s after-children including later inserts at
-  `After(u)` (glued semantics, MARKS.md); multiple elements at the same
-  point order among themselves by move-op `Id` — the sound id-order use
-  (arranges the contenders' own content; displaces nothing). Descendants of
-  a moved element (elements chained off it by run formation) stay at the
-  origin — run chaining is a causality artifact, not user intent.
+  never removed**), and render at the deciding placement (the arriving
+  head's destination on the single-head path; the last-agreed placement
+  when the arrival creates a conflict). A re-move deletes the stale
+  destination fragment. **A rendered move is an insert sibling**: the
+  deciding move op joins its anchor's fork order exactly as an insert
+  child at the same anchor would — keyed by the move op's own id, released
+  as the moved element, a leaf. Later inserts, run continuations, and
+  other moved-ins interleave with it by the one sibling rule the tree
+  already has; there is no second ordering concept. (An insert forking at
+  a mid-run anchor materializes the run split; a rendered move does the
+  same.) Descendants of a moved element (elements chained off it by run
+  formation) stay at the origin — run chaining is a causality artifact,
+  not user intent. When splice-point anchors are admitted, inserts
+  anchored `After(move_op)` become ordinary children of the move op and
+  render adjacent to the moved element with no new machinery.
 
 The `run_index` treap maintains the rendered order incrementally; per
 FRAMEWORK Law II it is a cache pinned equal to the definitional iterator

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
-use crate::run_index::{ElemRef, Glue, RunIndex};
+use crate::run_index::{ElemRef, IndexTarget, RunIndex};
 use crate::delivery::Delivery;
 use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
@@ -682,6 +682,42 @@ impl HashSeq {
         }
     }
 
+    /// Where a node with `id` anchored `After(anchor)` lands: directly
+    /// before the next bigger sibling's region — or, as the biggest sibling,
+    /// directly after everything hanging off the anchor. Siblings are
+    /// explicit forks, the implicit run continuation, and rendered move-ins;
+    /// tombstones don't matter (a removed element's region still occupies
+    /// its place in document order).
+    fn after_sibling_target(&self, anchor: NodeIdx, id: &Id) -> (NodeIdx, bool) {
+        // Explicit-afters case: O(log n) range seek. Run-fallback case: at
+        // most one candidate, just check it.
+        let next_node = if let Some(siblings) = self.afters.get(&anchor) {
+            siblings.first_ge(id, &self.ids)
+        } else {
+            self.afters_of(anchor)
+                .find(|a| self.ids[a.0 as usize] >= *id)
+        };
+        match next_node {
+            Some(next) => (self.region_first(next), true),
+            None => (self.subtree_last(anchor), false),
+        }
+    }
+
+    /// Where a node with `id` anchored `Before(anchor)` lands: before the
+    /// next bigger before-sibling's region, or — as the biggest — directly
+    /// before the anchor itself. (Before-siblings release in Id order,
+    /// directly before their anchor.)
+    fn before_sibling_target(&self, anchor: NodeIdx, id: &Id) -> NodeIdx {
+        match self
+            .befores_by_anchor
+            .get(&anchor)
+            .and_then(|s| s.first_ge(id, &self.ids))
+        {
+            Some(next) => self.region_first(next),
+            None => anchor,
+        }
+    }
+
     /// Check if node `a` is causally before node `b`.
     ///
     /// Walks handle space: the common case (run-chain neighbors) follows
@@ -798,30 +834,34 @@ impl HashSeq {
         Some(node_for_return)
     }
 
-    /// Insert `idx`'s fresh span directly before node `el` in the index.
-    /// `el` may be the virtual origin, whose "position" is the start of its
-    /// afters region (the origin's own befores precede that point).
-    fn index_insert_before_node(&mut self, el: NodeIdx, idx: NodeIdx) {
-        if el != ORIGIN_IDX {
-            let at = self.elem_ref(el);
-            self.index.insert_span_before(at, idx);
-            return;
-        }
-        // "Directly before the origin" is before the origin-glued moved-in
-        // block, when one occupies the origin boundary.
-        if self.index.insert_span_before_front_glued(idx) {
-            return;
-        }
-        match self.afters.get(&ORIGIN_IDX).and_then(|s| s.first()) {
-            Some(first) => {
-                let first = self.region_first(first);
-                let at = self.elem_ref(first);
-                self.index.insert_span_before(at, idx);
+    /// Resolve "directly before/after node `el`" into an index target.
+    /// `el` may be an element, a rendered move op (resolving to its target's
+    /// destination fragment), or the virtual origin, whose "position" is the
+    /// start of its afters region (the origin's own befores precede that
+    /// point — with no afters, everything precedes it, so it is the end).
+    fn index_target(&self, el: NodeIdx, before: bool) -> IndexTarget {
+        if el == ORIGIN_IDX {
+            if before {
+                return match self.afters.get(&ORIGIN_IDX).and_then(|s| s.first()) {
+                    Some(first) => self.index_target(self.region_first(first), true),
+                    None => IndexTarget::Back,
+                };
             }
-            // No top-level inserts yet: everything in the document (befores
-            // of the origin, if any) precedes the origin, so "directly
-            // before the origin" is the very end.
-            None => self.index.push_span_back(idx),
+            return IndexTarget::Back;
+        }
+        if let Loc::MoveOp = self.loc_of(el) {
+            let elem = self.elem_ref(self.move_nodes[&el].target);
+            return if before {
+                IndexTarget::BeforeMoved(elem)
+            } else {
+                IndexTarget::AfterMoved(elem)
+            };
+        }
+        let at = self.elem_ref(el);
+        if before {
+            IndexTarget::BeforeElem(at)
+        } else {
+            IndexTarget::AfterElem(at)
         }
     }
 
@@ -851,25 +891,8 @@ impl HashSeq {
             }
         }
 
-        // Slow path: this insert forks. Find the smallest afters node >= id.
-        // Explicit-afters case: O(log n) range seek into the BTreeSet.
-        // Run-fallback case: at most one candidate, just check it.
-        let next_node = if let Some(siblings) = self.afters.get(&anchor) {
-            siblings.first_ge(&id, &self.ids)
-        } else {
-            self.afters_of(anchor)
-                .find(|a| self.ids[a.0 as usize] >= id)
-        };
-        // The iterator releases siblings in Id order, each preceded by its
-        // before-runs and trailed by its subtree. So the new node lands
-        // directly before the next bigger sibling's region — or, when it is
-        // the biggest sibling, directly after everything hanging off the
-        // anchor. Tombstones don't matter here: a removed element's region
-        // still occupies its place in document order.
-        let target = match next_node {
-            Some(next) => (self.region_first(next), true),
-            None => (self.subtree_last(anchor), false),
-        };
+        // Slow path: this insert forks.
+        let target = self.after_sibling_target(anchor, &id);
 
         // We are inserting after a node inside a run (the extension case was
         // handled by the fast path above, so this is a fork). If the anchor isn't
@@ -900,20 +923,11 @@ impl HashSeq {
         // run extension is handled in the fast path above, fork/split updates the afters set
         self.afters.entry(anchor).or_default().insert(idx, &self.ids);
 
-        // Resolve the target element only now: the split above may have
+        // Resolve the target node only now: the split above may have
         // relocated it into the right-hand run.
         let (el, before) = target;
-        if before {
-            self.index_insert_before_node(el, idx);
-        } else if el == ORIGIN_IDX {
-            // subtree_last(origin) returned the origin itself: no top-level
-            // inserts exist yet, so the new span is the last (and first)
-            // visible content after any origin-befores.
-            self.index.push_span_back(idx);
-        } else {
-            let at = self.elem_ref(el);
-            self.index.insert_span_after(at, idx);
-        }
+        let t = self.index_target(el, before);
+        self.index.insert_span_at(t, idx);
     }
 
     /// Split the run `run` at element index `at` (0 < at < len). The right
@@ -1128,108 +1142,81 @@ impl HashSeq {
         }
     }
 
-    /// Element handle of an index element reference.
-    fn elem_of_ref(&self, (head, off): ElemRef) -> NodeIdx {
-        self.runs[&head].elements[off as usize]
-    }
-
     /// Re-render `target` after its placement register's decider changed:
-    /// one index relocation (excise the old rendering — the base slot stays,
-    /// as the origin ghost — then render at the new deciding placement).
-    /// Co-glued moved-ins order by move-op id: the sound id-order use — it
-    /// arranges the contenders' own content and displaces nothing.
+    /// one index relocation. The old rendering is excised (the base slot
+    /// stays — the origin ghost); the new deciding move op joins its
+    /// anchor's sibling set like an insert child, keyed by its own id, and
+    /// the destination fragment is placed exactly where an insert with that
+    /// id would land. Later inserts interleave with it by the same rules.
     fn rerender(&mut self, target: NodeIdx, old: Option<NodeIdx>, new: Option<NodeIdx>) {
-        let elem = self.elem_ref(target);
         match old {
-            Some(_) => {
-                self.index.remove_moved(elem);
+            Some(op) => {
+                self.index.remove_moved(self.elem_ref(target));
+                self.unregister_sibling(op);
             }
             None => {
-                self.index.remove_element(elem);
+                self.index.remove_element(self.elem_ref(target));
             }
         }
         let Some(op) = new else {
-            self.index.restore_base(elem);
+            self.index.restore_base(self.elem_ref(target));
             return;
         };
+        let op_id = self.id_of(op);
         let mv = &self.move_nodes[&op];
-        let new_id = self.id_of(op);
-        if mv.to_anchor == ORIGIN_IDX {
-            // Origin-glued block: befores-side group then afters-side group,
-            // each id-ordered.
-            let side = mv.to_before;
-            let rank = self
-                .index
-                .glued_elems(Glue::Origin)
-                .into_iter()
-                .filter(|&e| {
-                    let d = self
-                        .decider_of(self.elem_of_ref(e))
-                        .expect("glued elements are moved-rendered");
-                    let key = (!self.move_nodes[&d].to_before as u8, self.id_of(d));
-                    key < (!side as u8, new_id)
-                })
-                .count();
-            let first_top = self
-                .afters
-                .get(&ORIGIN_IDX)
-                .and_then(|s| s.first())
-                .map(|f| self.elem_ref(self.region_first(f)));
-            self.index.place_moved_origin(elem, rank, first_top);
+        let anchor = mv.to_anchor;
+        if mv.to_before {
+            let el = self.before_sibling_target(anchor, &op_id);
+            self.befores_by_anchor
+                .entry(anchor)
+                .or_default()
+                .insert(op, &self.ids);
+            let t = self.index_target(el, true);
+            self.index.place_moved_at(t, self.elem_ref(target));
         } else {
-            let at = self.elem_ref(mv.to_anchor);
-            let glue = if mv.to_before {
-                Glue::Before(at)
-            } else {
-                Glue::After(at)
-            };
-            let rank = self
-                .index
-                .glued_elems(glue)
-                .into_iter()
-                .filter(|&e| {
-                    let d = self
-                        .decider_of(self.elem_of_ref(e))
-                        .expect("glued elements are moved-rendered");
-                    self.id_of(d) < new_id
-                })
-                .count();
-            self.index.place_moved(elem, glue, rank);
+            let (el, before) = self.after_sibling_target(anchor, &op_id);
+            // Mirror the insert fork path: materialize the run fork when the
+            // anchor sits mid-run, so the continuation becomes an explicit
+            // sibling (afters_of's run fallback is suppressed by the new
+            // afters entry). The split can rebase element refs — including
+            // the target's — so refs resolve fresh after it.
+            if let Loc::Run { run, pos } = self.loc_of(anchor)
+                && (pos as usize) + 1 < self.runs[&run].len()
+            {
+                self.split_run_at(run, pos as usize + 1);
+            }
+            self.afters.entry(anchor).or_default().insert(op, &self.ids);
+            let t = self.index_target(el, before);
+            self.index.place_moved_at(t, self.elem_ref(target));
         }
     }
 
-    /// Rendered move state for the definitional iterator: the moved-out
-    /// element set, plus the moved-in elements at each glue point
-    /// (`(anchor handle, before-side)`), id-ordered. A pure function of the
-    /// placement registers.
-    #[allow(clippy::type_complexity)] // (moved-out set, glued-by-point map)
-    pub(crate) fn rendered_moves(
-        &self,
-    ) -> (FxHashSet<NodeIdx>, FxHashMap<(NodeIdx, bool), Vec<NodeIdx>>) {
-        let mut moved_out = FxHashSet::default();
-        let mut glued: FxHashMap<(NodeIdx, bool), Vec<(Id, NodeIdx)>> = FxHashMap::default();
-        for (&t, reg) in &self.moves {
-            if self.is_removed(t) {
-                continue; // remove beats move
+    /// Retire a no-longer-deciding move op from its anchor's sibling set.
+    /// An emptied set drops its entry: entry presence means "explicit forks
+    /// exist" everywhere (`afters_of`'s run fallback, the causal iterator's
+    /// run-rest release), so an empty entry would suppress the implicit run
+    /// continuation.
+    fn unregister_sibling(&mut self, op: NodeIdx) {
+        let mv = &self.move_nodes[&op];
+        let (anchor, to_before) = (mv.to_anchor, mv.to_before);
+        let op_id = self.id_of(op);
+        let map = if to_before {
+            &mut self.befores_by_anchor
+        } else {
+            &mut self.afters
+        };
+        if let Some(set) = map.get_mut(&anchor) {
+            set.remove(&op_id, &self.ids);
+            if set.is_empty() {
+                map.remove(&anchor);
             }
-            let Some(d) = self.resolve_decider(reg.iter().collect()) else {
-                continue; // frozen at the creation placement
-            };
-            let mv = &self.move_nodes[&d];
-            moved_out.insert(t);
-            glued
-                .entry((mv.to_anchor, mv.to_before))
-                .or_default()
-                .push((self.id_of(d), t));
         }
-        let glued = glued
-            .into_iter()
-            .map(|(k, mut v)| {
-                v.sort();
-                (k, v.into_iter().map(|(_, t)| t).collect())
-            })
-            .collect();
-        (moved_out, glued)
+    }
+
+    /// Is `t` rendered away from its base slot (a live element whose
+    /// register decides a move)?
+    pub(crate) fn rendered_elsewhere(&self, t: NodeIdx) -> bool {
+        !self.moves.is_empty() && !self.is_removed(t) && self.decider_of(t).is_some()
     }
 
     /// Author a move of the element at `target` to the glued point `to`,
@@ -1260,11 +1247,15 @@ impl HashSeq {
         for t in &targets {
             // Removes targeting non-inserts have no index entry and are inert.
             // A moved element renders at its destination fragment — remove
-            // that; otherwise clear the base bit.
-            if let Loc::Run { run, pos } = self.loc_of(*t)
-                && !self.index.remove_moved((run, pos))
-            {
-                self.index.remove_element((run, pos));
+            // that and retire its deciding move op from the sibling
+            // structures; otherwise clear the base bit.
+            if let Loc::Run { run, pos } = self.loc_of(*t) {
+                if self.index.remove_moved((run, pos)) {
+                    let op = self.decider_of(*t).expect("rendered implies decider");
+                    self.unregister_sibling(op);
+                } else {
+                    self.index.remove_element((run, pos));
+                }
             }
             self.removed.set(t.0 as usize);
         }
@@ -1322,19 +1313,7 @@ impl HashSeq {
         // The anchor is a checked dependency, so it is interned.
         let anchor = self.idx_of_known(&before.anchor);
 
-        // Before-siblings are released in Id order, directly before their
-        // anchor: the new node lands before the next bigger sibling's region,
-        // or — as the biggest — directly before the anchor element itself.
-        // (O(log n) Id-binary-search seek, no tombstone filtering: removed
-        // elements still anchor their regions.)
-        let target = match self
-            .befores_by_anchor
-            .get(&anchor)
-            .and_then(|s| s.first_ge(&id, &self.ids))
-        {
-            Some(next) => self.region_first(next),
-            None => anchor,
-        };
+        let target = self.before_sibling_target(anchor, &id);
 
         // The anchor may sit mid-run: no split is needed. Iteration visits the
         // befores of every run element individually (see HashSeqIter), and unlike
@@ -1360,7 +1339,8 @@ impl HashSeq {
             .or_default()
             .insert(idx, &self.ids);
 
-        self.index_insert_before_node(target, idx);
+        let t = self.index_target(target, true);
+        self.index.insert_span_at(t, idx);
     }
 
     pub fn apply(&mut self, node: HashNode) {
@@ -3186,21 +3166,27 @@ mod test {
     }
 
     #[test]
-    fn move_to_origin_renders_at_front() {
+    fn move_to_origin_joins_top_level_siblings() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abc".chars());
         let origin = seq.origin();
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
         let c = seq.id_at(2).unwrap();
 
-        seq.move_element(c, Anchor::After(origin));
-        assert_eq!(seq.iter().collect::<String>(), "cab");
+        // After(origin): the move op joins the top-level sibling set,
+        // ordered against the run head by id — like any insert would be.
+        let m = seq.move_element(c, Anchor::After(origin));
+        let expect = if m.id() < a { "cab" } else { "abc" };
+        assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
 
-        // New top-level content lands after the origin-glued block only if
-        // it sorts later; either way the block stays glued to the front.
-        let b = seq.id_at(2).unwrap();
+        // Before(origin): a before-child of the origin — releases before
+        // everything (the origin's befores precede all top-level content).
         seq.move_element(b, Anchor::Before(origin));
-        assert_eq!(seq.iter().collect::<String>(), "bca");
+        let text: String = seq.iter().collect();
+        assert_eq!(text.len(), 3);
+        assert!(text.starts_with('b'), "Before(origin) renders first: {text}");
         check_index_matches_iter(&seq);
     }
 
@@ -3221,49 +3207,58 @@ mod test {
         check_index_matches_iter(&seq);
     }
 
+    /// A rendered move-in is an ordinary sibling: later inserts at the same
+    /// anchor interleave with it by id, exactly as concurrent inserts do
+    /// among themselves.
     #[test]
-    fn later_inserts_stay_outside_the_glued_block() {
+    fn later_inserts_interleave_with_moved_ins_by_id() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abc".chars());
         let a = seq.id_at(0).unwrap();
         let b = seq.id_at(1).unwrap();
+        let c = seq.id_at(2).unwrap();
 
-        // Glue `a` after `b`: "bac"... base [a b c], a moves After(b).
-        seq.move_element(a, Anchor::After(b));
-        assert_eq!(seq.iter().collect::<String>(), "bac");
+        // Base [a b c]; a moves After(b) — the fork materializes, so b's
+        // siblings are the c-continuation and the move op, id-ordered.
+        let m = seq.move_element(a, Anchor::After(b));
+        let mut sibs = [(m.id(), 'a'), (c, 'c')];
+        sibs.sort();
+        let expect: String = std::iter::once('b').chain(sibs.iter().map(|s| s.1)).collect();
+        assert_eq!(seq.iter().collect::<String>(), expect);
 
-        // A later insert anchored After(b) is an after-child: it renders
-        // after the glued block, never between `b` and the moved-in `a`.
-        seq.apply(HashNode {
+        // A later insert anchored After(b) joins the same sibling order.
+        let x = HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(b, 'x'),
-        });
-        let text = seq.iter().collect::<String>();
-        assert!(
-            text == "baxc" || text == "bacx",
-            "insert must not split the glued pair; got {text}"
-        );
-        assert_eq!(&text[..2], "ba", "glued pair intact");
+        };
+        let mut sibs = [(m.id(), 'a'), (c, 'c'), (x.id(), 'x')];
+        sibs.sort();
+        let expect: String = std::iter::once('b').chain(sibs.iter().map(|s| s.1)).collect();
+        seq.apply(x);
+        assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
     }
 
+    /// A move-in at a run tail makes the anchor an explicit fork point:
+    /// continued typing forks (no silent extension through the sibling) and
+    /// orders against the move op by id.
     #[test]
-    fn run_extension_respects_glued_block() {
+    fn typing_at_a_moved_in_tail_forks_and_orders_by_id() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ab".chars());
         let a = seq.id_at(0).unwrap();
         let b = seq.id_at(1).unwrap();
 
-        seq.move_element(a, Anchor::After(b));
+        let m = seq.move_element(a, Anchor::After(b));
         assert_eq!(seq.iter().collect::<String>(), "ba");
 
-        // Typing continues the run through `b` (the run tail): the new char
-        // is an after-child of `b`, so it renders after the glued `a`.
-        seq.apply(HashNode {
+        let cnode = HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(b, 'c'),
-        });
-        assert_eq!(seq.iter().collect::<String>(), "bac");
+        };
+        let expect = if m.id() < cnode.id() { "bac" } else { "bca" };
+        seq.apply(cnode);
+        assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
     }
 
@@ -3328,8 +3323,12 @@ mod test {
         let b = base.id_at(1).unwrap();
         let c = base.id_at(2).unwrap();
 
-        base.move_element(a, Anchor::After(b));
-        assert_eq!(base.iter().collect::<String>(), "bac");
+        let m0 = base.move_element(a, Anchor::After(b));
+        // a joins b's sibling set (against the c-continuation), by id.
+        let mut sibs = [(m0.id(), 'a'), (c, 'c')];
+        sibs.sort();
+        let agreed: String = std::iter::once('b').chain(sibs.iter().map(|s| s.1)).collect();
+        assert_eq!(base.iter().collect::<String>(), agreed);
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
@@ -3340,10 +3339,10 @@ mod test {
         merged.merge(r2.clone());
         assert!(merged.placement_conflicted(&a));
         // Frozen at the last agreed placement — rendered there too.
-        assert_eq!(merged.iter().collect::<String>(), "bac");
+        assert_eq!(merged.iter().collect::<String>(), agreed);
         let mut merged2 = r2;
         merged2.merge(r1);
-        assert_eq!(merged2.iter().collect::<String>(), "bac");
+        assert_eq!(merged2.iter().collect::<String>(), agreed);
         check_index_matches_iter(&merged);
         check_index_matches_iter(&merged2);
     }

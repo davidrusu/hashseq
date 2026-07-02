@@ -141,10 +141,12 @@ discipline that keeps that sound (HASHSEQ_SPEC.md Apply/Validation):
   removed; `cmp_order` and every permanent verdict resolve through ghosts
   only (reading the rendered slot is a convergence bug: replicas that
   have/haven't seen a move would disagree on permanent gate verdicts);
-- the rendered copy is a singleton fragment at the glued point; moved-ins
-  sit exactly *at* the point — before all of the anchor's after-children,
-  including later inserts — and order among themselves by move-op id (the
-  sound id-order use: contenders' own content, displacing nothing);
+- the rendered copy is a singleton fragment placed by **insert-sibling
+  semantics**: the deciding move op joins its anchor's fork order like an
+  insert child, keyed by its own id — later inserts, run continuations,
+  and other moved-ins interleave with it by the one sibling rule the tree
+  already has (moves ground ids exactly as inserts can; no second
+  ordering concept, no privileged adjacency);
 - re-moves delete the stale destination fragment; **splice ghosts**
   materialize lazily, only where content actually anchored to a move op's
   splice point — bounding index growth to live placements plus anchored
@@ -217,8 +219,8 @@ semantics:
 - *drag + concurrent typing inside the block*: edits target the block's
   content object by id — fully orthogonal. The headline win over
   remove+reinsert, where typing into the tombstoned copy loses;
-- *two users drag different blocks to the same gap*: both splice at the same
-  glued point, ordered by move-op id — clean interleave;
+- *two users drag different blocks to the same gap*: both join the same
+  sibling fork order, ordered by move-op id — clean interleave;
 - *two users drag the same block within one list*: the block stays put
   (freeze), both UIs badge it, either user's next drag dominates and
   resolves (the industry default silently last-writes here; this is

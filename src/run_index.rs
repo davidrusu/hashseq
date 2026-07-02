@@ -194,17 +194,21 @@ enum FragsOf {
     Many(Vec<u32>),
 }
 
-/// A moved-in destination glue point (HASHSEQ_SPEC.md "Move"): the relocated
-/// element renders adjacent to the anchor's **base slot** — after it and
-/// before its after-children (`After`), or before it and after its
-/// before-children (`Before`) — or at the document-front boundary between
-/// the origin's befores and the top-level content (`Origin`, both sides).
-/// Nothing may come between an anchor and its glued block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Glue {
-    Origin,
-    Before(ElemRef),
-    After(ElemRef),
+/// Where a fresh span or a moved element's destination fragment lands.
+/// HashSeq resolves causal placement targets — which may be rendered move
+/// ops — into one of these.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum IndexTarget {
+    /// Directly before this element's base slot.
+    BeforeElem(ElemRef),
+    /// Directly after this element's base slot.
+    AfterElem(ElemRef),
+    /// Directly before this moved element's destination fragment.
+    BeforeMoved(ElemRef),
+    /// Directly after this moved element's destination fragment.
+    AfterMoved(ElemRef),
+    /// At the very end of the document.
+    Back,
 }
 
 #[derive(Debug, Clone)]
@@ -215,15 +219,9 @@ pub(crate) struct RunIndex {
     rng: u64,
     /// Rendered relocation (moves): element base ref -> its destination
     /// fragment. The base slot keeps its (cleared) bit for life — the origin
-    /// ghost; the destination is a 1-element fragment placed at the glue
-    /// point. Empty in move-free documents — every hot-path check guards on
-    /// that first.
+    /// ghost; the destination is a 1-element fragment placed like an insert
+    /// sibling. Empty in move-free documents — hot-path checks guard on that.
     moved: FxHashMap<ElemRef, u32>,
-    /// Destination fragment slot -> its glue point.
-    glue_of: FxHashMap<u32, Glue>,
-    /// Origin-glued destination fragments, in document order (the origin has
-    /// no fragment of its own to walk from).
-    origin_glued: Vec<u32>,
     /// Arena slots freed by deleted destination fragments.
     free: Vec<u32>,
 }
@@ -236,8 +234,6 @@ impl Default for RunIndex {
             frags_of: FxHashMap::default(),
             rng: 0x9E3779B97F4A7C15,
             moved: FxHashMap::default(),
-            glue_of: FxHashMap::default(),
-            origin_glued: Vec::new(),
             free: Vec::new(),
         }
     }
@@ -343,27 +339,6 @@ impl RunIndex {
         }
     }
 
-    fn predecessor(&self, mut n: u32) -> u32 {
-        let left = self.frags[n as usize].left;
-        if left != NIL {
-            let mut cur = left;
-            while self.frags[cur as usize].right != NIL {
-                cur = self.frags[cur as usize].right;
-            }
-            return cur;
-        }
-        loop {
-            let p = self.frags[n as usize].parent;
-            if p == NIL {
-                return NIL;
-            }
-            if self.frags[p as usize].right == n {
-                return p;
-            }
-            n = p;
-        }
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -430,25 +405,6 @@ impl RunIndex {
             Some(FragsOf::Many(v)) => *v.last().unwrap(),
             None => panic!("extend_run on unindexed run"),
         };
-        // If moved-in elements are glued after the run's tail element, the
-        // extension (an after-child of the tail) must render after the glued
-        // block: start a fresh tail fragment behind it.
-        if !self.glue_of.is_empty() {
-            let last_glued = self.skip_glued_after(slot, (head, off - 1));
-            if last_glued != slot {
-                let n = self.new_frag(head, off, 1, 1, Bits::Small(1));
-                match self.frags_of.get_mut(&head).expect("run is indexed") {
-                    entry @ FragsOf::One(_) => {
-                        let FragsOf::One(s) = *entry else { unreachable!() };
-                        *entry = FragsOf::Many(vec![s, n]);
-                    }
-                    FragsOf::Many(v) => v.push(n),
-                }
-                self.attach_succ(last_glued, n);
-                self.settle(n);
-                return;
-            }
-        }
         let f = &mut self.frags[slot as usize];
         debug_assert_eq!(
             f.start + f.len,
@@ -459,69 +415,10 @@ impl RunIndex {
         self.update_to_root(slot);
     }
 
-    /// Insert a fresh 1-element span for `head` directly before the element
-    /// `at` (splitting `at`'s fragment if it sits mid-fragment). Moved-in
-    /// elements glued `Before(at)` stay glued: the new span lands before them.
-    pub(crate) fn insert_span_before(&mut self, at: ElemRef, head: NodeIdx) {
-        let slot = self
-            .frag_containing(at.0, at.1)
-            .expect("anchor element must be indexed");
-        let k = at.1 - self.frags[slot as usize].start;
+    /// Insert a fresh 1-element span for `head` at `target`.
+    pub(crate) fn insert_span_at(&mut self, target: IndexTarget, head: NodeIdx) {
         let n = self.new_span(head);
-        if k == 0 {
-            let first = self.skip_glued_before(slot, at);
-            self.attach_pred(first, n);
-        } else {
-            self.split_frag(slot, k);
-            self.attach_succ(slot, n);
-        }
-        self.settle(n);
-    }
-
-    /// Insert a fresh 1-element span for `head` directly after the element
-    /// `at`. Moved-in elements glued `After(at)` stay glued: the new span
-    /// lands after them.
-    pub(crate) fn insert_span_after(&mut self, at: ElemRef, head: NodeIdx) {
-        let slot = self
-            .frag_containing(at.0, at.1)
-            .expect("anchor element must be indexed");
-        let f = &self.frags[slot as usize];
-        let k = at.1 - f.start;
-        if k + 1 < f.len {
-            self.split_frag(slot, k + 1);
-        }
-        let n = self.new_span(head);
-        let last = self.skip_glued_after(slot, at);
-        self.attach_succ(last, n);
-        self.settle(n);
-    }
-
-    /// Insert a fresh 1-element span directly before the origin-glued block
-    /// (the "directly before the origin" placement when moved-in elements
-    /// occupy the origin boundary). Returns false when there is no block.
-    pub(crate) fn insert_span_before_front_glued(&mut self, head: NodeIdx) -> bool {
-        let Some(&first) = self.origin_glued.first() else {
-            return false;
-        };
-        let n = self.new_span(head);
-        self.attach_pred(first, n);
-        self.settle(n);
-        true
-    }
-
-    /// Insert a fresh 1-element span for `head` at the end of the sequence.
-    pub(crate) fn push_span_back(&mut self, head: NodeIdx) {
-        let n = self.new_span(head);
-        if self.root == NIL {
-            self.root = n;
-            return;
-        }
-        let mut cur = self.root;
-        while self.frags[cur as usize].right != NIL {
-            cur = self.frags[cur as usize].right;
-        }
-        self.frags[cur as usize].right = n;
-        self.frags[n as usize].parent = cur;
+        self.attach_at(target, n);
         self.settle(n);
     }
 
@@ -567,20 +464,36 @@ impl RunIndex {
         let Some(slot) = self.moved.remove(&elem) else {
             return false;
         };
-        if let Some(Glue::Origin) = self.glue_of.remove(&slot) {
-            self.origin_glued.retain(|&s| s != slot);
-        }
         self.detach(slot);
         true
     }
 
-    /// Render `elem` at `glue` (an element glue point) as the `rank`-th
-    /// member of the glued block. The caller clears the old rendering first
-    /// and computes `rank` from the block's move-op id order.
-    pub(crate) fn place_moved(&mut self, elem: ElemRef, glue: Glue, rank: usize) {
-        let n = self.new_moved_frag(elem, glue);
-        match glue {
-            Glue::After(at) => {
+    /// Render `elem` (a moved element) at `target` as a 1-element destination
+    /// fragment. The caller clears the old rendering first.
+    pub(crate) fn place_moved_at(&mut self, target: IndexTarget, elem: ElemRef) {
+        let n = self.new_frag(elem.0, elem.1, 1, 1, Bits::Small(1));
+        let prev = self.moved.insert(elem, n);
+        debug_assert!(prev.is_none(), "old rendering must be cleared first");
+        self.attach_at(target, n);
+        self.settle(n);
+    }
+
+    /// Leaf-attach `n` at `target`.
+    fn attach_at(&mut self, target: IndexTarget, n: u32) {
+        match target {
+            IndexTarget::BeforeElem(at) => {
+                let slot = self
+                    .frag_containing(at.0, at.1)
+                    .expect("anchor element must be indexed");
+                let k = at.1 - self.frags[slot as usize].start;
+                if k == 0 {
+                    self.attach_pred(slot, n);
+                } else {
+                    self.split_frag(slot, k);
+                    self.attach_succ(slot, n);
+                }
+            }
+            IndexTarget::AfterElem(at) => {
                 let slot = self
                     .frag_containing(at.0, at.1)
                     .expect("anchor element must be indexed");
@@ -589,110 +502,29 @@ impl RunIndex {
                 if k + 1 < f.len {
                     self.split_frag(slot, k + 1);
                 }
-                let chain = self.chain_after(slot, at);
-                let prev = if rank == 0 { slot } else { chain[rank - 1] };
-                self.attach_succ(prev, n);
+                self.attach_succ(slot, n);
             }
-            Glue::Before(at) => {
-                let mut slot = self
-                    .frag_containing(at.0, at.1)
-                    .expect("anchor element must be indexed");
-                let k = at.1 - self.frags[slot as usize].start;
-                if k > 0 {
-                    slot = self.split_frag(slot, k);
-                }
-                let chain = self.chain_before(slot, at);
-                if rank == chain.len() {
-                    self.attach_pred(slot, n);
-                } else {
-                    self.attach_pred(chain[rank], n);
-                }
+            IndexTarget::BeforeMoved(other) => {
+                let slot = *self.moved.get(&other).expect("target is moved-rendered");
+                self.attach_pred(slot, n);
             }
-            Glue::Origin => unreachable!("origin glue uses place_moved_origin"),
+            IndexTarget::AfterMoved(other) => {
+                let slot = *self.moved.get(&other).expect("target is moved-rendered");
+                self.attach_succ(slot, n);
+            }
+            IndexTarget::Back => {
+                if self.root == NIL {
+                    self.root = n;
+                    return;
+                }
+                let mut cur = self.root;
+                while self.frags[cur as usize].right != NIL {
+                    cur = self.frags[cur as usize].right;
+                }
+                self.frags[cur as usize].right = n;
+                self.frags[n as usize].parent = cur;
+            }
         }
-        self.settle(n);
-    }
-
-    /// Render `elem` at the origin boundary as the `rank`-th origin-glued
-    /// member. `first_top` (the first top-level element, if any) locates the
-    /// boundary when the block is empty; with no top-level content the
-    /// boundary is the very end (everything else is origin-befores).
-    pub(crate) fn place_moved_origin(
-        &mut self,
-        elem: ElemRef,
-        rank: usize,
-        first_top: Option<ElemRef>,
-    ) {
-        let n = self.new_moved_frag(elem, Glue::Origin);
-        if self.origin_glued.is_empty() {
-            match first_top {
-                Some(at) => {
-                    let mut slot = self
-                        .frag_containing(at.0, at.1)
-                        .expect("first top-level element must be indexed");
-                    let k = at.1 - self.frags[slot as usize].start;
-                    if k > 0 {
-                        slot = self.split_frag(slot, k);
-                    }
-                    let first = self.skip_glued_before(slot, at);
-                    self.attach_pred(first, n);
-                }
-                None => {
-                    if self.root == NIL {
-                        self.root = n;
-                    } else {
-                        let mut cur = self.root;
-                        while self.frags[cur as usize].right != NIL {
-                            cur = self.frags[cur as usize].right;
-                        }
-                        self.frags[cur as usize].right = n;
-                        self.frags[n as usize].parent = cur;
-                    }
-                }
-            }
-        } else if rank == 0 {
-            self.attach_pred(self.origin_glued[0], n);
-        } else {
-            self.attach_succ(self.origin_glued[rank - 1], n);
-        }
-        self.origin_glued.insert(rank, n);
-        self.settle(n);
-    }
-
-    /// The elements glued at `glue`, in document order (for the caller's
-    /// rank computation).
-    pub(crate) fn glued_elems(&self, glue: Glue) -> Vec<ElemRef> {
-        if self.glue_of.is_empty() {
-            return Vec::new();
-        }
-        let slots = match glue {
-            Glue::Origin => self.origin_glued.clone(),
-            Glue::After(at) => {
-                let Some(slot) = self.frag_containing(at.0, at.1) else {
-                    return Vec::new();
-                };
-                if at.1 - self.frags[slot as usize].start + 1 < self.frags[slot as usize].len {
-                    return Vec::new(); // mid-fragment anchor: nothing glued
-                }
-                self.chain_after(slot, at)
-            }
-            Glue::Before(at) => {
-                let Some(slot) = self.frag_containing(at.0, at.1) else {
-                    return Vec::new();
-                };
-                if at.1 > self.frags[slot as usize].start {
-                    return Vec::new(); // mid-fragment anchor: nothing glued
-                }
-                self.chain_before(slot, at)
-            }
-        };
-        slots
-            .into_iter()
-            .map(|s| {
-                let f = &self.frags[s as usize];
-                (f.head, f.start)
-            })
-            .collect()
     }
 
     /// Mirror `StoredRun::split_at`: fragments covering `[at..)` now belong to
@@ -722,8 +554,8 @@ impl RunIndex {
         let prev = self.frags_of.insert(right_head, pack(moved));
         debug_assert!(prev.is_none(), "right head must be a fresh span");
 
-        // Destination fragments and glue anchors reference elements by
-        // (run, offset) too — rebase the ones the split moved.
+        // Destination fragments reference elements by (run, offset) too —
+        // rebase the ones the split moved.
         if !self.moved.is_empty() {
             let rekeys: Vec<(ElemRef, u32)> = self
                 .moved
@@ -738,80 +570,10 @@ impl RunIndex {
                 f.head = right_head;
                 f.start = o - at;
             }
-            for g in self.glue_of.values_mut() {
-                if let Glue::Before((h, o)) | Glue::After((h, o)) = g
-                    && *h == head
-                    && *o >= at
-                {
-                    *h = right_head;
-                    *o -= at;
-                }
-            }
         }
     }
 
     // ---- internals ----
-
-    /// Walk past the moved-in block glued `After(at)`, returning the last
-    /// glued fragment (or `slot` itself when nothing is glued).
-    fn skip_glued_after(&self, slot: u32, at: ElemRef) -> u32 {
-        if self.glue_of.is_empty() {
-            return slot;
-        }
-        let mut prev = slot;
-        let mut cur = self.successor(slot);
-        while cur != NIL && self.glue_of.get(&cur) == Some(&Glue::After(at)) {
-            prev = cur;
-            cur = self.successor(cur);
-        }
-        prev
-    }
-
-    /// Walk past the moved-in block glued `Before(at)`, returning the first
-    /// glued fragment (or `slot` itself when nothing is glued).
-    fn skip_glued_before(&self, slot: u32, at: ElemRef) -> u32 {
-        if self.glue_of.is_empty() {
-            return slot;
-        }
-        let mut first = slot;
-        let mut cur = self.predecessor(slot);
-        while cur != NIL && self.glue_of.get(&cur) == Some(&Glue::Before(at)) {
-            first = cur;
-            cur = self.predecessor(cur);
-        }
-        first
-    }
-
-    /// The `After(at)`-glued fragments following `slot`, in document order.
-    fn chain_after(&self, slot: u32, at: ElemRef) -> Vec<u32> {
-        let mut chain = Vec::new();
-        let mut cur = self.successor(slot);
-        while cur != NIL && self.glue_of.get(&cur) == Some(&Glue::After(at)) {
-            chain.push(cur);
-            cur = self.successor(cur);
-        }
-        chain
-    }
-
-    /// The `Before(at)`-glued fragments preceding `slot`, in document order.
-    fn chain_before(&self, slot: u32, at: ElemRef) -> Vec<u32> {
-        let mut chain = Vec::new();
-        let mut cur = self.predecessor(slot);
-        while cur != NIL && self.glue_of.get(&cur) == Some(&Glue::Before(at)) {
-            chain.push(cur);
-            cur = self.predecessor(cur);
-        }
-        chain.reverse();
-        chain
-    }
-
-    fn new_moved_frag(&mut self, elem: ElemRef, glue: Glue) -> u32 {
-        let n = self.new_frag(elem.0, elem.1, 1, 1, Bits::Small(1));
-        self.glue_of.insert(n, glue);
-        let prev = self.moved.insert(elem, n);
-        debug_assert!(prev.is_none(), "old rendering must be cleared first");
-        n
-    }
 
     /// Remove `n` from the treap (rotate to a leaf, unlink) and free its
     /// arena slot. Only destination fragments are ever detached.
@@ -1038,9 +800,9 @@ mod tests {
     #[test]
     fn push_back_get_position() {
         let mut ix = RunIndex::default();
-        ix.push_span_back(n(0));
-        ix.push_span_back(n(1));
-        ix.push_span_back(n(2));
+        ix.insert_span_at(IndexTarget::Back, n(0));
+        ix.insert_span_at(IndexTarget::Back, n(1));
+        ix.insert_span_at(IndexTarget::Back, n(2));
         assert_eq!(ix.len(), 3);
         assert_eq!(ix.get(0), Some((n(0), 0)));
         assert_eq!(ix.get(1), Some((n(1), 0)));
@@ -1052,7 +814,7 @@ mod tests {
     #[test]
     fn extend_and_remove() {
         let mut ix = RunIndex::default();
-        ix.push_span_back(n(0));
+        ix.insert_span_at(IndexTarget::Back, n(0));
         for off in 1..100 {
             ix.extend_run(n(0), off);
         }
@@ -1069,12 +831,12 @@ mod tests {
     #[test]
     fn insert_before_mid_fragment_splits() {
         let mut ix = RunIndex::default();
-        ix.push_span_back(n(0));
+        ix.insert_span_at(IndexTarget::Back, n(0));
         for off in 1..10 {
             ix.extend_run(n(0), off);
         }
         // span lands before element 5: [0..5) [span] [5..10)
-        ix.insert_span_before((n(0), 5), n(100));
+        ix.insert_span_at(IndexTarget::BeforeElem((n(0), 5)), n(100));
         assert_eq!(ix.len(), 11);
         assert_eq!(ix.get(4), Some((n(0), 4)));
         assert_eq!(ix.get(5), Some((n(100), 0)));
@@ -1088,11 +850,11 @@ mod tests {
     #[test]
     fn insert_after_and_split_run() {
         let mut ix = RunIndex::default();
-        ix.push_span_back(n(0));
+        ix.insert_span_at(IndexTarget::Back, n(0));
         for off in 1..6 {
             ix.extend_run(n(0), off);
         }
-        ix.insert_span_after((n(0), 2), n(50));
+        ix.insert_span_at(IndexTarget::AfterElem((n(0), 2)), n(50));
         assert_eq!(ix.get(2), Some((n(0), 2)));
         assert_eq!(ix.get(3), Some((n(50), 0)));
         assert_eq!(ix.get(4), Some((n(0), 3)));
@@ -1112,27 +874,27 @@ mod tests {
     #[test]
     fn removed_elements_still_anchor_inserts() {
         let mut ix = RunIndex::default();
-        ix.push_span_back(n(0));
+        ix.insert_span_at(IndexTarget::Back, n(0));
         for off in 1..4 {
             ix.extend_run(n(0), off);
         }
         assert!(ix.remove_element((n(0), 1)));
         assert!(ix.remove_element((n(0), 2)));
         // insert after a removed element: lands between visible 0 and 3
-        ix.insert_span_after((n(0), 1), n(10));
+        ix.insert_span_at(IndexTarget::AfterElem((n(0), 1)), n(10));
         assert_eq!(ix.len(), 3);
         assert_eq!(ix.get(0), Some((n(0), 0)));
         assert_eq!(ix.get(1), Some((n(10), 0)));
         assert_eq!(ix.get(2), Some((n(0), 3)));
         // insert before a removed element
-        ix.insert_span_before((n(0), 2), n(11));
+        ix.insert_span_at(IndexTarget::BeforeElem((n(0), 2)), n(11));
         assert_eq!(ix.get(2), Some((n(11), 0)));
     }
 
     #[test]
     fn large_fragment_bitmap() {
         let mut ix = RunIndex::default();
-        ix.push_span_back(n(0));
+        ix.insert_span_at(IndexTarget::Back, n(0));
         for off in 1..300 {
             ix.extend_run(n(0), off);
         }
@@ -1144,7 +906,7 @@ mod tests {
         assert_eq!(ix.position_of((n(0), 1)), Some(0));
         assert_eq!(ix.position_of((n(0), 299)), Some(199));
         // split a Large bitmap mid-word
-        ix.insert_span_before((n(0), 150), n(1));
+        ix.insert_span_at(IndexTarget::BeforeElem((n(0), 150)), n(1));
         assert_eq!(ix.len(), 201);
         let p = ix.position_of((n(1), 0)).unwrap();
         assert_eq!(ix.get(p), Some((n(1), 0)));
@@ -1176,16 +938,16 @@ mod tests {
                     next_head += 1;
                     run_len.insert(head, 1);
                     if doc.is_empty() || rand(8) == 0 {
-                        ix.push_span_back(head);
+                        ix.insert_span_at(IndexTarget::Back, head);
                         doc.push((head, 0, true));
                     } else {
                         let i = rand(doc.len() as u64);
                         let (h, off, _) = doc[i];
                         if rand(2) == 0 {
-                            ix.insert_span_before((h, off), head);
+                            ix.insert_span_at(IndexTarget::BeforeElem((h, off)), head);
                             doc.insert(i, (head, 0, true));
                         } else {
-                            ix.insert_span_after((h, off), head);
+                            ix.insert_span_at(IndexTarget::AfterElem((h, off)), head);
                             doc.insert(i + 1, (head, 0, true));
                         }
                     }
