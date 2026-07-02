@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
-use crate::run_index::{ElemRef, IndexTarget, RunIndex};
+use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepPos};
 use crate::delivery::Delivery;
 use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
@@ -1445,12 +1445,35 @@ impl HashSeq {
 
     // ---- mark reads (arbitration happens here, per Law II) ----
 
-    /// Does mark `mk` cover element `x` (strictly between its points, in the
-    /// base order)? Rendered relocation never changes coverage.
+    /// Sweep position of a mark anchor point: fixed at the anchor's base
+    /// slot (its ghost — points never relocate, so no move can reshape a
+    /// span's region). `None` = an origin point (below every element).
+    fn point_pos(&self, anchor: NodeIdx, after: bool) -> Option<SweepPos> {
+        if anchor == ORIGIN_IDX {
+            return None;
+        }
+        Some(
+            self.index
+                .base_pos(self.elem_ref(anchor), if after { 2 } else { 0 }),
+        )
+    }
+
+    /// Does mark `mk` cover element `x`? Regional semantics: the points are
+    /// fixed at their anchors' base slots, and membership is whether `x`'s
+    /// *rendered* crossing falls strictly between them — a moved-out
+    /// element sheds the region's marks, a moved-in element acquires them.
     fn mark_covers(&self, mk: &StoredMark, x: NodeIdx) -> bool {
         use std::cmp::Ordering;
-        self.cmp_points((mk.start_anchor, mk.start_after), (x, false)) != Ordering::Greater
-            && self.cmp_points((x, true), (mk.end_anchor, mk.end_after)) != Ordering::Greater
+        let xp = self.index.rendered_pos(self.elem_ref(x));
+        let after_start = match self.point_pos(mk.start_anchor, mk.start_after) {
+            None => true, // origin point: below everything
+            Some(s) => self.index.cmp_sweep(s, xp) == Ordering::Less,
+        };
+        let before_end = match self.point_pos(mk.end_anchor, mk.end_after) {
+            None => false, // an origin end point precedes every element
+            Some(e) => self.index.cmp_sweep(xp, e) == Ordering::Less,
+        };
+        after_start && before_end
     }
 
     /// The live mark set at element `id`, grouped by kind: every covering
@@ -1546,18 +1569,28 @@ impl HashSeq {
             fire(events, true, &mut active, &mut ended);
         }
 
-        let mut fmt: FxHashMap<NodeIdx, usize> = FxHashMap::default();
         let mut sets: Vec<MarkSet> = vec![Vec::new()];
         let mut current = 0usize; // index into `sets` for the current format
         let mut dirty = false;
-        for (run, start, len) in self.index.base_coverage() {
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for (run, start, len, moved_in) in self.index.sweep_coverage() {
             for off in start..start + len {
                 let e = self.runs[&run].elements[off as usize];
-                if let Some(events) = self.mark_events.get(&e) {
+                // Events fire at base slots only — a moved-in crossing is
+                // where the element renders, not where its points live.
+                if !moved_in && let Some(events) = self.mark_events.get(&e) {
                     dirty |= fire(events, false, &mut active, &mut ended);
                 }
-                if !self.is_removed(e) && !active.is_empty() {
-                    if dirty || current == 0 {
+                let renders_here = if moved_in {
+                    true // destination fragments hold live elements only
+                } else {
+                    !self.is_removed(e) && !self.rendered_elsewhere(e)
+                };
+                if renders_here {
+                    if active.is_empty() {
+                        current = 0;
+                        dirty = false;
+                    } else if dirty || current == 0 {
                         let members: Vec<NodeIdx> = active.iter().copied().collect();
                         let set = self.live_set(&members);
                         current = if set.is_empty() {
@@ -1568,27 +1601,14 @@ impl HashSeq {
                         };
                         dirty = false;
                     }
-                    if current != 0 {
-                        fmt.insert(e, current);
+                    match out.last_mut() {
+                        Some((text, last)) if *last == current => text.push(self.char_at(e)),
+                        _ => out.push((self.char_at(e).to_string(), current)),
                     }
-                } else if active.is_empty() {
-                    current = 0;
-                    dirty = false;
                 }
-                if let Some(events) = self.mark_events.get(&e) {
-                    let changed = fire(events, true, &mut active, &mut ended);
-                    dirty |= changed;
+                if !moved_in && let Some(events) = self.mark_events.get(&e) {
+                    dirty |= fire(events, true, &mut active, &mut ended);
                 }
-            }
-        }
-
-        // Rendered emission, coalescing runs of equal format.
-        let mut out: Vec<(String, usize)> = Vec::new();
-        for e in self.iter_idxs() {
-            let f = fmt.get(&e).copied().unwrap_or(0);
-            match out.last_mut() {
-                Some((text, last)) if *last == f => text.push(self.char_at(e)),
-                _ => out.push((self.char_at(e).to_string(), f)),
             }
         }
         out.into_iter()
@@ -4269,11 +4289,12 @@ mod test {
         assert!(seq.mark_tips().is_empty());
     }
 
-    /// Span membership is base order: moving an element does not change
-    /// which marks cover it, and it carries its formatting to where it
-    /// renders.
+    /// Regional semantics: a mark's points are fixed at their anchors'
+    /// base slots; membership is the element's *rendered* crossing between
+    /// them. Moving an element out of the region sheds its marks; moving
+    /// one in acquires them.
     #[test]
-    fn moved_elements_keep_their_marks() {
+    fn marks_are_regional_under_moves() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
@@ -4283,19 +4304,43 @@ mod test {
             vec![("ab".into(), true), ("cd".into(), false)]
         );
 
-        // Move bold `a` to the end: it renders last, still bold; the span
-        // still covers exactly {a, b} in base order.
+        // Move bold `a` out to the end: it leaves the region and sheds.
         seq.move_element(ids[0], Anchor::After(ids[3]));
         assert_eq!(seq.iter().collect::<String>(), "bcda");
         assert_eq!(
             span_texts(&seq),
-            vec![
-                ("b".into(), true),
-                ("cd".into(), false),
-                ("a".into(), true)
-            ]
+            vec![("b".into(), true), ("cda".into(), false)]
         );
-        assert_eq!(kinds_at(&seq, 3), vec![bold()]);
+        assert!(kinds_at(&seq, 3).is_empty(), "moved out: shed");
+
+        // Move plain `d` into the region: it acquires the bold.
+        seq.move_element(ids[3], Anchor::Before(ids[1]));
+        assert_eq!(seq.iter().collect::<String>(), "dbca");
+        assert_eq!(
+            span_texts(&seq),
+            vec![("db".into(), true), ("ca".into(), false)]
+        );
+    }
+
+    /// The review example: "hello bob", bold "bob", move the middle 'o' out
+    /// front — the o is not bold.
+    #[test]
+    fn moved_out_o_is_not_bold() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello bob".chars());
+        let b1 = seq.id_at(6).unwrap();
+        let o = seq.id_at(7).unwrap();
+        let b2 = seq.id_at(8).unwrap();
+        seq.mark_range(Anchor::Before(b1), Anchor::After(b2), bold(), yes());
+
+        let h = seq.id_at(0).unwrap();
+        seq.move_element(o, Anchor::Before(h));
+        assert_eq!(seq.iter().collect::<String>(), "ohello bb");
+        assert_eq!(
+            span_texts(&seq),
+            vec![("ohello ".into(), false), ("bb".into(), true)]
+        );
+        assert!(kinds_at(&seq, 0).is_empty());
     }
 
     /// A mark delivered before its text parks and applies on arrival.

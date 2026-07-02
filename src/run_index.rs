@@ -253,6 +253,11 @@ impl Default for RunIndex {
 /// elements are (their own handle, 0).
 pub(crate) type ElemRef = (NodeIdx, u32);
 
+/// A comparable crossing in the sweep order: (treap slot, element offset
+/// within it, tie). Tie orders a slot's coincident crossings: 0 = a
+/// Before-point, 1 = the element itself, 2 = an After-point.
+pub(crate) type SweepPos = (u32, u32, u8);
+
 /// A fragment as seen by document-order iteration: a contiguous element
 /// range of one run plus its visibility bits.
 #[derive(Clone, Copy)]
@@ -375,38 +380,49 @@ impl RunIndex {
         }
     }
 
-    /// Base-order comparison of two elements: the immutable order that
-    /// anchors, marks, and gate verdicts depend on. Resolves through base
-    /// slots only (origin ghosts — never destination fragments), counts
-    /// invisible elements, and is stable for life: splits subdivide in
-    /// place, tombstones keep slots, treap rotations preserve in-order.
-    /// O(log F) expected via the fragments' root paths.
-    pub(crate) fn cmp_base(&self, a: ElemRef, b: ElemRef) -> std::cmp::Ordering {
-        let fa = self
-            .frag_containing(a.0, a.1)
+    /// Base sweep position of an element (its ghost slot — immutable for
+    /// life: splits subdivide in place, tombstones keep slots, rotations
+    /// preserve in-order). Mark anchor points live here.
+    pub(crate) fn base_pos(&self, elem: ElemRef, tie: u8) -> SweepPos {
+        let slot = self
+            .frag_containing(elem.0, elem.1)
             .expect("element must be indexed");
-        let fb = self
-            .frag_containing(b.0, b.1)
-            .expect("element must be indexed");
-        if fa == fb {
-            return a.1.cmp(&b.1);
+        (slot, elem.1 - self.frags[slot as usize].start, tie)
+    }
+
+    /// Rendered sweep position of an element: its destination fragment when
+    /// moved, its base slot otherwise. Span membership samples here.
+    pub(crate) fn rendered_pos(&self, elem: ElemRef) -> SweepPos {
+        if !self.moved.is_empty()
+            && let Some(&slot) = self.moved.get(&elem)
+        {
+            return (slot, 0, 1);
         }
-        let pa = self.root_path(fa);
-        let pb = self.root_path(fb);
+        self.base_pos(elem, 1)
+    }
+
+    /// Compare two sweep positions: treap in-order on slots (O(log F)
+    /// expected via root paths), then offset, then tie.
+    pub(crate) fn cmp_sweep(&self, a: SweepPos, b: SweepPos) -> std::cmp::Ordering {
+        if a.0 == b.0 {
+            return (a.1, a.2).cmp(&(b.1, b.2));
+        }
+        let pa = self.root_path(a.0);
+        let pb = self.root_path(b.0);
         let mut i = 0;
         while i < pa.len() && i < pb.len() && pa[i] == pb[i] {
             i += 1;
         }
         if i == pa.len() {
-            // fa is an ancestor of fb: fb's side of fa decides.
-            return if pb[i] == self.frags[fa as usize].left {
+            // a's slot is an ancestor of b's: b's side of it decides.
+            return if pb[i] == self.frags[a.0 as usize].left {
                 std::cmp::Ordering::Greater
             } else {
                 std::cmp::Ordering::Less
             };
         }
         if i == pb.len() {
-            return if pa[i] == self.frags[fb as usize].left {
+            return if pa[i] == self.frags[b.0 as usize].left {
                 std::cmp::Ordering::Less
             } else {
                 std::cmp::Ordering::Greater
@@ -421,6 +437,12 @@ impl RunIndex {
         }
     }
 
+    /// Base-order comparison of two elements: the immutable order that
+    /// anchors and gate verdicts depend on (ghost-resolved).
+    pub(crate) fn cmp_base(&self, a: ElemRef, b: ElemRef) -> std::cmp::Ordering {
+        self.cmp_sweep(self.base_pos(a, 1), self.base_pos(b, 1))
+    }
+
     /// Root-to-`n` path of treap slots.
     fn root_path(&self, n: u32) -> Vec<u32> {
         let mut path = vec![n];
@@ -433,25 +455,20 @@ impl RunIndex {
         path
     }
 
-    /// The base coverage in document order: every `(run, start, len)` range
-    /// of every base fragment — invisible elements included, destination and
-    /// splice fragments excluded. This is the mark sweep's walk order.
-    pub(crate) fn base_coverage(&self) -> Vec<(NodeIdx, u32, u32)> {
-        let synthetic: FxHashSet<u32> = if self.moved.is_empty() && self.splice.is_empty() {
-            FxHashSet::default()
-        } else {
-            self.moved
-                .values()
-                .chain(self.splice.values())
-                .copied()
-                .collect()
-        };
+    /// Every fragment in treap (= rendered) order: `(run, start, len,
+    /// moved-in)`. Base fragments include invisible elements — the ghost
+    /// slots where mark anchor events fire; `moved-in` flags destination
+    /// fragments, where relocated elements render (and where the sweep
+    /// samples their formatting). Zero-width splice fragments yield no
+    /// elements. This is the mark sweep's walk.
+    pub(crate) fn sweep_coverage(&self) -> Vec<(NodeIdx, u32, u32, bool)> {
+        let moved_slots: FxHashSet<u32> = self.moved.values().copied().collect();
         let mut out = Vec::new();
         let mut cur = self.leftmost(self.root);
         while cur != NIL {
-            if !synthetic.contains(&cur) {
-                let f = &self.frags[cur as usize];
-                out.push((f.head, f.start, f.len));
+            let f = &self.frags[cur as usize];
+            if f.len > 0 {
+                out.push((f.head, f.start, f.len, moved_slots.contains(&cur)));
             }
             cur = self.successor(cur);
         }

@@ -56,10 +56,14 @@ An anchor is a glued point (HASHSEQ_SPEC.md): `Before(c)` is crossed
 immediately before emitting `c`, after all of `c`'s before-descendants;
 `After(c)` immediately after `c`, before any of its after-descendants.
 Anything later inserted into the adjacent gap lands on the same side of the
-point, so span membership is unambiguous: an element is in the span iff it
-is emitted strictly between the two points — **in the base order**
-(FRAMEWORK "Stability"). Rendered relocation of elements (`Move`) never
-changes which elements a span covers.
+point, so span membership is unambiguous. **Marks are regional**: the two
+points are fixed for life at their anchors' *base* slots (origin ghosts —
+a `Move` never relocates a point, so no placement op can reshape or drag a
+span's region), and an element is in the span iff its **rendered**
+crossing falls strictly between them. A moved-out element sheds the
+region's marks; a moved-in element acquires them. Formatting that should
+travel with moved content is editor policy — the move gesture authors a
+re-mark — exactly as edge expansion is anchor choice.
 
 Grow-at-edges behavior ("typing at the end of bold text continues bold; at
 the end of a link does not") is **anchor choice, not a flag**. For a span
@@ -133,12 +137,15 @@ Suppression is computed at read, never at apply.
 
 ## Rendering
 
-A sweep piggybacking the linear iterator: walk the sequence, toggle an
-active set at anchor events (an unmark/overwrite op is itself an interval,
-so suppression is interval-vs-interval inside the sweep), emit coalesced
-`(run, FormatSet)` spans. Cost O(text + anchor events); marks attach by id,
-so text edits never reposition marks. Point queries ride `position_of` /
-`cmp_order`. Wire: mark volume is orders of magnitude below element volume —
+One treap-order pass: anchor events toggle the active set as their ghost
+(base) slots are crossed — tombstoned and moved-out slots included — and
+each element samples the active set where it *renders* (its base slot, or
+its destination fragment when moved), emitting coalesced
+`(text, FormatSet)` spans. An unmark/overwrite op is itself an interval,
+so suppression is interval-vs-interval inside the sweep. Cost
+O(text + anchor events); marks attach by id, so text edits never
+reposition marks. Point queries compare sweep positions (rendered element
+vs base-fixed points) in O(log F). Wire: mark volume is orders of magnitude below element volume —
 individual ops, dict + positional refs (ENCODING_SPEC.md); a "format
 painter" session chain can run-compress later if profiles say so.
 

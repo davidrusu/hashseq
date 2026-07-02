@@ -278,8 +278,10 @@ FRAMEWORK Law II it is a cache pinned equal to the definitional iterator
   move would disagree on permanent gate verdicts.) Anchor points
   (`Before(c)` / `After(c)`, MARKS.md) are glued and stable for life.
   **Rendered placement is not base order**: a move relocates where an
-  element renders, never the base order that anchors, marks, and gate
-  verdicts depend on (FRAMEWORK "Stability"). Every higher layer (marks' permanent inverted-span check,
+  element renders, never the base order that anchors, mark *points*, and
+  gate verdicts depend on (FRAMEWORK "Stability"; mark *membership*
+  samples the rendered crossing against those base-fixed points —
+  MARKS.md "regional"). Every higher layer (marks' permanent inverted-span check,
   the move splice-point anchor) borrows the base order's immutability.
 - **Retention.** The supersession spine of each placement register
   (superseded ops' ids, `overwrites` edges, and one `Anchor` each) is
