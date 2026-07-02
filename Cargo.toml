@@ -24,6 +24,8 @@ getrandom = { version = "0.2", features = ["js"] }
 # in FxHash without inverting BLAKE3, so HashDoS protection from SipHash is
 # redundant here.
 rustc-hash = "2"
+# structure_json (wasm introspection) serializes through serde_json.
+serde_json = "1"
 
 [features]
 default = []
@@ -36,7 +38,6 @@ ignored = ["getrandom"]
 
 [dev-dependencies]
 rand = "0.8.5"
-serde_json = "1.0.86"
 flate2 = "1.0"
 quickcheck = "1"
 quickcheck_macros = "1"

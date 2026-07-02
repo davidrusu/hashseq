@@ -30,6 +30,37 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// Byte cursor for decoding: threads the position through the
+/// `fn(&[u8]) -> (value, consumed)` decoders below via `step`.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn step<T>(
+        &mut self,
+        f: impl FnOnce(&[u8]) -> Result<(T, usize), DecodeError>,
+    ) -> Result<T, DecodeError> {
+        let (v, n) = f(&self.bytes[self.pos..])?;
+        self.pos += n;
+        Ok(v)
+    }
+
+    fn byte(&mut self) -> Result<u8, DecodeError> {
+        let b = *self.bytes.get(self.pos).ok_or(DecodeError::UnexpectedEof)?;
+        self.pos += 1;
+        Ok(b)
+    }
+}
+
+// Reference-position codecs: the standalone node form writes refs as raw ids,
+// the snapshot orphan section writes them positionally. One layout, two codecs.
+type PutRef<'f> = dyn FnMut(&Id, &mut Vec<u8>) + 'f;
+type PutRefSet<'f> = dyn FnMut(&BTreeSet<Id>, &mut Vec<u8>) + 'f;
+type GetRef<'f> = dyn FnMut(&mut Cursor) -> Result<Id, DecodeError> + 'f;
+type GetRefSet<'f> = dyn FnMut(&mut Cursor) -> Result<BTreeSet<Id>, DecodeError> + 'f;
+
 // Stream framing tags — the transport tag space (distinct from the GRAMMAR
 // kind tags, which live inside node preimages).
 const TAG_RUN: u8 = 0x00;
@@ -189,49 +220,42 @@ pub fn encode_run(run: &Run, buf: &mut Vec<u8>) {
     }
 }
 
-pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
-    if bytes.is_empty() {
-        return Err(DecodeError::UnexpectedEof);
-    }
-    let mut pos = 0;
-    let first_op_tag = bytes[pos];
-    pos += 1;
-
-    let (anchor, id_size) = decode_id(&bytes[pos..])?;
-    pos += id_size;
-
-    let (first_extra_deps, deps_size) = decode_id_set(&bytes[pos..])?;
-    pos += deps_size;
-
-    let (run_str, str_size) = decode_string(&bytes[pos..])?;
-    pos += str_size;
-
-    let (num_interior, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
+/// Decode a run body after its first-op tag: `anchor ‖ first_extra_deps ‖
+/// text ‖ interior deps`. Shared by the standalone form (raw ids) and the
+/// snapshot run block (positional refs).
+fn decode_run_with(
+    c: &mut Cursor,
+    first_op: crate::run::FirstOp,
+    ref_: &mut GetRef,
+    ref_set: &mut GetRefSet,
+) -> Result<Run, DecodeError> {
+    let anchor = ref_(c)?;
+    let first_extra_deps = ref_set(c)?;
+    let text = c.step(decode_string)?;
+    let num_interior = c.step(decode_varint)?;
     let mut interior_extra_deps = BTreeMap::new();
     for _ in 0..num_interior {
-        let (offset, size) = decode_varint(&bytes[pos..])?;
-        pos += size;
-        let (deps, size) = decode_id_set(&bytes[pos..])?;
-        pos += size;
-        interior_extra_deps.insert(offset, deps);
+        let offset = c.step(decode_varint)?;
+        interior_extra_deps.insert(offset, ref_set(c)?);
     }
+    Run::from_text(anchor, first_op, first_extra_deps, &text, interior_extra_deps)
+        .ok_or(DecodeError::EmptyRun)
+}
 
-    let first_op = match first_op_tag {
+pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
+    let mut c = Cursor { bytes, pos: 0 };
+    let first_op = match c.byte()? {
         RUN_OP_AFTER => crate::run::FirstOp::After,
         RUN_OP_BEFORE => crate::run::FirstOp::Before,
-        _ => return Err(DecodeError::InvalidOpTag(first_op_tag)),
+        other => return Err(DecodeError::InvalidOpTag(other)),
     };
-    let run = Run::from_text(
-        anchor,
+    let run = decode_run_with(
+        &mut c,
         first_op,
-        first_extra_deps,
-        &run_str,
-        interior_extra_deps,
-    )
-    .ok_or(DecodeError::EmptyRun)?;
-
-    Ok((run, pos))
+        &mut |c| c.step(decode_id),
+        &mut |c| c.step(decode_id_set),
+    )?;
+    Ok((run, c.pos))
 }
 
 // --- HashNode wire + preimage encoding/decoding ---
@@ -410,24 +434,27 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
     }
 }
 
-/// Standalone wire form of a node (full ids; payload in elision form).
-/// Used for batches and anywhere a node travels outside a snapshot stream.
-pub fn encode_hash_node(node: &HashNode, buf: &mut Vec<u8>) {
+/// One wire layout for a whole node — `tag ‖ pins ‖ per-kind fields` — shared
+/// by the standalone form (refs as raw ids) and the snapshot orphan section
+/// (refs positional). Reference fields go through `ref_`/`ref_set`; value
+/// fields (payload, Put key/value, Mark kind/value) always ride raw — values
+/// are not references.
+fn encode_node_with(node: &HashNode, buf: &mut Vec<u8>, ref_: &mut PutRef, ref_set: &mut PutRefSet) {
+    fn anchor(a: &Anchor, buf: &mut Vec<u8>, ref_: &mut PutRef) {
+        buf.push(a.side_bit() as u8);
+        ref_(a.id(), buf);
+    }
     match &node.op {
         Op::Insert { at, payload } => {
             buf.push(TAG_INSERT);
-            encode_id_set(&node.pins, buf);
-            buf.push(at.side_bit() as u8);
-            encode_id(at.id(), buf);
+            ref_set(&node.pins, buf);
+            anchor(at, buf, ref_);
             encode_payload(payload, buf);
         }
-        Op::Remove(ids) => {
+        Op::Remove(targets) => {
             buf.push(TAG_REMOVE);
-            encode_id_set(&node.pins, buf);
-            encode_varint(ids.len(), buf);
-            for id in ids {
-                encode_id(id, buf);
-            }
+            ref_set(&node.pins, buf);
+            ref_set(targets, buf);
         }
         Op::Move {
             target,
@@ -435,11 +462,10 @@ pub fn encode_hash_node(node: &HashNode, buf: &mut Vec<u8>) {
             overwrites,
         } => {
             buf.push(TAG_MOVE);
-            encode_id_set(&node.pins, buf);
-            encode_id(target, buf);
-            buf.push(to.side_bit() as u8);
-            encode_id(to.id(), buf);
-            encode_id_set(overwrites, buf);
+            ref_set(&node.pins, buf);
+            ref_(target, buf);
+            anchor(to, buf, ref_);
+            ref_set(overwrites, buf);
         }
         Op::Put {
             key,
@@ -447,10 +473,10 @@ pub fn encode_hash_node(node: &HashNode, buf: &mut Vec<u8>) {
             overwrites,
         } => {
             buf.push(TAG_PUT);
-            encode_id_set(&node.pins, buf);
+            ref_set(&node.pins, buf);
             encode_id(key, buf);
             encode_id(value, buf);
-            encode_id_set(overwrites, buf);
+            ref_set(overwrites, buf);
         }
         Op::Mark {
             start,
@@ -460,138 +486,68 @@ pub fn encode_hash_node(node: &HashNode, buf: &mut Vec<u8>) {
             overwrites,
         } => {
             buf.push(TAG_MARK);
-            encode_id_set(&node.pins, buf);
-            buf.push(start.side_bit() as u8);
-            encode_id(start.id(), buf);
-            buf.push(end.side_bit() as u8);
-            encode_id(end.id(), buf);
+            ref_set(&node.pins, buf);
+            anchor(start, buf, ref_);
+            anchor(end, buf, ref_);
             encode_id(kind_v, buf);
             encode_id(value, buf);
-            encode_id_set(overwrites, buf);
+            ref_set(overwrites, buf);
         }
     }
 }
 
-fn anchor_from(side: u8, id: Id) -> Result<Anchor, DecodeError> {
-    match side {
-        0 => Ok(Anchor::Before(id)),
-        1 => Ok(Anchor::After(id)),
-        other => Err(DecodeError::InvalidOpTag(other)),
+/// Standalone wire form of a node (full ids; payload in elision form).
+/// Used for batches and anywhere a node travels outside a snapshot stream.
+pub fn encode_hash_node(node: &HashNode, buf: &mut Vec<u8>) {
+    encode_node_with(
+        node,
+        buf,
+        &mut |id, buf| encode_id(id, buf),
+        &mut |ids, buf| encode_id_set(ids, buf),
+    );
+}
+
+/// Inverse of `encode_node_with`: decode a node body after its `tag`.
+fn decode_node_with(
+    tag: u8,
+    c: &mut Cursor,
+    ref_: &mut GetRef,
+    ref_set: &mut GetRefSet,
+) -> Result<HashNode, DecodeError> {
+    fn anchor(c: &mut Cursor, ref_: &mut GetRef) -> Result<Anchor, DecodeError> {
+        match c.byte()? {
+            0 => Ok(Anchor::Before(ref_(c)?)),
+            1 => Ok(Anchor::After(ref_(c)?)),
+            other => Err(DecodeError::InvalidOpTag(other)),
+        }
     }
-}
-
-fn decode_insert(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
-    let (pins, mut pos) = decode_id_set(bytes)?;
-    let side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-    pos += 1;
-    let (anchor_id, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let (payload, n) = decode_payload(&bytes[pos..])?;
-    pos += n;
-    Ok((
-        HashNode {
-            pins,
-            op: Op::Insert {
-                at: anchor_from(side, anchor_id)?,
-                payload,
-            },
+    let pins = ref_set(c)?;
+    let op = match tag {
+        TAG_INSERT => Op::Insert {
+            at: anchor(c, ref_)?,
+            payload: c.step(decode_payload)?,
         },
-        pos,
-    ))
-}
-
-fn decode_remove(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
-    let (pins, mut pos) = decode_id_set(bytes)?;
-    let (remove_len, n) = decode_varint(&bytes[pos..])?;
-    pos += n;
-    let mut remove_ids = BTreeSet::new();
-    for _ in 0..remove_len {
-        let (id, n) = decode_id(&bytes[pos..])?;
-        remove_ids.insert(id);
-        pos += n;
-    }
-    Ok((
-        HashNode {
-            pins,
-            op: Op::Remove(remove_ids),
+        TAG_REMOVE => Op::Remove(ref_set(c)?),
+        TAG_MOVE => Op::Move {
+            target: ref_(c)?,
+            to: anchor(c, ref_)?,
+            overwrites: ref_set(c)?,
         },
-        pos,
-    ))
-}
-
-fn decode_move(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
-    let (pins, mut pos) = decode_id_set(bytes)?;
-    let (target, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-    pos += 1;
-    let (to_id, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let (overwrites, n) = decode_id_set(&bytes[pos..])?;
-    pos += n;
-    Ok((
-        HashNode {
-            pins,
-            op: Op::Move {
-                target,
-                to: anchor_from(side, to_id)?,
-                overwrites,
-            },
+        TAG_PUT => Op::Put {
+            key: c.step(decode_id)?,
+            value: c.step(decode_id)?,
+            overwrites: ref_set(c)?,
         },
-        pos,
-    ))
-}
-
-fn decode_mark(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
-    let (pins, mut pos) = decode_id_set(bytes)?;
-    let s_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-    pos += 1;
-    let (s_id, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let e_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-    pos += 1;
-    let (e_id, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let (kind_v, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let (value, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let (overwrites, n) = decode_id_set(&bytes[pos..])?;
-    pos += n;
-    Ok((
-        HashNode {
-            pins,
-            op: Op::Mark {
-                start: anchor_from(s_side, s_id)?,
-                end: anchor_from(e_side, e_id)?,
-                kind_v,
-                value,
-                overwrites,
-            },
+        TAG_MARK => Op::Mark {
+            start: anchor(c, ref_)?,
+            end: anchor(c, ref_)?,
+            kind_v: c.step(decode_id)?,
+            value: c.step(decode_id)?,
+            overwrites: ref_set(c)?,
         },
-        pos,
-    ))
-}
-
-fn decode_put(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
-    let (pins, mut pos) = decode_id_set(bytes)?;
-    let (key, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let (value, n) = decode_id(&bytes[pos..])?;
-    pos += n;
-    let (overwrites, n) = decode_id_set(&bytes[pos..])?;
-    pos += n;
-    Ok((
-        HashNode {
-            pins,
-            op: Op::Put {
-                key,
-                value,
-                overwrites,
-            },
-        },
-        pos,
-    ))
+        other => return Err(DecodeError::InvalidOpTag(other)),
+    };
+    Ok(HashNode { pins, op })
 }
 
 // --- Unified operation type for batch encoding ---
@@ -613,50 +569,20 @@ pub fn encode_op(op: &EncodableOp, buf: &mut Vec<u8>) {
 }
 
 pub fn decode_op(bytes: &[u8]) -> Result<(EncodableOp, usize), DecodeError> {
-    if bytes.is_empty() {
-        return Err(DecodeError::UnexpectedEof);
-    }
-
-    let tag = bytes[0];
-    let bytes = &bytes[1..];
-
-    let node = match tag {
-        TAG_RUN => {
-            let (run, size) = decode_run(bytes)?;
-            return Ok((EncodableOp::Run(run), 1 + size));
-        }
-        TAG_INSERT => decode_insert(bytes)?,
-        TAG_REMOVE => decode_remove(bytes)?,
-        TAG_MOVE => decode_move(bytes)?,
-        TAG_PUT => decode_put(bytes)?,
-        TAG_MARK => decode_mark(bytes)?,
-        _ => return Err(DecodeError::InvalidOpTag(tag)),
+    let mut c = Cursor { bytes, pos: 0 };
+    let tag = c.byte()?;
+    let op = if tag == TAG_RUN {
+        EncodableOp::Run(c.step(decode_run)?)
+    } else {
+        let node = decode_node_with(
+            tag,
+            &mut c,
+            &mut |c| c.step(decode_id),
+            &mut |c| c.step(decode_id_set),
+        )?;
+        EncodableOp::Node(node)
     };
-    Ok((EncodableOp::Node(node.0), 1 + node.1))
-}
-
-// --- Batch encoding/decoding ---
-
-pub fn encode_batch(ops: &[EncodableOp]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    encode_varint(ops.len(), &mut buf);
-    for op in ops {
-        encode_op(op, &mut buf);
-    }
-    buf
-}
-
-pub fn decode_batch(bytes: &[u8]) -> Result<Vec<EncodableOp>, DecodeError> {
-    let (count, mut pos) = decode_varint(bytes)?;
-    let mut ops = Vec::with_capacity(count);
-
-    for _ in 0..count {
-        let (op, size) = decode_op(&bytes[pos..])?;
-        ops.push(op);
-        pos += size;
-    }
-
-    Ok(ops)
+    Ok((op, c.pos))
 }
 
 // --- HashSeq encoding/decoding ---
@@ -907,63 +833,66 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // extra_deps) are broken to resolve a cycle.
     let is_run = |b: usize| matches!(blocks[b].payload, Payload::Run(_));
 
+    // Every id-valued position in a block body; `hard` marks remove→target
+    // refs (encoded with no dictionary fallback). A RemoveSpan's target is a
+    // raw run rank, not an id ref — its hard edge is added separately below.
+    let visit_refs = |block: &Block, f: &mut dyn FnMut(&Id, bool)| match &block.payload {
+        Payload::Run(head) => {
+            let run = &seq.runs[head];
+            f(&run.anchor, false);
+            for id in run.first_extra_deps.iter_ids(&seq.ids) {
+                f(&id, false);
+            }
+            for deps in run.interior_extra_deps.values() {
+                for id in deps.iter_ids(&seq.ids) {
+                    f(&id, false);
+                }
+            }
+        }
+        Payload::RemoveSpan {
+            first_extra_deps, ..
+        } => {
+            for id in first_extra_deps {
+                f(id, false);
+            }
+        }
+        Payload::Single { extra_deps, target } => {
+            for id in extra_deps {
+                f(id, false);
+            }
+            f(target, true);
+        }
+        Payload::Other { extra_deps, targets } => {
+            for id in extra_deps {
+                f(id, false);
+            }
+            for t in targets {
+                f(t, true);
+            }
+        }
+    };
+
     let mut indeg = vec![0usize; nb];
     let mut hard_indeg = vec![0usize; nb];
     let mut children: Vec<Vec<(usize, bool)>> = vec![Vec::new(); nb];
     {
-        fn note(parents: &mut FxHashSet<usize>, producer: &FxHashMap<Id, (usize, usize)>, b: usize, id: &Id) {
-            if let Some(&(pb, _)) = producer.get(id)
-                && pb != b
-            {
-                parents.insert(pb);
-            }
-        }
         let mut soft: FxHashSet<usize> = FxHashSet::default();
         let mut hard: FxHashSet<usize> = FxHashSet::default();
         for (b, block) in blocks.iter().enumerate() {
             soft.clear();
             hard.clear();
-            match &block.payload {
-                Payload::Run(head) => {
-                    let run = &seq.runs[head];
-                    note(&mut soft, &producer, b, &run.anchor);
-                    for id in run.first_extra_deps.iter_ids(&seq.ids) {
-                        note(&mut soft, &producer, b, &id);
-                    }
-                    for deps in run.interior_extra_deps.values() {
-                        for id in deps.iter_ids(&seq.ids) {
-                            note(&mut soft, &producer, b, &id);
-                        }
-                    }
+            visit_refs(block, &mut |id, is_hard| {
+                if let Some(&(pb, _)) = producer.get(id)
+                    && pb != b
+                {
+                    if is_hard { &mut hard } else { &mut soft }.insert(pb);
                 }
-                Payload::RemoveSpan {
-                    first_extra_deps,
-                    target_run,
-                    ..
-                } => {
-                    for id in first_extra_deps {
-                        note(&mut soft, &producer, b, id);
-                    }
-                    if let Some(&tb) = run_block.get(target_run)
-                        && tb != b
-                    {
-                        hard.insert(tb);
-                    }
-                }
-                Payload::Single { extra_deps, target } => {
-                    for id in extra_deps {
-                        note(&mut soft, &producer, b, id);
-                    }
-                    note(&mut hard, &producer, b, target);
-                }
-                Payload::Other { extra_deps, targets } => {
-                    for id in extra_deps {
-                        note(&mut soft, &producer, b, id);
-                    }
-                    for t in targets {
-                        note(&mut hard, &producer, b, t);
-                    }
-                }
+            });
+            if let Payload::RemoveSpan { target_run, .. } = &block.payload
+                && let Some(&tb) = run_block.get(target_run)
+                && tb != b
+            {
+                hard.insert(tb);
             }
             for h in &hard {
                 soft.remove(h); // a parent referenced both ways counts as hard
@@ -1056,16 +985,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // sorted by node id for deterministic bytes.
     let orphans: Vec<HashNode> = {
         let mut nodes: Vec<(Id, HashNode)> = seq
-            .orphaned
-            .values()
-            .flatten()
+            .delivery
+            .held()
             .map(|(id, node)| (*id, node.clone()))
             .collect();
         for (idx, mv) in &seq.move_nodes {
             nodes.push((seq.id_of(*idx), seq.move_node(*idx, mv)));
-        }
-        for (id, node) in &seq.gated {
-            nodes.push((*id, node.clone()));
         }
         nodes.sort_by_key(|(id, _)| *id);
         nodes.into_iter().map(|(_, node)| node).collect()
@@ -1077,89 +1002,20 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // unknown nodes. Remove-span targets are raw block indices (never dict).
     let mut id_set: BTreeSet<Id> = BTreeSet::new();
     {
-        let note = |id: &Id, limit: usize, id_set: &mut BTreeSet<Id>| {
+        let mut note = |id: &Id, limit: usize| {
             if resolve(id, limit).is_none() {
                 id_set.insert(*id);
             }
         };
         for (b, block) in blocks.iter().enumerate() {
             let limit = emit_pos[b];
-            match &block.payload {
-                Payload::Run(head) => {
-                    let run = &seq.runs[head];
-                    note(&run.anchor, limit, &mut id_set);
-                    for id in run.first_extra_deps.iter_ids(&seq.ids) {
-                        note(&id, limit, &mut id_set);
-                    }
-                    for deps in run.interior_extra_deps.values() {
-                        for id in deps.iter_ids(&seq.ids) {
-                            note(&id, limit, &mut id_set);
-                        }
-                    }
-                }
-                Payload::RemoveSpan {
-                    first_extra_deps, ..
-                } => {
-                    for id in first_extra_deps {
-                        note(id, limit, &mut id_set);
-                    }
-                }
-                Payload::Single { extra_deps, target } => {
-                    for id in extra_deps {
-                        note(id, limit, &mut id_set);
-                    }
-                    note(target, limit, &mut id_set);
-                }
-                Payload::Other { extra_deps, targets } => {
-                    for id in extra_deps {
-                        note(id, limit, &mut id_set);
-                    }
-                    for t in targets {
-                        note(t, limit, &mut id_set);
-                    }
-                }
-            }
+            visit_refs(block, &mut |id, _| note(id, limit));
         }
+        // Orphan refs are exactly `refs(u)` — value fields (Put key/value,
+        // Mark kind/value) are commitments, not refs, and ride raw 32 B.
         for orphan in &orphans {
-            for dep in &orphan.pins {
-                note(dep, NO_LIMIT, &mut id_set);
-            }
-            match &orphan.op {
-                Op::Insert { at, .. } => note(at.id(), NO_LIMIT, &mut id_set),
-                Op::Remove(ids) => {
-                    for id in ids {
-                        note(id, NO_LIMIT, &mut id_set);
-                    }
-                }
-                Op::Move {
-                    target,
-                    to,
-                    overwrites,
-                } => {
-                    note(target, NO_LIMIT, &mut id_set);
-                    note(to.id(), NO_LIMIT, &mut id_set);
-                    for id in overwrites {
-                        note(id, NO_LIMIT, &mut id_set);
-                    }
-                }
-                // Put key/value are value commitments, not refs — raw 32 B.
-                Op::Put { overwrites, .. } => {
-                    for id in overwrites {
-                        note(id, NO_LIMIT, &mut id_set);
-                    }
-                }
-                Op::Mark {
-                    start,
-                    end,
-                    overwrites,
-                    ..
-                } => {
-                    note(start.id(), NO_LIMIT, &mut id_set);
-                    note(end.id(), NO_LIMIT, &mut id_set);
-                    for id in overwrites {
-                        note(id, NO_LIMIT, &mut id_set);
-                    }
-                }
+            for id in orphan.iter_refs() {
+                note(id, NO_LIMIT);
             }
         }
     }
@@ -1292,166 +1148,100 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     }
 
-    // Orphans and gated nodes (tagged, with ref-encoded IDs; payloads and
-    // Put key/value ride raw — values are not references)
+    // Orphans and gated nodes: the shared node layout with ref-encoded IDs.
     encode_varint(orphans.len(), &mut buf);
     for orphan in &orphans {
-        match &orphan.op {
-            Op::Insert { at, payload } => {
-                buf.push(TAG_INSERT);
-                encode_ref_set(&orphan.pins, NO_LIMIT, &mut buf);
-                buf.push(at.side_bit() as u8);
-                encode_ref(at.id(), NO_LIMIT, &mut buf);
-                encode_payload(payload, &mut buf);
-            }
-            Op::Remove(ids) => {
-                buf.push(TAG_REMOVE);
-                encode_ref_set(&orphan.pins, NO_LIMIT, &mut buf);
-                encode_varint(ids.len(), &mut buf);
-                for id in ids {
-                    encode_ref(id, NO_LIMIT, &mut buf);
-                }
-            }
-            Op::Move {
-                target,
-                to,
-                overwrites,
-            } => {
-                buf.push(TAG_MOVE);
-                encode_ref_set(&orphan.pins, NO_LIMIT, &mut buf);
-                encode_ref(target, NO_LIMIT, &mut buf);
-                buf.push(to.side_bit() as u8);
-                encode_ref(to.id(), NO_LIMIT, &mut buf);
-                encode_ref_set(overwrites, NO_LIMIT, &mut buf);
-            }
-            Op::Put {
-                key,
-                value,
-                overwrites,
-            } => {
-                buf.push(TAG_PUT);
-                encode_ref_set(&orphan.pins, NO_LIMIT, &mut buf);
-                encode_id(key, &mut buf);
-                encode_id(value, &mut buf);
-                encode_ref_set(overwrites, NO_LIMIT, &mut buf);
-            }
-            Op::Mark {
-                start,
-                end,
-                kind_v,
-                value,
-                overwrites,
-            } => {
-                buf.push(TAG_MARK);
-                encode_ref_set(&orphan.pins, NO_LIMIT, &mut buf);
-                buf.push(start.side_bit() as u8);
-                encode_ref(start.id(), NO_LIMIT, &mut buf);
-                buf.push(end.side_bit() as u8);
-                encode_ref(end.id(), NO_LIMIT, &mut buf);
-                encode_id(kind_v, &mut buf);
-                encode_id(value, &mut buf);
-                encode_ref_set(overwrites, NO_LIMIT, &mut buf);
-            }
-        }
+        encode_node_with(
+            orphan,
+            &mut buf,
+            &mut |id, buf| encode_ref(id, NO_LIMIT, buf),
+            &mut |ids, buf| encode_ref_set(ids, NO_LIMIT, buf),
+        );
     }
 
     buf
 }
 
-/// Resolve a wire `ref`: low bit 1 = positional (run_idx, elem_idx) into the
-/// already-decoded run elements; low bit 0 = dictionary index.
-fn decode_ref(
-    bytes: &[u8],
-    id_list: &[Id],
-    run_elems: &[Vec<Id>],
-    remove_ids: &[Vec<Id>],
-) -> Result<(Id, usize), DecodeError> {
-    let (v, mut size) = decode_varint(bytes)?;
-    if v & 1 == 1 {
-        // run element: (run_rank, offset)
-        let rank = v >> 1;
-        let (off, s) = decode_varint(&bytes[size..])?;
-        size += s;
-        let id = run_elems
+/// Decoded ids addressable by positional refs, by within-kind rank in emit
+/// order: a run block appends its element ids to `runs`, a remove block its
+/// remove-op ids to `removes`.
+struct Ranks {
+    runs: Vec<Vec<Id>>,
+    removes: Vec<Vec<Id>>,
+}
+
+impl Ranks {
+    fn run_elem(&self, rank: usize, off: usize) -> Result<Id, DecodeError> {
+        self.runs
             .get(rank)
             .and_then(|e| e.get(off))
             .copied()
-            .ok_or(DecodeError::InvalidIdIndex(rank))?;
-        Ok((id, size))
-    } else if v & 2 == 0 {
-        // dictionary index
-        let idx = v >> 2;
-        let id = id_list
-            .get(idx)
-            .copied()
-            .ok_or(DecodeError::InvalidIdIndex(idx))?;
-        Ok((id, size))
-    } else {
-        // remove op: (remove_rank, offset)
-        let rank = v >> 2;
-        let (off, s) = decode_varint(&bytes[size..])?;
-        size += s;
-        let id = remove_ids
-            .get(rank)
-            .and_then(|e| e.get(off))
-            .copied()
-            .ok_or(DecodeError::InvalidIdIndex(rank))?;
-        Ok((id, size))
+            .ok_or(DecodeError::InvalidIdIndex(rank))
     }
 }
 
-fn decode_ref_set(
-    bytes: &[u8],
-    id_list: &[Id],
-    run_elems: &[Vec<Id>],
-    remove_ids: &[Vec<Id>],
-) -> Result<(BTreeSet<Id>, usize), DecodeError> {
-    let (count, mut pos) = decode_varint(bytes)?;
+/// Resolve a wire `ref`: `xxx1` run element (rank, offset); `xx00` dictionary
+/// index; `xx10` remove op (rank, offset).
+fn decode_ref(c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Result<Id, DecodeError> {
+    let v = c.step(decode_varint)?;
+    ref_from_head(v, c, id_list, ranks)
+}
+
+/// The tail of a ref whose head varint is already consumed (`BLK_REMOVE_OTHER`
+/// segment heads reuse the ref forms, with run-element heads meaning a range).
+fn ref_from_head(v: usize, c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Result<Id, DecodeError> {
+    if v & 1 == 1 {
+        let off = c.step(decode_varint)?;
+        ranks.run_elem(v >> 1, off)
+    } else if v & 2 == 0 {
+        id_list
+            .get(v >> 2)
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(v >> 2))
+    } else {
+        let off = c.step(decode_varint)?;
+        ranks
+            .removes
+            .get(v >> 2)
+            .and_then(|e| e.get(off))
+            .copied()
+            .ok_or(DecodeError::InvalidIdIndex(v >> 2))
+    }
+}
+
+fn decode_ref_set(c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Result<BTreeSet<Id>, DecodeError> {
+    let count = c.step(decode_varint)?;
     let mut ids = BTreeSet::new();
     for _ in 0..count {
-        let (id, size) = decode_ref(&bytes[pos..], id_list, run_elems, remove_ids)?;
-        ids.insert(id);
-        pos += size;
+        ids.insert(decode_ref(c, id_list, ranks)?);
     }
-    Ok((ids, pos))
+    Ok(ids)
 }
 
 /// Decode a HashSeq from its byte representation.
 pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
-    let mut pos = 0;
+    let mut c = Cursor { bytes, pos: 0 };
 
     // Origin header (also the implicit first dictionary entry)
-    let (origin, size) = decode_id(bytes)?;
-    pos += size;
-
-    // Read dictionary
-    let (num_ids, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
-
+    let origin = c.step(decode_id)?;
+    let num_ids = c.step(decode_varint)?;
     let mut id_list: Vec<Id> = Vec::with_capacity(num_ids + 1);
     id_list.push(origin);
     for _ in 0..num_ids {
-        let (id, size) = decode_id(&bytes[pos..])?;
-        id_list.push(id);
-        pos += size;
+        id_list.push(c.step(decode_id)?);
     }
 
     let mut seq = HashSeq::new(origin);
-    // Decoded ids by within-kind rank, in emit order: a run block appends its
-    // element ids to `run_elems`, a remove block its remove-op ids to
-    // `remove_ids`. Positional refs index one of these arrays (the ref's low
-    // bits pick which); refs always point at an earlier block of that kind.
-    let mut run_elems: Vec<Vec<Id>> = Vec::new();
-    let mut remove_ids: Vec<Vec<Id>> = Vec::new();
+    // Positional refs index `ranks` by within-kind rank (the ref's low bits
+    // pick which kind); refs always point at an earlier block of that kind.
+    let mut ranks = Ranks {
+        runs: Vec::new(),
+        removes: Vec::new(),
+    };
 
-    let (num_blocks, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
+    let num_blocks = c.step(decode_varint)?;
     for _ in 0..num_blocks {
-        if pos >= bytes.len() {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        let tag = bytes[pos];
-        pos += 1;
+        let tag = c.byte()?;
         match tag {
             BLK_RUN_AFTER | BLK_RUN_BEFORE => {
                 let first_op = if tag == BLK_RUN_AFTER {
@@ -1459,35 +1249,13 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 } else {
                     crate::run::FirstOp::Before
                 };
-                let (anchor, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (first_extra_deps, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (run_str, size) = decode_string(&bytes[pos..])?;
-                pos += size;
-
-                let (num_interior, size) = decode_varint(&bytes[pos..])?;
-                pos += size;
-                let mut interior_extra_deps = BTreeMap::new();
-                for _ in 0..num_interior {
-                    let (offset, size) = decode_varint(&bytes[pos..])?;
-                    pos += size;
-                    let (deps, size) =
-                        decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                    pos += size;
-                    interior_extra_deps.insert(offset, deps);
-                }
-
-                let run = Run::from_text(
-                    anchor,
+                let run = decode_run_with(
+                    &mut c,
                     first_op,
-                    first_extra_deps,
-                    &run_str,
-                    interior_extra_deps,
-                )
-                .ok_or(DecodeError::EmptyRun)?;
-                run_elems.push(run.elements.clone());
+                    &mut |c| decode_ref(c, &id_list, &ranks),
+                    &mut |c| decode_ref_set(c, &id_list, &ranks),
+                )?;
+                ranks.runs.push(run.elements.clone());
                 // `from_text` computed the element ids from the wire content —
                 // the authoritative derivation, so apply without rehashing.
                 for (id, node) in run.decompress_with_ids() {
@@ -1499,18 +1267,12 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 // the target run's elements, each depending on the previous.
                 // Forward walks the span ascending (delete-key bursts),
                 // backward descending (backspace bursts).
-                let backwards = tag == BLK_REMOVE_BWD;
-                let (first_extra_deps, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (target_run, size) = decode_varint(&bytes[pos..])?;
-                pos += size;
-                let (start_idx, size) = decode_varint(&bytes[pos..])?;
-                pos += size;
-                let (end_idx, size) = decode_varint(&bytes[pos..])?;
-                pos += size;
+                let first_extra_deps = decode_ref_set(&mut c, &id_list, &ranks)?;
+                let target_run = c.step(decode_varint)?;
+                let start_idx = c.step(decode_varint)?;
+                let end_idx = c.step(decode_varint)?;
 
-                let span: Vec<usize> = if backwards {
+                let span: Vec<usize> = if tag == BLK_REMOVE_BWD {
                     (end_idx..=start_idx).rev().collect()
                 } else {
                     (start_idx..=end_idx).collect()
@@ -1518,17 +1280,13 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 let mut exposed = Vec::with_capacity(span.len());
                 let mut prev_remove_id: Option<Id> = None;
                 for elem_idx in span {
-                    let removed_id = run_elems
-                        .get(target_run)
-                        .and_then(|e| e.get(elem_idx))
-                        .copied()
-                        .ok_or(DecodeError::InvalidIdIndex(elem_idx))?;
-                    let extra_deps = match prev_remove_id {
+                    let removed_id = ranks.run_elem(target_run, elem_idx)?;
+                    let pins = match prev_remove_id {
                         Some(prev_id) => BTreeSet::from_iter([prev_id]),
                         None => first_extra_deps.clone(),
                     };
                     let node = HashNode {
-                        pins: extra_deps,
+                        pins,
                         op: Op::Remove(BTreeSet::from_iter([removed_id])),
                     };
                     let id = node.id();
@@ -1536,212 +1294,61 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     exposed.push(id);
                     seq.apply_with_id(id, node);
                 }
-                remove_ids.push(exposed);
+                ranks.removes.push(exposed);
             }
             BLK_REMOVE_SINGLE => {
-                let (extra_deps, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (target, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
+                let pins = decode_ref_set(&mut c, &id_list, &ranks)?;
+                let target = decode_ref(&mut c, &id_list, &ranks)?;
                 let node = HashNode {
-                    pins: extra_deps,
+                    pins,
                     op: Op::Remove(std::iter::once(target).collect()),
                 };
                 let id = node.id();
-                remove_ids.push(vec![id]);
+                ranks.removes.push(vec![id]);
                 seq.apply_with_id(id, node);
             }
             BLK_REMOVE_OTHER => {
-                let (extra_deps, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (num_segments, size) = decode_varint(&bytes[pos..])?;
-                pos += size;
+                let pins = decode_ref_set(&mut c, &id_list, &ranks)?;
+                let num_segments = c.step(decode_varint)?;
                 let mut targets = BTreeSet::new();
                 // Each segment's head reuses the ref low bits (mirrors emit):
-                // `xxx1` run-element range (rank, off, count); `xx00` dict
-                // singleton; `xx10` remove-op singleton.
+                // a run-element head means a range (rank, off, count); dict and
+                // remove-op heads decode as plain ref tails.
                 for _ in 0..num_segments {
-                    let (head, size) = decode_varint(&bytes[pos..])?;
-                    pos += size;
+                    let head = c.step(decode_varint)?;
                     if head & 1 == 1 {
-                        let rank = head >> 1;
-                        let (off, size) = decode_varint(&bytes[pos..])?;
-                        pos += size;
-                        let (count, size) = decode_varint(&bytes[pos..])?;
-                        pos += size;
-                        let run = run_elems
-                            .get(rank)
-                            .ok_or(DecodeError::InvalidIdIndex(rank))?;
+                        let off = c.step(decode_varint)?;
+                        let count = c.step(decode_varint)?;
                         for i in off..off + count {
-                            targets.insert(
-                                run.get(i).copied().ok_or(DecodeError::InvalidIdIndex(i))?,
-                            );
+                            targets.insert(ranks.run_elem(head >> 1, i)?);
                         }
-                    } else if head & 2 == 0 {
-                        let idx = head >> 2;
-                        targets.insert(
-                            id_list.get(idx).copied().ok_or(DecodeError::InvalidIdIndex(idx))?,
-                        );
                     } else {
-                        let rank = head >> 2;
-                        let (off, size) = decode_varint(&bytes[pos..])?;
-                        pos += size;
-                        targets.insert(
-                            remove_ids
-                                .get(rank)
-                                .and_then(|e| e.get(off))
-                                .copied()
-                                .ok_or(DecodeError::InvalidIdIndex(rank))?,
-                        );
+                        targets.insert(ref_from_head(head, &mut c, &id_list, &ranks)?);
                     }
                 }
                 let node = HashNode {
-                    pins: extra_deps,
+                    pins,
                     op: Op::Remove(targets),
                 };
                 let id = node.id();
-                remove_ids.push(vec![id]);
+                ranks.removes.push(vec![id]);
                 seq.apply_with_id(id, node);
             }
             other => return Err(DecodeError::InvalidOpTag(other)),
         }
     }
 
-    // Orphans (tagged)
-    let (num_orphans, size) = decode_varint(&bytes[pos..])?;
-    pos += size;
+    // Orphans and gated nodes: the shared node layout with ref-encoded IDs.
+    let num_orphans = c.step(decode_varint)?;
     for _ in 0..num_orphans {
-        if pos >= bytes.len() {
-            return Err(DecodeError::UnexpectedEof);
-        }
-        let tag = bytes[pos];
-        pos += 1;
-        match tag {
-            TAG_INSERT => {
-                let (pins, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-                pos += 1;
-                let (id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (payload, size) = decode_payload(&bytes[pos..])?;
-                pos += size;
-                let at = match side {
-                    0 => Anchor::Before(id),
-                    1 => Anchor::After(id),
-                    other => return Err(DecodeError::InvalidOpTag(other)),
-                };
-                seq.apply(HashNode {
-                    pins,
-                    op: Op::Insert { at, payload },
-                });
-            }
-            TAG_REMOVE => {
-                let (pins, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (count, size) = decode_varint(&bytes[pos..])?;
-                pos += size;
-                let mut removed_ids = BTreeSet::new();
-                for _ in 0..count {
-                    let (id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                    pos += size;
-                    removed_ids.insert(id);
-                }
-                seq.apply(HashNode {
-                    pins,
-                    op: Op::Remove(removed_ids),
-                });
-            }
-            TAG_MOVE => {
-                let (pins, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (target, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-                pos += 1;
-                let (to_id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (overwrites, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let to = match side {
-                    0 => Anchor::Before(to_id),
-                    1 => Anchor::After(to_id),
-                    other => return Err(DecodeError::InvalidOpTag(other)),
-                };
-                seq.apply(HashNode {
-                    pins,
-                    op: Op::Move {
-                        target,
-                        to,
-                        overwrites,
-                    },
-                });
-            }
-            TAG_PUT => {
-                let (pins, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (key, size) = decode_id(&bytes[pos..])?;
-                pos += size;
-                let (value, size) = decode_id(&bytes[pos..])?;
-                pos += size;
-                let (overwrites, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                seq.apply(HashNode {
-                    pins,
-                    op: Op::Put {
-                        key,
-                        value,
-                        overwrites,
-                    },
-                });
-            }
-            TAG_MARK => {
-                let (pins, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let s_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-                pos += 1;
-                let (s_id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let e_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
-                pos += 1;
-                let (e_id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let (kind_v, size) = decode_id(&bytes[pos..])?;
-                pos += size;
-                let (value, size) = decode_id(&bytes[pos..])?;
-                pos += size;
-                let (overwrites, size) =
-                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
-                pos += size;
-                let mk = |side: u8, id: Id| -> Result<Anchor, DecodeError> {
-                    match side {
-                        0 => Ok(Anchor::Before(id)),
-                        1 => Ok(Anchor::After(id)),
-                        other => Err(DecodeError::InvalidOpTag(other)),
-                    }
-                };
-                seq.apply(HashNode {
-                    pins,
-                    op: Op::Mark {
-                        start: mk(s_side, s_id)?,
-                        end: mk(e_side, e_id)?,
-                        kind_v,
-                        value,
-                        overwrites,
-                    },
-                });
-            }
-            other => return Err(DecodeError::InvalidOpTag(other)),
-        }
+        let tag = c.byte()?;
+        let node = decode_node_with(
+            tag,
+            &mut c,
+            &mut |c| decode_ref(c, &id_list, &ranks),
+            &mut |c| decode_ref_set(c, &id_list, &ranks),
+        )?;
+        seq.apply(node);
     }
 
     Ok(seq)
@@ -1836,89 +1443,54 @@ mod tests {
         assert_eq!(size, buf.len());
     }
 
-    #[test]
-    fn test_origin_anchored_insert_roundtrip() {
+    fn node_roundtrips(pins: impl IntoIterator<Item = Id>, op: Op) {
         let node = HashNode {
-            pins: BTreeSet::new(),
-            op: Op::insert_after(Id::default(), 'a'),
+            pins: pins.into_iter().collect(),
+            op,
         };
-
         let mut buf = Vec::new();
         encode_hash_node(&node, &mut buf);
-
         let (decoded, size) = decode_op(&buf).unwrap();
         assert_eq!(decoded, EncodableOp::Node(node));
         assert_eq!(size, buf.len());
     }
 
+    /// Every op kind's standalone wire form roundtrips through the shared
+    /// node layout, with and without pins.
     #[test]
-    fn test_insert_before_roundtrip() {
-        let node = HashNode {
-            pins: BTreeSet::new(),
-            op: Op::insert_before(test_id(5), 'z'),
-        };
-
-        let mut buf = Vec::new();
-        encode_hash_node(&node, &mut buf);
-
-        let (decoded, size) = decode_op(&buf).unwrap();
-        assert_eq!(decoded, EncodableOp::Node(node));
-        assert_eq!(size, buf.len());
-    }
-
-    #[test]
-    fn test_remove_roundtrip() {
-        let mut remove_ids = BTreeSet::new();
-        remove_ids.insert(test_id(1));
-        remove_ids.insert(test_id(2));
-        remove_ids.insert(test_id(3));
-
-        let node = HashNode {
-            pins: BTreeSet::new(),
-            op: Op::Remove(remove_ids),
-        };
-
-        let mut buf = Vec::new();
-        encode_hash_node(&node, &mut buf);
-
-        let (decoded, size) = decode_op(&buf).unwrap();
-        assert_eq!(decoded, EncodableOp::Node(node));
-        assert_eq!(size, buf.len());
-    }
-
-    #[test]
-    fn test_batch_roundtrip() {
-        let anchor = test_id(0);
-        let mut run = Run::new(anchor, BTreeSet::new(), 'h');
-        run.extend('e');
-        run.extend('l');
-        run.extend('l');
-        run.extend('o');
-
-        let ops = vec![
-            EncodableOp::Node(HashNode {
-                pins: BTreeSet::new(),
-                op: Op::insert_after(Id::default(), 'a'),
-            }),
-            EncodableOp::Run(run),
-            EncodableOp::Node(HashNode {
-                pins: BTreeSet::new(),
-                op: Op::insert_before(test_id(10), 'x'),
-            }),
-        ];
-
-        let encoded = encode_batch(&ops);
-        let decoded = decode_batch(&encoded).unwrap();
-
-        assert_eq!(decoded, ops);
-    }
-
-    #[test]
-    fn test_empty_batch() {
-        let ops: Vec<EncodableOp> = vec![];
-        let encoded = encode_batch(&ops);
-        let decoded = decode_batch(&encoded).unwrap();
-        assert_eq!(decoded, ops);
+    fn test_standalone_node_forms_roundtrip() {
+        node_roundtrips([], Op::insert_after(Id::default(), 'a'));
+        node_roundtrips([test_id(9)], Op::insert_before(test_id(5), 'z'));
+        node_roundtrips(
+            [],
+            Op::Remove([test_id(1), test_id(2), test_id(3)].into()),
+        );
+        node_roundtrips(
+            [test_id(9)],
+            Op::Move {
+                target: test_id(1),
+                to: Anchor::After(test_id(2)),
+                overwrites: [test_id(3)].into(),
+            },
+        );
+        node_roundtrips(
+            [],
+            Op::Put {
+                key: test_id(4),
+                value: test_id(5),
+                overwrites: [test_id(6), test_id(7)].into(),
+            },
+        );
+        node_roundtrips(
+            [test_id(9)],
+            Op::Mark {
+                start: Anchor::Before(test_id(1)),
+                end: Anchor::After(test_id(2)),
+                kind_v: test_id(3),
+                value: test_id(4),
+                overwrites: [].into(),
+            },
+        );
     }
 
     #[test]
@@ -1933,21 +1505,6 @@ mod tests {
 
         let (decoded, size) = decode_run(&buf).unwrap();
         assert_eq!(decoded, run);
-        assert_eq!(size, buf.len());
-    }
-
-    #[test]
-    fn test_insert_after_roundtrip() {
-        let node = HashNode {
-            pins: BTreeSet::new(),
-            op: Op::insert_after(test_id(5), 'z'),
-        };
-
-        let mut buf = Vec::new();
-        encode_hash_node(&node, &mut buf);
-
-        let (decoded, size) = decode_op(&buf).unwrap();
-        assert_eq!(decoded, EncodableOp::Node(node));
         assert_eq!(size, buf.len());
     }
 
@@ -2122,56 +1679,32 @@ mod tests {
         assert_eq!(encode_hashseq(&decoded), encoded);
     }
 
-    #[quickcheck]
-    fn prop_hashseq_roundtrip_preserves_content(ops: Vec<(bool, u8, char)>) -> bool {
+    /// Drive a seq from fuzz ops: (insert?, index, char), indices clamped.
+    fn seq_from_ops(ops: &[(bool, u8, char)]) -> HashSeq {
         let mut seq = HashSeq::default();
-
-        for (is_insert, idx, ch) in ops {
+        for &(is_insert, idx, ch) in ops {
             let idx = idx as usize;
             if is_insert {
-                let insert_idx = if seq.is_empty() {
-                    0
-                } else {
-                    idx % (seq.len() + 1)
-                };
-                seq.insert(insert_idx, ch);
+                let at = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                seq.insert(at, ch);
             } else if !seq.is_empty() {
-                let remove_idx = idx % seq.len();
-                seq.remove(remove_idx);
+                seq.remove(idx % seq.len());
             }
         }
+        seq
+    }
 
-        let original_str: String = seq.iter().collect();
-
-        let encoded = encode_hashseq(&seq);
-        let decoded = decode_hashseq(&encoded).unwrap();
-
-        original_str == decoded.iter().collect::<String>()
+    #[quickcheck]
+    fn prop_hashseq_roundtrip_preserves_content(ops: Vec<(bool, u8, char)>) -> bool {
+        let seq = seq_from_ops(&ops);
+        let decoded = decode_hashseq(&encode_hashseq(&seq)).unwrap();
+        seq.iter().collect::<String>() == decoded.iter().collect::<String>()
     }
 
     #[quickcheck]
     fn prop_hashseq_roundtrip_preserves_equality(ops: Vec<(bool, u8, char)>) -> bool {
-        let mut seq = HashSeq::default();
-
-        for (is_insert, idx, ch) in ops {
-            let idx = idx as usize;
-            if is_insert {
-                let insert_idx = if seq.is_empty() {
-                    0
-                } else {
-                    idx % (seq.len() + 1)
-                };
-                seq.insert(insert_idx, ch);
-            } else if !seq.is_empty() {
-                let remove_idx = idx % seq.len();
-                seq.remove(remove_idx);
-            }
-        }
-
-        let encoded = encode_hashseq(&seq);
-        let decoded = decode_hashseq(&encoded).unwrap();
-
-        seq == decoded
+        let seq = seq_from_ops(&ops);
+        seq == decode_hashseq(&encode_hashseq(&seq)).unwrap()
     }
 
     /// Encoding the same logical state twice must produce bit-identical bytes,
@@ -2179,26 +1712,9 @@ mod tests {
     /// Decoded seqs use fresh `HashMap`s, so this round-trip is a real cross-seed test.
     #[quickcheck]
     fn prop_encoding_is_deterministic(ops: Vec<(bool, u8, char)>) -> bool {
-        let mut seq = HashSeq::default();
-
-        for (is_insert, idx, ch) in ops {
-            let idx = idx as usize;
-            if is_insert {
-                let insert_idx = if seq.is_empty() {
-                    0
-                } else {
-                    idx % (seq.len() + 1)
-                };
-                seq.insert(insert_idx, ch);
-            } else if !seq.is_empty() {
-                let remove_idx = idx % seq.len();
-                seq.remove(remove_idx);
-            }
-        }
-
+        let seq = seq_from_ops(&ops);
         let first = encode_hashseq(&seq);
-        let decoded = decode_hashseq(&first).unwrap();
-        let second = encode_hashseq(&decoded);
+        let second = encode_hashseq(&decode_hashseq(&first).unwrap());
         first == second
     }
 

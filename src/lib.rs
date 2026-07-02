@@ -1,4 +1,5 @@
 pub mod bitset;
+pub mod delivery;
 pub mod encoding;
 pub mod hash_node;
 pub mod hashkv;
@@ -10,9 +11,7 @@ mod run_index;
 pub mod value;
 pub mod wasm;
 
-pub use self::encoding::{
-    DecodeError, EncodableOp, decode_batch, decode_hashseq, encode_batch, encode_hashseq,
-};
+pub use self::encoding::{DecodeError, EncodableOp, decode_hashseq, encode_hashseq};
 pub use self::hash_node::{Anchor, HashNode, Op, Payload};
 pub use self::hashkv::{HashKv, Read};
 pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};

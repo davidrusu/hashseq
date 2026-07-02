@@ -10,12 +10,11 @@
 //! out-of-band), and any object is a complete replica root from its own
 //! perspective.
 
-use std::collections::HashMap;
-
 use rustc_hash::FxHashMap;
 
 use crate::hashkv::HashKv;
-use crate::hashseq::{IdMap, IdSet};
+use crate::hashseq::IdMap;
+use crate::delivery::Delivery;
 use crate::value::{NEW_MAP, NEW_SEQ, Value, object_id};
 use crate::{HashNode, HashSeq, Id, Op, Payload};
 
@@ -46,14 +45,12 @@ pub struct HashWeb {
     /// node id -> the origin id of the object it belongs to (the routing
     /// table — replica-local, derived, never on the wire).
     node_home: IdMap<Id>,
-    /// Global orphan buffering: refs cross objects at creation bridges, so
-    /// parking is document-wide; each object's own buffer stays empty.
-    orphaned: HashMap<Id, Vec<(Id, HashNode)>>,
-    orphan_ids: IdSet,
-    /// The composition-level gate: ops whose refs determine no single
-    /// object, or whose kind the routed object does not admit, quarantine
-    /// here or in their object (both re-presented on merge).
-    pub gated: IdMap<HashNode>,
+    /// Document-wide delivery: refs cross objects at creation bridges, so
+    /// parking is global (each object's own buffer stays empty). The gate
+    /// here holds ops whose refs determine no single object; kind-vs-object
+    /// verdicts quarantine in their routed object instead. Both re-present
+    /// on merge.
+    pub(crate) delivery: Delivery,
     /// Value-artifact side store shared across objects.
     values: IdMap<Vec<u8>>,
 }
@@ -91,9 +88,7 @@ impl HashWeb {
             root: doc_id,
             objects,
             node_home: IdMap::default(),
-            orphaned: HashMap::new(),
-            orphan_ids: IdSet::default(),
-            gated: IdMap::default(),
+            delivery: Delivery::default(),
             values: IdMap::default(),
         }
     }
@@ -255,15 +250,12 @@ impl HashWeb {
         self.apply_with_id(id, node);
     }
 
+    /// Apply with a pre-computed id (`id` must be the node's true hash).
+    /// Iterative worklist: applying a node wakes exactly the orphans parked
+    /// on its id.
     pub fn apply_with_id(&mut self, id: Id, node: HashNode) {
-        debug_assert_eq!(id, node.id());
-        if self.contains(&id) {
-            return;
-        }
-        if !self.orphan_ids.is_empty() && self.orphan_ids.contains(&id) {
-            return;
-        }
-        if !self.gated.is_empty() && self.gated.contains_key(&id) {
+        debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
+        if self.contains(&id) || self.delivery.holds(&id) {
             return;
         }
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
@@ -273,24 +265,36 @@ impl HashWeb {
         }
     }
 
+    /// One step of the worklist. Parking is document-wide: origin ids count
+    /// as present once their object exists (the derive-and-wake in
+    /// `interpret` makes that true). A gated node wakes nothing — its
+    /// dependents stay parked (the quarantine cascade).
     fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
-        // Global buffering: park on the first ref not present anywhere in
-        // the document (origin ids count as present once their object
-        // exists — the derive-and-wake below makes that true).
         let missing = node.iter_refs().find(|d| !self.contains(d)).copied();
         if let Some(missing) = missing {
-            self.orphan_ids.insert(id);
-            self.orphaned.entry(missing).or_default().push((id, node));
+            self.delivery.park(missing, id, node);
             return;
         }
-        if !self.orphan_ids.is_empty() {
-            self.orphan_ids.remove(&id);
+        self.delivery.unpark(&id);
+        match self.interpret(id, node, queue) {
+            Ok(()) => self.delivery.wake(&id, queue),
+            Err(node) => self.delivery.gate(id, node),
         }
+    }
 
+    /// Interpret one node whose refs are all present — routing, creation,
+    /// and dispatch to the routed object. `Err` hands the node back for
+    /// quarantine (refs spanning objects).
+    #[allow(clippy::result_large_err)]
+    fn interpret(
+        &mut self,
+        id: Id,
+        node: HashNode,
+        queue: &mut Vec<(Id, HashNode)>,
+    ) -> Result<(), HashNode> {
         // Routing (stable gate on refs spanning objects).
         let Some(home) = self.route(&node) else {
-            self.gated.insert(id, node);
-            return;
+            return Err(node);
         };
 
         // Creation: an op whose payload/value is a creation artifact births
@@ -328,18 +332,9 @@ impl HashWeb {
             });
             // Derive-and-wake: the origin id just became present; wake any
             // ops parked on it (no inversion needed — we derived it).
-            if !self.orphaned.is_empty()
-                && let Some(waiting) = self.orphaned.remove(&child)
-            {
-                queue.extend(waiting);
-            }
+            self.delivery.wake(&child, queue);
         }
-
-        if !self.orphaned.is_empty()
-            && let Some(waiting) = self.orphaned.remove(&id)
-        {
-            queue.extend(waiting);
-        }
+        Ok(())
     }
 
     pub fn merge(&mut self, other: Self) {
@@ -363,16 +358,13 @@ impl HashWeb {
                 self.apply_with_id(id, node);
             }
         }
-        for (id, node) in other.orphaned.into_values().flatten() {
-            self.apply_with_id(id, node);
-        }
-        for (id, node) in other.gated {
+        for (id, node) in other.delivery.into_held() {
             self.apply_with_id(id, node);
         }
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
-        self.orphaned.values().flatten().map(|(_, node)| node)
+        self.delivery.orphans()
     }
 }
 
@@ -487,7 +479,7 @@ mod tests {
             op: Op::Remove([a0, b0].into_iter().collect()),
         };
         doc.apply(node);
-        assert_eq!(doc.gated.len(), 1);
+        assert_eq!(doc.delivery.gated.len(), 1);
         assert_eq!(doc.text(&a).unwrap(), "a"); // untouched
         assert_eq!(doc.text(&b).unwrap(), "b");
     }

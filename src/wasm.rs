@@ -38,24 +38,32 @@ fn first_char(s: &str) -> Result<char, JsValue> {
         .ok_or_else(|| JsValue::from_str("expected non-empty string"))
 }
 
-/// Minimal JSON string escaping (we hand-roll the structure dump to avoid pulling
-/// serde_json into the wasm build).
-fn push_json_str(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+/// One box in the `structure_json` dump; field names are the wire contract
+/// with the visualizer.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructureNode {
+    id: String,
+    kind: &'static str,
+    text: String,
+    parent: Option<String>,
+    parent_offset: Option<usize>,
+    rel: Option<&'static str>,
+    removed: bool,
+    removed_mask: String,
+    deps: Vec<StructureDep>,
+}
+
+#[derive(serde::Serialize)]
+struct StructureDep {
+    r#box: String,
+    off: usize,
+}
+
+#[derive(serde::Serialize)]
+struct Structure {
+    tips: Vec<String>,
+    nodes: Vec<StructureNode>,
 }
 
 fn collect_deps(hex_deps: Vec<String>) -> Result<std::collections::BTreeSet<Id>, JsValue> {
@@ -243,147 +251,72 @@ impl WasmHashSeq {
     #[wasm_bindgen(js_name = structureJson)]
     pub fn structure_json(&self) -> String {
         let s = &self.inner;
-        // Map any element id to the id of the box (run head or root) it belongs
-        // to; anchors may point at interior run elements.
-        let resolve = |id: &Id| -> Id {
-            match s.idx_of(id).map(|i| s.loc_of(i)) {
-                Some(Loc::Run { run, .. }) => s.id_of(run),
-                _ => *id,
-            }
-        };
-
-        let mut out = String::from("{\"tips\":[");
-        for (i, t) in s.tips().iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            push_json_str(&mut out, &id_to_hex(t));
-        }
-        out.push_str("],\"nodes\":[");
-
-        // Resolve a set of dependency ids to (box, offset-within-box) — an
-        // anchor may point at an interior run element, and so may an extra-dep
-        // (e.g. a mid-run insert depends on the run's *tip*, a different element
-        // of the same box than its anchor). Keeping the offset lets the edge
-        // attach to the right character instead of being mistaken for the
-        // anchor edge and dropped. Deduped by (box, offset).
-        let resolve_with_off = |id: &Id| -> (Id, usize) {
+        // Resolve any element id to (its box id, element offset within the
+        // box): anchors may point at interior run elements (befores don't
+        // split runs), and so may extra-deps (a mid-run insert depends on the
+        // run's *tip*, a different element of the same box than its anchor).
+        // Keeping the offset lets each edge attach to the right character.
+        let resolve = |id: &Id| -> (Id, usize) {
             match s.idx_of(id).map(|i| s.loc_of(i)) {
                 Some(Loc::Run { run, pos }) => (s.id_of(run), pos as usize),
                 _ => (*id, 0),
             }
         };
-        let resolve_deps = |set: &std::collections::BTreeSet<Id>| -> Vec<(Id, usize)> {
-            let mut seen = std::collections::BTreeSet::new();
-            set.iter()
-                .map(&resolve_with_off)
-                .filter(|bo| seen.insert(*bo))
-                .collect()
-        };
 
-        let mut first = true;
-        {
-            let mut emit = |id: &Id,
-                            kind: &str,
-                            text: &str,
-                            parent: Option<(Id, usize)>,
-                            rel: Option<&str>,
-                            removed: bool,
-                            removed_mask: &str,
-                            deps: &[(Id, usize)]| {
-                if !first {
-                    out.push(',');
-                }
-                first = false;
-                out.push_str("{\"id\":");
-                push_json_str(&mut out, &id_to_hex(id));
-                out.push_str(",\"kind\":\"");
-                out.push_str(kind);
-                out.push_str("\",\"text\":");
-                push_json_str(&mut out, text);
-                out.push_str(",\"parent\":");
-                match parent {
-                    Some((p, _)) => push_json_str(&mut out, &id_to_hex(&p)),
-                    None => out.push_str("null"),
-                }
-                out.push_str(",\"parentOffset\":");
-                match parent {
-                    Some((_, off)) => out.push_str(&off.to_string()),
-                    None => out.push_str("null"),
-                }
-                out.push_str(",\"rel\":");
-                match rel {
-                    Some(r) => {
-                        out.push('"');
-                        out.push_str(r);
-                        out.push('"');
-                    }
-                    None => out.push_str("null"),
-                }
-                out.push_str(",\"removed\":");
-                out.push_str(if removed { "true" } else { "false" });
-                out.push_str(",\"removedMask\":");
-                push_json_str(&mut out, removed_mask);
-                out.push_str(",\"deps\":[");
-                for (i, (box_id, off)) in deps.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    out.push_str("{\"box\":");
-                    push_json_str(&mut out, &id_to_hex(box_id));
-                    out.push_str(",\"off\":");
-                    out.push_str(&off.to_string());
-                    out.push('}');
-                }
-                out.push_str("]}");
+        let mut nodes = Vec::new();
+        for (head, run) in &s.runs {
+            // Origin-anchored runs are the document's top level — emitted
+            // with no anchor, like the old standalone root nodes.
+            let is_top_level = run.anchor == s.origin();
+            let (kind, rel) = match run.first_op {
+                _ if is_top_level => ("root", "after"),
+                crate::run::FirstOp::After => ("run", "after"),
+                crate::run::FirstOp::Before => ("before", "before"),
             };
-
-            for (head, run) in &s.runs {
-                let head_id = s.id_of(*head);
-                // Origin-anchored runs are the document's top level — emitted
-                // with no anchor, like the old standalone root nodes.
-                let is_top_level = run.anchor == s.origin();
-                let (kind, rel) = match run.first_op {
-                    _ if is_top_level => ("root", "after"),
-                    crate::run::FirstOp::After => ("run", "after"),
-                    crate::run::FirstOp::Before => ("before", "before"),
-                };
-                // The anchor may be an interior element of the parent box (befores
-                // don't split runs); report its offset so the layout can attach there.
-                let anchor_offset = match s.idx_of(&run.anchor).map(|i| s.loc_of(i)) {
-                    Some(Loc::Run { pos, .. }) => pos as usize,
-                    _ => 0,
-                };
-                let anchor = if is_top_level {
-                    None
-                } else {
-                    Some((resolve(&run.anchor), anchor_offset))
-                };
-                // Per-element tombstone state — one '0'/'1' per char, aligned
-                // with `run.text` (one element per char). `removed` (box-level)
-                // is true only when the whole run is gone.
-                let mut removed_mask = String::with_capacity(run.elements.len());
-                let mut all_removed = true;
-                for e in &run.elements {
-                    let r = s.is_removed(*e);
-                    removed_mask.push(if r { '1' } else { '0' });
-                    all_removed &= r;
-                }
-                emit(
-                    &head_id,
-                    kind,
-                    &run.text,
-                    anchor,
-                    (!is_top_level).then_some(rel),
-                    all_removed,
-                    &removed_mask,
-                    &resolve_deps(&run.first_extra_deps.to_id_set(&s.ids)),
-                );
+            let (parent, parent_offset) = if is_top_level {
+                (None, None)
+            } else {
+                let (box_id, off) = resolve(&run.anchor);
+                (Some(id_to_hex(&box_id)), Some(off))
+            };
+            // Per-element tombstone state — one '0'/'1' per char, aligned
+            // with `run.text` (one element per char). `removed` (box-level)
+            // is true only when the whole run is gone.
+            let mut removed_mask = String::with_capacity(run.elements.len());
+            let mut all_removed = true;
+            for e in &run.elements {
+                let r = s.is_removed(*e);
+                removed_mask.push(if r { '1' } else { '0' });
+                all_removed &= r;
             }
+            let mut seen = std::collections::BTreeSet::new();
+            let deps = run
+                .first_extra_deps
+                .iter_ids(&s.ids)
+                .map(|id| resolve(&id))
+                .filter(|bo| seen.insert(*bo)) // dedup by (box, offset)
+                .map(|(box_id, off)| StructureDep {
+                    r#box: id_to_hex(&box_id),
+                    off,
+                })
+                .collect();
+            nodes.push(StructureNode {
+                id: id_to_hex(&s.id_of(*head)),
+                kind,
+                text: run.text.clone(),
+                parent,
+                parent_offset,
+                rel: (!is_top_level).then_some(rel),
+                removed: all_removed,
+                removed_mask,
+                deps,
+            });
         }
-
-        out.push_str("]}");
-        out
+        let structure = Structure {
+            tips: s.tips().iter().map(id_to_hex).collect(),
+            nodes,
+        };
+        serde_json::to_string(&structure).expect("plain data serializes")
     }
 
     /// Build a `WasmCursor` for inserting at position `idx`, or undefined when

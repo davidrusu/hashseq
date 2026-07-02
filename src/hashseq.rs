@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
 use crate::run_index::{ElemRef, RunIndex};
+use crate::delivery::Delivery;
 use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
@@ -191,47 +192,11 @@ pub struct CausalInsert {
     pub ch: char,
 }
 
-/// A set-once extra-dependency set, stored as `Box<[NodeIdx]>` in `Id` order
-/// (4 B/entry, 16 B inline — like `BTreeSet<Id>` — but a fraction of the heap:
-/// a 1-element `BTreeSet<Id>` allocates a ~400 B B-tree node for one 32 B id,
-/// while these sets are almost always 1–3 tips). Used for the deps of applied
-/// runs and removes. Order is by `Id` (convergence-safe); the handle is the
-/// compact payload, and the `BTreeSet<Id>` is rebuilt for the wire / hashing at
-/// encode and decompress time.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct IdxSet(Box<[NodeIdx]>);
-
-impl IdxSet {
-    /// Build from an already-`Id`-sorted set, mapping each id to its handle.
-    /// `BTreeSet` iterates in `Id` order, so the handles land `Id`-sorted.
-    pub(crate) fn from_id_set(set: &BTreeSet<Id>, to_handle: impl FnMut(&Id) -> NodeIdx) -> Self {
-        IdxSet(set.iter().map(to_handle).collect())
-    }
-
-    /// Rebuild the `Id` set (for the wire format / hashing).
-    pub fn to_id_set(&self, ids: &[Id]) -> BTreeSet<Id> {
-        self.0.iter().map(|h| ids[h.0 as usize]).collect()
-    }
-
-    /// Iterate the member ids in `Id` order.
-    pub fn iter_ids<'a>(&'a self, ids: &'a [Id]) -> impl Iterator<Item = Id> + 'a {
-        self.0.iter().map(move |h| ids[h.0 as usize])
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
 /// Storage form of a multi-target remove (`remove_batch` spanning several
 /// chars). Single-target removes live in `RemoveRun` chains instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalRemove {
-    pub pins: IdxSet,
+    pub pins: SortedIdVec,
     /// Removed element handles, in Id order.
     pub nodes: Box<[NodeIdx]>,
 }
@@ -245,9 +210,9 @@ pub struct StoredMove {
     pub to_before: bool,
     pub to_anchor: NodeIdx,
     /// Superseded move ops (the register's overwrites edges), in Id order.
-    pub overwrites: IdxSet,
+    pub overwrites: SortedIdVec,
     /// Frontier pins, in Id order.
-    pub pins: IdxSet,
+    pub pins: SortedIdVec,
 }
 
 /// A coalesced chain of single-target removes: remove `i` deletes `targets[i]`
@@ -257,7 +222,7 @@ pub struct StoredMove {
 /// analog of insert runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RemoveRun {
-    pub first_extra_deps: IdxSet,
+    pub first_extra_deps: SortedIdVec,
     /// Element handles removed, in removal order.
     pub targets: Vec<NodeIdx>,
     /// Handles of the remove nodes themselves; `links[i]` removes `targets[i]`.
@@ -281,11 +246,11 @@ impl RemoveRun {
 pub struct StoredRun {
     pub anchor: Id,
     pub first_op: FirstOp,
-    pub first_extra_deps: IdxSet,
+    pub first_extra_deps: SortedIdVec,
     /// Extra deps of interior elements (offset >= 1), sparse — see
     /// [`Run::interior_extra_deps`]. Lets a typing burst extend its run
     /// across a remove instead of starting a new run per burst.
-    pub interior_extra_deps: BTreeMap<usize, IdxSet>,
+    pub interior_extra_deps: BTreeMap<usize, SortedIdVec>,
     pub text: String,
     pub elements: Vec<NodeIdx>,
 }
@@ -311,7 +276,7 @@ impl StoredRun {
         *self.elements.last().unwrap()
     }
 
-    fn extend(&mut self, idx: NodeIdx, ch: char, extra_deps: IdxSet) {
+    fn extend(&mut self, idx: NodeIdx, ch: char, extra_deps: SortedIdVec) {
         if !extra_deps.is_empty() {
             self.interior_extra_deps
                 .insert(self.elements.len(), extra_deps);
@@ -331,7 +296,7 @@ impl StoredRun {
         // head keeps its id); later offsets rebase.
         let mut right_interior = self.interior_extra_deps.split_off(&at);
         let right_first_deps = right_interior.remove(&at).unwrap_or_default();
-        let right_interior: BTreeMap<usize, IdxSet> = right_interior
+        let right_interior: BTreeMap<usize, SortedIdVec> = right_interior
             .into_iter()
             .map(|(k, v)| (k - at, v))
             .collect();
@@ -364,8 +329,11 @@ impl StoredRun {
 }
 
 /// A set of node handles kept sorted by their `Id`, stored as `Vec<NodeIdx>`
-/// (4 bytes/entry) instead of `BTreeSet<Id>` (32 bytes/entry plus a tree node
-/// each). Used for the `afters` / `befores_by_anchor` sibling sets.
+/// (4 bytes/entry) instead of `BTreeSet<Id>` (32 bytes/entry plus a ~400 B
+/// B-tree node each). Used for the `afters` / `befores_by_anchor` sibling
+/// sets, and as the set-once storage for applied deps/pins/overwrites
+/// (built with `from_id_set`, rebuilt as `BTreeSet<Id>` for the wire /
+/// hashing at encode and decompress time).
 ///
 /// The order is by `Id` — never by handle — because sibling order is a
 /// convergence concern and handles are replica-local (see the interning
@@ -381,6 +349,22 @@ impl SortedIdVec {
     #[inline]
     fn search(&self, id: &Id, ids: &[Id]) -> Result<usize, usize> {
         self.0.binary_search_by(|h| ids[h.0 as usize].cmp(id))
+    }
+
+    /// Build from an already-`Id`-sorted set, mapping each id to its handle
+    /// (`BTreeSet` iterates in `Id` order, so the handles land sorted).
+    pub(crate) fn from_id_set(set: &BTreeSet<Id>, to_handle: impl FnMut(&Id) -> NodeIdx) -> Self {
+        SortedIdVec(set.iter().map(to_handle).collect())
+    }
+
+    /// Rebuild the `Id` set (for the wire format / hashing).
+    pub fn to_id_set(&self, ids: &[Id]) -> BTreeSet<Id> {
+        self.0.iter().map(|h| ids[h.0 as usize]).collect()
+    }
+
+    /// Iterate the member ids in `Id` order.
+    pub fn iter_ids<'a>(&'a self, ids: &'a [Id]) -> impl Iterator<Item = Id> + 'a {
+        self.0.iter().map(move |h| ids[h.0 as usize])
     }
 
     /// Insert `handle` keyed by its id; a no-op if an equal id is already
@@ -483,25 +467,11 @@ pub struct HashSeq {
     pub afters: FxHashMap<NodeIdx, SortedIdVec>,
 
     pub(crate) tips: BTreeSet<Id>,
-    /// Ops waiting on a dependency, keyed by *one* missing dep id (the first
-    /// found): applying that id wakes exactly these waiters — no global
-    /// retries. A waiter still missing more deps is re-parked on the next
-    /// one. Values carry the precomputed node id so wakes don't rehash.
-    ///
-    /// Keys are adversary-chosen bytes (an op can name any id as a dep), so
-    /// this stays a std `HashMap` for SipHash's HashDoS protection — unlike
-    /// `orphan_ids`, whose keys we computed ourselves with BLAKE3.
-    pub(crate) orphaned: HashMap<Id, Vec<(Id, HashNode)>>,
-    /// Ids of all parked orphans: dedups network re-delivery while parked.
-    orphan_ids: IdSet,
-    /// Permanently quarantined nodes (the apply-time gate, HASHWEB_SPEC.md
-    /// "The edge table"): ops this projection does not admit — today `Move`
-    /// (placement registers land with the move projection), `Put` (a map op
-    /// in a seq), and non-char insert payloads (the value column
-    /// generalization). Gated nodes never intern and never enter tips, so
-    /// anything referencing them stays parked — exactly the spec's
-    /// quarantine semantics. Kept so merge/encode re-present them.
-    pub(crate) gated: IdMap<HashNode>,
+    /// Parked orphans + the gate (see `delivery::Delivery`). Gated here
+    /// today: `Move` targets/anchors that fail the placement rows, `Put`
+    /// (a map op in a seq), and non-char insert payloads (the value column
+    /// generalization).
+    pub(crate) delivery: Delivery,
     index: RunIndex,
 }
 
@@ -540,9 +510,7 @@ impl HashSeq {
             remove_runs: FxHashMap::default(),
             afters: FxHashMap::default(),
             tips: BTreeSet::new(),
-            orphaned: HashMap::new(),
-            orphan_ids: IdSet::default(),
-            gated: IdMap::default(),
+            delivery: Delivery::default(),
             index: RunIndex::default(),
         };
         // The origin is an axiom: present (so anchoring at it always
@@ -626,7 +594,7 @@ impl HashSeq {
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
-        self.orphaned.values().flatten().map(|(_, node)| node)
+        self.delivery.orphans()
     }
 
     // ---- causal adjacency (handle space) ----
@@ -868,7 +836,7 @@ impl HashSeq {
             if !has_explicit_afters && pos as usize + 1 == self.runs[&run].len() {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
-                let deps = IdxSet::from_id_set(&after.pins, |d| self.idx_of_known(d));
+                let deps = SortedIdVec::from_id_set(&after.pins, |d| self.idx_of_known(d));
                 self.runs
                     .get_mut(&run)
                     .unwrap()
@@ -911,7 +879,7 @@ impl HashSeq {
         // Start a new run anchored at the anchor node.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
-        let first_extra_deps = IdxSet::from_id_set(&after.pins, |d| self.idx_of_known(d));
+        let first_extra_deps = SortedIdVec::from_id_set(&after.pins, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
@@ -1006,10 +974,10 @@ impl HashSeq {
             target: target_idx,
             to_before,
             to_anchor,
-            overwrites: IdxSet::from_id_set(&overwrites, |d| {
+            overwrites: SortedIdVec::from_id_set(&overwrites, |d| {
                 self.id_to_idx.get(d, &self.ids).expect("ref was interned")
             }),
-            pins: IdxSet::from_id_set(&pins, |d| {
+            pins: SortedIdVec::from_id_set(&pins, |d| {
                 self.id_to_idx.get(d, &self.ids).expect("ref was interned")
             }),
         };
@@ -1198,7 +1166,7 @@ impl HashSeq {
             // Start a new chain (a lone remove is a 1-link chain).
             let idx = self.next_idx();
             self.intern(id, Loc::RemoveChain { chain: idx, pos: 0 });
-            let first_extra_deps = IdxSet::from_id_set(&extra_deps, |d| self.idx_of_known(d));
+            let first_extra_deps = SortedIdVec::from_id_set(&extra_deps, |d| self.idx_of_known(d));
             self.remove_runs.insert(
                 idx,
                 RemoveRun {
@@ -1211,7 +1179,7 @@ impl HashSeq {
         }
 
         let idx = self.intern(id, Loc::MultiRemove);
-        let pins = IdxSet::from_id_set(&extra_deps, |d| self.idx_of_known(d));
+        let pins = SortedIdVec::from_id_set(&extra_deps, |d| self.idx_of_known(d));
         self.remove_nodes.insert(
             idx,
             CausalRemove {
@@ -1245,7 +1213,7 @@ impl HashSeq {
         // always lands immediately before its anchor.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
-        let first_extra_deps = IdxSet::from_id_set(&before.pins, |d| self.idx_of_known(d));
+        let first_extra_deps = SortedIdVec::from_id_set(&before.pins, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
@@ -1282,16 +1250,9 @@ impl HashSeq {
     /// dep instead of a global retry per apply.
     pub fn apply_with_id(&mut self, id: Id, node: HashNode) {
         debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
-        if self.contains_node(&id) {
-            return; // Already processed this node
+        if self.contains_node(&id) || self.delivery.holds(&id) {
+            return;
         }
-        if !self.orphan_ids.is_empty() && self.orphan_ids.contains(&id) {
-            return; // Already parked, waiting on a dependency
-        }
-        if !self.gated.is_empty() && self.gated.contains_key(&id) {
-            return; // Permanently quarantined
-        }
-
         // `queue` only allocates when an apply actually wakes parked orphans;
         // the common case (sequential typing, nothing parked) stays
         // allocation-free and dispatches `node` directly.
@@ -1302,22 +1263,31 @@ impl HashSeq {
         }
     }
 
-    /// One step of the apply worklist: park `node` on its first missing dep,
-    /// or apply it and push any orphans waiting on it onto `queue`.
+    /// One step of the worklist: park `node` on its first missing dep, or
+    /// interpret it and wake its waiters. A gated node wakes nothing — its
+    /// dependents stay parked (the quarantine cascade).
     fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
         let missing = node
             .iter_refs()
             .find(|d| !self.contains_node(d))
             .copied();
         if let Some(missing) = missing {
-            self.orphan_ids.insert(id);
-            self.orphaned.entry(missing).or_default().push((id, node));
+            self.delivery.park(missing, id, node);
             return;
         }
-        if !self.orphan_ids.is_empty() {
-            self.orphan_ids.remove(&id);
+        self.delivery.unpark(&id);
+        match self.interpret(id, node) {
+            Ok(()) => self.delivery.wake(&id, queue),
+            Err(node) => self.delivery.gate(id, node),
         }
+    }
 
+    /// Interpret one node whose refs are all applied — this projection's
+    /// edge-table rows. `Err` hands the node back for quarantine.
+    // The Err carries the node back by value — same move the parameters
+    // make; boxing would buy an allocation per gated op for nothing.
+    #[allow(clippy::result_large_err)]
+    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), HashNode> {
         // The apply-time gate: ops this projection does not admit are
         // quarantined before touching tips or the index. They never intern,
         // so dependents stay parked (the correct edge-table semantics).
@@ -1344,8 +1314,7 @@ impl HashSeq {
             _ => false,
         };
         if !admitted {
-            self.gated.insert(id, node);
-            return;
+            return Err(node);
         }
 
         // Update tips before consuming node (insert ops don't depend on tips)
@@ -1385,14 +1354,9 @@ impl HashSeq {
             } => self.apply_move(id, node.pins, target, to, overwrites),
             _ => unreachable!("gated above"),
         }
-
-        // Wake the orphans waiting on this id.
-        if !self.orphaned.is_empty()
-            && let Some(waiting) = self.orphaned.remove(&id)
-        {
-            queue.extend(waiting);
-        }
+        Ok(())
     }
+
 
     /// Reconstruct a remove chain's `HashNode`s (for merge / re-broadcast).
     pub fn remove_run_nodes(&self, rr: &RemoveRun) -> Vec<HashNode> {
@@ -1486,14 +1450,10 @@ impl HashSeq {
             self.apply_with_id(other.id_of(*idx), node);
         }
 
-        // Apply all orphaned nodes (ids were computed when they were parked)
-        for (id, orphan) in other.orphaned.into_values().flatten() {
-            self.apply_with_id(id, orphan);
-        }
-
-        // Re-present the other side's quarantined nodes: applying re-gates
-        // them here (deterministically), keeping merge lossless.
-        for (id, node) in other.gated {
+        // Apply parked orphans (ids were computed when they were parked)
+        // and re-present the other side's quarantined nodes: applying
+        // re-gates them here (deterministically), keeping merge lossless.
+        for (id, node) in other.delivery.into_held() {
             self.apply_with_id(id, node);
         }
     }
@@ -2159,185 +2119,50 @@ mod test {
         assert_eq!(&String::from_iter(seq.iter()), "");
     }
 
-    #[test]
-    fn test_prop_associative_qc1() {
-        // ([(true, 0, '\u{0}'), (true, 0, '\u{0}')], [], [(true, 0, '\u{3}')])
-
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-
-        seq_a.insert(0, 'a');
-        seq_a.insert(0, 'a');
-
-        seq_b.insert(0, 'b');
-
+    /// merge(a, b) == merge(b, a) for one concrete pair of editors.
+    fn check_merge_commutes(a: &[(bool, u8, char)], b: &[(bool, u8, char)]) {
+        let seq_a = seq_from_ops(a);
+        let seq_b = seq_from_ops(b);
         let mut ab = seq_a.clone();
         ab.merge(seq_b.clone());
-
-        let mut ba = seq_b.clone();
-        ba.merge(seq_a.clone());
-
+        let mut ba = seq_b;
+        ba.merge(seq_a);
         assert_eq!(ab, ba);
     }
 
+    /// Minimized quickcheck failures, kept as concrete regressions.
     #[test]
-    fn test_prop_commutative_qc1() {
-        let mut seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-
-        seq_a.insert(0, 'a');
-        seq_a.remove(0);
-        assert_eq!(String::from_iter(seq_a.iter()), "");
-
-        seq_b.insert(0, 'a');
-        seq_b.insert(0, 'b');
-        assert_eq!(String::from_iter(seq_b.iter()), "ba");
-
-        // merge(a, b) == merge(b, a)
-
-        let mut merge_a_b = seq_a.clone();
-        merge_a_b.merge(seq_b.clone());
-        let mut merge_b_a = seq_b.clone();
-        merge_b_a.merge(seq_a.clone());
-
-        assert_eq!(merge_a_b, merge_b_a);
+    fn test_merge_commutes_regressions() {
+        let i = |idx, ch| (true, idx, ch);
+        let r = |idx| (false, idx, '\0');
+        check_merge_commutes(&[i(0, 'a'), i(0, 'a')], &[i(0, 'b')]);
+        check_merge_commutes(&[i(0, 'a'), r(0)], &[i(0, 'a'), i(0, 'b')]);
+        check_merge_commutes(&[], &[i(0, '\0'), r(0)]);
+        check_merge_commutes(&[i(0, '\0'), i(1, '\0')], &[]);
+        check_merge_commutes(&[], &[i(0, '\0'), i(1, '\0'), i(1, '\0'), i(2, '\0')]);
+        check_merge_commutes(&[], &[i(0, '\0'), i(1, '\0'), r(0)]);
     }
 
-    #[test]
-    fn test_prop_commutative_insert_remove() {
-        // Failing case: a = [], b = [(true, 0, '\0'), (false, 0, '\0')]
-        let seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-
-        // seq_a is empty
-
-        // seq_b: insert then remove
-        seq_b.insert(0, '\0');
-        seq_b.remove(0);
-
-        // merge(a, b) == merge(b, a)
-        let mut merge_a_b = seq_a.clone();
-        merge_a_b.merge(seq_b.clone());
-        let mut merge_b_a = seq_b.clone();
-        merge_b_a.merge(seq_a.clone());
-
-        assert_eq!(merge_a_b, merge_b_a);
-    }
-
-    #[test]
-    fn test_prop_commutative_two_inserts() {
-        // Failing case: a = [(true, 0, '\0'), (true, 1, '\0')], b = []
-        let mut seq_a = HashSeq::default();
-        let seq_b = HashSeq::default();
-
-        // seq_a: two inserts
-        seq_a.insert(0, '\0');
-        seq_a.insert(1, '\0');
-
-        // seq_b is empty
-
-        // merge(a, b) == merge(b, a)
-        let mut merge_a_b = seq_a.clone();
-        merge_a_b.merge(seq_b.clone());
-
-        let mut merge_b_a = seq_b.clone();
-        merge_b_a.merge(seq_a.clone());
-
-        assert_eq!(merge_a_b, merge_b_a);
-    }
-
-    #[test]
-    fn test_prop_commutative_four_inserts() {
-        // Failing case: a = [], b = [(true, 0, '\0'), (true, 1, '\0'), (true, 1, '\0'), (true, 2, '\0')]
-        let seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-
-        // seq_b: four inserts
-        seq_b.insert(0, '\0');
-        seq_b.insert(1, '\0');
-        seq_b.insert(1, '\0');
-        seq_b.insert(2, '\0');
-
-        // seq_a is empty
-
-        // merge(a, b) == merge(b, a)
-        let mut merge_a_b = seq_a.clone();
-        merge_a_b.merge(seq_b.clone());
-
-        let mut merge_b_a = seq_b.clone();
-        merge_b_a.merge(seq_a.clone());
-
-        assert_eq!(merge_a_b, merge_b_a);
-    }
-
-    #[test]
-    fn test_prop_commutative_insert_insert_remove() {
-        // Failing case: a = [], b = [(true, 0, '\0'), (true, 1, '\0'), (false, 0, '\0')]
-        let seq_a = HashSeq::default();
-        let mut seq_b = HashSeq::default();
-
-        // seq_b: insert at 0, insert at 1, remove at 0
-        seq_b.insert(0, '\0');
-        seq_b.insert(1, '\0');
-        seq_b.remove(0);
-
-        // seq_a is empty
-
-        // merge(a, b) == merge(b, a)
-        let mut merge_a_b = seq_a.clone();
-        merge_a_b.merge(seq_b.clone());
-
-        let mut merge_b_a = seq_b.clone();
-        merge_b_a.merge(seq_a.clone());
-
-        assert_eq!(merge_a_b, merge_b_a);
+    /// merge(a, a) == a for one concrete editor.
+    fn check_merge_reflexive(ops: &[(bool, u8, char)]) {
+        let seq = seq_from_ops(ops);
+        let mut merged = seq.clone();
+        merged.merge(seq.clone());
+        assert_eq!(merged, seq);
     }
 
     #[quickcheck]
     fn prop_reflexive(ops: Vec<(bool, u8, char)>) {
-        let seq = seq_from_ops(&ops);
-
-        // merge(a, a) == a
-        let mut merge_self = seq.clone();
-        merge_self.merge(seq.clone());
-
-        assert_eq!(merge_self, seq);
+        check_merge_reflexive(&ops);
     }
 
+    /// Minimized quickcheck failures, kept as concrete regressions.
     #[test]
-    fn test_reflexive_merge_with_remove() {
-        // Failing case: [(true, 0, '\0'), (true, 1, '\u{80}'), (true, 2, '\0'), (false, 0, '\0'), (true, 1, '\0')]
-        let mut seq = HashSeq::default();
-
-        seq.insert(0, '\0');
-        seq.insert(1, '\u{80}');
-        seq.insert(2, '\0');
-        seq.remove(0);
-        seq.insert(1, '\0');
-
-        // merge(a, a) == a
-        let mut merge_self = seq.clone();
-        merge_self.merge(seq.clone());
-
-        assert_eq!(merge_self, seq);
-    }
-
-    #[test]
-    fn test_reflexive_regression() {
-        // Regression test from quickcheck failure:
-        // [(true, 0, '\0'), (true, 1, '\0'), (false, 0, '\0'), (true, 1, '\0')]
-        let mut seq = HashSeq::default();
-
-        seq.insert(0, 'a'); // op 1: idx=0, len=0 -> insert at 0
-        seq.insert(1, 'b'); // op 2: idx=1, len=1 -> insert at 1
-        seq.remove(0); // op 3: idx=0, len=2 -> remove at 0
-        seq.insert(1, 'c'); // op 4: idx=1, len=1 -> insert at 1
-
-        // merge(a, a) == a
-        let mut merge_self = seq.clone();
-        merge_self.merge(seq.clone());
-
-        assert_eq!(merge_self, seq);
+    fn test_merge_reflexive_regressions() {
+        let i = |idx, ch| (true, idx, ch);
+        let r = |idx| (false, idx, '\0');
+        check_merge_reflexive(&[i(0, '\0'), i(1, '\u{80}'), i(2, '\0'), r(0), i(1, '\0')]);
+        check_merge_reflexive(&[i(0, 'a'), i(1, 'b'), r(0), i(1, 'c')]);
     }
 
     /// The position index must agree with the causal iterator — the causal
@@ -3227,7 +3052,7 @@ mod test {
             },
         };
         seq.apply(node);
-        assert_eq!(seq.gated.len(), 1);
+        assert_eq!(seq.delivery.gated.len(), 1);
         assert_eq!(seq.placement_of(&a), None);
     }
 
@@ -3249,7 +3074,7 @@ mod test {
             },
         };
         seq.apply(node);
-        assert_eq!(seq.gated.len(), 1);
+        assert_eq!(seq.delivery.gated.len(), 1);
         let _ = b;
     }
 

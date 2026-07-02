@@ -10,9 +10,10 @@
 //! (or op-node / origin ids — links). Artifact bytes ride a side store;
 //! an absent artifact is the `pending` state, never papered over.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
-use crate::hashseq::{IdMap, IdSet};
+use crate::hashseq::IdMap;
+use crate::delivery::Delivery;
 use crate::value::{TOMBSTONE, Value};
 use crate::{HashNode, Id, Op};
 
@@ -53,12 +54,8 @@ pub struct HashKv {
     /// this replica has seen bytes for. Reads without bytes are `pending`.
     values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
-    /// Ops waiting on a missing ref (same discipline as HashSeq: park on
-    /// the first missing ref; applying it wakes exactly these waiters).
-    orphaned: HashMap<Id, Vec<(Id, HashNode)>>,
-    orphan_ids: IdSet,
-    /// Permanently quarantined nodes (non-map ops — the edge-table gate).
-    pub(crate) gated: IdMap<HashNode>,
+    /// Parked orphans + the gate (non-map ops quarantine — the edge table).
+    pub(crate) delivery: Delivery,
 }
 
 impl PartialEq for HashKv {
@@ -82,9 +79,7 @@ impl HashKv {
             keys: IdMap::default(),
             values: IdMap::default(),
             tips: BTreeSet::new(),
-            orphaned: HashMap::new(),
-            orphan_ids: IdSet::default(),
-            gated: IdMap::default(),
+            delivery: Delivery::default(),
         };
         // The origin is axiomatically present: the map's frontier begins at
         // it, so a fresh map's first put pins {origin}.
@@ -216,15 +211,12 @@ impl HashKv {
         self.apply_with_id(id, node);
     }
 
+    /// Apply with a pre-computed id (`id` must be the node's true hash).
+    /// Iterative worklist: applying a node wakes exactly the orphans parked
+    /// on its id.
     pub fn apply_with_id(&mut self, id: Id, node: HashNode) {
         debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
-        if self.contains_node(&id) {
-            return;
-        }
-        if !self.orphan_ids.is_empty() && self.orphan_ids.contains(&id) {
-            return;
-        }
-        if !self.gated.is_empty() && self.gated.contains_key(&id) {
+        if self.contains_node(&id) || self.delivery.holds(&id) {
             return;
         }
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
@@ -234,28 +226,36 @@ impl HashKv {
         }
     }
 
+    /// One step of the worklist: park `node` on its first missing ref, or
+    /// interpret it and wake its waiters. A gated node wakes nothing — its
+    /// dependents stay parked (the quarantine cascade).
     fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
         let missing = node
             .iter_refs()
             .find(|d| !self.contains_node(d))
             .copied();
         if let Some(missing) = missing {
-            self.orphan_ids.insert(id);
-            self.orphaned.entry(missing).or_default().push((id, node));
+            self.delivery.park(missing, id, node);
             return;
         }
-        if !self.orphan_ids.is_empty() {
-            self.orphan_ids.remove(&id);
+        self.delivery.unpark(&id);
+        match self.interpret(id, node) {
+            Ok(()) => self.delivery.wake(&id, queue),
+            Err(node) => self.delivery.gate(id, node),
         }
+    }
 
+    /// Interpret one node whose refs are all applied — this projection's
+    /// edge-table rows. `Err` hands the node back for quarantine.
+    #[allow(clippy::result_large_err)]
+    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), HashNode> {
         // Edge-table gate: only map ops are admitted here (a seq op in a
         // Map is ill-typed — stable, permanent).
         let Op::Put {
             key, overwrites, ..
         } = &node.op
         else {
-            self.gated.insert(id, node);
-            return;
+            return Err(node);
         };
         let key = *key;
 
@@ -266,23 +266,17 @@ impl HashKv {
         self.tips.insert(id);
 
         // heads(k) = heads(k) − overwrites(u) ∪ {u}, with the definitional
-        // same-key filter: entries that are not puts on this key are
-        // ignored, never errors (they cannot corrupt another register).
-        // The same-key filter is structural: we only touch THIS key's head
-        // list, so an overwrite naming a put on another key (or a non-put)
-        // simply isn't here — ignored, never an error.
+        // same-key filter: we only touch THIS key's head list, so an
+        // overwrite naming a put on another key (or a non-put) simply isn't
+        // here — ignored, never an error (it cannot corrupt another
+        // register).
         let ks = self.keys.entry(key).or_default();
         ks.heads.retain(|h| !overwrites.contains(h));
         let pos = ks.heads.binary_search(&id).unwrap_or_else(|p| p);
         ks.heads.insert(pos, id);
 
         self.nodes.insert(id, node);
-
-        if !self.orphaned.is_empty()
-            && let Some(waiting) = self.orphaned.remove(&id)
-        {
-            queue.extend(waiting);
-        }
+        Ok(())
     }
 
     pub fn merge(&mut self, other: Self) {
@@ -299,16 +293,13 @@ impl HashKv {
         for (id, node) in other.nodes {
             self.apply_with_id(id, node);
         }
-        for (id, node) in other.orphaned.into_values().flatten() {
-            self.apply_with_id(id, node);
-        }
-        for (id, node) in other.gated {
+        for (id, node) in other.delivery.into_held() {
             self.apply_with_id(id, node);
         }
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
-        self.orphaned.values().flatten().map(|(_, node)| node)
+        self.delivery.orphans()
     }
 
     /// Every applied node as `(id, HashNode)` (parked/gated not included).
@@ -321,6 +312,7 @@ impl HashKv {
         self.values.iter()
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -438,7 +430,7 @@ mod tests {
             pins: BTreeSet::new(),
             op: Op::insert_after(origin, 'x'),
         });
-        assert_eq!(kv.gated.len(), 1);
+        assert_eq!(kv.delivery.gated.len(), 1);
         assert!(kv.tips().len() == 1, "gated ops never enter tips");
     }
 
