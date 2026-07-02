@@ -1,5 +1,41 @@
 # Performance notes & remaining optimization ideas
 
+## New-design port (2026-07-02)
+
+The identity layer now implements GRAMMAR_SPEC.md Part A (envelope preimage,
+payload-as-id, unified `Insert`, `NODE_CONTEXT = "hashweb v1 node id"`), with
+the Move placement registers and the HashKv projection alongside. Measured on
+AC power (see the thermal-hygiene note below — a battery-powered control run
+showed ~45% machine-level slowdown on *untouched* code paths; all numbers
+here are from the mains-powered run):
+
+| Trace               | Build min (old → new) | Δ      | Encoded (old → new) |
+|---------------------|-----------------------|--------|---------------------|
+| automerge-paper     | 123 → 126.8 ms        | +3.1%  | 447 → 451 KB        |
+| rustcode            | 326 → 343.2 ms        | +5.3%  | 834 → 820 KB        |
+| sveltecomponent     | 48 → 52.0 ms          | +8.3%  | 247 → 236 KB        |
+| seph-blog1          | 123 → 130.9 ms        | +6.4%  | 659 → 658 KB        |
+| clownschool_flat    | 9.0 → 9.8 ms          | +8.7%  | 130 → 130 KB        |
+| friendsforever_flat | 10.3 → 11.1 ms        | +7.3%  | 115 → 116 KB        |
+| json-crdt-blog-post | 15.1 → 16.4 ms        | +8.4%  | 91 → 92 KB          |
+
+`Correct=T` everywhere and the `Runs` structure checksums are identical to
+the old baseline — the port is structure-neutral. The +3–9% is the accepted
+identity cost of payload-as-id: the per-char preimage grew from ~40 to 68
+bytes (kind ‖ ref_count ‖ anchor ‖ body_len ‖ anchor-ref ‖ value_id), which
+crosses a BLAKE3 block boundary — one extra compression per chained hash.
+Mitigations already in: cached char value-ids (ASCII table + thread-local
+memo) and a single-buffer fast path (the whole 68-byte preimage assembled on
+the stack, one hasher update — recovered roughly half of the initial
+regression). A same-conditions A/B against the pre-Move commit confirmed the
+Move/HashKv additions cost nothing on text traces.
+
+Remaining perf headroom if the +3–9% ever matters: none inside the current
+grammar (the 68-byte preimage is spec-fixed); the only lever would be
+inline-char preimages, which GRAMMAR_SPEC.md rejects for
+availability-independent identity. Spend optimization effort elsewhere.
+
+
 Status as of 2026-06-11, after the optimization push. Benchmark:
 `cargo run --release --example sequential_traces` (traces from
 `../editing-traces/sequential_traces`, 50 iterations each). Snapshots of full

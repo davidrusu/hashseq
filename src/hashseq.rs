@@ -1280,7 +1280,7 @@ impl HashSeq {
     /// orphans parked on its id (which may re-park on their next missing
     /// dep), so out-of-order delivery costs each node one park per missing
     /// dep instead of a global retry per apply.
-    pub(crate) fn apply_with_id(&mut self, id: Id, node: HashNode) {
+    pub fn apply_with_id(&mut self, id: Id, node: HashNode) {
         debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
         if self.contains_node(&id) {
             return; // Already processed this node
@@ -1408,6 +1408,37 @@ impl HashSeq {
                 op: Op::Remove(BTreeSet::from_iter([self.id_of(*target)])),
             })
             .collect()
+    }
+
+    /// Every applied node as `(id, HashNode)` — runs decompressed, remove
+    /// chains reconstructed, moves and multi-removes included. Ids come from
+    /// the local table (no rehashing). Parked orphans and gated nodes are
+    /// NOT included; iterate `orphans()` / `gated` separately.
+    pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
+        let mut out: Vec<(Id, HashNode)> = Vec::new();
+        for run in self.runs.values() {
+            out.extend(run.to_run(&self.ids).decompress_with_ids());
+        }
+        for rr in self.remove_runs.values() {
+            for (i, node) in self.remove_run_nodes(rr).into_iter().enumerate() {
+                out.push((self.id_of(rr.links[i]), node));
+            }
+        }
+        for (idx, causal_remove) in &self.remove_nodes {
+            out.push((
+                self.id_of(*idx),
+                HashNode {
+                    pins: causal_remove.pins.to_id_set(&self.ids),
+                    op: Op::Remove(
+                        causal_remove.nodes.iter().map(|i| self.id_of(*i)).collect(),
+                    ),
+                },
+            ));
+        }
+        for (idx, mv) in &self.move_nodes {
+            out.push((self.id_of(*idx), self.move_node(*idx, mv)));
+        }
+        out
     }
 
     pub fn merge(&mut self, other: Self) {

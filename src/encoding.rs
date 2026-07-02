@@ -37,6 +37,7 @@ pub(crate) const TAG_INSERT: u8 = 0x01;
 pub(crate) const TAG_REMOVE: u8 = 0x02;
 pub(crate) const TAG_MOVE: u8 = 0x03;
 pub(crate) const TAG_PUT: u8 = 0x04;
+pub(crate) const TAG_MARK: u8 = 0x05;
 
 // --- Varint (LEB128) encoding/decoding ---
 
@@ -287,7 +288,7 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(Payload, usize), DecodeError> {
 /// This is the reference encoder that `HashNode::id`'s streaming hasher is
 /// locked to by test.
 pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
-    use crate::hash_node::{KIND_INSERT, KIND_MOVE, KIND_PUT, KIND_REMOVE};
+    use crate::hash_node::{KIND_INSERT, KIND_MARK, KIND_MOVE, KIND_PUT, KIND_REMOVE};
 
     let mut refs: Vec<Id> = node.iter_refs().copied().collect();
     refs.sort_unstable();
@@ -320,6 +321,7 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
         Op::Remove(_) => KIND_REMOVE,
         Op::Move { .. } => KIND_MOVE,
         Op::Put { .. } => KIND_PUT,
+        Op::Mark { .. } => KIND_MARK,
     };
     buf.push(kind);
     encode_varint(refs.len(), buf);
@@ -380,6 +382,31 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
                 encode_varint(i, buf);
             }
         }
+        Op::Mark {
+            start,
+            end,
+            kind_v,
+            value,
+            overwrites,
+        } => {
+            let sp = (ref_idx(start.id()) << 1) | start.side_bit();
+            let ep = (ref_idx(end.id()) << 1) | end.side_bit();
+            let idxs = subset_idxs(overwrites);
+            let body_len = varint_len(sp)
+                + varint_len(ep)
+                + 64
+                + varint_len(idxs.len())
+                + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
+            encode_varint(body_len, buf);
+            encode_varint(sp, buf);
+            encode_varint(ep, buf);
+            encode_id(kind_v, buf);
+            encode_id(value, buf);
+            encode_varint(idxs.len(), buf);
+            for i in idxs {
+                encode_varint(i, buf);
+            }
+        }
     }
 }
 
@@ -422,6 +449,23 @@ pub fn encode_hash_node(node: &HashNode, buf: &mut Vec<u8>) {
             buf.push(TAG_PUT);
             encode_id_set(&node.pins, buf);
             encode_id(key, buf);
+            encode_id(value, buf);
+            encode_id_set(overwrites, buf);
+        }
+        Op::Mark {
+            start,
+            end,
+            kind_v,
+            value,
+            overwrites,
+        } => {
+            buf.push(TAG_MARK);
+            encode_id_set(&node.pins, buf);
+            buf.push(start.side_bit() as u8);
+            encode_id(start.id(), buf);
+            buf.push(end.side_bit() as u8);
+            encode_id(end.id(), buf);
+            encode_id(kind_v, buf);
             encode_id(value, buf);
             encode_id_set(overwrites, buf);
         }
@@ -498,6 +542,37 @@ fn decode_move(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
     ))
 }
 
+fn decode_mark(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
+    let (pins, mut pos) = decode_id_set(bytes)?;
+    let s_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
+    pos += 1;
+    let (s_id, n) = decode_id(&bytes[pos..])?;
+    pos += n;
+    let e_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
+    pos += 1;
+    let (e_id, n) = decode_id(&bytes[pos..])?;
+    pos += n;
+    let (kind_v, n) = decode_id(&bytes[pos..])?;
+    pos += n;
+    let (value, n) = decode_id(&bytes[pos..])?;
+    pos += n;
+    let (overwrites, n) = decode_id_set(&bytes[pos..])?;
+    pos += n;
+    Ok((
+        HashNode {
+            pins,
+            op: Op::Mark {
+                start: anchor_from(s_side, s_id)?,
+                end: anchor_from(e_side, e_id)?,
+                kind_v,
+                value,
+                overwrites,
+            },
+        },
+        pos,
+    ))
+}
+
 fn decode_put(bytes: &[u8]) -> Result<(HashNode, usize), DecodeError> {
     let (pins, mut pos) = decode_id_set(bytes)?;
     let (key, n) = decode_id(&bytes[pos..])?;
@@ -554,6 +629,7 @@ pub fn decode_op(bytes: &[u8]) -> Result<(EncodableOp, usize), DecodeError> {
         TAG_REMOVE => decode_remove(bytes)?,
         TAG_MOVE => decode_move(bytes)?,
         TAG_PUT => decode_put(bytes)?,
+        TAG_MARK => decode_mark(bytes)?,
         _ => return Err(DecodeError::InvalidOpTag(tag)),
     };
     Ok((EncodableOp::Node(node.0), 1 + node.1))
@@ -1072,6 +1148,18 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                         note(id, NO_LIMIT, &mut id_set);
                     }
                 }
+                Op::Mark {
+                    start,
+                    end,
+                    overwrites,
+                    ..
+                } => {
+                    note(start.id(), NO_LIMIT, &mut id_set);
+                    note(end.id(), NO_LIMIT, &mut id_set);
+                    for id in overwrites {
+                        note(id, NO_LIMIT, &mut id_set);
+                    }
+                }
             }
         }
     }
@@ -1244,6 +1332,23 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 buf.push(TAG_PUT);
                 encode_ref_set(&orphan.pins, NO_LIMIT, &mut buf);
                 encode_id(key, &mut buf);
+                encode_id(value, &mut buf);
+                encode_ref_set(overwrites, NO_LIMIT, &mut buf);
+            }
+            Op::Mark {
+                start,
+                end,
+                kind_v,
+                value,
+                overwrites,
+            } => {
+                buf.push(TAG_MARK);
+                encode_ref_set(&orphan.pins, NO_LIMIT, &mut buf);
+                buf.push(start.side_bit() as u8);
+                encode_ref(start.id(), NO_LIMIT, &mut buf);
+                buf.push(end.side_bit() as u8);
+                encode_ref(end.id(), NO_LIMIT, &mut buf);
+                encode_id(kind_v, &mut buf);
                 encode_id(value, &mut buf);
                 encode_ref_set(overwrites, NO_LIMIT, &mut buf);
             }
@@ -1593,6 +1698,43 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     pins,
                     op: Op::Put {
                         key,
+                        value,
+                        overwrites,
+                    },
+                });
+            }
+            TAG_MARK => {
+                let (pins, size) =
+                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
+                pos += size;
+                let s_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
+                pos += 1;
+                let (s_id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
+                pos += size;
+                let e_side = *bytes.get(pos).ok_or(DecodeError::UnexpectedEof)?;
+                pos += 1;
+                let (e_id, size) = decode_ref(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
+                pos += size;
+                let (kind_v, size) = decode_id(&bytes[pos..])?;
+                pos += size;
+                let (value, size) = decode_id(&bytes[pos..])?;
+                pos += size;
+                let (overwrites, size) =
+                    decode_ref_set(&bytes[pos..], &id_list, &run_elems, &remove_ids)?;
+                pos += size;
+                let mk = |side: u8, id: Id| -> Result<Anchor, DecodeError> {
+                    match side {
+                        0 => Ok(Anchor::Before(id)),
+                        1 => Ok(Anchor::After(id)),
+                        other => Err(DecodeError::InvalidOpTag(other)),
+                    }
+                };
+                seq.apply(HashNode {
+                    pins,
+                    op: Op::Mark {
+                        start: mk(s_side, s_id)?,
+                        end: mk(e_side, e_id)?,
+                        kind_v,
                         value,
                         overwrites,
                     },

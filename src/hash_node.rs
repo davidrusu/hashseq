@@ -20,7 +20,7 @@ pub const KIND_INSERT: u8 = 0;
 pub const KIND_REMOVE: u8 = 1;
 pub const KIND_MOVE: u8 = 2;
 pub const KIND_PUT: u8 = 3;
-// KIND_MARK: u8 = 4 — reserved; marks land with the mark projection.
+pub const KIND_MARK: u8 = 4;
 
 /// THE glued point — the addressing primitive shared by inserts, moves, and
 /// marks (HASHSEQ_SPEC.md). The side is data, not op kind: a gap *is* an
@@ -96,6 +96,17 @@ pub enum Op {
         value: Id,
         overwrites: BTreeSet<Id>,
     },
+    /// Claim a (element, kind) formatting register over the span
+    /// `[start, end]` (MARKS.md): `kind_v`/`value` are value commitments
+    /// (`TOMBSTONE` value = unmark); `overwrites` names the same-kind marks
+    /// this op saw and supersedes within its range.
+    Mark {
+        start: Anchor,
+        end: Anchor,
+        kind_v: Id,
+        value: Id,
+        overwrites: BTreeSet<Id>,
+    },
 }
 
 impl Op {
@@ -122,6 +133,7 @@ impl Op {
             Op::Remove(_) => KIND_REMOVE,
             Op::Move { .. } => KIND_MOVE,
             Op::Put { .. } => KIND_PUT,
+            Op::Mark { .. } => KIND_MARK,
         }
     }
 
@@ -131,6 +143,7 @@ impl Op {
         match self {
             Op::Insert { at, .. } => Some(at.id()),
             Op::Move { target, .. } => Some(target),
+            Op::Mark { start, .. } => Some(start.id()),
             Op::Remove(_) | Op::Put { .. } => None,
         }
     }
@@ -140,6 +153,7 @@ impl Op {
     fn named_secondary(&self) -> Option<&Id> {
         match self {
             Op::Move { to, .. } => Some(to.id()),
+            Op::Mark { end, .. } => Some(end.id()),
             _ => None,
         }
     }
@@ -149,7 +163,9 @@ impl Op {
     fn named_set(&self) -> Option<&BTreeSet<Id>> {
         match self {
             Op::Remove(targets) => Some(targets),
-            Op::Move { overwrites, .. } | Op::Put { overwrites, .. } => Some(overwrites),
+            Op::Move { overwrites, .. }
+            | Op::Put { overwrites, .. }
+            | Op::Mark { overwrites, .. } => Some(overwrites),
             Op::Insert { .. } => None,
         }
     }
@@ -320,6 +336,31 @@ impl HashNode {
                     update_varint(&mut hasher, i);
                 }
             }
+            Op::Mark {
+                start,
+                end,
+                kind_v,
+                value,
+                overwrites,
+            } => {
+                let sp = (ref_idx(start.id()) << 1) | start.side_bit();
+                let ep = (ref_idx(end.id()) << 1) | end.side_bit();
+                let idxs = sorted_subset_indices(&refs, overwrites);
+                let body_len = varint_len(sp)
+                    + varint_len(ep)
+                    + 64
+                    + varint_len(idxs.len())
+                    + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
+                update_varint(&mut hasher, body_len);
+                update_varint(&mut hasher, sp);
+                update_varint(&mut hasher, ep);
+                hasher.update(&kind_v.0);
+                hasher.update(&value.0);
+                update_varint(&mut hasher, idxs.len());
+                for i in idxs {
+                    update_varint(&mut hasher, i);
+                }
+            }
         }
         Id(*hasher.finalize().as_bytes())
     }
@@ -398,6 +439,16 @@ mod tests {
                     key: tid(0x11),
                     value: tid(0x22),
                     overwrites: BTreeSet::from_iter([tid(0x0C), tid(0x0D)]),
+                },
+            },
+            HashNode {
+                pins,
+                op: Op::Mark {
+                    start: Anchor::Before(tid(0x01)),
+                    end: Anchor::After(tid(0x02)),
+                    kind_v: tid(0x30),
+                    value: tid(0x31),
+                    overwrites: BTreeSet::from_iter([tid(0x03)]),
                 },
             },
         ];

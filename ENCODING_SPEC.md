@@ -24,11 +24,11 @@ id(u) = BLAKE3::derive_key(NODE_CONTEXT, encode_node(u))
 // one context string for every op kind; kinds are tags in the encoding
 ```
 
-- `encode_node(u)` is the node's self-contained canonical encoding: the ids
-  of `refs(u)` sorted ascending, once each (the per-op dictionary), a tips
-  subset indicator, and the op body with *reference* fields as dictionary
-  indices. Hash cost is `|refs(u)|` ids plus index bytes — overlap between
-  tips and named ids is never double-hashed.
+- `encode_node(u)` is the node's self-contained canonical encoding
+  (GRAMMAR_SPEC.md envelope ‖ body): the ids of `refs(u)` sorted ascending,
+  once each (the per-op refs table), and the op body with *reference* fields
+  as table indices. Hash cost is `|refs(u)|` ids plus index bytes — an id is
+  never double-hashed whatever mix of roles references it.
 - **Value fields are not references** (HASHSEQ_SPEC.md "Payload"): a payload
   appears in the body as its value id — always raw 32 B, never a dictionary
   index (GRAMMAR_SPEC.md) — while the *wire* form inlines the value's bytes
@@ -43,11 +43,12 @@ id(u) = BLAKE3::derive_key(NODE_CONTEXT, encode_node(u))
   materializing it must be pinned, by test, to byte-equality with
   `encode_node`.
 
-*Code today*: `encoding::encode_hash_node` (`src/encoding.rs`), hashed by
-`HashNode::id` (`src/hash_node.rs`) with exactly that streaming lock — but it
-implements the `extra_dependencies` + inline-id preimage layout, not yet the
-sorted-refs dictionary above. Align at substrate extraction (a context-string
-bump, since ids change).
+*Code today* (aligned 2026-07-02): `encoding::encode_node_preimage` is this
+encoder; `HashNode::id` streams the identical bytes (locked by
+`id_preimage_is_the_canonical_encoding`), with a single-buffer fast path for
+the typing chain. The Part B stream still derives blocks from replica
+storage (the canonical-normalization pass — smallest-id chain continuation —
+is the remaining encoder work); same-storage determinism holds as before.
 
 ## Canonical snapshot
 

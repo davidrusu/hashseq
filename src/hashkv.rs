@@ -127,8 +127,8 @@ impl HashKv {
         self.put_ids(key_id, value_id)
     }
 
-    /// `put` by raw ids (links, already-provided artifacts, tombstone).
-    pub fn put_ids(&mut self, key: Id, value: Id) -> HashNode {
+    /// Build (without applying) the put node this replica would author.
+    pub fn make_put(&self, key: Id, value: Id) -> HashNode {
         let overwrites: BTreeSet<Id> = self
             .keys
             .get(&key)
@@ -137,14 +137,19 @@ impl HashKv {
         // pins = frontier ∖ named (normalized storage of refs = pins ∪ named)
         let pins: BTreeSet<Id> =
             BTreeSet::from_iter(self.tips.difference(&overwrites).cloned());
-        let node = HashNode {
+        HashNode {
             pins,
             op: Op::Put {
                 key,
                 value,
                 overwrites,
             },
-        };
+        }
+    }
+
+    /// `put` by raw ids (links, already-provided artifacts, tombstone).
+    pub fn put_ids(&mut self, key: Id, value: Id) -> HashNode {
+        let node = self.make_put(key, value);
         self.apply(node.clone());
         node
     }
@@ -304,6 +309,16 @@ impl HashKv {
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
         self.orphaned.values().flatten().map(|(_, node)| node)
+    }
+
+    /// Every applied node as `(id, HashNode)` (parked/gated not included).
+    pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
+        self.nodes.iter().map(|(id, n)| (*id, n.clone())).collect()
+    }
+
+    /// Value artifacts this replica holds bytes for.
+    pub fn value_store(&self) -> impl Iterator<Item = (&Id, &Vec<u8>)> {
+        self.values.iter()
     }
 }
 

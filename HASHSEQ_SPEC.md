@@ -19,10 +19,9 @@ enum Op {
 }
 struct HashNode { refs: BTreeSet<Id>, op: Op }
 // id = BLAKE3::derive_key(NODE_CONTEXT, canonical_encoding)
-// NODE_CONTEXT is ONE string for every op kind in the family — kinds are
-// tags inside the encoding, never separate contexts (HETEROGENEITY.md).
-// Concrete string fixed at substrate extraction; code today uses
-// "hashseq v1 node id".
+// NODE_CONTEXT = "hashweb v1 node id" — ONE string for every op kind in the
+// family; kinds are tags inside the encoding, never separate contexts
+// (HETEROGENEITY.md, GRAMMAR_SPEC.md).
 ```
 
 The anchor's side is data, not op kind — matching the resource definition
@@ -65,11 +64,15 @@ observed frontier (the commitment vector), making move-vs-remove concurrency
 decidable; nothing requires it and v1 does not. Orphan buffering covers
 moves arriving before `target` or `to`.
 
-*Code today*: stores `extra_dependencies = tips − named` in place of the
-unified `refs` (`HashNode::iter_dependencies` yields `refs(u)`), two side-tagged
-ops (`InsertAfter`/`InsertBefore`) in place of the unified `Insert`, a raw
-`char` payload in place of the payload id, and no `Move`. Align at substrate
-extraction (one context-string bump — ids change).
+*Code today* (aligned 2026-07-02): the preimage and id derivation implement
+this spec exactly (GRAMMAR_SPEC.md Part A; `tests/grammar_vectors.rs` locks
+the vectors). Storage keeps the normalized split — `HashNode { pins, op }`
+with `pins = refs ∖ named` and `iter_refs()` yielding `refs(u)` — a
+replica-local layout choice, not a wire or identity one. Known gaps, gated
+(quarantined pending re-evaluation, the loosening path): non-char insert
+payloads (the value-column generalization), and inserts anchored on move-op
+splice points. Move's rendered index relocation (origin-ghost treap overlay)
+is not wired yet — `placement_of` is the read-time placement.
 
 ## Payload
 

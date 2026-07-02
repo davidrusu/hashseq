@@ -3,6 +3,7 @@ pub mod encoding;
 pub mod hash_node;
 pub mod hashkv;
 pub mod hashseq;
+pub mod hashweb;
 pub mod hashseq_iter;
 pub mod run;
 mod run_index;
@@ -15,6 +16,7 @@ pub use self::encoding::{
 pub use self::hash_node::{Anchor, HashNode, Op, Payload};
 pub use self::hashkv::{HashKv, Read};
 pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};
+pub use self::hashweb::HashWeb;
 pub use self::run::{FirstOp, Run};
 pub use self::value::{Value, object_id};
 
