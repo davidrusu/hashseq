@@ -168,6 +168,9 @@ The identity grammar (preimages, contexts, derived constants) is implemented
 exactly per `GRAMMAR_SPEC.md` and locked by test vectors
 (`tests/grammar_vectors.rs`). Moves render: placement registers relocate
 elements in the position index (origin ghosts, frozen conflicts render at
-the last agreed placement). Marks (rich-text spans) and canonical snapshot
-normalization are specified and queued — see the spec set's *Code today*
-notes for the precise implementation frontier.
+the last agreed placement), with splice-point anchors for typing adjacent
+to moved content. Marks render: Peritext-style span annotations with
+anchor-encoded edge expansion, add-wins concurrent unmark, and spans that
+survive deletion and relocation (`marks_at` / `marked_spans`). Canonical
+snapshot normalization is specified and queued — see the spec set's *Code
+today* notes for the precise implementation frontier.

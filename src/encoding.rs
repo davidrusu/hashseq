@@ -992,6 +992,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         for (idx, mv) in &seq.move_nodes {
             nodes.push((seq.id_of(*idx), seq.move_node(*idx, mv)));
         }
+        for (idx, mk) in &seq.mark_nodes {
+            nodes.push((seq.id_of(*idx), seq.mark_node(mk)));
+        }
         nodes.sort_by_key(|(id, _)| *id);
         nodes.into_iter().map(|(_, node)| node).collect()
     };

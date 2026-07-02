@@ -86,6 +86,8 @@ pub enum Loc {
     MultiRemove,
     /// A placement-register move op (stored in `move_nodes`).
     MoveOp,
+    /// A span-annotation mark op (stored in `mark_nodes`).
+    MarkOp,
 }
 
 /// `Loc` packed into 8 bytes for the per-node `locs` Vec (the enum is 12).
@@ -102,6 +104,7 @@ impl PackedLoc {
     const KIND_REMOVE_CHAIN: u64 = 2;
     const KIND_MULTI_REMOVE: u64 = 3;
     const KIND_MOVE_OP: u64 = 4;
+    const KIND_MARK_OP: u64 = 5;
 
     #[inline]
     fn pack(handle: NodeIdx, pos: u32, kind: u64) -> Self {
@@ -118,6 +121,7 @@ impl PackedLoc {
             Self::KIND_ORIGIN => Loc::Origin,
             Self::KIND_REMOVE_CHAIN => Loc::RemoveChain { chain: handle, pos },
             Self::KIND_MOVE_OP => Loc::MoveOp,
+            Self::KIND_MARK_OP => Loc::MarkOp,
             _ => Loc::MultiRemove,
         }
     }
@@ -134,6 +138,7 @@ impl From<Loc> for PackedLoc {
             }
             Loc::MultiRemove => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MULTI_REMOVE),
             Loc::MoveOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MOVE_OP),
+            Loc::MarkOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MARK_OP),
         }
     }
 }
@@ -212,6 +217,23 @@ pub struct StoredMove {
     /// Superseded move ops (the register's overwrites edges), in Id order.
     pub overwrites: SortedIdVec,
     /// Frontier pins, in Id order.
+    pub pins: SortedIdVec,
+}
+
+/// Storage form of an applied mark op (the span-annotation projection,
+/// MARKS.md). Anchors are glue points on elements (or the origin); `kind`
+/// and `value` are value commitments, not references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMark {
+    pub start_after: bool,
+    pub start_anchor: NodeIdx,
+    pub end_after: bool,
+    pub end_anchor: NodeIdx,
+    pub kind: Id,
+    pub value: Id,
+    /// Superseded mark ops (range- and kind-scoped at read), in Id order.
+    pub overwrites: SortedIdVec,
+    /// Frontier pins (the mark layer's own frontier), in Id order.
     pub pins: SortedIdVec,
 }
 
@@ -466,18 +488,42 @@ pub struct HashSeq {
     /// `befores_by_anchor`).
     pub afters: FxHashMap<NodeIdx, SortedIdVec>,
 
+    /// Applied mark ops, by their own handle (MARKS.md).
+    pub mark_nodes: FxHashMap<NodeIdx, StoredMark>,
+    /// Anchor events for the mark sweep: anchor element (or origin) ->
+    /// events crossing at its glue points. Empty in mark-free documents.
+    mark_events: FxHashMap<NodeIdx, Vec<MarkEvent>>,
+
     pub(crate) tips: BTreeSet<Id>,
+    /// The mark layer's own frontier: marks are downstream-only (content
+    /// never references marks), so mark ops never enter the text tips.
+    pub(crate) mark_tips: BTreeSet<Id>,
     /// Parked orphans + the gate (see `delivery::Delivery`). Gated here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
-    /// (a map op in a seq), and non-char insert payloads (the value column
-    /// generalization).
+    /// (a map op in a seq), non-char insert payloads (the value column
+    /// generalization), inverted mark spans, and mark anchors on move-op
+    /// splice points.
     pub(crate) delivery: Delivery,
     index: RunIndex,
 }
 
+/// The live mark set at a point, grouped by kind: `(kind, [(mark id,
+/// value)])`, both levels id-ordered. Multiple entries under one kind are a
+/// surfaced conflict (MVR); a TOMBSTONE value is an unmark.
+pub type MarkSet = Vec<(Id, Vec<(Id, Id)>)>;
+
+/// One crossing at an anchor's glue point: a mark op starting or ending.
+#[derive(Debug, Clone, Copy)]
+struct MarkEvent {
+    op: NodeIdx,
+    start: bool,
+    /// Which of the anchor's two points: `After` (true) or `Before`.
+    after: bool,
+}
+
 impl PartialEq for HashSeq {
     fn eq(&self, other: &Self) -> bool {
-        self.tips == other.tips
+        self.tips == other.tips && self.mark_tips == other.mark_tips
     }
 }
 
@@ -509,7 +555,10 @@ impl HashSeq {
             moves: FxHashMap::default(),
             remove_runs: FxHashMap::default(),
             afters: FxHashMap::default(),
+            mark_nodes: FxHashMap::default(),
+            mark_events: FxHashMap::default(),
             tips: BTreeSet::new(),
+            mark_tips: BTreeSet::new(),
             delivery: Delivery::default(),
             index: RunIndex::default(),
         };
@@ -1300,6 +1349,314 @@ impl HashSeq {
         node
     }
 
+    /// Resolve a mark anchor to a base glue point `(node, after-side)`;
+    /// `None` if it names anything but an element or the origin.
+    fn glue_point(&self, a: &Anchor) -> Option<(NodeIdx, bool)> {
+        let i = self.idx_of(a.id())?;
+        match self.loc_of(i) {
+            Loc::Run { .. } | Loc::Origin => Some((i, matches!(a, Anchor::After(_)))),
+            _ => None,
+        }
+    }
+
+    /// Base-order comparison of two glue points. Same element: `Before`
+    /// precedes `After`. Distinct elements: base element order decides.
+    /// Origin points compare below every element point (imprecise only for
+    /// content inserted Before(origin) — the sweep's activation guard keeps
+    /// that corner inert).
+    fn cmp_points(&self, a: (NodeIdx, bool), b: (NodeIdx, bool)) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if a.0 == b.0 {
+            return a.1.cmp(&b.1);
+        }
+        if a.0 == ORIGIN_IDX {
+            return Ordering::Less;
+        }
+        if b.0 == ORIGIN_IDX {
+            return Ordering::Greater;
+        }
+        self.index.cmp_base(self.elem_ref(a.0), self.elem_ref(b.0))
+    }
+
+    /// Apply a mark: O(1) bookkeeping (MARKS.md "Apply") — intern, attach
+    /// the two anchor events, update the mark layer's tips. Suppression is
+    /// computed at read, never at apply.
+    #[allow(clippy::too_many_arguments)] // one parameter per op field
+    fn apply_mark(
+        &mut self,
+        id: Id,
+        pins: BTreeSet<Id>,
+        start: Anchor,
+        end: Anchor,
+        kind: Id,
+        value: Id,
+        overwrites: BTreeSet<Id>,
+    ) {
+        let idx = self.intern(id, Loc::MarkOp);
+        let (start_anchor, start_after) = self.glue_point(&start).expect("gated above");
+        let (end_anchor, end_after) = self.glue_point(&end).expect("gated above");
+
+        for r in overwrites.iter().chain(pins.iter()) {
+            self.mark_tips.remove(r);
+        }
+        self.mark_tips.insert(id);
+
+        self.mark_events.entry(start_anchor).or_default().push(MarkEvent {
+            op: idx,
+            start: true,
+            after: start_after,
+        });
+        self.mark_events.entry(end_anchor).or_default().push(MarkEvent {
+            op: idx,
+            start: false,
+            after: end_after,
+        });
+
+        let stored = StoredMark {
+            start_after,
+            start_anchor,
+            end_after,
+            end_anchor,
+            kind,
+            value,
+            overwrites: SortedIdVec::from_id_set(&overwrites, |d| self.idx_of_known(d)),
+            pins: SortedIdVec::from_id_set(&pins, |d| self.idx_of_known(d)),
+        };
+        self.mark_nodes.insert(idx, stored);
+    }
+
+    /// Reconstruct a mark op's `HashNode` (for merge / re-broadcast).
+    pub fn mark_node(&self, mk: &StoredMark) -> HashNode {
+        let anchor = |after: bool, n: NodeIdx| {
+            let id = self.id_of(n);
+            if after { Anchor::After(id) } else { Anchor::Before(id) }
+        };
+        HashNode {
+            pins: mk.pins.to_id_set(&self.ids),
+            op: Op::Mark {
+                start: anchor(mk.start_after, mk.start_anchor),
+                end: anchor(mk.end_after, mk.end_anchor),
+                kind_v: mk.kind,
+                value: mk.value,
+                overwrites: mk.overwrites.to_id_set(&self.ids),
+            },
+        }
+    }
+
+    // ---- mark reads (arbitration happens here, per Law II) ----
+
+    /// Does mark `mk` cover element `x` (strictly between its points, in the
+    /// base order)? Rendered relocation never changes coverage.
+    fn mark_covers(&self, mk: &StoredMark, x: NodeIdx) -> bool {
+        use std::cmp::Ordering;
+        self.cmp_points((mk.start_anchor, mk.start_after), (x, false)) != Ordering::Greater
+            && self.cmp_points((x, true), (mk.end_anchor, mk.end_after)) != Ordering::Greater
+    }
+
+    /// The live mark set at element `id`, grouped by kind: every covering
+    /// mark not named in the `overwrites` of a same-kind mark that also
+    /// covers `id` (range- and kind-scoped suppression, MARKS.md). MVR: the
+    /// whole live set is exposed, unmark tombstones included; no LWW.
+    pub fn marks_at(&self, id: &Id) -> MarkSet {
+        let Some(x) = self.idx_of(id) else {
+            return Vec::new();
+        };
+        if self.mark_nodes.is_empty() {
+            return Vec::new();
+        }
+        let covering: Vec<NodeIdx> = self
+            .mark_nodes
+            .iter()
+            .filter(|(_, mk)| self.mark_covers(mk, x))
+            .map(|(&i, _)| i)
+            .collect();
+        self.live_set(&covering)
+    }
+
+    /// Suppression among a set of covering marks: drop those named in the
+    /// overwrites of a same-kind member. Returns (kind, [(mark id, value)])
+    /// groups, both levels id-ordered.
+    fn live_set(&self, covering: &[NodeIdx]) -> MarkSet {
+        let mut by_kind: BTreeMap<Id, Vec<NodeIdx>> = BTreeMap::new();
+        for &m in covering {
+            by_kind.entry(self.mark_nodes[&m].kind).or_default().push(m);
+        }
+        by_kind
+            .into_iter()
+            .filter_map(|(kind, members)| {
+                let mut live: Vec<(Id, Id)> = members
+                    .iter()
+                    .filter(|&&m| {
+                        !members.iter().any(|&o| {
+                            o != m && self.mark_nodes[&o].overwrites.iter().any(|w| w == m)
+                        })
+                    })
+                    .map(|&m| (self.id_of(m), self.mark_nodes[&m].value))
+                    .collect();
+                live.sort();
+                if live.is_empty() { None } else { Some((kind, live)) }
+            })
+            .collect()
+    }
+
+    /// The rendered document as coalesced marked spans: a base-order sweep
+    /// toggles the active set at anchor events (activation-guarded — an end
+    /// for a never-started mark is inert), then rendered-order emission
+    /// coalesces equal formats. Unmark tombstone values suppress but do not
+    /// display. O(text + anchor events).
+    pub fn marked_spans(&self) -> Vec<(String, MarkSet)> {
+        if self.mark_nodes.is_empty() {
+            let text: String = self.iter().collect();
+            return if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![(text, Vec::new())]
+            };
+        }
+
+        // Base sweep: per-element live sets, recomputed only when the
+        // active set changes.
+        let mut active: FxHashSet<NodeIdx> = FxHashSet::default();
+        let mut ended: FxHashSet<NodeIdx> = FxHashSet::default();
+        let fire = |events: &Vec<MarkEvent>,
+                        after: bool,
+                        active: &mut FxHashSet<NodeIdx>,
+                        ended: &mut FxHashSet<NodeIdx>|
+         -> bool {
+            let mut changed = false;
+            for ev in events.iter().filter(|ev| ev.after == after) {
+                if ev.start {
+                    if !ended.contains(&ev.op) {
+                        changed |= active.insert(ev.op);
+                    }
+                } else if !active.remove(&ev.op) {
+                    ended.insert(ev.op);
+                } else {
+                    changed = true;
+                }
+            }
+            changed
+        };
+
+        // Origin events fire up front (After(origin) = the document start;
+        // any Before(origin) content predates every mark point — inert by
+        // the activation guard).
+        if let Some(events) = self.mark_events.get(&ORIGIN_IDX) {
+            fire(events, false, &mut active, &mut ended);
+            fire(events, true, &mut active, &mut ended);
+        }
+
+        let mut fmt: FxHashMap<NodeIdx, usize> = FxHashMap::default();
+        let mut sets: Vec<MarkSet> = vec![Vec::new()];
+        let mut current = 0usize; // index into `sets` for the current format
+        let mut dirty = false;
+        for (run, start, len) in self.index.base_coverage() {
+            for off in start..start + len {
+                let e = self.runs[&run].elements[off as usize];
+                if let Some(events) = self.mark_events.get(&e) {
+                    dirty |= fire(events, false, &mut active, &mut ended);
+                }
+                if !self.is_removed(e) && !active.is_empty() {
+                    if dirty || current == 0 {
+                        let members: Vec<NodeIdx> = active.iter().copied().collect();
+                        let set = self.live_set(&members);
+                        current = if set.is_empty() {
+                            0
+                        } else {
+                            sets.push(set);
+                            sets.len() - 1
+                        };
+                        dirty = false;
+                    }
+                    if current != 0 {
+                        fmt.insert(e, current);
+                    }
+                } else if active.is_empty() {
+                    current = 0;
+                    dirty = false;
+                }
+                if let Some(events) = self.mark_events.get(&e) {
+                    let changed = fire(events, true, &mut active, &mut ended);
+                    dirty |= changed;
+                }
+            }
+        }
+
+        // Rendered emission, coalescing runs of equal format.
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for e in self.iter_idxs() {
+            let f = fmt.get(&e).copied().unwrap_or(0);
+            match out.last_mut() {
+                Some((text, last)) if *last == f => text.push(self.char_at(e)),
+                _ => out.push((self.char_at(e).to_string(), f)),
+            }
+        }
+        out.into_iter()
+            .map(|(text, f)| {
+                let mut marks = sets[f].clone();
+                // Tombstone values suppress but never display.
+                for (_, live) in marks.iter_mut() {
+                    live.retain(|(_, v)| *v != *crate::value::TOMBSTONE);
+                }
+                marks.retain(|(_, live)| !live.is_empty());
+                (text, marks)
+            })
+            .collect()
+    }
+
+    // ---- mark authoring ----
+
+    /// Author a mark of `kind`/`value` over `[start, end]`, superseding the
+    /// same-kind marks intersecting the range that this replica sees.
+    /// Anchor-side choice encodes edge-expansion behavior (MARKS.md).
+    pub fn mark_range(&mut self, start: Anchor, end: Anchor, kind: Id, value: Id) -> HashNode {
+        // Overwrites hygiene (open problem 1, simple form): name every
+        // same-kind mark whose span intersects the new range.
+        let (s, e) = (
+            self.glue_point(&start).expect("anchor must be applied"),
+            self.glue_point(&end).expect("anchor must be applied"),
+        );
+        let overwrites: BTreeSet<Id> = self
+            .mark_nodes
+            .iter()
+            .filter(|(_, mk)| {
+                use std::cmp::Ordering;
+                mk.kind == kind
+                    && self.cmp_points((mk.end_anchor, mk.end_after), s) == Ordering::Greater
+                    && self.cmp_points(e, (mk.start_anchor, mk.start_after)) == Ordering::Greater
+            })
+            .map(|(&i, _)| self.id_of(i))
+            .collect();
+        let mut named: BTreeSet<Id> = overwrites.clone();
+        named.insert(*start.id());
+        named.insert(*end.id());
+        let pins: BTreeSet<Id> = self.mark_tips.difference(&named).cloned().collect();
+        let node = HashNode {
+            pins,
+            op: Op::Mark {
+                start,
+                end,
+                kind_v: kind,
+                value,
+                overwrites,
+            },
+        };
+        self.apply(node.clone());
+        node
+    }
+
+    /// Remove `kind` formatting over `[start, end]`: a mark whose value is
+    /// the tombstone artifact (partial unmark is the same op over a
+    /// sub-range — the overwritten mark keeps applying outside it).
+    pub fn unmark_range(&mut self, start: Anchor, end: Anchor, kind: Id) -> HashNode {
+        self.mark_range(start, end, kind, *crate::value::TOMBSTONE)
+    }
+
+    /// The mark layer's frontier (mark ops not superseded or pinned-over).
+    pub fn mark_tips(&self) -> &BTreeSet<Id> {
+        &self.mark_tips
+    }
+
     fn apply_remove(&mut self, id: Id, extra_deps: BTreeSet<Id>, target_ids: BTreeSet<Id>) {
         // Targets are checked dependencies of the remove, so they are interned.
         // (A remove targeting a non-insert node is harmless: it's not in the
@@ -1488,10 +1845,35 @@ impl HashSeq {
                 });
                 target_ok && anchor_ok && to.id() != target
             }
+            // The Mark rows (MARKS.md "Validation", all stable): anchors
+            // must be elements or the origin (splice-point anchors for marks
+            // are a future loosening), and the span must not be inverted —
+            // one cmp over the immutable base order, so no later Move can
+            // flip the verdict.
+            Op::Mark { start, end, .. } => {
+                match (self.glue_point(start), self.glue_point(end)) {
+                    (Some(s), Some(e)) => self.cmp_points(s, e) != std::cmp::Ordering::Greater,
+                    _ => false,
+                }
+            }
             _ => false,
         };
         if !admitted {
             return Err(node);
+        }
+
+        // Marks live in their own layer: they never enter the text tips
+        // (downstream-only — content never references marks; LAYERING.md).
+        if let Op::Mark {
+            start,
+            end,
+            kind_v,
+            value,
+            overwrites,
+        } = node.op
+        {
+            self.apply_mark(id, node.pins, start, end, kind_v, value, overwrites);
+            return Ok(());
         }
 
         // Update tips before consuming node (insert ops don't depend on tips)
@@ -1579,6 +1961,9 @@ impl HashSeq {
         for (idx, mv) in &self.move_nodes {
             out.push((self.id_of(*idx), self.move_node(*idx, mv)));
         }
+        for (idx, mk) in &self.mark_nodes {
+            out.push((self.id_of(*idx), self.mark_node(mk)));
+        }
         out
     }
 
@@ -1624,6 +2009,12 @@ impl HashSeq {
         // the orphan machinery orders them after their runs arrive.
         for (idx, mv) in &other.move_nodes {
             let node = other.move_node(*idx, mv);
+            self.apply_with_id(other.id_of(*idx), node);
+        }
+
+        // Mark ops (span annotations) — same discipline.
+        for (idx, mk) in &other.mark_nodes {
+            let node = other.mark_node(mk);
             self.apply_with_id(other.id_of(*idx), node);
         }
 
@@ -3462,7 +3853,7 @@ mod test {
         let ab_ids: Vec<Id> = ab.iter_ids().copied().collect();
         let ba_ids: Vec<Id> = ba.iter_ids().copied().collect();
         let causal: Vec<Id> = ab.iter_idxs_causal().map(|i| ab.id_of(i)).collect();
-        ab == ba && ab_ids == ba_ids && ab_ids == causal
+        ab == ba && ab_ids == ba_ids && ab_ids == causal && ab.marked_spans() == ba.marked_spans()
     }
 
     /// Fuzz driver mixing inserts, removes, moves, and splice-anchored
@@ -3471,7 +3862,7 @@ mod test {
     /// generated and must be harmless).
     fn seq_from_move_ops(seq: &mut HashSeq, ops: &[(u8, u8, u8)]) {
         for &(kind, x, y) in ops {
-            match kind % 5 {
+            match kind % 6 {
                 0 | 3 => {
                     let at = if seq.is_empty() {
                         0
@@ -3502,7 +3893,7 @@ mod test {
                     };
                     seq.move_element(target, to);
                 }
-                _ => {
+                4 => {
                     // Insert anchored at a move op's splice point (any head
                     // of some element's register — deciding or not).
                     if seq.is_empty() {
@@ -3520,6 +3911,45 @@ mod test {
                             op,
                         });
                     }
+                }
+                _ => {
+                    // Mark or unmark a range (possibly inverted — gates
+                    // harmlessly; possibly over tombstones — spec-valid).
+                    if seq.is_empty() {
+                        continue;
+                    }
+                    let p1 = seq.id_at(x as usize % seq.len()).unwrap();
+                    let p2 = seq.id_at(y as usize % seq.len()).unwrap();
+                    let start = if x & 1 == 0 {
+                        Anchor::Before(p1)
+                    } else {
+                        Anchor::After(p1)
+                    };
+                    let end = if y & 1 == 0 {
+                        Anchor::After(p2)
+                    } else {
+                        Anchor::Before(p2)
+                    };
+                    let kind = crate::value::Value::String("b".into()).value_id();
+                    let value = if (x ^ y) & 2 == 0 {
+                        crate::value::Value::Bool(true).value_id()
+                    } else {
+                        *crate::value::TOMBSTONE
+                    };
+                    let mut named: BTreeSet<Id> = BTreeSet::new();
+                    named.insert(*start.id());
+                    named.insert(*end.id());
+                    seq.apply(HashNode {
+                        pins: BTreeSet::new(),
+                        op: Op::Mark {
+                            start,
+                            end,
+                            kind_v: kind,
+                            value,
+                            overwrites: BTreeSet::new(),
+                        },
+                    });
+                    let _ = named;
                 }
             }
         }
@@ -3652,6 +4082,259 @@ mod test {
         assert_eq!(decoded, seq);
         assert_eq!(decoded.iter().collect::<String>(), "amy!");
         check_index_matches_iter(&decoded);
+    }
+
+    // ---- marks (the span-annotation projection, MARKS.md) ----
+
+    fn bold() -> Id {
+        crate::value::Value::String("bold".into()).value_id()
+    }
+
+    fn yes() -> Id {
+        crate::value::Value::Bool(true).value_id()
+    }
+
+    /// Kinds present at an element, tombstone-suppressed but conflict-honest.
+    fn kinds_at(seq: &HashSeq, pos: usize) -> Vec<Id> {
+        let id = seq.id_at(pos).unwrap();
+        seq.marks_at(&id)
+            .into_iter()
+            .filter(|(_, live)| live.iter().any(|(_, v)| *v != *crate::value::TOMBSTONE))
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    fn span_texts(seq: &HashSeq) -> Vec<(String, bool)> {
+        seq.marked_spans()
+            .into_iter()
+            .map(|(text, marks)| (text, !marks.is_empty()))
+            .collect()
+    }
+
+    #[test]
+    fn mark_renders_coalesced_spans() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello world".chars());
+        let h = seq.id_at(0).unwrap();
+        let space = seq.id_at(5).unwrap();
+
+        // Bold "hello": Before(h) .. Before(space) — the bold expansion
+        // choice from the MARKS.md anchor table.
+        seq.mark_range(Anchor::Before(h), Anchor::Before(space), bold(), yes());
+
+        assert_eq!(
+            span_texts(&seq),
+            vec![("hello".into(), true), (" world".into(), false)]
+        );
+        assert_eq!(kinds_at(&seq, 0), vec![bold()]);
+        assert_eq!(kinds_at(&seq, 4), vec![bold()]);
+        assert!(kinds_at(&seq, 5).is_empty());
+    }
+
+    /// Grow-at-edges is anchor choice, not a flag: `Before(next)` ends
+    /// expand with edge inserts, `After(last)` ends do not.
+    #[test]
+    fn edge_expansion_is_anchor_choice() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+
+        let link = crate::value::Value::String("link".into()).value_id();
+        // bold: Before(a)..Before(b) — expanding end.
+        seq.mark_range(Anchor::Before(a), Anchor::Before(b), bold(), yes());
+        // link: Before(a)..After(a) — non-expanding end.
+        seq.mark_range(Anchor::Before(a), Anchor::After(a), link, yes());
+
+        // Type between a and b (a before-child of b: inside Before(b),
+        // outside After(a)).
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_before(b, 'x'),
+        });
+        let x_pos = seq.position_of(&seq.id_at(1).unwrap()).unwrap();
+        assert_eq!(seq.iter().collect::<String>(), "axb");
+        assert_eq!(kinds_at(&seq, x_pos), vec![bold()], "bold expands, link does not");
+    }
+
+    /// Partial unmark: the overwritten bold keeps applying outside the
+    /// unmarked sub-range.
+    #[test]
+    fn partial_unmark_splits_the_span() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcde".chars());
+        let ids: Vec<Id> = (0..5).map(|i| seq.id_at(i).unwrap()).collect();
+
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[4]), bold(), yes());
+        assert_eq!(span_texts(&seq), vec![("abcde".into(), true)]);
+
+        seq.unmark_range(Anchor::Before(ids[2]), Anchor::After(ids[2]), bold());
+        assert_eq!(
+            span_texts(&seq),
+            vec![
+                ("ab".into(), true),
+                ("c".into(), false),
+                ("de".into(), true)
+            ]
+        );
+    }
+
+    /// Peritext case 1: concurrent bold vs overlapping unbold — the unbold
+    /// kills only what it names; the concurrent bold survives (add wins).
+    #[test]
+    fn concurrent_bold_survives_unbold_it_never_saw() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "abcd".chars());
+        let ids: Vec<Id> = (0..4).map(|i| base.id_at(i).unwrap()).collect();
+        base.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes());
+
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        // r1 unbolds bc; r2 concurrently re-bolds cd.
+        r1.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold());
+        r2.mark_range(Anchor::Before(ids[2]), Anchor::After(ids[3]), bold(), yes());
+
+        let mut m1 = r1.clone();
+        m1.merge(r2.clone());
+        let mut m2 = r2;
+        m2.merge(r1);
+        assert_eq!(m1, m2);
+        assert_eq!(m1.marked_spans(), m2.marked_spans());
+
+        // a bold; b unbolded; c: unbold vs unseen concurrent bold — the
+        // bold survives; d bold.
+        assert_eq!(kinds_at(&m1, 0), vec![bold()]);
+        assert!(kinds_at(&m1, 1).is_empty());
+        assert_eq!(kinds_at(&m1, 2), vec![bold()]);
+        assert_eq!(kinds_at(&m1, 3), vec![bold()]);
+    }
+
+    /// Peritext case 2: an insert into a gap inside an unmarked sub-span is
+    /// covered by the unmark — not bold.
+    #[test]
+    fn insert_into_unmarked_gap_is_not_marked() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcd".chars());
+        let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes());
+        seq.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold());
+
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(ids[1], 'x'),
+        });
+        assert_eq!(seq.iter().collect::<String>(), "abxcd");
+        assert!(kinds_at(&seq, 2).is_empty(), "x falls inside the unmark");
+    }
+
+    /// Peritext case 3: text deleted, new text inserted between the
+    /// tombstones inherits the span (documented, correct).
+    #[test]
+    fn insert_between_tombstones_inherits_the_mark() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcd".chars());
+        let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
+        seq.mark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold(), yes());
+        seq.remove_batch(1, 2); // tombstone b, c
+
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(ids[1], 'x'),
+        });
+        assert_eq!(seq.iter().collect::<String>(), "axd");
+        assert_eq!(kinds_at(&seq, 1), vec![bold()], "between the tombstones");
+    }
+
+    /// Peritext case 4: an inverted span (end before start in base order)
+    /// gates permanently.
+    #[test]
+    fn inverted_mark_span_gates() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Mark {
+                start: Anchor::Before(b),
+                end: Anchor::After(a),
+                kind_v: bold(),
+                value: yes(),
+                overwrites: BTreeSet::new(),
+            },
+        });
+        assert_eq!(seq.delivery.gated.len(), 1);
+        assert!(seq.mark_nodes.is_empty());
+        assert!(seq.mark_tips().is_empty());
+    }
+
+    /// Span membership is base order: moving an element does not change
+    /// which marks cover it, and it carries its formatting to where it
+    /// renders.
+    #[test]
+    fn moved_elements_keep_their_marks() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcd".chars());
+        let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[1]), bold(), yes());
+        assert_eq!(
+            span_texts(&seq),
+            vec![("ab".into(), true), ("cd".into(), false)]
+        );
+
+        // Move bold `a` to the end: it renders last, still bold; the span
+        // still covers exactly {a, b} in base order.
+        seq.move_element(ids[0], Anchor::After(ids[3]));
+        assert_eq!(seq.iter().collect::<String>(), "bcda");
+        assert_eq!(
+            span_texts(&seq),
+            vec![
+                ("b".into(), true),
+                ("cd".into(), false),
+                ("a".into(), true)
+            ]
+        );
+        assert_eq!(kinds_at(&seq, 3), vec![bold()]);
+    }
+
+    /// A mark delivered before its text parks and applies on arrival.
+    #[test]
+    fn mark_before_its_text_parks() {
+        let mut source = HashSeq::default();
+        source.insert_batch(0, "ab".chars());
+        let a = source.id_at(0).unwrap();
+        let b = source.id_at(1).unwrap();
+        let mark = source.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes());
+
+        let mut fresh = HashSeq::default();
+        fresh.apply(mark);
+        assert_eq!(fresh.orphans().count(), 1);
+        assert!(fresh.mark_nodes.is_empty());
+        for (id, node) in source.all_nodes() {
+            if matches!(node.op, Op::Insert { .. }) {
+                fresh.apply_with_id(id, node);
+            }
+        }
+        assert_eq!(fresh.orphans().count(), 0);
+        assert_eq!(span_texts(&fresh), vec![("ab".into(), true)]);
+    }
+
+    /// Marks survive the wire.
+    #[test]
+    fn marks_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello".chars());
+        let h = seq.id_at(0).unwrap();
+        let o = seq.id_at(4).unwrap();
+        seq.mark_range(Anchor::Before(h), Anchor::After(o), bold(), yes());
+        seq.unmark_range(Anchor::Before(seq.id_at(2).unwrap()), Anchor::After(seq.id_at(2).unwrap()), bold());
+
+        let decoded = crate::encoding::decode_hashseq(&crate::encoding::encode_hashseq(&seq))
+            .expect("roundtrip");
+        assert_eq!(decoded, seq);
+        assert_eq!(decoded.marked_spans(), seq.marked_spans());
+        assert_eq!(decoded.mark_tips(), seq.mark_tips());
     }
 
     #[test]

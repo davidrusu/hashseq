@@ -18,7 +18,7 @@
 //! Everything here is replica-local bookkeeping (handle space); nothing in
 //! this module participates in convergence.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hashseq::NodeIdx;
 
@@ -373,6 +373,89 @@ impl RunIndex {
                 n = f.right;
             }
         }
+    }
+
+    /// Base-order comparison of two elements: the immutable order that
+    /// anchors, marks, and gate verdicts depend on. Resolves through base
+    /// slots only (origin ghosts — never destination fragments), counts
+    /// invisible elements, and is stable for life: splits subdivide in
+    /// place, tombstones keep slots, treap rotations preserve in-order.
+    /// O(log F) expected via the fragments' root paths.
+    pub(crate) fn cmp_base(&self, a: ElemRef, b: ElemRef) -> std::cmp::Ordering {
+        let fa = self
+            .frag_containing(a.0, a.1)
+            .expect("element must be indexed");
+        let fb = self
+            .frag_containing(b.0, b.1)
+            .expect("element must be indexed");
+        if fa == fb {
+            return a.1.cmp(&b.1);
+        }
+        let pa = self.root_path(fa);
+        let pb = self.root_path(fb);
+        let mut i = 0;
+        while i < pa.len() && i < pb.len() && pa[i] == pb[i] {
+            i += 1;
+        }
+        if i == pa.len() {
+            // fa is an ancestor of fb: fb's side of fa decides.
+            return if pb[i] == self.frags[fa as usize].left {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+        if i == pb.len() {
+            return if pa[i] == self.frags[fb as usize].left {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        // Divergence below a common ancestor: left subtree precedes.
+        let anc = pa[i - 1];
+        if pa[i] == self.frags[anc as usize].left {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    }
+
+    /// Root-to-`n` path of treap slots.
+    fn root_path(&self, n: u32) -> Vec<u32> {
+        let mut path = vec![n];
+        let mut cur = n;
+        while self.frags[cur as usize].parent != NIL {
+            cur = self.frags[cur as usize].parent;
+            path.push(cur);
+        }
+        path.reverse();
+        path
+    }
+
+    /// The base coverage in document order: every `(run, start, len)` range
+    /// of every base fragment — invisible elements included, destination and
+    /// splice fragments excluded. This is the mark sweep's walk order.
+    pub(crate) fn base_coverage(&self) -> Vec<(NodeIdx, u32, u32)> {
+        let synthetic: FxHashSet<u32> = if self.moved.is_empty() && self.splice.is_empty() {
+            FxHashSet::default()
+        } else {
+            self.moved
+                .values()
+                .chain(self.splice.values())
+                .copied()
+                .collect()
+        };
+        let mut out = Vec::new();
+        let mut cur = self.leftmost(self.root);
+        while cur != NIL {
+            if !synthetic.contains(&cur) {
+                let f = &self.frags[cur as usize];
+                out.push((f.head, f.start, f.len));
+            }
+            cur = self.successor(cur);
+        }
+        out
     }
 
     /// Visible position of the element, or `None` if it is removed. A moved

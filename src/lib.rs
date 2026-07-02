@@ -14,7 +14,7 @@ pub mod wasm;
 pub use self::encoding::{DecodeError, EncodableOp, decode_hashseq, encode_hashseq};
 pub use self::hash_node::{Anchor, HashNode, Op, Payload};
 pub use self::hashkv::{HashKv, Read};
-pub use self::hashseq::{Cursor, HashSeq, Loc, NodeIdx, StoredRun};
+pub use self::hashseq::{Cursor, HashSeq, Loc, MarkSet, NodeIdx, StoredRun};
 pub use self::hashweb::HashWeb;
 pub use self::run::{FirstOp, Run};
 pub use self::value::{Value, object_id};
