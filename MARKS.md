@@ -1,273 +1,195 @@
-# Marks: Peritext-style span annotations on hashseq (design sketch)
+# Marks op spec
 
-Status: design sketch, 2026-06-11. Nothing here is implemented. Companion to
-HASHDOC.md (marks are a natural third projection alongside seq and map).
+Framework: FRAMEWORK.md (one reference set + honest frontier rule; Law I/II;
+resource → conflict → resolution; locality dividing line; stability
+requirement). Design lineage: Peritext (PRIOR_ART.md §5) — the anchoring and
+span model, with hash-committed ids and causal supersession in place of
+Lamport ids and timestamp LWW.
 
-## Goal
+Rich-text formatting and span annotations (bold, links, comments) over a seq
+object: anchored to elements, not indices; concurrent mark/unmark converges;
+spans survive deletion of the underlying text. The substrate already
+provides everything the model requires — stable element ids, tombstones that
+keep resolving, and both-sided glued anchors.
 
-Rich-text formatting and span annotations (bold, links, comments) over a
-hashseq text object, with Peritext's merge behavior — anchored to characters,
-not indices; sane concurrent mark/unmark semantics; surviving deletion of the
-underlying text — but with BFT identities instead of actor/counter opIds and
-causal supersession instead of timestamp LWW.
-
-## Why hashseq is already most of Peritext
-
-Peritext's substrate requirements are: (1) every character has a stable id,
-(2) deleted characters leave tombstones so anchors keep resolving, (3) anchors
-can attach to either *side* of a character. Hashseq has all three natively —
-ids are the BLAKE3 node ids, removes tombstone rather than drop, and the
-insert tree already distinguishes before-children from after-children. The
-annotation layer adds no new requirements to the text CRDT.
-
-## Anchors
-
-```rust
-enum Anchor {
-    Before(Id), // glued to the char's left edge
-    After(Id),  // glued to the char's right edge
-    DocEnd,     // virtual point after everything (see below)
-}
-```
-
-An anchor is a virtual point in the linearization, **glued tight** to its
-character:
-
-- `Before(c)` is crossed immediately before emitting `c` — after all of `c`'s
-  before-descendants. Anything later inserted in the gap to `c`'s left
-  (whether `InsertBefore(c)` or `InsertAfter(prev)`) lands *before* the point.
-- `After(c)` is crossed immediately after emitting `c` — before any of `c`'s
-  after-descendants. Anything later inserted in the gap to `c`'s right lands
-  *after* the point.
-
-Both insertion flavors that can target a gap land on the same side of a glued
-anchor, so span membership is unambiguous: a character is in the span iff it
-is emitted strictly between the two anchor points. Since hashseq never
-reorders two existing characters as new ops arrive, anchor points are stable.
-
-### Expansion is anchor choice, not a flag
-
-Peritext's grow-at-edges behavior ("typing at the end of bold text continues
-bold; typing at the end of a link does not") falls out of *which char and
-which side* the editor anchors to, with glued semantics doing the rest. For a
-span whose first/last chars are `s`/`e`, with `p` preceding and `n` following:
-
-| edge behavior        | anchor          | why                                  |
-|----------------------|-----------------|--------------------------------------|
-| start, non-expanding | `Before(s)`     | gap inserts land before the point    |
-| start, expanding     | `After(p)`      | gap inserts land after the point     |
-| end, non-expanding   | `After(e)`      | gap inserts land after the point     |
-| end, expanding       | `Before(n)`     | gap inserts land before the point    |
-
-Bold = `Before(s) .. Before(n)`; link = `Before(s) .. After(e)`. The policy
-is chosen by the editor at op-creation time and committed in the artifact —
-the CRDT layer never needs a registry of mark kinds to converge.
-
-Edge cases of the table:
-
-- expanding start at document start: `After(origin)` — the origin is a real
-  interned node, so this needs nothing new;
-- expanding end at document end: there is no `n`, hence the `DocEnd` sentinel;
-- anchors to deleted chars: tombstones keep resolving, the point sits where
-  the tombstone sits. This is exactly why Peritext keeps tombstones; hashseq
-  gets it for free.
-
-## The op: one shape for mark, unmark, and re-style
-
-The HashKv observation applies verbatim: changing formatting is superseding
-prior formatting, which is the `Remove`/`Put` pattern — name what you saw and
-replace it, causally anchored.
+## Op
 
 ```rust
 struct MarkOp {
-    start: Anchor,
+    start: Anchor,             // glued points — HASHSEQ_SPEC.md
     end: Anchor,
-    kind: Box<str>,            // "bold", "link", "comment", ...
-    value: Value,              // Bool(true), Bytes(url), Ref(comment_obj), ...
-                               // Tombstone = pure unmark
-    /// Mark ops this op saw and supersedes within [start, end] — the
-    /// analog of Remove's targets / Put's overwrites (Peritext has no
-    /// equivalent; it uses opId LWW instead).
-    overwrites: BTreeSet<Id>,
+    kind: Id,                  // value commitment, e.g. value_id("bold")
+    value: Id,                 // value commitment: flag, payload, or an
+                               //   object link (comment thread);
+                               //   TOMBSTONE = unmark
+    overwrites: BTreeSet<Id>,  // mark ops this op saw and supersedes
+                               //   within [start, end]
 }
-
-struct MarkNode {
-    extra_dependencies: BTreeSet<Id>, // mark-layer tips − overwrites − anchors
-    op: MarkOp,
-}
-// id = BLAKE3 derive_key, own tag in the shared tag space — same convention
+struct MarkNode { refs: BTreeSet<Id>, op: MarkOp }
+// id = BLAKE3::derive_key(NODE_CONTEXT, canonical_encoding) — the family's
+// single context; op kinds are tags in the encoding (HETEROGENEITY.md)
 ```
 
-Dependencies: both anchor ids and all `overwrites` are deps (a mark is
-uninterpretable without its anchor chars). Global orphan buffering parks
-marks that arrive before their text.
+One shape covers **mark** (`value = value_id(true)` or a payload,
+`overwrites` = the visible same-kind marks it replaces), **unmark including
+partial unmark** (`value = TOMBSTONE` over the sub-range; the overwritten
+bold keeps applying outside it), and **re-style** (a link's new URL,
+`overwrites = {old}`).
 
-This one shape covers:
+## Refs
 
-- **mark**: `value = Bool(true)` (or payload), `overwrites = {}` — or the
-  currently-visible same-kind marks it intends to replace;
-- **unmark**, including *partial* unmark (unbolding the middle of a bold
-  span): `value = Tombstone`, range = the sub-span, `overwrites = {bold op}`.
-  The bold op keeps applying outside the unmark's range;
-- **re-style** (change a link's url): new value, `overwrites = {old}`.
-
-### Read semantics: per-(char, kind) MVR, no LWW
-
-At character `x`, for kind `k`: the live set is every `k`-mark covering `x`
-that is not named in the `overwrites` of some op also covering `x`. Suppression
-is *range-scoped*: an overwrite only erases its targets where the superseding
-op's span overlaps them.
-
-- The API is MVR-first: expose the live set. There is no LWW (timestamps
-  are forgeable), and per the locality invariant (HASHDOC.md), max-`Id` is
-  only a *display* tiebreak for cosmetic ambiguity (e.g. which of two
-  concurrent identical bolds to attribute). Anything semantics-bearing
-  renders the conflict state instead — the sharp case is a link's URL:
-  hash order is grindable, and a ground hash must not silently win a
-  phishing target. Conflicted links render disabled with both targets
-  surfaced.
-- Comments want the full set anyway (concurrent comments must all survive);
-  they are just kind="comment" marks whose values never get arbitrated.
-- A comment *thread* is a child object in the HashDoc sense:
-  `value = Ref(creation_op)` — replies are seq inserts in the child.
-
-Checking against Peritext's hard cases:
-
-1. *Concurrent bold vs unbold, overlapping ranges.* The unbold only kills
-   what it names. A concurrent bold it never saw survives in the overlap —
-   "add wins", and the conflict is visible as a multi-head, not silently
-   timestamp-flattened.
-2. *Insert into a gap inside a concurrently-unbolded sub-span.* The new char
-   falls between the unmark's anchors, the unmark covers it, the bold it
-   targets is suppressed there → not bold. Matches Peritext.
-3. *Span text deleted, new text inserted between the tombstones.* New text is
-   between the anchors → inherits the mark. Matches Peritext (documented,
-   slightly surprising, correct).
-4. *Adversarial inverted span* (end point before start point): rejected at
-   apply time and permanently quarantined — see "Inverted spans" below.
-
-## Marks are a separate layer with their own tips
-
-Mark ops must not enter the text object's tips: a mark at the tips becomes
-`extra_deps` on the next insert and fragments runs — the per-object-tips
-argument from HASHDOC.md, applied here. So the mark layer is its own object:
-
-- own tips, own (trivial) projection state;
-- causally **downstream-only**: marks depend on text ops (anchors), text ops
-  never depend on marks. Text run formation is untouched;
-- shares the substrate: IdIndex/interning, orphan buffering, merge = op-set
-  union, the same merge-law quickcheck props.
-
-In HashDoc terms it is a per-text-object sibling projection; standalone it is
-a companion struct alongside `HashSeq` sharing the same `doc_id`.
-
-## State and rendering
-
-```rust
-struct MarkLayer {
-    marks: Vec<MarkRecord>,                              // by mark NodeIdx
-    anchor_events: FxHashMap<NodeIdx, SmallVec<[MarkIdx; 2]>>, // char → start/end events
-    // tips, orphans: substrate
-}
+```
+named(u) = { anchor_id(start), anchor_id(end) } ∪ overwrites
+refs(u)  = named(u) ∪ frontier pins   // kind and value are values, not references
 ```
 
-Rendering is a sweep that piggybacks on the existing linear iterator: walk
-the sequence, toggle an active set at anchor events (an unmark/overwrite op
-is itself an interval, so suppression is interval-vs-interval inside the
-sweep, not per-char set algebra), emit coalesced `(text run, FormatSet)`
-spans — a rich-text iterator. Cost is O(text + anchor events); marks attach
-by id, so text edits never reposition marks — only a span cache (if we add
-one) invalidates locally.
+The pinned frontier is the mark layer's own: marks are **downstream-only**
+(marks reference content; content never references marks), so mark ops never
+enter the text object's tips or touch its runs — the frontier-granularity
+choice per LAYERING.md. Anchor ids are refs, so a mark arriving before its
+text parks as a normal orphan. `kind` and `value` are value commitments —
+never buffered on, `pending` when unresolvable.
 
-Anchor → position lookups for point queries go through the existing
-`position_of` / run index; no new index needed for v1.
+## Anchors and expansion
 
-Wire format: mark volume is orders of magnitude below char volume, so v1
-encodes ops individually — dict header + positional refs for anchor and
-overwrite ids (they overwhelmingly point at recently-encoded runs, exactly
-like remove targets). A "format painter" session chain could run-compress
-later if profiles ever say so.
+An anchor is a glued point (HASHSEQ_SPEC.md): `Before(c)` is crossed
+immediately before emitting `c`, after all of `c`'s before-descendants;
+`After(c)` immediately after `c`, before any of its after-descendants.
+Anything later inserted into the adjacent gap lands on the same side of the
+point, so span membership is unambiguous: an element is in the span iff it
+is emitted strictly between the two points — **in the base order**
+(FRAMEWORK "Stability"). Rendered relocation of elements (`Move`) never
+changes which elements a span covers.
 
-## Inverted spans: validate at apply, O(log F) per mark
+Grow-at-edges behavior ("typing at the end of bold text continues bold; at
+the end of a link does not") is **anchor choice, not a flag**. For a span
+with first/last elements `s`/`e`, `p` preceding and `n` following:
 
-A malicious peer can author a well-formed, well-hashed mark whose end anchor
-precedes its start anchor. This must be cheap to reject — and naively it is
-dangerous: a sweep that just toggles at anchor events would see the end event
-first (no-op), then the start event, activate the mark, and never deactivate
-it — formatting leaks to end of document.
+| edge behavior        | anchor      | why                               |
+|----------------------|-------------|-----------------------------------|
+| start, non-expanding | `Before(s)` | gap inserts land before the point |
+| start, expanding     | `After(p)`  | gap inserts land after the point  |
+| end, non-expanding   | `After(e)`  | gap inserts land after the point  |
+| end, expanding       | `Before(n)` | gap inserts land before the point |
 
-Resolution: this is an instance of HASHDOC.md's **validate before apply**
-rule, and the check is total, convergent, and permanent:
+Bold = `Before(s) .. Before(n)`; link = `Before(s) .. After(e)`. The policy
+is chosen by the editor at op-creation time and committed in the artifact —
+the CRDT layer needs no registry of mark kinds to converge.
 
-1. **The check can always run at apply time.** Anchor ids are dependencies,
-   so a mark op only applies once both anchor chars are in the sequence (it
-   parks as a normal orphan until then). At that moment both anchor points
-   are resolvable.
-2. **The check is O(log F) with no new state.** Anchor order is lexicographic
-   `(char order, Before < After)` thanks to glued semantics, so it reduces to
-   a tombstone-inclusive order comparison between two chars. The run index
-   already supports this: it is an order-statistics treap of fragments *with
-   parent pointers*, and tombstoned elements stay in their fragments (only
-   the visibility bit clears). Compare `(run, element offset)` within a
-   fragment directly, otherwise walk both fragments' root paths and compare
-   at the fork — a `cmp_order(a, b) -> Ordering` primitive next to
-   `position_of`, O(log F), touching nothing convergence-relevant.
-   (`After(origin)` is before everything; `DocEnd` after everything.)
-3. **A failed check is permanent.** Hashseq never reorders two existing
-   elements, so an inverted span can never become valid — quarantine is
-   forever, exactly like a failed type check in HASHDOC.md. And the relative
-   order of two chars is convergent across replicas, so honest replicas
-   agree on every verdict.
-4. **No honest op ever depends on one.** An honest editor authors a mark from
-   chars it can see, in their (convergent) order — it cannot produce an
-   inverted span. Because every honest replica validates before applying,
-   inverted marks never enter honest mark-layer tips; anything that depends
-   on one was authored by a faulty peer and correctly orphans forever.
+Edge cases: expanding start at document start = `After(origin)` (a real
+interned node). Expanding end at document end — deliberately **no
+sentinel** (HASHSEQ_SPEC.md): the editor extends the span with an overwrite
+mark as typing continues at the boundary, or the app maintains its own
+terminal element to anchor `Before` of. Anchors to tombstoned elements keep
+resolving — tombstones keep their slot; that is why they exist.
 
-The same apply-time gate also handles the neighboring ill-typed case: an
-anchor naming a non-char node (a Remove or another mark op). Anchor must
-resolve to `Loc::Run`/`Origin`; anything else fails validation identically.
+## Resource
 
-Cost under attack is one O(log F) comparison plus one quarantine entry per
-malicious op — linear in attacker effort, no amplification. Note that
-rejecting inverted spans does not shrink the spam surface (valid empty marks
-like `Before(c)..Before(c)` are always authorable); the goals are bounded
-cost and no rendering leak, which this gives.
+One **register per (element, kind)**: the `k`-formatting of element `x`,
+claimed by every `k`-mark covering `x`.
 
-Defense in depth: the sweep stays activation-guarded anyway — a mark
-activates only at its start event, and an end event for a never-started mark
-flags it inert rather than perturbing the active set. O(1) per event, and a
-future relaxation of the apply gate can't reintroduce the leak.
+## Conflict
 
-## BFT properties
+The live set at `(x, k)` is every `k`-mark covering `x` not named in the
+`overwrites` of a **same-kind** op that also covers `x`. Suppression is
+**range-scoped**: an overwrite erases its targets only where the
+superseding op's span overlaps them — and **kind-scoped**: cross-kind
+entries in `overwrites` are ignored by the definitional filter (mirroring
+HashKv's same-key rule; never gated — HASHWEB_SPEC.md "Gate vs filter"). A conflict is a multi-head live set — non-supersession, per
+FRAMEWORK; the honest-author lemma connects it to concurrency exactly as
+everywhere else.
 
-Nothing new: ids self-certifying, deps unforgeable, worst-case malice is
-concurrent mark forks surfaced as MVR conflicts. Two notes:
+## Resolution (read time)
 
-- `kind` strings are adversary-chosen bytes: in-memory keying by kind hashes
-  with SipHash or a BLAKE3-derived KindHash (the HashKv `KeyHash` rule);
-- mark spam over huge ranges costs the renderer O(anchor events), not
-  O(range), and MVR set growth is the application-surfaced symptom — same
-  posture as sibling-fork spam in the text layer.
+- **MVR-first**: expose the live set. **No LWW** — there is no timestamp
+  input.
+- *Cosmetic ambiguity* (which of two identical concurrent bolds to
+  attribute) → `max-Id` display tiebreak, never semantics.
+- *Semantics-bearing values* — the sharp case is a link's URL — **freeze**:
+  render the conflict state (link disabled, all targets surfaced). Hash
+  order is grindable; a ground id must not silently win a phishing target
+  (locality dividing line).
+- **Comments never arbitrate**: concurrent comments all survive. A comment
+  thread is `value = <the thread object's origin id>` — replies are seq
+  inserts in the child object (HASHWEB_SPEC.md).
 
-## Open problems (decide before building)
+The classic hard cases, as they converge here:
 
-1. **DocEnd encoding.** A reserved sentinel id vs a tagged anchor variant on
-   the wire. Leaning tagged variant (no magic ids in `Id` space).
-2. **Overwrites hygiene.** Should a new bold over an existing bold *have* to
-   name it (keeping live sets minimal), or may it stack? Leaning: editors
-   should name what they see (HashKv discipline), but stacking must still
-   converge since a malicious peer can always stack.
-3. **Cross-object spans** (a mark spanning multiple HashDoc text objects):
-   punt — marks are per-object; the editor splits the gesture into one op per
+1. *Concurrent bold vs overlapping unbold*: the unbold kills only what it
+   names; a concurrent bold it never saw survives in the overlap — add
+   wins, surfaced as a multi-head, never timestamp-flattened.
+2. *Insert into a gap inside a concurrently-unbolded sub-span*: the new
+   element falls between the unmark's points → covered by it → not bold.
+3. *Span text deleted, new text inserted between the tombstones*: between
+   the points → inherits the mark (documented, slightly surprising,
+   correct).
+4. *Adversarial inverted span*: gated at apply — Validation below.
+
+## Apply
+
+O(1) bookkeeping: intern; attach start/end events to the anchor elements
+(`anchor_events: element → mark events`); update mark-layer tips.
+Suppression is computed at read, never at apply.
+
+## Rendering
+
+A sweep piggybacking the linear iterator: walk the sequence, toggle an
+active set at anchor events (an unmark/overwrite op is itself an interval,
+so suppression is interval-vs-interval inside the sweep), emit coalesced
+`(run, FormatSet)` spans. Cost O(text + anchor events); marks attach by id,
+so text edits never reposition marks. Point queries ride `position_of` /
+`cmp_order`. Wire: mark volume is orders of magnitude below element volume —
+individual ops, dict + positional refs (ENCODING_SPEC.md); a "format
+painter" session chain can run-compress later if profiles say so.
+
+## Validation
+
+- **Inverted span** (end point before start point) — an apply-time gate:
+  1. the check can always run at apply: anchor ids are refs, so both
+     elements are present when the op leaves the orphan buffer;
+  2. it is one `cmp_order` comparison over the **base order** — O(log F),
+     resolved through origin ghosts (HASHSEQ_SPEC.md), so a concurrent or
+     later `Move` can never flip a verdict;
+  3. a failed check is permanent (base order is immutable) and convergent
+     (all replicas agree on every verdict);
+  4. no honest op ever depends on one: honest replicas gate before apply,
+     so inverted marks never enter honest mark-layer tips.
+  Defense in depth: the sweep stays activation-guarded — an end event for a
+  never-started mark is inert rather than perturbing the active set — so a
+  future relaxation of the gate cannot reintroduce the
+  formatting-leaks-to-end-of-document failure.
+- **Anchor kind**: anchors must name elements or the origin, in one `Seq` —
+  a row of the edge table (HASHWEB_SPEC.md). Move-op splice points are
+  gated for now; admitting them later is a loosening-class upgrade
+  (HASHWEB_SPEC.md "Tighten never, loosen carefully").
+- `kind` and `value` are ids (BLAKE3 outputs), so in-memory keying by kind
+  id is fast-hash-safe — no SipHash needed (the HASHKV_SPEC.md key rule;
+  adversarial kind bytes cost their author indirection, never a table).
+- **Amplification**: one O(log F) comparison plus one quarantine entry per
+  malicious op — linear in attacker effort. Mark spam over huge ranges
+  costs the renderer O(anchor events), not O(range); MVR set growth is the
+  application-surfaced symptom. Note the gate does not shrink the spam
+  surface (valid empty spans are always authorable); its goals are bounded
+  cost and no rendering leak.
+
+## Open problems
+
+1. **Overwrites hygiene.** Should a new bold be required to name the bold
+   it covers (keeping live sets minimal)? Leaning yes for honest editors —
+   the HashKv discipline — but stacking must converge regardless, since a
+   Byzantine author can always stack.
+2. **Cross-object spans** (a mark spanning multiple text objects): punt —
+   marks are per-object; the editor splits the gesture into one op per
    object.
-4. **History retention.** Superseded marks: keep (time travel) vs ids only.
-   Same question and likely same answer as HashKv open problem 4.
+3. **History retention.** Superseded marks: keep (time travel) vs ids only.
+   Same question as the seq placement-register spine; likely the same
+   answer.
 
 ## Test strategy
 
-Merge-law props (commutative/associative/reflexive) port directly; the
-Peritext paper's worked examples become a fixture suite (each is a small op
-DAG with an expected rendered span list); plus a quickcheck invariant: render
-is identical across all delivery orders, including marks delivered before
-their anchor text.
+Merge-law props (commutative/associative/idempotent) port directly; the
+Peritext worked examples become a fixture suite (each a small op DAG with an
+expected rendered span list); plus the quickcheck invariant: render is
+identical across all delivery orders — including marks delivered before
+their anchor text, and now including interleaved `Move`s of anchored
+elements.
