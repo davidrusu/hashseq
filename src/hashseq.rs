@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
-use crate::run_index::{ElemRef, RunIndex};
+use crate::run_index::{ElemRef, Glue, RunIndex};
 use crate::delivery::Delivery;
 use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
@@ -807,6 +807,11 @@ impl HashSeq {
             self.index.insert_span_before(at, idx);
             return;
         }
+        // "Directly before the origin" is before the origin-glued moved-in
+        // block, when one occupies the origin boundary.
+        if self.index.insert_span_before_front_glued(idx) {
+            return;
+        }
         match self.afters.get(&ORIGIN_IDX).and_then(|s| s.first()) {
             Some(first) => {
                 let first = self.region_first(first);
@@ -940,10 +945,10 @@ impl HashSeq {
         right_head
     }
 
-    /// Apply a move: O(1) register bookkeeping, no replay. The rendered
-    /// relocation in the position index is not wired up yet — `placement_of`
-    /// is the read-time placement (register semantics are complete and
-    /// convergent; the treap overlay with origin ghosts is the follow-up).
+    /// Apply a move: O(1) register bookkeeping plus, when the *rendered*
+    /// placement changed, one index relocation (HASHSEQ_SPEC.md "Move"):
+    /// excise at the origin — keeping the base slot, the origin ghost — and
+    /// insert a singleton fragment at the newly rendered glue point.
     fn apply_move(
         &mut self,
         id: Id,
@@ -953,6 +958,7 @@ impl HashSeq {
         overwrites: BTreeSet<Id>,
     ) {
         let target_idx = self.idx_of_known(&target);
+        let old_decider = self.decider_of(target_idx);
         let idx = self.intern(id, Loc::MoveOp);
         let (to_before, to_id) = match to {
             Anchor::Before(a) => (true, a),
@@ -982,6 +988,15 @@ impl HashSeq {
             }),
         };
         self.move_nodes.insert(idx, stored);
+
+        // Remove beats move: a tombstoned element renders nowhere, so a
+        // register change must not touch the index.
+        if !self.is_removed(target_idx) {
+            let new_decider = self.decider_of(target_idx);
+            if old_decider != new_decider {
+                self.rerender(target_idx, old_decider, new_decider);
+            }
+        }
     }
 
     /// Reconstruct a move op's `HashNode` (for merge / re-broadcast).
@@ -1033,9 +1048,15 @@ impl HashSeq {
         if self.is_removed(t) {
             return None;
         }
+        self.decider_of(t).map(|op| self.move_anchor(op))
+    }
+
+    /// The move op whose destination `target` renders at (`None` = the
+    /// creation placement). Pure register read — removal is the caller's
+    /// concern.
+    fn decider_of(&self, t: NodeIdx) -> Option<NodeIdx> {
         let reg = self.moves.get(&t)?;
-        let heads: Vec<NodeIdx> = reg.iter().collect();
-        self.resolve_placement(heads)
+        self.resolve_decider(reg.iter().collect())
     }
 
     fn move_anchor(&self, m: NodeIdx) -> Anchor {
@@ -1069,10 +1090,10 @@ impl HashSeq {
         seen
     }
 
-    fn resolve_placement(&self, heads: Vec<NodeIdx>) -> Option<Anchor> {
+    fn resolve_decider(&self, heads: Vec<NodeIdx>) -> Option<NodeIdx> {
         match heads.as_slice() {
             [] => None, // the creation placement — the implicit root
-            [one] => Some(self.move_anchor(*one)),
+            [one] => Some(*one),
             many => {
                 let target = self.move_nodes[&many[0]].target;
                 // Intersection of every head's transitive overwrites.
@@ -1102,9 +1123,113 @@ impl HashSeq {
                 }
                 // Deterministic order (by id) for the recursion.
                 maximal.sort_by_key(|i| self.id_of(*i));
-                self.resolve_placement(maximal)
+                self.resolve_decider(maximal)
             }
         }
+    }
+
+    /// Element handle of an index element reference.
+    fn elem_of_ref(&self, (head, off): ElemRef) -> NodeIdx {
+        self.runs[&head].elements[off as usize]
+    }
+
+    /// Re-render `target` after its placement register's decider changed:
+    /// one index relocation (excise the old rendering — the base slot stays,
+    /// as the origin ghost — then render at the new deciding placement).
+    /// Co-glued moved-ins order by move-op id: the sound id-order use — it
+    /// arranges the contenders' own content and displaces nothing.
+    fn rerender(&mut self, target: NodeIdx, old: Option<NodeIdx>, new: Option<NodeIdx>) {
+        let elem = self.elem_ref(target);
+        match old {
+            Some(_) => {
+                self.index.remove_moved(elem);
+            }
+            None => {
+                self.index.remove_element(elem);
+            }
+        }
+        let Some(op) = new else {
+            self.index.restore_base(elem);
+            return;
+        };
+        let mv = &self.move_nodes[&op];
+        let new_id = self.id_of(op);
+        if mv.to_anchor == ORIGIN_IDX {
+            // Origin-glued block: befores-side group then afters-side group,
+            // each id-ordered.
+            let side = mv.to_before;
+            let rank = self
+                .index
+                .glued_elems(Glue::Origin)
+                .into_iter()
+                .filter(|&e| {
+                    let d = self
+                        .decider_of(self.elem_of_ref(e))
+                        .expect("glued elements are moved-rendered");
+                    let key = (!self.move_nodes[&d].to_before as u8, self.id_of(d));
+                    key < (!side as u8, new_id)
+                })
+                .count();
+            let first_top = self
+                .afters
+                .get(&ORIGIN_IDX)
+                .and_then(|s| s.first())
+                .map(|f| self.elem_ref(self.region_first(f)));
+            self.index.place_moved_origin(elem, rank, first_top);
+        } else {
+            let at = self.elem_ref(mv.to_anchor);
+            let glue = if mv.to_before {
+                Glue::Before(at)
+            } else {
+                Glue::After(at)
+            };
+            let rank = self
+                .index
+                .glued_elems(glue)
+                .into_iter()
+                .filter(|&e| {
+                    let d = self
+                        .decider_of(self.elem_of_ref(e))
+                        .expect("glued elements are moved-rendered");
+                    self.id_of(d) < new_id
+                })
+                .count();
+            self.index.place_moved(elem, glue, rank);
+        }
+    }
+
+    /// Rendered move state for the definitional iterator: the moved-out
+    /// element set, plus the moved-in elements at each glue point
+    /// (`(anchor handle, before-side)`), id-ordered. A pure function of the
+    /// placement registers.
+    #[allow(clippy::type_complexity)] // (moved-out set, glued-by-point map)
+    pub(crate) fn rendered_moves(
+        &self,
+    ) -> (FxHashSet<NodeIdx>, FxHashMap<(NodeIdx, bool), Vec<NodeIdx>>) {
+        let mut moved_out = FxHashSet::default();
+        let mut glued: FxHashMap<(NodeIdx, bool), Vec<(Id, NodeIdx)>> = FxHashMap::default();
+        for (&t, reg) in &self.moves {
+            if self.is_removed(t) {
+                continue; // remove beats move
+            }
+            let Some(d) = self.resolve_decider(reg.iter().collect()) else {
+                continue; // frozen at the creation placement
+            };
+            let mv = &self.move_nodes[&d];
+            moved_out.insert(t);
+            glued
+                .entry((mv.to_anchor, mv.to_before))
+                .or_default()
+                .push((self.id_of(d), t));
+        }
+        let glued = glued
+            .into_iter()
+            .map(|(k, mut v)| {
+                v.sort();
+                (k, v.into_iter().map(|(_, t)| t).collect())
+            })
+            .collect();
+        (moved_out, glued)
     }
 
     /// Author a move of the element at `target` to the glued point `to`,
@@ -1134,7 +1259,11 @@ impl HashSeq {
         let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.idx_of_known(t)).collect();
         for t in &targets {
             // Removes targeting non-inserts have no index entry and are inert.
-            if let Loc::Run { run, pos } = self.loc_of(*t) {
+            // A moved element renders at its destination fragment — remove
+            // that; otherwise clear the base bit.
+            if let Loc::Run { run, pos } = self.loc_of(*t)
+                && !self.index.remove_moved((run, pos))
+            {
                 self.index.remove_element((run, pos));
             }
             self.removed.set(t.0 as usize);
@@ -2946,8 +3075,10 @@ mod test {
         seq.move_element(a, Anchor::After(c));
         assert_eq!(seq.placement_of(&a), Some(Anchor::After(c)));
         assert!(!seq.placement_conflicted(&a));
-        // base order is untouched — moves never reorder the base
-        assert_eq!(seq.iter().collect::<String>(), "abc");
+        // the rendered order relocates `a` to the glued point after `c`
+        assert_eq!(seq.iter().collect::<String>(), "bca");
+        assert_eq!(seq.position_of(&a), Some(2));
+        assert_eq!(seq.id_at(2), Some(a));
     }
 
     #[test]
@@ -3033,8 +3164,261 @@ mod test {
         let c = seq.id_at(2).unwrap();
 
         seq.move_element(a, Anchor::After(c));
-        seq.remove(0); // tombstone a
+        let rendered = seq.position_of(&a).unwrap();
+        assert_eq!(rendered, 2, "moved to the end");
+        seq.remove(rendered); // tombstone a at its rendered position
         assert_eq!(seq.placement_of(&a), None, "register is moot once dead");
+        assert_eq!(seq.iter().collect::<String>(), "bc");
+        assert_eq!(seq.position_of(&a), None);
+    }
+
+    #[test]
+    fn move_before_renders_at_glued_point() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+
+        seq.move_element(c, Anchor::Before(a));
+        assert_eq!(seq.iter().collect::<String>(), "cab");
+        assert_eq!(seq.position_of(&c), Some(0));
+        check_index_matches_iter(&seq);
+    }
+
+    #[test]
+    fn move_to_origin_renders_at_front() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let origin = seq.origin();
+        let c = seq.id_at(2).unwrap();
+
+        seq.move_element(c, Anchor::After(origin));
+        assert_eq!(seq.iter().collect::<String>(), "cab");
+        check_index_matches_iter(&seq);
+
+        // New top-level content lands after the origin-glued block only if
+        // it sorts later; either way the block stays glued to the front.
+        let b = seq.id_at(2).unwrap();
+        seq.move_element(b, Anchor::Before(origin));
+        assert_eq!(seq.iter().collect::<String>(), "bca");
+        check_index_matches_iter(&seq);
+    }
+
+    #[test]
+    fn co_glued_moves_order_by_move_id() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcd".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+        let d = seq.id_at(3).unwrap();
+
+        // Two elements glued at the same point: order among them is the
+        // move ops' id order, whatever the application order was.
+        let m1 = seq.move_element(a, Anchor::After(d));
+        let m2 = seq.move_element(b, Anchor::After(d));
+        let expect = if m1.id() < m2.id() { "cdab" } else { "cdba" };
+        assert_eq!(seq.iter().collect::<String>(), expect);
+        check_index_matches_iter(&seq);
+    }
+
+    #[test]
+    fn later_inserts_stay_outside_the_glued_block() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+
+        // Glue `a` after `b`: "bac"... base [a b c], a moves After(b).
+        seq.move_element(a, Anchor::After(b));
+        assert_eq!(seq.iter().collect::<String>(), "bac");
+
+        // A later insert anchored After(b) is an after-child: it renders
+        // after the glued block, never between `b` and the moved-in `a`.
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(b, 'x'),
+        });
+        let text = seq.iter().collect::<String>();
+        assert!(
+            text == "baxc" || text == "bacx",
+            "insert must not split the glued pair; got {text}"
+        );
+        assert_eq!(&text[..2], "ba", "glued pair intact");
+        check_index_matches_iter(&seq);
+    }
+
+    #[test]
+    fn run_extension_respects_glued_block() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+
+        seq.move_element(a, Anchor::After(b));
+        assert_eq!(seq.iter().collect::<String>(), "ba");
+
+        // Typing continues the run through `b` (the run tail): the new char
+        // is an after-child of `b`, so it renders after the glued `a`.
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(b, 'c'),
+        });
+        assert_eq!(seq.iter().collect::<String>(), "bac");
+        check_index_matches_iter(&seq);
+    }
+
+    #[test]
+    fn re_move_relocates_and_frees_the_old_destination() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcd".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+        let d = seq.id_at(3).unwrap();
+
+        seq.move_element(a, Anchor::After(d));
+        assert_eq!(seq.iter().collect::<String>(), "bcda");
+        seq.move_element(a, Anchor::Before(c));
+        assert_eq!(seq.iter().collect::<String>(), "bacd");
+        seq.move_element(a, Anchor::After(a)); // self-move gates, no change
+        assert_eq!(seq.iter().collect::<String>(), "bacd");
+        check_index_matches_iter(&seq);
+    }
+
+    #[test]
+    fn rendered_moves_survive_merge_and_roundtrip() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "abcd".chars());
+        let a = base.id_at(0).unwrap();
+        let d = base.id_at(3).unwrap();
+
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.move_element(a, Anchor::After(d));
+        r2.insert(2, 'x');
+
+        let mut m1 = r1.clone();
+        m1.merge(r2.clone());
+        let mut m2 = r2.clone();
+        m2.merge(r1.clone());
+        assert_eq!(m1, m2);
+        assert_eq!(
+            m1.iter().collect::<String>(),
+            m2.iter().collect::<String>(),
+            "rendered order converges"
+        );
+        check_index_matches_iter(&m1);
+        check_index_matches_iter(&m2);
+
+        // Wire roundtrip re-applies the move and reconstructs the rendering.
+        let decoded = crate::encoding::decode_hashseq(&crate::encoding::encode_hashseq(&m1))
+            .expect("roundtrip");
+        assert_eq!(decoded, m1);
+        assert_eq!(
+            decoded.iter().collect::<String>(),
+            m1.iter().collect::<String>()
+        );
+        check_index_matches_iter(&decoded);
+    }
+
+    #[test]
+    fn frozen_conflict_renders_at_last_agreed() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "abc".chars());
+        let a = base.id_at(0).unwrap();
+        let b = base.id_at(1).unwrap();
+        let c = base.id_at(2).unwrap();
+
+        base.move_element(a, Anchor::After(b));
+        assert_eq!(base.iter().collect::<String>(), "bac");
+
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.move_element(a, Anchor::After(c));
+        r2.move_element(a, Anchor::Before(b));
+
+        let mut merged = r1.clone();
+        merged.merge(r2.clone());
+        assert!(merged.placement_conflicted(&a));
+        // Frozen at the last agreed placement — rendered there too.
+        assert_eq!(merged.iter().collect::<String>(), "bac");
+        let mut merged2 = r2;
+        merged2.merge(r1);
+        assert_eq!(merged2.iter().collect::<String>(), "bac");
+        check_index_matches_iter(&merged);
+        check_index_matches_iter(&merged2);
+    }
+
+    /// Random inserts/removes/moves on one replica: the index must stay
+    /// pinned to the definitional causal iterator (Law II — the treap is a
+    /// cache of the rendered order).
+    #[quickcheck]
+    fn prop_index_matches_iterator_with_moves(ops: Vec<(u8, u8, u8)>) -> bool {
+        let mut seq = HashSeq::default();
+        seq_from_move_ops(&mut seq, &ops);
+        let iter_ids: Vec<Id> = seq.iter_idxs_causal().map(|i| seq.id_of(i)).collect();
+        let index_ids: Vec<Id> = seq.iter_ids().copied().collect();
+        iter_ids == index_ids && seq.len() == iter_ids.len()
+    }
+
+    /// Rendered order converges across merge orders when moves are in play.
+    #[quickcheck]
+    fn prop_moves_merge_commutative(a: Vec<(u8, u8, u8)>, b: Vec<(u8, u8, u8)>) -> bool {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "seed".chars());
+        let mut seq_a = base.clone();
+        let mut seq_b = base;
+        seq_from_move_ops(&mut seq_a, &a);
+        seq_from_move_ops(&mut seq_b, &b);
+
+        let mut ab = seq_a.clone();
+        ab.merge(seq_b.clone());
+        let mut ba = seq_b;
+        ba.merge(seq_a);
+
+        let ab_ids: Vec<Id> = ab.iter_ids().copied().collect();
+        let ba_ids: Vec<Id> = ba.iter_ids().copied().collect();
+        let causal: Vec<Id> = ab.iter_idxs_causal().map(|i| ab.id_of(i)).collect();
+        ab == ba && ab_ids == ba_ids && ab_ids == causal
+    }
+
+    /// Fuzz driver mixing inserts, removes, and moves (targets/anchors picked
+    /// by rendered position; self-moves and moves of removed elements are
+    /// generated and must be harmless).
+    fn seq_from_move_ops(seq: &mut HashSeq, ops: &[(u8, u8, u8)]) {
+        for &(kind, x, y) in ops {
+            match kind % 4 {
+                0 | 3 => {
+                    let at = if seq.is_empty() {
+                        0
+                    } else {
+                        x as usize % (seq.len() + 1)
+                    };
+                    seq.insert(at, (b'a' + (y % 26)) as char);
+                }
+                1 => {
+                    if !seq.is_empty() {
+                        seq.remove(x as usize % seq.len());
+                    }
+                }
+                _ => {
+                    if seq.is_empty() {
+                        continue;
+                    }
+                    let target = seq.id_at(x as usize % seq.len()).unwrap();
+                    let anchor = if y as usize % (seq.len() + 1) == seq.len() {
+                        seq.origin()
+                    } else {
+                        seq.id_at(y as usize % seq.len()).unwrap()
+                    };
+                    let to = if y & 1 == 0 {
+                        Anchor::After(anchor)
+                    } else {
+                        Anchor::Before(anchor)
+                    };
+                    seq.move_element(target, to);
+                }
+            }
+        }
     }
 
     #[test]

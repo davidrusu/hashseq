@@ -71,8 +71,13 @@ with `pins = refs ∖ named` and `iter_refs()` yielding `refs(u)` — a
 replica-local layout choice, not a wire or identity one. Known gaps, gated
 (quarantined pending re-evaluation, the loosening path): non-char insert
 payloads (the value-column generalization), and inserts anchored on move-op
-splice points. Move's rendered index relocation (origin-ghost treap overlay)
-is not wired yet — `placement_of` is the read-time placement.
+splice points. Move's rendered index relocation is wired per "Apply" below:
+origin ghosts (base slots live forever), one relocation per rendered-
+placement change, glued blocks id-ordered and skipped by the insert/extend
+paths; `prop_index_matches_iterator_with_moves` pins the index to the
+definitional iterator. Cursors still anchor at base slots — inserting at a
+rendered position adjacent to a moved-in element lands at the element's
+ghost until splice-point anchors are admitted.
 
 ## Payload
 

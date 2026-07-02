@@ -166,7 +166,8 @@ Then open <http://localhost:8000>, type into both editors, click **Sync**.
 
 The identity grammar (preimages, contexts, derived constants) is implemented
 exactly per `GRAMMAR_SPEC.md` and locked by test vectors
-(`tests/grammar_vectors.rs`). Marks (rich-text spans), the HashWeb
-multi-object composition, rendered move relocation in the position index,
-and canonical snapshot normalization are specified and queued — see the
-spec set's *Code today* notes for the precise implementation frontier.
+(`tests/grammar_vectors.rs`). Moves render: placement registers relocate
+elements in the position index (origin ghosts, frozen conflicts render at
+the last agreed placement). Marks (rich-text spans) and canonical snapshot
+normalization are specified and queued — see the spec set's *Code today*
+notes for the precise implementation frontier.
