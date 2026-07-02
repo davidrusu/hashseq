@@ -53,10 +53,8 @@ to identical bytes across replicas and delivery orders, asserted by the
 merge props and locked by the `canonical_snapshot_vector` test. Strict
 acceptance is `decode_hashseq_strict` (re-encode and compare). Measured
 cost of canonical grouping vs arrival grouping on the editing traces:
-encode-time unchanged, wire +4–8% on edit-heavy traces (the smallest-id
-rule sometimes cuts a long typing chain in favor of a one-char fork child;
-a longest-continuation fork rule would recover it — a canonical-form
-refinement to decide deliberately, since it changes locked bytes).
+encode-time unchanged, wire +4–8% on edit-heavy traces (dictionary spills
+from force-broken soft cycles — fork-rule-independent; see Open problems 5).
 
 ## Canonical snapshot
 
@@ -234,9 +232,18 @@ unaffected).
 4. **Chunk alignment.** Byte-level dedupe across *versions* wants chunk
    boundaries that survive appends; blocks give natural boundaries — decide
    whether to spec a chunking discipline or leave it to storage.
-5. **Encoder cost — measured.** Block derivation from the op set is
-   encode-time-only (build times and structure checksums unchanged). The
-   open question moved: the smallest-id fork rule costs +4–8% wire on
-   edit-heavy traces vs arrival grouping; evaluate a longest-continuation
-   fork rule (still a pure function of the op set, ties by id) as a
-   deliberate canonical-form change.
+5. **Encoder cost — measured; fork rule exonerated.** Block derivation
+   from the op set is encode-time-only (build times and structure
+   checksums unchanged). Canonical bytes run +4–8% over arrival grouping
+   on edit-heavy traces, and the experiment (2026-07-02) shows the fork
+   rule is not the lever: a longest-continuation rule moves totals ±0.5%
+   (slightly worse). The entire delta is **dictionary growth** —
+   op-set-derived blocks span wider time ranges than arrival-order
+   storage, producing more force-broken soft cycles in the emission
+   order, each spilling full ids. Arrival grouping is near-optimal on
+   single-replica histories because it *is* the temporal order — exactly
+   what canonical derivation must not consult. Candidate levers if the
+   4–8% ever matters: same-block backward positional refs (needs a
+   two-pass run decode), or a cycle-aware emission heuristic (must stay
+   deterministic). The smallest-id rule stays — simplest, and as good as
+   anything measured.
