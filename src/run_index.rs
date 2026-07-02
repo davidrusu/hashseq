@@ -207,6 +207,10 @@ pub(crate) enum IndexTarget {
     BeforeMoved(ElemRef),
     /// Directly after this moved element's destination fragment.
     AfterMoved(ElemRef),
+    /// Directly before this move op's zero-width splice fragment.
+    BeforeSplice(NodeIdx),
+    /// Directly after this move op's zero-width splice fragment.
+    AfterSplice(NodeIdx),
     /// At the very end of the document.
     Back,
 }
@@ -222,6 +226,11 @@ pub(crate) struct RunIndex {
     /// ghost; the destination is a 1-element fragment placed like an insert
     /// sibling. Empty in move-free documents — hot-path checks guard on that.
     moved: FxHashMap<ElemRef, u32>,
+    /// Splice ghosts: move op handle -> its zero-width fragment. A move op
+    /// that content anchored to keeps a permanent slot at its rank; the same
+    /// slot converts to/from a destination fragment as the op gains/loses
+    /// decider status, so its position never recomputes.
+    splice: FxHashMap<NodeIdx, u32>,
     /// Arena slots freed by deleted destination fragments.
     free: Vec<u32>,
 }
@@ -234,6 +243,7 @@ impl Default for RunIndex {
             frags_of: FxHashMap::default(),
             rng: 0x9E3779B97F4A7C15,
             moved: FxHashMap::default(),
+            splice: FxHashMap::default(),
             free: Vec::new(),
         }
     }
@@ -478,6 +488,57 @@ impl RunIndex {
         self.settle(n);
     }
 
+    /// Place a zero-width splice fragment for move op `op` at `target` (the
+    /// op is anchored-to but not rendering its target).
+    pub(crate) fn place_splice_at(&mut self, target: IndexTarget, op: NodeIdx) {
+        let n = self.new_frag(op, 0, 0, 0, Bits::Small(0));
+        let prev = self.splice.insert(op, n);
+        debug_assert!(prev.is_none(), "op already has a splice slot");
+        self.attach_at(target, n);
+        self.settle(n);
+    }
+
+    pub(crate) fn has_splice(&self, op: NodeIdx) -> bool {
+        !self.splice.is_empty() && self.splice.contains_key(&op)
+    }
+
+    /// Convert `elem`'s destination fragment into `op`'s zero-width splice
+    /// ghost, in place — the op lost decider status but content anchored to
+    /// it keeps its rank. Returns false if `elem` is not moved-rendered.
+    pub(crate) fn demote_to_splice(&mut self, elem: ElemRef, op: NodeIdx) -> bool {
+        if self.moved.is_empty() {
+            return false;
+        }
+        let Some(slot) = self.moved.remove(&elem) else {
+            return false;
+        };
+        let f = &mut self.frags[slot as usize];
+        f.head = op;
+        f.start = 0;
+        f.len = 0;
+        f.visible = 0;
+        f.bits = Bits::Small(0);
+        self.update_to_root(slot);
+        let prev = self.splice.insert(op, slot);
+        debug_assert!(prev.is_none(), "op already has a splice slot");
+        true
+    }
+
+    /// Convert `op`'s splice ghost back into a destination fragment
+    /// rendering `elem` — the op regained decider status at its old rank.
+    pub(crate) fn promote_splice(&mut self, op: NodeIdx, elem: ElemRef) {
+        let slot = self.splice.remove(&op).expect("op has a splice slot");
+        let f = &mut self.frags[slot as usize];
+        f.head = elem.0;
+        f.start = elem.1;
+        f.len = 1;
+        f.visible = 1;
+        f.bits = Bits::Small(1);
+        self.update_to_root(slot);
+        let prev = self.moved.insert(elem, slot);
+        debug_assert!(prev.is_none(), "old rendering must be cleared first");
+    }
+
     /// Leaf-attach `n` at `target`.
     fn attach_at(&mut self, target: IndexTarget, n: u32) {
         match target {
@@ -510,6 +571,14 @@ impl RunIndex {
             }
             IndexTarget::AfterMoved(other) => {
                 let slot = *self.moved.get(&other).expect("target is moved-rendered");
+                self.attach_succ(slot, n);
+            }
+            IndexTarget::BeforeSplice(op) => {
+                let slot = *self.splice.get(&op).expect("op has a splice slot");
+                self.attach_pred(slot, n);
+            }
+            IndexTarget::AfterSplice(op) => {
+                let slot = *self.splice.get(&op).expect("op has a splice slot");
                 self.attach_succ(slot, n);
             }
             IndexTarget::Back => {

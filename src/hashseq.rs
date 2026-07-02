@@ -850,11 +850,21 @@ impl HashSeq {
             return IndexTarget::Back;
         }
         if let Loc::MoveOp = self.loc_of(el) {
-            let elem = self.elem_ref(self.move_nodes[&el].target);
+            // The op fragment: the rendered element when `el` decides its
+            // register, its zero-width splice ghost otherwise.
+            let target = self.move_nodes[&el].target;
+            if self.decider_of(target) == Some(el) && !self.is_removed(target) {
+                let elem = self.elem_ref(target);
+                return if before {
+                    IndexTarget::BeforeMoved(elem)
+                } else {
+                    IndexTarget::AfterMoved(elem)
+                };
+            }
             return if before {
-                IndexTarget::BeforeMoved(elem)
+                IndexTarget::BeforeSplice(el)
             } else {
-                IndexTarget::AfterMoved(elem)
+                IndexTarget::AfterSplice(el)
             };
         }
         let at = self.elem_ref(el);
@@ -868,6 +878,12 @@ impl HashSeq {
     fn insert_after(&mut self, id: Id, after: CausalInsert) {
         // The anchor is a checked dependency, so it is interned.
         let anchor = self.idx_of_known(&after.anchor);
+
+        // A move-op anchor: content anchoring at the splice point — make
+        // sure the op holds a physical rank first.
+        if let Loc::MoveOp = self.loc_of(anchor) {
+            self.ensure_op_fragment(anchor);
+        }
 
         // Fast path: extend the run whose tail is the anchor. Extra deps on
         // the new element (e.g. `{remove_id}` when typing resumes after a
@@ -1068,7 +1084,7 @@ impl HashSeq {
     /// The move op whose destination `target` renders at (`None` = the
     /// creation placement). Pure register read — removal is the caller's
     /// concern.
-    fn decider_of(&self, t: NodeIdx) -> Option<NodeIdx> {
+    pub(crate) fn decider_of(&self, t: NodeIdx) -> Option<NodeIdx> {
         let reg = self.moves.get(&t)?;
         self.resolve_decider(reg.iter().collect())
     }
@@ -1151,8 +1167,14 @@ impl HashSeq {
     fn rerender(&mut self, target: NodeIdx, old: Option<NodeIdx>, new: Option<NodeIdx>) {
         match old {
             Some(op) => {
-                self.index.remove_moved(self.elem_ref(target));
-                self.unregister_sibling(op);
+                // An op with splice children keeps its rank: its destination
+                // fragment demotes in place to a zero-width splice ghost.
+                if self.op_has_children(op) {
+                    self.index.demote_to_splice(self.elem_ref(target), op);
+                } else {
+                    self.index.remove_moved(self.elem_ref(target));
+                    self.unregister_sibling(op);
+                }
             }
             None => {
                 self.index.remove_element(self.elem_ref(target));
@@ -1162,17 +1184,31 @@ impl HashSeq {
             self.index.restore_base(self.elem_ref(target));
             return;
         };
+        if self.index.has_splice(op) {
+            // The op already holds its rank (anchored-to while superseded):
+            // its splice ghost promotes back into the rendered element.
+            self.index.promote_splice(op, self.elem_ref(target));
+        } else {
+            self.register_op_fragment(op, true);
+        }
+    }
+
+    /// Does anything anchor at `op`'s splice point? (Sibling-set entries are
+    /// dropped when emptied, so presence means non-empty.)
+    fn op_has_children(&self, op: NodeIdx) -> bool {
+        self.afters.contains_key(&op) || self.befores_by_anchor.contains_key(&op)
+    }
+
+    /// Register `op` in its destination's sibling set (keyed by its own id,
+    /// like an insert child) and place its op fragment at that rank: the
+    /// rendered target element when `render`, a zero-width splice ghost
+    /// otherwise.
+    fn register_op_fragment(&mut self, op: NodeIdx, render: bool) {
         let op_id = self.id_of(op);
         let mv = &self.move_nodes[&op];
-        let anchor = mv.to_anchor;
-        if mv.to_before {
-            let el = self.before_sibling_target(anchor, &op_id);
-            self.befores_by_anchor
-                .entry(anchor)
-                .or_default()
-                .insert(op, &self.ids);
-            let t = self.index_target(el, true);
-            self.index.place_moved_at(t, self.elem_ref(target));
+        let (anchor, to_before, target) = (mv.to_anchor, mv.to_before, mv.target);
+        let (el, before) = if to_before {
+            (self.before_sibling_target(anchor, &op_id), true)
         } else {
             let (el, before) = self.after_sibling_target(anchor, &op_id);
             // Mirror the insert fork path: materialize the run fork when the
@@ -1185,10 +1221,35 @@ impl HashSeq {
             {
                 self.split_run_at(run, pos as usize + 1);
             }
-            self.afters.entry(anchor).or_default().insert(op, &self.ids);
-            let t = self.index_target(el, before);
+            (el, before)
+        };
+        let set = if to_before {
+            self.befores_by_anchor.entry(anchor).or_default()
+        } else {
+            self.afters.entry(anchor).or_default()
+        };
+        set.insert(op, &self.ids);
+        let t = self.index_target(el, before);
+        if render {
             self.index.place_moved_at(t, self.elem_ref(target));
+        } else {
+            self.index.place_splice_at(t, op);
         }
+    }
+
+    /// Make sure `op` (an insert anchor) has a physical op fragment: content
+    /// is about to anchor at its splice point. No-op when the op currently
+    /// renders its target (the destination fragment serves) or already has a
+    /// splice ghost.
+    fn ensure_op_fragment(&mut self, op: NodeIdx) {
+        let target = self.move_nodes[&op].target;
+        if self.decider_of(target) == Some(op) && !self.is_removed(target) {
+            return;
+        }
+        if self.index.has_splice(op) {
+            return;
+        }
+        self.register_op_fragment(op, false);
     }
 
     /// Retire a no-longer-deciding move op from its anchor's sibling set.
@@ -1246,15 +1307,17 @@ impl HashSeq {
         let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.idx_of_known(t)).collect();
         for t in &targets {
             // Removes targeting non-inserts have no index entry and are inert.
-            // A moved element renders at its destination fragment — remove
-            // that and retire its deciding move op from the sibling
-            // structures; otherwise clear the base bit.
-            if let Loc::Run { run, pos } = self.loc_of(*t) {
-                if self.index.remove_moved((run, pos)) {
-                    let op = self.decider_of(*t).expect("rendered implies decider");
+            // Base-rendered elements just clear their bit; a moved element's
+            // destination fragment retires with its deciding op — demoting
+            // to a splice ghost when content anchored at the op.
+            if let Loc::Run { run, pos } = self.loc_of(*t)
+                && !self.index.remove_element((run, pos))
+                && let Some(op) = self.decider_of(*t)
+            {
+                if self.op_has_children(op) {
+                    self.index.demote_to_splice((run, pos), op);
+                } else if self.index.remove_moved((run, pos)) {
                     self.unregister_sibling(op);
-                } else {
-                    self.index.remove_element((run, pos));
                 }
             }
             self.removed.set(t.0 as usize);
@@ -1312,6 +1375,10 @@ impl HashSeq {
     fn insert_before(&mut self, id: Id, before: CausalInsert) {
         // The anchor is a checked dependency, so it is interned.
         let anchor = self.idx_of_known(&before.anchor);
+
+        if let Loc::MoveOp = self.loc_of(anchor) {
+            self.ensure_op_fragment(anchor);
+        }
 
         let target = self.before_sibling_target(anchor, &id);
 
@@ -1409,8 +1476,9 @@ impl HashSeq {
             // The Move rows of the edge table (all stable — every input is a
             // hash-committed fact about already-applied referents):
             // target must be an element of THIS seq; the destination must be
-            // a glued point on an element or the origin (move-op splice
-            // anchors are not yet admitted); self-moves gate.
+            // an element or the origin (a Move whose destination is another
+            // move op's splice point is not yet admitted — insert anchors on
+            // splice points ARE live); self-moves gate.
             Op::Move { target, to, .. } => {
                 let target_ok = self
                     .idx_of(target)
@@ -1636,11 +1704,28 @@ impl HashSeq {
     /// At the start of a non-empty sequence, returns a `Before(id_at(0))` cursor.
     /// In an empty sequence, returns an `After(origin)` cursor. Returns `None`
     /// only when `idx` is out of bounds (> len).
+    /// The causal node a rendered neighbor stands for when picking a cursor
+    /// anchor: a moved-in element is represented by its deciding move op, so
+    /// typing next to moved content anchors at the splice point and renders
+    /// where the user sees it — never at the element's base ghost.
+    fn render_anchor(&self, idx: NodeIdx) -> NodeIdx {
+        if self.rendered_elsewhere(idx) {
+            self.decider_of(idx)
+                .expect("rendered_elsewhere implies a decider")
+        } else {
+            idx
+        }
+    }
+
     pub fn cursor_at(&self, idx: usize) -> Option<Cursor> {
         if idx > self.len() {
             return None;
         }
-        match self.neighbours(idx) {
+        let (left, right) = self.neighbours(idx);
+        match (
+            left.map(|l| self.render_anchor(l)),
+            right.map(|r| self.render_anchor(r)),
+        ) {
             (Some(left), Some(right)) => {
                 if self.is_causally_before(left, right) {
                     let anchor = self.id_of(right);
@@ -3380,12 +3465,13 @@ mod test {
         ab == ba && ab_ids == ba_ids && ab_ids == causal
     }
 
-    /// Fuzz driver mixing inserts, removes, and moves (targets/anchors picked
-    /// by rendered position; self-moves and moves of removed elements are
+    /// Fuzz driver mixing inserts, removes, moves, and splice-anchored
+    /// inserts (targets/anchors picked by rendered position; self-moves,
+    /// moves of removed elements, and inserts on superseded move heads are
     /// generated and must be harmless).
     fn seq_from_move_ops(seq: &mut HashSeq, ops: &[(u8, u8, u8)]) {
         for &(kind, x, y) in ops {
-            match kind % 4 {
+            match kind % 5 {
                 0 | 3 => {
                     let at = if seq.is_empty() {
                         0
@@ -3399,7 +3485,7 @@ mod test {
                         seq.remove(x as usize % seq.len());
                     }
                 }
-                _ => {
+                2 => {
                     if seq.is_empty() {
                         continue;
                     }
@@ -3416,8 +3502,156 @@ mod test {
                     };
                     seq.move_element(target, to);
                 }
+                _ => {
+                    // Insert anchored at a move op's splice point (any head
+                    // of some element's register — deciding or not).
+                    if seq.is_empty() {
+                        continue;
+                    }
+                    let el = seq.id_at(x as usize % seq.len()).unwrap();
+                    if let Some(m) = seq.move_heads(&el).first().copied() {
+                        let op = if y & 1 == 0 {
+                            Op::insert_after(m, 's')
+                        } else {
+                            Op::insert_before(m, 's')
+                        };
+                        seq.apply(HashNode {
+                            pins: BTreeSet::new(),
+                            op,
+                        });
+                    }
+                }
             }
         }
+    }
+
+    /// The design-review scenario: b = Move(x, After(a)); c = Insert(After(b))
+    /// ∥ d = Move(x, After(q)). x freezes at base (surfaced conflict); c
+    /// renders at b's splice point on both merge orders.
+    #[test]
+    fn splice_children_survive_placement_conflicts() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "aq".chars());
+        let a = base.id_at(0).unwrap();
+        let q = base.id_at(1).unwrap();
+        base.insert(1, 'x'); // "axq": x is a before-child of q
+        let x = base.id_at(1).unwrap();
+
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        let b = r1.move_element(x, Anchor::After(a));
+        // c: type y right after the moved-in x — the cursor anchors at b's
+        // splice point (After(b)), not at x's ghost.
+        let pos = r1.position_of(&x).unwrap();
+        r1.insert(pos + 1, 'y');
+
+        r2.move_element(x, Anchor::After(q));
+
+        let mut m1 = r1.clone();
+        m1.merge(r2.clone());
+        let mut m2 = r2.clone();
+        m2.merge(r1.clone());
+
+        assert_eq!(m1, m2);
+        assert_eq!(
+            m1.iter().collect::<String>(),
+            m2.iter().collect::<String>()
+        );
+        assert!(m1.placement_conflicted(&x));
+        // x froze at its base slot (creation placement).
+        assert_eq!(m1.placement_of(&x), None);
+        // y renders at b's rank among a's siblings — a pure function of ids,
+        // independent of x's contested register.
+        let expect = if b.id() < q { "ayxq" } else { "axqy" };
+        assert_eq!(m1.iter().collect::<String>(), expect);
+        check_index_matches_iter(&m1);
+        check_index_matches_iter(&m2);
+
+        // A resolving move naming both heads re-renders x; y keeps its spot.
+        m1.move_element(x, Anchor::After(a));
+        assert!(!m1.placement_conflicted(&x));
+        assert_eq!(m1.placement_of(&x), Some(Anchor::After(a)));
+        check_index_matches_iter(&m1);
+    }
+
+    /// A superseded op with splice children keeps its rank (demote), and a
+    /// conflict resolving back to it re-renders the element there (promote).
+    #[test]
+    fn splice_point_survives_demote_and_promote() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "ma".chars());
+        let m = base.id_at(0).unwrap();
+        let a = base.id_at(1).unwrap();
+
+        let b = base.move_element(m, Anchor::After(a));
+        assert_eq!(base.iter().collect::<String>(), "am");
+        // Type y after the moved-in m: anchors After(b).
+        base.insert(2, 'y');
+        assert_eq!(base.iter().collect::<String>(), "amy");
+        // And w between a and m: anchors Before(b).
+        base.insert(1, 'w');
+        assert_eq!(base.iter().collect::<String>(), "awmy");
+        check_index_matches_iter(&base);
+        let _ = b;
+
+        // Two concurrent re-moves, both overwriting b: the register
+        // conflicts and freezes at the last agreed op — b — whose splice
+        // slot promotes back to rendering m. Children stay adjacent.
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.move_element(m, Anchor::Before(a));
+        assert_eq!(r1.iter().collect::<String>(), "mawy", "demoted: children keep b's rank");
+        check_index_matches_iter(&r1);
+        r2.move_element(m, Anchor::After(a));
+
+        let mut m1 = r1.clone();
+        m1.merge(r2.clone());
+        let mut m2 = r2;
+        m2.merge(r1);
+        assert_eq!(m1, m2);
+        assert!(m1.placement_conflicted(&m));
+        assert_eq!(m1.placement_of(&m), Some(Anchor::After(a)));
+        assert_eq!(m1.iter().collect::<String>(), "awmy");
+        assert_eq!(m2.iter().collect::<String>(), "awmy");
+        check_index_matches_iter(&m1);
+        check_index_matches_iter(&m2);
+    }
+
+    /// Removing a moved element keeps its op's splice children rendering.
+    #[test]
+    fn removing_a_moved_element_keeps_splice_children() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ma".chars());
+        let m = seq.id_at(0).unwrap();
+        let a = seq.id_at(1).unwrap();
+
+        seq.move_element(m, Anchor::After(a));
+        seq.insert(2, 'y'); // After(op)
+        assert_eq!(seq.iter().collect::<String>(), "amy");
+
+        seq.remove(1); // tombstone m at its rendered position
+        assert_eq!(seq.iter().collect::<String>(), "ay");
+        assert_eq!(seq.position_of(&m), None);
+        check_index_matches_iter(&seq);
+    }
+
+    /// Splice-anchored runs survive the wire (their anchor is a move-op id,
+    /// carried via the dictionary).
+    #[test]
+    fn splice_children_roundtrip() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ma".chars());
+        let m = seq.id_at(0).unwrap();
+        seq.move_element(m, Anchor::After(seq.id_at(1).unwrap()));
+        seq.insert(2, 'y');
+        seq.insert(3, '!');
+        assert_eq!(seq.iter().collect::<String>(), "amy!");
+
+        let decoded = crate::encoding::decode_hashseq(&crate::encoding::encode_hashseq(&seq))
+            .expect("roundtrip");
+        assert_eq!(decoded, seq);
+        assert_eq!(decoded.iter().collect::<String>(), "amy!");
+        check_index_matches_iter(&decoded);
     }
 
     #[test]

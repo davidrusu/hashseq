@@ -82,9 +82,11 @@ impl<'a> Iterator for HashSeqIdxIter<'a> {
                     }
                 }
                 if let Loc::MoveOp = self.seq.loc_of(n) {
-                    // A deciding move op releases as its target — a leaf.
+                    // A move op in a sibling set releases its target iff it
+                    // currently decides the register; a superseded op with
+                    // splice children released only the children above.
                     let t = self.seq.move_nodes[&n].target;
-                    if !self.seq.is_removed(t) {
+                    if self.seq.decider_of(t) == Some(n) && !self.seq.is_removed(t) {
                         return Some(t);
                     }
                 } else if !self.seq.is_removed(n) && !self.seq.rendered_elsewhere(n) {

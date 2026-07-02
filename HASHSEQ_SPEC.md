@@ -75,9 +75,14 @@ splice points. Move's rendered index relocation is wired per "Apply" below:
 origin ghosts (base slots live forever), one relocation per rendered-
 placement change, the deciding move op an ordinary insert sibling in its
 anchor's fork order; `prop_index_matches_iterator_with_moves` pins the
-index to the definitional iterator. Cursors still anchor at base slots —
-inserting at a rendered position adjacent to a moved-in element lands at
-the element's ghost until splice-point anchors are admitted.
+index to the definitional iterator. Splice-point insert anchors are live:
+inserts anchored `Before/After(move_op)` are children of the move op and
+render adjacent to the moved element; cursors anchor moved-in neighbors at
+their deciding op, so typing next to moved content lands where the user
+sees it. A superseded op that content anchored to keeps a zero-width
+splice slot at its rank (its destination fragment demotes in place, and
+promotes back if the register re-agrees on it). Still gated: a Move whose
+*destination* is another op's splice point.
 
 ## Payload
 
@@ -241,9 +246,13 @@ O(1) bookkeeping, no replay (nothing is order-dependent):
   a mid-run anchor materializes the run split; a rendered move does the
   same.) Descendants of a moved element (elements chained off it by run
   formation) stay at the origin — run chaining is a causality artifact,
-  not user intent. When splice-point anchors are admitted, inserts
-  anchored `After(move_op)` become ordinary children of the move op and
-  render adjacent to the moved element with no new machinery.
+  not user intent. Inserts anchored `Before/After(move_op)` are ordinary
+  children of the move op: they render adjacent to the moved element, and
+  when the op is superseded they keep its rank — the op's fragment demotes
+  to a zero-width splice ghost rather than being deleted (and promotes
+  back if the register re-agrees). A splice child's position is a pure
+  function of the op's rank: it never inherits the target's placement
+  conflicts and never follows the element to another destination.
 
 The `run_index` treap maintains the rendered order incrementally; per
 FRAMEWORK Law II it is a cache pinned equal to the definitional iterator

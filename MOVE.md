@@ -147,9 +147,12 @@ discipline that keeps that sound (HASHSEQ_SPEC.md Apply/Validation):
   and other moved-ins interleave with it by the one sibling rule the tree
   already has (moves ground ids exactly as inserts can; no second
   ordering concept, no privileged adjacency);
-- re-moves delete the stale destination fragment; **splice ghosts**
-  materialize lazily, only where content actually anchored to a move op's
-  splice point — bounding index growth to live placements plus anchored
+- re-moves delete the stale destination fragment — unless content anchored
+  to the op's splice point, in which case the fragment **demotes in place
+  to a zero-width splice ghost** (and promotes back if the register
+  re-agrees on the op). Splice ghosts materialize lazily, only where
+  content actually anchored — bounding index growth to live placements
+  plus anchored
   splice points rather than total move churn;
 - descendants of a moved element (elements chained off it by run formation)
   stay at the origin — run chaining is a causality artifact, not user
