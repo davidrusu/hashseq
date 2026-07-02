@@ -172,6 +172,8 @@ the last agreed placement), with splice-point anchors for typing adjacent
 to moved content. Marks render: Peritext-style span annotations with
 anchor-encoded edge expansion and add-wins concurrent unmark; marks are
 regional — points stay glued to base slots, elements moved out of a span
-shed it, elements moved in acquire it (`marks_at` / `marked_spans`). Canonical
-snapshot normalization is specified and queued — see the spec set's *Code
-today* notes for the precise implementation frontier.
+shed it, elements moved in acquire it (`marks_at` / `marked_spans`). Snapshots are
+canonical: blocks derive from the op set, never replica storage — equal op
+sets encode to identical bytes across replicas and delivery orders
+(quickcheck'd, hash-locked), with `decode_hashseq_strict` as the verifying
+acceptance mode.

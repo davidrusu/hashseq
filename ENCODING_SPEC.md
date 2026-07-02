@@ -46,9 +46,17 @@ id(u) = BLAKE3::derive_key(NODE_CONTEXT, encode_node(u))
 *Code today* (aligned 2026-07-02): `encoding::encode_node_preimage` is this
 encoder; `HashNode::id` streams the identical bytes (locked by
 `id_preimage_is_the_canonical_encoding`), with a single-buffer fast path for
-the typing chain. The Part B stream still derives blocks from replica
-storage (the canonical-normalization pass — smallest-id chain continuation —
-is the remaining encoder work); same-storage determinism holds as before.
+the typing chain. The Part B stream is normalized: blocks derive from the
+op set (smallest-id chain continuation for insert chains; the pins-exactly-
+`{prev}` relation for remove chains, same fork rule) — equal op sets encode
+to identical bytes across replicas and delivery orders, asserted by the
+merge props and locked by the `canonical_snapshot_vector` test. Strict
+acceptance is `decode_hashseq_strict` (re-encode and compare). Measured
+cost of canonical grouping vs arrival grouping on the editing traces:
+encode-time unchanged, wire +4–8% on edit-heavy traces (the smallest-id
+rule sometimes cuts a long typing chain in favor of a one-char fork child;
+a longest-continuation fork rule would recover it — a canonical-form
+refinement to decide deliberately, since it changes locked bytes).
 
 ## Canonical snapshot
 
@@ -214,8 +222,8 @@ unaffected).
 
 1. **Byte grammar — drafted.** GRAMMAR_SPEC.md pins the preimage grammar
    (Part A, identity-frozen) and the stream grammar (Part B,
-   stream-versioned). Remaining inside it: test vectors and stream-ref
-   bit-packing widths.
+   stream-versioned). The snapshot test vector is locked
+   (`canonical_snapshot_vector`); stream-ref bit-packing widths remain.
 2. **Dict-residual refinements — adopted** (GRAMMAR_SPEC.md): the run-split
    rule and `RemoveChain` consolidation are canonical form, decided before
    the freeze.
@@ -226,6 +234,9 @@ unaffected).
 4. **Chunk alignment.** Byte-level dedupe across *versions* wants chunk
    boundaries that survive appends; blocks give natural boundaries — decide
    whether to spec a chunking discipline or leave it to storage.
-5. **Encoder cost.** Block derivation from the op set (rather than a walk
-   of stored chains) is encode-time work; it must stay off the apply/build
-   path and be verified benchmark-neutral.
+5. **Encoder cost — measured.** Block derivation from the op set is
+   encode-time-only (build times and structure checksums unchanged). The
+   open question moved: the smallest-id fork rule costs +4–8% wire on
+   edit-heavy traces vs arrival grouping; evaluate a longest-continuation
+   fork rule (still a pure function of the op set, ties by id) as a
+   deliberate canonical-form change.

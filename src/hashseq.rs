@@ -3873,7 +3873,11 @@ mod test {
         let ab_ids: Vec<Id> = ab.iter_ids().copied().collect();
         let ba_ids: Vec<Id> = ba.iter_ids().copied().collect();
         let causal: Vec<Id> = ab.iter_idxs_causal().map(|i| ab.id_of(i)).collect();
-        ab == ba && ab_ids == ba_ids && ab_ids == causal && ab.marked_spans() == ba.marked_spans()
+        ab == ba
+            && ab_ids == ba_ids
+            && ab_ids == causal
+            && ab.marked_spans() == ba.marked_spans()
+            && crate::encoding::encode_hashseq(&ab) == crate::encoding::encode_hashseq(&ba)
     }
 
     /// Fuzz driver mixing inserts, removes, moves, and splice-anchored

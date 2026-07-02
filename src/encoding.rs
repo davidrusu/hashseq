@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::hashseq::{CausalRemove, Loc, RemoveRun};
+use crate::hashseq::{CausalRemove, Loc};
+use crate::run::FirstOp;
 use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,9 @@ pub enum DecodeError {
     InvalidOpTag(u8),
     EmptyRun,
     InvalidIdIndex(usize),
+    /// The bytes decode but are not the canonical encoding of their op set
+    /// (strict acceptance mode, ENCODING_SPEC.md).
+    NotCanonical,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -24,6 +28,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidOpTag(tag) => write!(f, "invalid operation tag: {}", tag),
             DecodeError::EmptyRun => write!(f, "run string cannot be empty"),
             DecodeError::InvalidIdIndex(idx) => write!(f, "invalid ID index: {}", idx),
+            DecodeError::NotCanonical => write!(f, "bytes are not a canonical snapshot"),
         }
     }
 }
@@ -648,11 +653,11 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // produces, in offset order); references to those ids resolve to
     // `(this block's emit pos, offset)`.
     enum Payload {
-        Run(NodeIdx),
+        Run(usize),
         RemoveSpan {
             backwards: bool,
             first_extra_deps: BTreeSet<Id>,
-            target_run: NodeIdx,
+            target_run: usize,
             start: usize,
             end: usize,
         },
@@ -671,51 +676,231 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         payload: Payload,
     }
 
-    let mut blocks: Vec<Block> = Vec::new();
-
-    // Run blocks.
-    for (head, run) in &seq.runs {
-        let exposed: Vec<Id> = run.elements.iter().map(|e| seq.id_of(*e)).collect();
-        blocks.push(Block {
-            head_id: exposed[0],
-            exposed,
-            payload: Payload::Run(*head),
-        });
+    // --- Canonical block derivation (a pure function of the op set) ---
+    // Stored chain grouping is an arrival-order artifact (under concurrency,
+    // whichever extension applied first extended the stored run); blocks
+    // must not depend on it — deriving them from the op set is what makes
+    // equal op sets encode to identical bytes (ENCODING_SPEC.md).
+    //
+    // Canonical insert chains follow the fast-path relation — element x
+    // continues element p's chain iff x's op is `Insert{After(p)}` — with
+    // the fork rule: the smallest-id extender continues the chain, every
+    // other extender heads its own block. Chains extend *through* interior
+    // extra-deps (typing across a delete never splits a canonical run).
+    struct CanonRun {
+        first_op: FirstOp,
+        anchor: Id,
+        first_deps: BTreeSet<Id>,
+        text: String,
+        interior: BTreeMap<usize, BTreeSet<Id>>,
+        elements: Vec<NodeIdx>,
     }
 
-    // Remove blocks. In-memory `RemoveRun` chains are already what the wire
-    // wants; each chain is segmented into maximal spans contiguous within one
-    // encoded run (run splits since removal can break a chain across runs).
-    // Multi-char spans become remove-runs; isolated links become singles;
-    // non-element targets become others. Segments after the first synthesize
-    // extra_deps = {previous remove id} — exactly the deps those links carry,
-    // so decode reconstructs identical nodes.
-    let elem_of = |idx: NodeIdx| -> Option<(NodeIdx, usize)> {
-        match seq.loc_of(idx) {
-            Loc::Run { run, pos } => Some((run, pos as usize)),
-            _ => None,
+    // Smallest-id After-child of an element. Stored-interior elements never
+    // carry explicit afters (forks split the stored run), so their stored
+    // successor is their only extender; at stored tails the Id-ordered
+    // `afters` set decides (move-op siblings are not extenders).
+    let smallest_after_child = |p: NodeIdx| -> Option<NodeIdx> {
+        if let Loc::Run { run, pos } = seq.loc_of(p) {
+            let r = &seq.runs[&run];
+            if (pos as usize) + 1 < r.elements.len() {
+                return Some(r.elements[pos as usize + 1]);
+            }
+        }
+        seq.afters
+            .get(&p)
+            .into_iter()
+            .flatten()
+            .find(|a| matches!(seq.loc_of(*a), Loc::Run { .. }))
+    };
+    // Pins of one insert element, from wherever its stored run keeps them.
+    let elem_pins = |e: NodeIdx| -> BTreeSet<Id> {
+        let Loc::Run { run, pos } = seq.loc_of(e) else {
+            unreachable!("insert elements live in runs")
+        };
+        let r = &seq.runs[&run];
+        if pos == 0 {
+            r.first_extra_deps.to_id_set(&seq.ids)
+        } else {
+            r.interior_extra_deps
+                .get(&(pos as usize))
+                .map(|d| d.to_id_set(&seq.ids))
+                .unwrap_or_default()
+        }
+    };
+    // One element's anchor: (side, anchor id, anchor element if it is one).
+    let elem_anchor = |e: NodeIdx| -> (FirstOp, Id, Option<NodeIdx>) {
+        let Loc::Run { run, pos } = seq.loc_of(e) else {
+            unreachable!("insert elements live in runs")
+        };
+        if pos > 0 {
+            let p = seq.runs[&run].elements[pos as usize - 1];
+            (FirstOp::After, seq.id_of(p), Some(p))
+        } else {
+            let r = &seq.runs[&run];
+            let anchor_elem = seq
+                .idx_of(&r.anchor)
+                .filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }));
+            (r.first_op, r.anchor, anchor_elem)
         }
     };
 
-    let mut chains: Vec<&RemoveRun> = seq.remove_runs.values().collect();
-    chains.sort_by_key(|c| c.links.first().map(|l| seq.id_of(*l)));
-    for chain in &chains {
-        let mut i = 0;
-        while i < chain.targets.len() {
-            let deps = if i == 0 {
-                chain.first_extra_deps.to_id_set(&seq.ids)
+    let mut canon_runs: Vec<CanonRun> = Vec::new();
+    // element handle -> (canonical run index, offset); u32::MAX = unset.
+    let mut elem_canon: Vec<(u32, u32)> = vec![(u32::MAX, 0); seq.ids.len()];
+    for stored in seq.runs.values() {
+        for &e in &stored.elements {
+            let (first_op, anchor, anchor_elem) = elem_anchor(e);
+            let continues = first_op == FirstOp::After
+                && anchor_elem.is_some_and(|p| smallest_after_child(p) == Some(e));
+            if continues {
+                continue; // an interior member of some canonical chain
+            }
+            // e heads a canonical run: walk smallest-child extensions.
+            let ci = canon_runs.len() as u32;
+            let mut elements: Vec<NodeIdx> = Vec::new();
+            let mut text = String::new();
+            let mut interior = BTreeMap::new();
+            let mut cur = e;
+            loop {
+                elem_canon[cur.0 as usize] = (ci, elements.len() as u32);
+                if !elements.is_empty() {
+                    let pins = elem_pins(cur);
+                    if !pins.is_empty() {
+                        interior.insert(elements.len(), pins);
+                    }
+                }
+                elements.push(cur);
+                text.push(seq.char_at(cur));
+                match smallest_after_child(cur) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+            canon_runs.push(CanonRun {
+                first_op,
+                anchor,
+                first_deps: elem_pins(e),
+                text,
+                interior,
+                elements,
+            });
+        }
+    }
+
+    let mut blocks: Vec<Block> = Vec::new();
+    for (ci, cr) in canon_runs.iter().enumerate() {
+        let exposed: Vec<Id> = cr.elements.iter().map(|e| seq.id_of(*e)).collect();
+        blocks.push(Block {
+            head_id: exposed[0],
+            exposed,
+            payload: Payload::Run(ci),
+        });
+    }
+
+    // Canonical remove chains: link r2 continues r1 iff r2's pins are
+    // exactly `{id(r1)}` — the relation decode synthesizes — with the same
+    // smallest-id fork rule. The derivation may join chains a replica
+    // stored apart and split where a smaller-id contender chains the same
+    // link; a link that loses its fork heads a chain whose first deps are
+    // `{predecessor}`, which reconstructs identically.
+    // link -> (stored chain key, index within it)
+    let mut link_pos: FxHashMap<NodeIdx, (NodeIdx, usize)> = FxHashMap::default();
+    for (&key, chain) in &seq.remove_runs {
+        for (i, &l) in chain.links.iter().enumerate() {
+            link_pos.insert(l, (key, i));
+        }
+    }
+    // link r -> stored-chain heads whose first deps are exactly {id(r)}.
+    let mut heads_pinning: FxHashMap<NodeIdx, Vec<NodeIdx>> = FxHashMap::default();
+    for chain in seq.remove_runs.values() {
+        let deps: Vec<Id> = chain.first_extra_deps.iter_ids(&seq.ids).collect();
+        if let [d] = deps[..]
+            && let Some(di) = seq.idx_of(&d)
+            && link_pos.contains_key(&di)
+        {
+            heads_pinning.entry(di).or_default().push(chain.links[0]);
+        }
+    }
+    let next_link = |r: NodeIdx| -> Option<NodeIdx> {
+        let (key, i) = link_pos[&r];
+        let stored_next = seq.remove_runs[&key].links.get(i + 1).copied();
+        let contenders = heads_pinning.get(&r).into_iter().flatten().copied();
+        stored_next
+            .into_iter()
+            .chain(contenders)
+            .min_by_key(|l| seq.id_of(*l))
+    };
+    // Does r canonically continue its pinned predecessor?
+    let link_continues = |r: NodeIdx| -> bool {
+        let (key, i) = link_pos[&r];
+        let parent = if i > 0 {
+            Some(seq.remove_runs[&key].links[i - 1])
+        } else {
+            let deps: Vec<Id> = seq.remove_runs[&key].first_extra_deps.iter_ids(&seq.ids).collect();
+            match deps[..] {
+                [d] => seq.idx_of(&d).filter(|di| link_pos.contains_key(di)),
+                _ => None,
+            }
+        };
+        parent.is_some_and(|p| next_link(p) == Some(r))
+    };
+
+    // Remove blocks: each canonical chain is segmented into maximal spans
+    // contiguous within one canonical run. Multi-link spans become
+    // remove-runs; isolated links become singles; non-element targets
+    // become others. Segments after the first synthesize extra_deps =
+    // {previous remove id} — exactly the deps those links carry, so decode
+    // reconstructs identical nodes.
+    let elem_of = |idx: NodeIdx| -> Option<(usize, usize)> {
+        let (ci, off) = elem_canon[idx.0 as usize];
+        (ci != u32::MAX).then_some((ci as usize, off as usize))
+    };
+
+    let mut canon_chains: Vec<(Vec<NodeIdx>, Vec<NodeIdx>, BTreeSet<Id>)> = Vec::new();
+    for stored in seq.remove_runs.values() {
+        for (i, &l) in stored.links.iter().enumerate() {
+            if link_continues(l) {
+                continue;
+            }
+            let first_deps = if i > 0 {
+                BTreeSet::from_iter([seq.id_of(stored.links[i - 1])])
             } else {
-                BTreeSet::from_iter([seq.id_of(chain.links[i - 1])])
+                stored.first_extra_deps.to_id_set(&seq.ids)
             };
-            match elem_of(chain.targets[i]) {
+            let mut links = Vec::new();
+            let mut targets = Vec::new();
+            let mut cur = l;
+            loop {
+                let (key, j) = link_pos[&cur];
+                links.push(cur);
+                targets.push(seq.remove_runs[&key].targets[j]);
+                match next_link(cur) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+            canon_chains.push((links, targets, first_deps));
+        }
+    }
+    canon_chains.sort_by_key(|(links, _, _)| seq.id_of(links[0]));
+    for (links, targets, first_deps) in &canon_chains {
+        let mut i = 0;
+        while i < targets.len() {
+            let deps = if i == 0 {
+                first_deps.clone()
+            } else {
+                BTreeSet::from_iter([seq.id_of(links[i - 1])])
+            };
+            match elem_of(targets[i]) {
                 Some((run_head, elem_idx)) => {
-                    // Greedy span: stay in the same encoded run, stepping ±1 in
-                    // a consistent direction.
+                    // Greedy span: stay in the same canonical run, stepping
+                    // ±1 in a consistent direction.
                     let mut j = i + 1;
                     let mut backwards = None;
                     let mut last = elem_idx;
-                    while j < chain.targets.len() {
-                        let Some((r2, e2)) = elem_of(chain.targets[j]) else {
+                    while j < targets.len() {
+                        let Some((r2, e2)) = elem_of(targets[j]) else {
                             break;
                         };
                         if r2 != run_head {
@@ -732,8 +917,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                         last = e2;
                         j += 1;
                     }
-                    let exposed: Vec<Id> =
-                        chain.links[i..j].iter().map(|l| seq.id_of(*l)).collect();
+                    let exposed: Vec<Id> = links[i..j].iter().map(|l| seq.id_of(*l)).collect();
                     if j - i > 1 {
                         blocks.push(Block {
                             head_id: exposed[0],
@@ -752,20 +936,20 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                             exposed,
                             payload: Payload::Single {
                                 extra_deps: deps,
-                                target: seq.id_of(chain.targets[i]),
+                                target: seq.id_of(targets[i]),
                             },
                         });
                     }
                     i = j;
                 }
                 None => {
-                    let id = seq.id_of(chain.links[i]);
+                    let id = seq.id_of(links[i]);
                     blocks.push(Block {
                         head_id: id,
                         exposed: vec![id],
                         payload: Payload::Other {
                             extra_deps: deps,
-                            targets: vec![seq.id_of(chain.targets[i])],
+                            targets: vec![seq.id_of(targets[i])],
                         },
                     });
                     i += 1;
@@ -805,11 +989,11 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             producer.insert(*id, (b, off));
         }
     }
-    // run head -> block index (remove-span target edges and emit).
-    let mut run_block: FxHashMap<NodeIdx, usize> = FxHashMap::default();
+    // canonical run index -> block index (remove-span target edges + emit).
+    let mut run_block: FxHashMap<usize, usize> = FxHashMap::default();
     for (b, block) in blocks.iter().enumerate() {
-        if let Payload::Run(head) = block.payload {
-            run_block.insert(head, b);
+        if let Payload::Run(ci) = block.payload {
+            run_block.insert(ci, b);
         }
     }
 
@@ -837,15 +1021,15 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // refs (encoded with no dictionary fallback). A RemoveSpan's target is a
     // raw run rank, not an id ref — its hard edge is added separately below.
     let visit_refs = |block: &Block, f: &mut dyn FnMut(&Id, bool)| match &block.payload {
-        Payload::Run(head) => {
-            let run = &seq.runs[head];
-            f(&run.anchor, false);
-            for id in run.first_extra_deps.iter_ids(&seq.ids) {
-                f(&id, false);
+        Payload::Run(ci) => {
+            let cr = &canon_runs[*ci];
+            f(&cr.anchor, false);
+            for id in &cr.first_deps {
+                f(id, false);
             }
-            for deps in run.interior_extra_deps.values() {
-                for id in deps.iter_ids(&seq.ids) {
-                    f(&id, false);
+            for deps in cr.interior.values() {
+                for id in deps {
+                    f(id, false);
                 }
             }
         }
@@ -1064,19 +1248,19 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     for (pe, &bi) in order.iter().enumerate() {
         let block = &blocks[bi];
         match &block.payload {
-            Payload::Run(head) => {
-                let run = &seq.runs[head];
-                buf.push(match run.first_op {
-                    crate::run::FirstOp::After => BLK_RUN_AFTER,
-                    crate::run::FirstOp::Before => BLK_RUN_BEFORE,
+            Payload::Run(ci) => {
+                let cr = &canon_runs[*ci];
+                buf.push(match cr.first_op {
+                    FirstOp::After => BLK_RUN_AFTER,
+                    FirstOp::Before => BLK_RUN_BEFORE,
                 });
-                encode_ref(&run.anchor, pe, &mut buf);
-                encode_ref_set(&run.first_extra_deps.to_id_set(&seq.ids), pe, &mut buf);
-                encode_string(&run.text, &mut buf);
-                encode_varint(run.interior_extra_deps.len(), &mut buf);
-                for (offset, deps) in &run.interior_extra_deps {
+                encode_ref(&cr.anchor, pe, &mut buf);
+                encode_ref_set(&cr.first_deps, pe, &mut buf);
+                encode_string(&cr.text, &mut buf);
+                encode_varint(cr.interior.len(), &mut buf);
+                for (offset, deps) in &cr.interior {
                     encode_varint(*offset, &mut buf);
-                    encode_ref_set(&deps.to_id_set(&seq.ids), pe, &mut buf);
+                    encode_ref_set(deps, pe, &mut buf);
                 }
             }
             Payload::RemoveSpan {
@@ -1219,6 +1403,20 @@ fn decode_ref_set(c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Result<BTree
         ids.insert(decode_ref(c, id_list, ranks)?);
     }
     Ok(ids)
+}
+
+/// Strict acceptance (ENCODING_SPEC.md): decode, then verify the bytes are
+/// the canonical encoding of the decoded op set by re-encoding. Only
+/// strict-verified bytes may be cached, deduped, or fingerprinted as
+/// canonical; `decode_hashseq` alone is transport mode (any well-formed
+/// stream decodes — ops are self-certifying — but the bytes carry no
+/// canonical status).
+pub fn decode_hashseq_strict(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
+    let seq = decode_hashseq(bytes)?;
+    if encode_hashseq(&seq) != bytes {
+        return Err(DecodeError::NotCanonical);
+    }
+    Ok(seq)
 }
 
 /// Decode a HashSeq from its byte representation.
@@ -1642,17 +1840,128 @@ mod tests {
 
         let encoded = encode_hashseq(&seq_a);
         let decoded = decode_hashseq(&encoded).unwrap();
-        // Note: re-encoding `decoded` may produce *different bytes* — chain
-        // and run storage are arrival-order dependent under concurrency
-        // (e.g. two removes claiming the same parent), so byte-canonical
-        // encoding is not a property the format has. Logical state must
-        // roundtrip exactly, and a second roundtrip must be logically stable.
+        // Blocks derive from the op set, never replica storage, so the
+        // encoding is byte-canonical: the decoded copy (whose stored chain
+        // grouping may differ) re-encodes to identical bytes, and the two
+        // replicas (equal op sets, different arrival orders) encode
+        // identically too.
         let encoded2 = encode_hashseq(&decoded);
-        let decoded2 = decode_hashseq(&encoded2).unwrap();
         decoded == seq_a
             && decoded.iter().collect::<String>() == seq_a.iter().collect::<String>()
-            && decoded2 == seq_a
-            && decoded2.iter().collect::<String>() == seq_a.iter().collect::<String>()
+            && encoded2 == encoded
+            && encode_hashseq(&seq_b) == encoded
+            && decode_hashseq_strict(&encoded).is_ok()
+    }
+
+    /// The canonical snapshot vector (owed by GRAMMAR_SPEC.md once Part B
+    /// normalized): one concurrent document's exact bytes, locked by hash.
+    /// A change to block derivation or the stream grammar is a
+    /// canonical-form change and must update this hash *knowingly* —
+    /// unlike the Part A identity vectors, which never change.
+    #[test]
+    fn canonical_snapshot_vector() {
+        let mut a = HashSeq::default();
+        let mut b = HashSeq::default();
+        a.insert_batch(0, "hello world".chars());
+        b.merge(a.clone());
+        a.insert(5, '!');
+        b.remove_batch(0, 3);
+        a.merge(b.clone());
+        b.merge(a.clone());
+        assert_eq!(a, b);
+        // A move, a splice-anchored insert, and a mark, for trailing-section
+        // coverage.
+        let e0 = a.id_at(0).unwrap();
+        let last = a.id_at(a.len() - 1).unwrap();
+        let mv = a.move_element(e0, crate::Anchor::After(last));
+        a.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(mv.id(), 'x'),
+        });
+        let s0 = a.id_at(0).unwrap();
+        let s2 = a.id_at(2).unwrap();
+        a.mark_range(
+            crate::Anchor::Before(s0),
+            crate::Anchor::After(s2),
+            crate::value::Value::String("bold".into()).value_id(),
+            crate::value::Value::Bool(true).value_id(),
+        );
+        b.merge(a.clone());
+
+        let bytes = encode_hashseq(&a);
+        assert_eq!(encode_hashseq(&b), bytes, "equal sets, equal bytes");
+        assert_eq!(
+            blake3::hash(&bytes).to_hex().as_str(),
+            "bedb884305a836b82a0164b96c8b37a61f59313a7c55e94ca00d33242af8acaf",
+            "canonical snapshot bytes moved — bump knowingly"
+        );
+    }
+
+    /// Strict mode rejects well-formed but noncanonical bytes: a two-char
+    /// typing chain encoded as two single-element run blocks decodes to the
+    /// same op set the canonical single-block form does — transport mode
+    /// accepts it, strict mode does not.
+    #[test]
+    fn strict_decode_rejects_noncanonical_grouping() {
+        let mut noncanon = Vec::new();
+        encode_id(&Id::default(), &mut noncanon); // origin header
+        encode_varint(0, &mut noncanon); // empty dict
+        encode_varint(2, &mut noncanon); // two blocks
+        // block 0: run "a" anchored at the origin (dict entry 0)
+        noncanon.push(BLK_RUN_AFTER);
+        encode_varint(0 << 2, &mut noncanon); // dict ref 0
+        encode_varint(0, &mut noncanon); // no first deps
+        encode_string("a", &mut noncanon);
+        encode_varint(0, &mut noncanon); // no interior deps
+        // block 1: run "b" anchored After(run 0, elem 0) — the canonical
+        // form would extend block 0 instead (sole extender = smallest).
+        noncanon.push(BLK_RUN_AFTER);
+        encode_varint(1, &mut noncanon); // run-element ref (rank 0, ...)
+        encode_varint(0, &mut noncanon); // ... offset 0
+        encode_varint(0, &mut noncanon);
+        encode_string("b", &mut noncanon);
+        encode_varint(0, &mut noncanon);
+        encode_varint(0, &mut noncanon); // no orphans
+
+        let decoded = decode_hashseq(&noncanon).expect("transport mode accepts");
+        assert_eq!(decoded.iter().collect::<String>(), "ab");
+        assert_eq!(
+            decode_hashseq_strict(&noncanon),
+            Err(DecodeError::NotCanonical)
+        );
+        // The canonical bytes for the same op set: one two-element run.
+        let canonical = encode_hashseq(&decoded);
+        assert_ne!(canonical, noncanon);
+        let strict = decode_hashseq_strict(&canonical).expect("canonical bytes verify");
+        assert_eq!(strict, decoded);
+    }
+
+    /// Equal op sets encode to identical bytes even when replicas stored
+    /// their chains differently: a fork whose smaller-id extender arrived
+    /// second is grouped by id, not arrival.
+    #[test]
+    fn encoding_is_storage_independent() {
+        // Replica 1: type "ab", then a concurrent fork "c" after 'a' arrives.
+        let mut r1 = HashSeq::default();
+        r1.insert_batch(0, "ab".chars());
+        let a = r1.id_at(0).unwrap();
+        let fork = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(a, 'c'),
+        };
+        let mut r2 = HashSeq::default();
+        // Replica 2 sees the fork before the run continuation.
+        for (id, node) in r1.all_nodes().into_iter().take(1) {
+            r2.apply_with_id(id, node); // 'a'
+        }
+        r2.apply(fork.clone());
+        for (id, node) in r1.all_nodes() {
+            r2.apply_with_id(id, node); // 'b' (and 'a' dedup)
+        }
+        r1.apply(fork);
+
+        assert_eq!(r1, r2);
+        assert_eq!(encode_hashseq(&r1), encode_hashseq(&r2));
     }
 
     /// Deterministic cycle shape: two concurrent runs that each extend with
