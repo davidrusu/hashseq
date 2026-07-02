@@ -30,10 +30,30 @@ the stack, one hasher update — recovered roughly half of the initial
 regression). A same-conditions A/B against the pre-Move commit confirmed the
 Move/HashKv additions cost nothing on text traces.
 
-Remaining perf headroom if the +3–9% ever matters: none inside the current
-grammar (the 68-byte preimage is spec-fixed); the only lever would be
-inline-char preimages, which GRAMMAR_SPEC.md rejects for
-availability-independent identity. Spend optimization effort elsewhere.
+**Update (same day): the regression is gone.** The `hash_cost` microbench
+decomposed the per-op id() cost and confirmed the attribution — preimage
+width (68B vs 36B ≈ 50–58 ns/op, the second BLAKE3 block), not value-id
+derivation (char lookup: 1.1 ns — the ASCII table already covers it). Two
+consequences:
+
+1. **Adopted `blake3::hazmat` context keys**: `Hasher::new_from_context_key`
+   with a cached `hash_derive_key_context` output produces byte-identical
+   ids to `new_derive_key` (locked vectors prove it) while skipping the
+   ~1.9 KB template clone — 127.8 → 105.7 ns/op on the 68-byte hash path.
+   With it, the trace run beats the old-design baseline (same machine, quiet
+   load — the earlier ~45% slowdown turned out to be background load, not
+   battery power):
+   automerge 123 → 108.9 ms min, rustcode 326 → 302.1, seph 123 → 115.8
+   (machine-state variance means treat the microbench deltas as the
+   reliable component; either way the width penalty is fully paid for).
+2. **The shave-to-64-bytes question is settled — unreachable.** The
+   fast-path preimage carries two 32-byte ids (anchor + payload value id),
+   leaving exactly 4 metadata bytes: kind, ref_count, anchor-ref, body_len.
+   Even dropping `body_len` from the preimage (arguably demanded by the
+   grammar's own boundary principle — the body is the trailing field) and
+   packing kind+ref_count into one varint reaches 66 bytes, still two
+   blocks. One block requires zero metadata. No identity change is worth
+   making for this.
 
 
 Status as of 2026-06-11, after the optimization push. Benchmark:
