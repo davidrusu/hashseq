@@ -36,7 +36,7 @@ convergence concern. JSON fidelity is an exporter's projection choice.
 No new op shape.
 
 - **Create**: an op whose payload/value is a creation artifact
-  (`NewSeq`/`NewMap` — ordinary derived value ids, computed constants)
+  (`NewSeq`/`NewKv` — ordinary derived value ids, computed constants)
   creates a child object: `Insert { at, payload: New* }` from a sequence
   slot, `Put { key, value: New* }` from a map slot, identically. The
   object's identity is its **origin id**,
@@ -72,7 +72,7 @@ Routed, not new:
 | object | resource / conflict / resolution |
 |---|---|
 | `Seq` | gap → intra-gap order → total order by id; tombstone union; placement register → freeze, same-container (HASHSEQ_SPEC.md) |
-| `Map` | key register → multi-head → MVR / freeze (HASHKV_SPEC.md) |
+| `Kv` | key register → multi-head → MVR / freeze (HASHKV_SPEC.md) |
 | marks | (element, kind) register → multi-head → MVR / freeze (MARKS.md) |
 
 The substrate routes by object; the projection applies and resolves. State
@@ -113,7 +113,7 @@ verdicts that are total, convergent, and stable:
 | `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the origin id, in one `Seq`; inverted spans gate (MARKS.md) | gate |
 | `Mark . overwrites` | — | never gated: entries that are not covering same-kind marks are ignored by the definitional suppression filter (same class as `Put . overwrites` — kind- and coverage-scoping live in the read, not the gate) |
 | `Put . overwrites` | — | never gated: entries that are not puts on the same key are ignored by the definitional head-set filter |
-| op kind vs object type | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Map` | gate |
+| op kind vs object type | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv` | gate |
 | routing | the op's refs must determine one object | gate |
 | pins (unroled refs) | anything | always meaningful — pure frontier pins |
 | payloads / keys / values | any id | never edge-checked: values are not references, and payload kinds are not schema-gated (Objects, above) — schema is the renderer's concern |

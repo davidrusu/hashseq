@@ -1859,7 +1859,7 @@ pub fn decode_hashkv_strict(bytes: &[u8]) -> Result<HashKv, DecodeError> {
 // this same canonical form (ENCODING_SPEC.md "Interaction with the
 // family").
 
-const OBJ_MAP: u8 = 0;
+const OBJ_KV: u8 = 0;
 const OBJ_SEQ: u8 = 1;
 
 pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
@@ -1872,7 +1872,7 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
     for (id, bytes) in web.values.iter() {
         artifacts.insert(*id, bytes);
     }
-    for m in web.maps.values() {
+    for m in web.kvs.values() {
         for (id, bytes) in m.values.iter() {
             artifacts.entry(*id).or_insert(bytes);
         }
@@ -1888,7 +1888,7 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
         Seq(&'a HashSeq),
     }
     let mut objects: Vec<(&Id, ObjRef)> = web
-        .maps
+        .kvs
         .iter()
         .map(|(o, m)| (o, ObjRef::Map(m)))
         .chain(web.seqs.iter().map(|(o, s)| (o, ObjRef::Seq(s))))
@@ -1899,7 +1899,7 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
         encode_id(origin, &mut buf);
         let inner = match obj {
             ObjRef::Map(m) => {
-                buf.push(OBJ_MAP);
+                buf.push(OBJ_KV);
                 encode_hashkv_with_store(m, false)
             }
             ObjRef::Seq(s) => {
@@ -1952,12 +1952,12 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
         // Rebuild the replica-local routing table from the object's
         // applied ids (never on the wire).
         match kind {
-            OBJ_MAP => {
+            OBJ_KV => {
                 let m = decode_hashkv(inner)?;
                 for id in m.nodes.keys() {
                     web.node_home.insert(*id, origin);
                 }
-                web.maps.insert(origin, m);
+                web.kvs.insert(origin, m);
             }
             OBJ_SEQ => {
                 let s = decode_hashseq(inner)?;
@@ -2578,11 +2578,11 @@ mod family_wire {
         let mut doc = HashWeb::new();
         let root = Id([9; 32]);
         doc.create_kv(root);
-        let block = doc.new_map(&root, s("block-1")).unwrap();
+        let block = doc.new_kv(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
         doc.put(&block, s("color"), s("blue"));
         doc.text_insert(&content, 0, "hello world");
-        let inner = doc.seq_new_object(&content, 5, Value::NewSeq).unwrap();
+        let inner = doc.new_seq_at(&content, 5).unwrap();
         doc.text_insert(&inner, 0, "embedded");
 
         let bytes = encode_hashweb(&doc);
@@ -2593,7 +2593,7 @@ mod family_wire {
         // through the document-wide store (inner stores are replica-local
         // views and deliberately not canonical snapshot state).
         assert!(matches!(
-            decoded.map(&block).unwrap().read(&s("color")),
+            decoded.kv(&block).unwrap().read(&s("color")),
             crate::hashkv::Read::One(_)
         ));
         assert_eq!(decoded.get(&block, &s("color")), Some(s("blue")));
@@ -2626,7 +2626,7 @@ mod family_wire {
         // transitively.
         let mut decoded = decoded;
         decoded.create_kv(root);
-        for (id, node) in a.map(&root).unwrap().all_nodes() {
+        for (id, node) in a.kv(&root).unwrap().all_nodes() {
             decoded.apply_with_id(id, node);
         }
         assert_eq!(decoded.orphans().count(), 0);
@@ -2639,7 +2639,7 @@ mod family_wire {
         let root = Id([9; 32]);
         base.create_kv(root);
         let text = base.new_seq(&root, s("text")).unwrap();
-        let meta = base.new_map(&root, s("meta")).unwrap();
+        let meta = base.new_kv(&root, s("meta")).unwrap();
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();

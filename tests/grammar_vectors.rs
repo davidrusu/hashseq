@@ -1,6 +1,6 @@
 //! GRAMMAR_SPEC.md test vectors — locked. Any change to these values is an
 //! identity hard fork and must be deliberate (context-string bump).
-use hashseq::value::{NEW_MAP, NEW_SEQ, TOMBSTONE, char_value_id};
+use hashseq::value::{NEW_KV, NEW_SEQ, TOMBSTONE, char_value_id};
 use hashseq::{Anchor, HashNode, Id, Op, Payload, object_id};
 use std::collections::BTreeSet;
 
@@ -19,7 +19,7 @@ fn derived_constants_are_locked() {
         "8fff7f38a876c8f8dc821a2acd0027539f496194f366d1c7401f2e1d765d0ef7"
     );
     assert_eq!(
-        hx(&NEW_MAP),
+        hx(&NEW_KV),
         "76796526efce6c555148595918fd9cf934753cd7e06f8f22e26b7f2501c60e26"
     );
     assert_eq!(

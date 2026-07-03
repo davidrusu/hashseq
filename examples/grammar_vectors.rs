@@ -1,5 +1,5 @@
 // examples/grammar_vectors.rs — print the GRAMMAR_SPEC test vectors
-use hashseq::value::{NEW_MAP, NEW_SEQ, TOMBSTONE, char_value_id};
+use hashseq::value::{NEW_KV, NEW_SEQ, TOMBSTONE, char_value_id};
 use hashseq::{Anchor, HashNode, Id, Op, Payload, object_id};
 use std::collections::BTreeSet;
 
@@ -10,7 +10,7 @@ fn hex(id: &Id) -> String {
 fn main() {
     println!("TOMBSTONE = {}", hex(&TOMBSTONE));
     println!("NEW_SEQ   = {}", hex(&NEW_SEQ));
-    println!("NEW_MAP   = {}", hex(&NEW_MAP));
+    println!("NEW_KV   = {}", hex(&NEW_KV));
     println!("value_id('a') = {}", hex(&char_value_id('a')));
     let x = Id([0x11; 32]);
     println!("object_id(0x11*32) = {}", hex(&object_id(&x)));

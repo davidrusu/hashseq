@@ -51,7 +51,7 @@ covers everything a tagged union would — and more:
 |---|---|
 | a value artifact (bytes, string, int, bool, …) | a scalar. Encodes inline on the wire at ≤ hash size, id derived at decode — inline vs indirect is transport, never identity |
 | the well-known tombstone artifact | `Del` |
-| a creation artifact (`NewSeq` / `NewMap`) | **this Put creates a child object**, identified by its origin id — `object_id = derive_key(OBJECT_CONTEXT, <this Put's id>)` (GRAMMAR_SPEC.md). Creation works identically from a map slot and a sequence slot |
+| a creation artifact (`NewSeq` / `NewKv`) | **this Put creates a child object**, identified by its origin id — `object_id = derive_key(OBJECT_CONTEXT, <this Put's id>)` (GRAMMAR_SPEC.md). Creation works identically from a map slot and a sequence slot |
 | an object's origin id (`object_id`, GRAMMAR_SPEC.md) | a link to that object — `Ref` with no wrapper needed. Linking an object that already lives elsewhere is transclusion (HETEROGENEITY.md open problems) |
 | an op node | a reference to that op — e.g. the subject of an "about" register (below) |
 

@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 use crate::hashkv::HashKv;
 use crate::hashseq::IdMap;
 use crate::delivery::Delivery;
-use crate::value::{NEW_MAP, NEW_SEQ, Value, object_id};
+use crate::value::{NEW_KV, NEW_SEQ, Value, object_id};
 use crate::{HashNode, HashSeq, Id, Op, Payload};
 
 #[derive(Debug, Clone, Default)]
@@ -31,7 +31,7 @@ pub struct HashWeb {
     /// out-of-band and children born by creation ops alike.
     pub(crate) seqs: FxHashMap<Id, HashSeq>,
     /// Every map object, likewise.
-    pub(crate) maps: FxHashMap<Id, HashKv>,
+    pub(crate) kvs: FxHashMap<Id, HashKv>,
     /// node id -> the origin id of the object it belongs to (the routing
     /// table — replica-local, derived, never on the wire).
     pub(crate) node_home: IdMap<Id>,
@@ -47,7 +47,7 @@ pub struct HashWeb {
 
 impl PartialEq for HashWeb {
     fn eq(&self, other: &Self) -> bool {
-        self.seqs == other.seqs && self.maps == other.maps
+        self.seqs == other.seqs && self.kvs == other.kvs
     }
 }
 impl Eq for HashWeb {}
@@ -75,7 +75,7 @@ impl HashWeb {
         if self.is_origin(&origin) {
             return false;
         }
-        self.maps.insert(origin, HashKv::new(origin));
+        self.kvs.insert(origin, HashKv::new(origin));
         self.wake_origin(origin);
         true
     }
@@ -93,23 +93,23 @@ impl HashWeb {
         self.seqs.get(origin)
     }
 
-    pub fn map(&self, origin: &Id) -> Option<&HashKv> {
-        self.maps.get(origin)
+    pub fn kv(&self, origin: &Id) -> Option<&HashKv> {
+        self.kvs.get(origin)
     }
 
-    /// Every known origin id (seqs and maps).
+    /// Every known origin id (seqs and kvs).
     pub fn origins(&self) -> impl Iterator<Item = &Id> {
-        self.seqs.keys().chain(self.maps.keys())
+        self.seqs.keys().chain(self.kvs.keys())
     }
 
     pub fn object_count(&self) -> usize {
-        self.seqs.len() + self.maps.len()
+        self.seqs.len() + self.kvs.len()
     }
 
     /// Is this id a live object origin (roots adopted out-of-band and
     /// creation-derived children alike)?
     fn is_origin(&self, id: &Id) -> bool {
-        self.seqs.contains_key(id) || self.maps.contains_key(id)
+        self.seqs.contains_key(id) || self.kvs.contains_key(id)
     }
 
     /// An id is present if it is an applied node or a live object origin.
@@ -135,7 +135,7 @@ impl HashWeb {
         let key_id = self.provide_value(&key);
         let value_id = self.provide_value(&value);
         let node = {
-            let m = self.maps.get_mut(origin)?;
+            let m = self.kvs.get_mut(origin)?;
             m.provide_value(&key);
             m.provide_value(&value);
             m.make_put(key_id, value_id)
@@ -148,7 +148,7 @@ impl HashWeb {
     /// origin id. The creating op *is* the object: its identity is
     /// `object_id(creation op id)` — a virtual origin, never an op.
     pub fn create_child(&mut self, parent: &Id, key: Value, kind: Value) -> Option<Id> {
-        debug_assert!(matches!(kind, Value::NewSeq | Value::NewMap));
+        debug_assert!(matches!(kind, Value::NewSeq | Value::NewKv));
         let node = self.put(parent, key, kind.clone())?;
         let creation = node.id();
         // put() routed the node; creation additionally births the child.
@@ -157,8 +157,8 @@ impl HashWeb {
         Some(child)
     }
 
-    pub fn new_map(&mut self, parent: &Id, key: Value) -> Option<Id> {
-        self.create_child(parent, key, Value::NewMap)
+    pub fn new_kv(&mut self, parent: &Id, key: Value) -> Option<Id> {
+        self.create_child(parent, key, Value::NewKv)
     }
 
     pub fn new_seq(&mut self, parent: &Id, key: Value) -> Option<Id> {
@@ -167,7 +167,7 @@ impl HashWeb {
 
     /// Insert a value commitment into a child seq at `idx` — an artifact,
     /// a link (another object's origin id), or a creation value
-    /// (`NewSeq`/`NewMap` births a child object inline). Routes through the
+    /// (`NewSeq`/`NewKv` births a child object inline). Routes through the
     /// composition's apply so creation semantics fire.
     pub fn seq_insert_value(&mut self, origin: &Id, idx: usize, value: &Value) -> Option<HashNode> {
         let vid = self.provide_value(value);
@@ -176,10 +176,19 @@ impl HashWeb {
         Some(node)
     }
 
-    /// Create a child object as an inline element of a seq (creation-in-seq:
-    /// the element IS the creation op; the child's origin id derives from it).
-    pub fn seq_new_object(&mut self, parent: &Id, idx: usize, kind: Value) -> Option<Id> {
-        debug_assert!(matches!(kind, Value::NewSeq | Value::NewMap));
+    /// Create a child seq as an inline element of a seq (creation-in-seq:
+    /// the element IS the creation op; the child's origin id derives from
+    /// it).
+    pub fn new_seq_at(&mut self, parent: &Id, idx: usize) -> Option<Id> {
+        self.create_child_at(parent, idx, Value::NewSeq)
+    }
+
+    /// Create a child kv as an inline element of a seq.
+    pub fn new_kv_at(&mut self, parent: &Id, idx: usize) -> Option<Id> {
+        self.create_child_at(parent, idx, Value::NewKv)
+    }
+
+    fn create_child_at(&mut self, parent: &Id, idx: usize, kind: Value) -> Option<Id> {
         let node = self.seq_insert_value(parent, idx, &kind)?;
         let child = object_id(&node.id());
         debug_assert!(self.is_origin(&child), "creation birthed");
@@ -218,15 +227,15 @@ impl HashWeb {
         Some(self.seq(origin)?.iter().collect())
     }
 
-    /// Read `key` in map `origin`, resolving artifacts through the
-    /// composition's value store (the store is document-wide; inner
-    /// projections keep only what they saw locally). Conflicts and pending
-    /// values are not collapsed — `None` (use the map's `read` to surface).
+    /// Read `key` in kv `origin`, resolving artifacts through the store's
+    /// value store (store-wide; inner projections keep only what they saw
+    /// locally). Conflicts and pending values are not collapsed — `None`
+    /// (use the kv's `read` to surface).
     pub fn get(&self, origin: &Id, key: &Value) -> Option<Value> {
-        match self.map(origin)?.read(key) {
+        match self.kv(origin)?.read(key) {
             crate::hashkv::Read::One(vid) => self
                 .resolve(&vid)
-                .or_else(|| self.map(origin)?.resolve(&vid)),
+                .or_else(|| self.kv(origin)?.resolve(&vid)),
             _ => None,
         }
     }
@@ -310,7 +319,7 @@ impl HashWeb {
         // a child object whose origin is object_id(creation op).
         let creation_kind = match &node.op {
             Op::Put { value, .. } if *value == *NEW_SEQ => Some(true),
-            Op::Put { value, .. } if *value == *NEW_MAP => Some(false),
+            Op::Put { value, .. } if *value == *NEW_KV => Some(false),
             Op::Insert {
                 payload: Payload::Id(v),
                 ..
@@ -318,7 +327,7 @@ impl HashWeb {
             Op::Insert {
                 payload: Payload::Id(v),
                 ..
-            } if *v == *NEW_MAP => Some(false),
+            } if *v == *NEW_KV => Some(false),
             _ => None,
         };
 
@@ -326,7 +335,7 @@ impl HashWeb {
         // op-kind-vs-object-type (a Put into a Seq quarantines there).
         if let Some(seq) = self.seqs.get_mut(&home) {
             seq.apply_with_id(id, node);
-        } else if let Some(map) = self.maps.get_mut(&home) {
+        } else if let Some(map) = self.kvs.get_mut(&home) {
             map.apply_with_id(id, node);
         } else {
             unreachable!("routed to a live object");
@@ -339,7 +348,7 @@ impl HashWeb {
                 if is_seq {
                     self.seqs.insert(child, HashSeq::new(child));
                 } else {
-                    self.maps.insert(child, HashKv::new(child));
+                    self.kvs.insert(child, HashKv::new(child));
                 }
             }
             // Derive-and-wake: the origin id just became present; wake any
@@ -364,14 +373,14 @@ impl HashWeb {
             .seqs
             .keys()
             .map(|o| (*o, true))
-            .chain(other.maps.keys().map(|o| (*o, false)))
+            .chain(other.kvs.keys().map(|o| (*o, false)))
             .filter(|(o, _)| !self.is_origin(o))
             .collect();
         for (origin, is_seq) in adopt {
             if is_seq {
                 self.seqs.insert(origin, HashSeq::new(origin));
             } else {
-                self.maps.insert(origin, HashKv::new(origin));
+                self.kvs.insert(origin, HashKv::new(origin));
             }
             let mut queue: Vec<(Id, HashNode)> = Vec::new();
             self.delivery.wake(&origin, &mut queue);
@@ -386,7 +395,7 @@ impl HashWeb {
                 self.apply_with_id(id, node);
             }
         }
-        for m in other.maps.values() {
+        for m in other.kvs.values() {
             for (vid, bytes) in m.value_store() {
                 self.values.entry(*vid).or_insert_with(|| bytes.clone());
             }
@@ -453,8 +462,8 @@ mod tests {
         let mut confused = HashWeb::new();
         confused.create_kv(oid(1));
         confused.merge(a.clone());
-        assert!(confused.map(&oid(1)).is_some());
-        assert!(!confused.map(&oid(1)).unwrap().delivery.gated.is_empty());
+        assert!(confused.kv(&oid(1)).is_some());
+        assert!(!confused.kv(&oid(1)).unwrap().delivery.gated.is_empty());
 
         // Roundtrip of a multi-root store.
         let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(
@@ -471,16 +480,16 @@ mod tests {
         let root = oid(9);
         doc.create_kv(root);
 
-        let block = doc.new_map(&root, s("block-1")).unwrap();
+        let block = doc.new_kv(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
         doc.put(&block, s("color"), s("blue"));
         doc.text_insert(&content, 0, "hello world");
 
         assert_eq!(doc.text(&content).unwrap(), "hello world");
-        assert_eq!(doc.map(&block).unwrap().get(&s("color")), Some(s("blue")));
+        assert_eq!(doc.kv(&block).unwrap().get(&s("color")), Some(s("blue")));
         // The root links to the block by... the creation op is the value; the
         // child object id is derived from it.
-        assert!(doc.map(&block).is_some());
+        assert!(doc.kv(&block).is_some());
         assert_eq!(doc.object_count(), 3); // root + block + content
     }
 
@@ -507,7 +516,7 @@ mod tests {
         let root = oid(9);
         base.create_kv(root);
         let text = base.new_seq(&root, s("text")).unwrap();
-        let meta = base.new_map(&root, s("meta")).unwrap();
+        let meta = base.new_kv(&root, s("meta")).unwrap();
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
@@ -538,7 +547,7 @@ mod tests {
         // Extract the child's inserts and the creation chain separately
         // (root adoption -> root map's put -> child).
         let child_nodes = a.seq(&child).unwrap().all_nodes();
-        let creation_chain: Vec<(Id, HashNode)> = a.map(&root).unwrap().all_nodes();
+        let creation_chain: Vec<(Id, HashNode)> = a.kv(&root).unwrap().all_nodes();
 
         let mut fresh = HashWeb::new();
         fresh.create_kv(root);
@@ -590,9 +599,7 @@ mod tests {
         doc.create_seq(text);
         doc.text_insert(&text, 0, "see [] here");
 
-        let inner = doc
-            .seq_new_object(&text, 5, Value::NewSeq)
-            .expect("inline creation");
+        let inner = doc.new_seq_at(&text, 5).expect("inline creation");
         doc.text_insert(&inner, 0, "the embedded doc");
 
         assert_eq!(doc.text(&inner).unwrap(), "the embedded doc");
@@ -647,15 +654,15 @@ mod tests {
         let mut r1 = base.clone();
         let mut r2 = base.clone();
         let c1 = r1.new_seq(&root, s("content")).unwrap();
-        let c2 = r2.new_map(&root, s("content")).unwrap();
+        let c2 = r2.new_kv(&root, s("content")).unwrap();
         r1.text_insert(&c1, 0, "one");
 
         base.merge(r1);
         base.merge(r2);
         assert!(base.seq(&c1).is_some());
-        assert!(base.map(&c2).is_some());
+        assert!(base.kv(&c2).is_some());
         assert!(matches!(
-            base.map(&root).unwrap().read(&s("content")),
+            base.kv(&root).unwrap().read(&s("content")),
             crate::hashkv::Read::Conflict(_)
         ));
         assert_eq!(base.text(&c1).unwrap(), "one");

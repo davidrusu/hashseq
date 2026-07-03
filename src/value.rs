@@ -29,7 +29,7 @@ pub const VK_STRING: u8 = 4;
 pub const VK_BYTES: u8 = 5;
 pub const VK_F64: u8 = 6;
 pub const VK_NEW_SEQ: u8 = 7;
-pub const VK_NEW_MAP: u8 = 8;
+pub const VK_NEW_KV: u8 = 8;
 
 // Pre-hashed derive-key context keys: `Hasher::new_from_context_key` yields
 // output identical to `Hasher::new_derive_key(ctx)` (same derive_key
@@ -75,7 +75,7 @@ pub enum Value {
     /// IEEE 754 bits, verbatim — every bit pattern is a distinct value.
     F64(u64),
     NewSeq,
-    NewMap,
+    NewKv,
 }
 
 impl Value {
@@ -109,7 +109,7 @@ impl Value {
                 buf.extend_from_slice(&bits.to_le_bytes());
             }
             Value::NewSeq => buf.push(VK_NEW_SEQ),
-            Value::NewMap => buf.push(VK_NEW_MAP),
+            Value::NewKv => buf.push(VK_NEW_KV),
         }
     }
 
@@ -147,7 +147,7 @@ impl Value {
                 Value::F64(u64::from_le_bytes(bits))
             }
             VK_NEW_SEQ if rest.is_empty() => Value::NewSeq,
-            VK_NEW_MAP if rest.is_empty() => Value::NewMap,
+            VK_NEW_KV if rest.is_empty() => Value::NewKv,
             _ => return None,
         })
     }
@@ -209,8 +209,9 @@ fn decode_zigzag(bytes: &[u8]) -> Option<(i64, usize)> {
 pub static TOMBSTONE: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_TOMBSTONE]));
 /// `NEW_SEQ = value_id([VK_NEW_SEQ])` — the seq-creation artifact.
 pub static NEW_SEQ: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_NEW_SEQ]));
-/// `NEW_MAP = value_id([VK_NEW_MAP])` — the map-creation artifact.
-pub static NEW_MAP: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_NEW_MAP]));
+/// `NEW_KV = value_id([VK_NEW_KV])` — the kv-creation artifact (tag byte
+/// unchanged from its former NewMap name; the name is Rust-level only).
+pub static NEW_KV: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_NEW_KV]));
 
 // ---- char value-id cache ----
 //
@@ -274,7 +275,7 @@ mod tests {
             Value::F64(1.5f64.to_bits()),
             Value::F64(f64::NAN.to_bits()),
             Value::NewSeq,
-            Value::NewMap,
+            Value::NewKv,
         ];
         for v in values {
             let bytes = v.encoded();
@@ -292,7 +293,7 @@ mod tests {
             Value::Bytes(vec![b'a']).value_id(),
             Value::Tombstone.value_id(),
             Value::NewSeq.value_id(),
-            Value::NewMap.value_id(),
+            Value::NewKv.value_id(),
         ];
         for (i, a) in ids.iter().enumerate() {
             for b in &ids[i + 1..] {
@@ -314,10 +315,10 @@ mod tests {
     fn well_known_constants_are_derived() {
         assert_eq!(*TOMBSTONE, Value::Tombstone.value_id());
         assert_eq!(*NEW_SEQ, Value::NewSeq.value_id());
-        assert_eq!(*NEW_MAP, Value::NewMap.value_id());
+        assert_eq!(*NEW_KV, Value::NewKv.value_id());
         // and all distinct
         assert_ne!(*TOMBSTONE, *NEW_SEQ);
-        assert_ne!(*NEW_SEQ, *NEW_MAP);
+        assert_ne!(*NEW_SEQ, *NEW_KV);
     }
 
     #[test]
