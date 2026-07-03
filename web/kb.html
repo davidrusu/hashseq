@@ -125,10 +125,36 @@
     border:1px solid var(--red); color:var(--red); background:rgba(178,58,46,0.06);
   }
   #conflict-bar b { letter-spacing:2px; }
-  #fmt-row { display:flex; align-items:center; gap:14px; margin:12px 22px 0; }
-  #fmt-tools { display:flex; gap:6px; }
-  #fmt-tools button { font-size:10px; letter-spacing:1px; }
+  #fmt-row { display:flex; align-items:center; gap:16px; margin:12px 22px 0; }
+  .fmt-hint { color:var(--muted); font-size:11px; letter-spacing:0.5px; }
+  .fmt-hint b { color:var(--ink); border:1px solid var(--grid); padding:0 4px; }
   #view-tabs { display:flex; width:fit-content; border:1px solid var(--ink); }
+  /* floating selection toolbar */
+  #sel-toolbar {
+    position:fixed; z-index:30; display:none; gap:2px; padding:3px;
+    background:var(--ink); border:1px solid var(--ink);
+    box-shadow:2px 3px 0 rgba(27,24,22,0.25);
+  }
+  #sel-toolbar.show { display:flex; }
+  #sel-toolbar button {
+    background:var(--ink); color:var(--paper); border:none; padding:4px 8px;
+    font-family:inherit; font-size:13px; cursor:pointer; line-height:1;
+  }
+  #sel-toolbar button:hover { background:#3a3430; }
+  #sel-toolbar .ic { font-size:11px; letter-spacing:-1px; }
+  /* slash command menu */
+  #slash-menu {
+    position:fixed; z-index:30; display:none; min-width:210px;
+    background:var(--paper2); border:1px solid var(--ink);
+    box-shadow:3px 3px 0 rgba(27,24,22,0.18); font-size:12px;
+  }
+  #slash-menu.show { display:block; }
+  #slash-menu .sl-item {
+    display:flex; align-items:baseline; gap:10px; padding:6px 11px; cursor:pointer;
+  }
+  #slash-menu .sl-item.sel, #slash-menu .sl-item:hover { background:#ece5d3; }
+  #slash-menu .sl-key { color:var(--muted); font-size:10px; letter-spacing:1px; width:18px; }
+  #slash-menu .sl-desc { color:var(--muted); font-size:10px; margin-left:auto; }
   #view-tabs button { border:none; border-right:1px solid var(--ink); }
   #view-tabs button:last-child { border-right:none; }
   #view-tabs button.active { background:var(--ink); color:var(--paper); }
@@ -162,6 +188,9 @@
   }
   .block-ed:focus { border-color:var(--grid); background:rgba(246,241,229,0.9); }
   .block-ed:empty::before { content:attr(data-placeholder); color:var(--muted); }
+  .block-ed.bl-h1 { font-size:22px; font-weight:600; letter-spacing:0.3px; line-height:1.3; }
+  .block-ed.bl-h2 { font-size:18px; font-weight:600; letter-spacing:0.3px; line-height:1.3; }
+  .block-ed.bl-h3 { font-size:15px; font-weight:600; letter-spacing:0.3px; line-height:1.35; }
   .block-ed code {
     background:#E6DEC9; border:1px solid var(--grid); padding:0 3px;
     font-family:inherit; font-size:13px;
@@ -180,7 +209,7 @@
   .inline-widget.w-math:hover, .inline-widget.w-eq:hover { background:#ece5d3; }
   .inline-widget.w-eq {
     display:block; border:1px solid var(--grid); background:var(--paper2);
-    margin:4px 0; padding:8px 14px; text-align:center; overflow-x:auto;
+    margin:3px 0; padding:5px 14px; text-align:center; overflow-x:auto;
   }
   .inline-widget.w-embed { display:block; margin:4px 0; cursor:default; }
   .inline-widget.w-img { display:inline-block; vertical-align:middle; margin:4px 6px 4px 0; }
@@ -223,7 +252,7 @@
   }
   #preview .eq-block {
     border:1px solid var(--grid); background:var(--paper2); margin:0 0 12px;
-    padding:10px 14px; overflow-x:auto; text-align:center;
+    padding:6px 14px; overflow-x:auto; text-align:center;
   }
   #preview .math-src { color:var(--red); font-style:italic; }
   #preview .obj-table { margin:4px 0 12px; }
@@ -345,19 +374,16 @@
           <button id="tab-split">SPLIT</button>
           <button id="tab-view">VIEW</button>
         </div>
-        <div id="fmt-tools">
-          <button data-mark="code" title="inline code (mark)">`CODE`</button>
-          <button data-mark="math" title="inline math (mark)">$MATH$</button>
-          <button data-mark="codeblock" title="code block (mark, whole lines)">CODE BLOCK</button>
-          <button data-mark="eqblock" title="equation block (mark, whole lines)">EQUATION</button>
-          <button data-mark="clear" title="remove formatting marks">CLEAR</button>
-          <button data-mark="comment" title="comment on the selection (mark)">COMMENT</button>
-          <button id="insert-table" title="insert a table object at the caret">TABLE</button>
-          <button id="insert-link" title="link to another page (a link atom naming its object id)">LINK</button>
-          <button id="insert-image" title="insert an image (a content-addressed byte artifact; paste works too)">IMAGE</button>
-          <input id="image-file" type="file" accept="image/*" style="display:none">
-        </div>
+        <div class="fmt-hint">Select text to format · type <b>/</b> for blocks</div>
+        <input id="image-file" type="file" accept="image/*" style="display:none">
       </div>
+      <div id="sel-toolbar">
+        <button data-act="code" title="inline code (⌘E)"><span class="ic">&lt;/&gt;</span></button>
+        <button data-act="math" title="inline math">∑</button>
+        <button data-act="comment" title="comment on selection">💬</button>
+        <button data-act="clear" title="clear formatting">⌫</button>
+      </div>
+      <div id="slash-menu"></div>
       <div id="work">
         <div id="blocks"></div>
         <div id="preview" style="display:none"></div>

@@ -533,3 +533,40 @@ Two design observations that outlast the bug:
 transfer (fetch-by-id, cache-forever) separate from the op-snapshot wire —
 exactly what content addressing was designed to enable. First real
 system-facing work item the app has forced.
+
+## 22. Writing-flow pass: the chrome was in the way (2026-07-03)
+
+Wrote a real document (a floating-point explainer) in the editor and the
+friction was exactly where intuition said: an 11-button toolbar sat
+between title and body, permanently, and I never touched it while writing
+prose — yet to format I'd have to leave the text, travel up to a fixed
+bar (which scrolls off in a long doc), and travel back. Redesigned around
+"tools appear where the work is":
+
+- **Floating selection toolbar.** Selecting text pops a small toolbar
+  just above the selection with the inline ops (code, math, comment,
+  clear). It follows the selection, flips below when there's no room
+  above, and vanishes on collapse. This is the whole formatting surface
+  now — no fixed chrome.
+- **Slash menu for blocks.** Typing `/` in an empty block opens a
+  filterable menu (heading, code block, equation, table, image, page
+  link) with arrow/Enter nav; picking removes the `/query` and inserts.
+  Block insertion is a keyboard flow, not a button hunt.
+- **The top toolbar is gone**, replaced by a one-line hint. EDIT/SPLIT/
+  VIEW (view modes, not formatting) stay.
+- **Headings render live in EDIT** (a leading `#` styles the whole
+  block); tighter equation padding.
+
+Bug the writing pass surfaced (had been mis-attributed to "CDN slow" all
+session): **math never repainted after KaTeX finished loading.** KaTeX
+loads async and post-render; the incremental renderer then skips the math
+blocks because their *span signature* is unchanged — only KaTeX
+availability changed. Fix: on KaTeX load, force-rerender blocks that
+carry math/eqblock marks (not by scanning for `$` — eqblock text has the
+delimiters stripped). Math now reliably renders.
+
+**Feedback**: none of this touched the store — it's all editor-surface
+work over the same marks/atoms model. Confirms the projection API is the
+right shape; the app layer is where the product lives. Still owed: vendor
+KaTeX so first-paint math needs no network (the load race is now handled,
+but offline still shows source).

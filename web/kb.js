@@ -322,12 +322,25 @@ import('https://esm.sh/katex@0.16.11')
     link.rel = 'stylesheet';
     link.href = 'https://esm.sh/katex@0.16.11/dist/katex.min.css';
     document.head.appendChild(link);
-    // Gentle arrival: never rebuild rows underneath an in-flight edit —
-    // a rebuild mid-interaction drops focus and eats keystrokes.
+    // Force-repaint math: blocks' span signatures didn't change (only
+    // KaTeX availability did), so the incremental renderer would skip
+    // them. Rerender every block/preview directly — but never under an
+    // in-flight edit (a rebuild drops focus and eats keystrokes).
+    const hasMath = (obj) =>
+      JSON.parse(web.markedSpans(obj)).some((sp) =>
+        sp.marks.some((m) => m.kind === 'math' || m.kind === 'eqblock'),
+      );
+    const repaintMath = () => {
+      for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+        if (ed === document.activeElement || ed.contains(document.activeElement)) continue;
+        if (hasMath(ed.dataset.blockObj)) rerenderBlock(ed, ed.dataset.blockObj, null);
+      }
+      if (viewMode !== 'edit') renderPreview();
+    };
     if (document.activeElement?.closest?.('.block-ed, [contenteditable]')) {
-      window.addEventListener('focusout', () => render(), { once: true });
+      window.addEventListener('focusout', repaintMath, { once: true });
     } else {
-      render();
+      repaintMath();
     }
   })
   .catch((e) => console.warn('[kb] KaTeX unavailable — math renders as source:', e));
@@ -1236,6 +1249,12 @@ document.addEventListener('selectionchange', () => {
 function renderEditableInto(ed, blockObj) {
   ed.innerHTML = '';
   renderTargetObj = blockObj;
+  // Live heading styling: a leading '#'/'##'/'###' makes the whole block a
+  // heading (the markup marker stays but reads as an affordance).
+  const plain = web.text(blockObj);
+  const hm = plain.match(/^(#{1,3}) /);
+  ed.classList.remove('bl-h1', 'bl-h2', 'bl-h3');
+  if (hm) ed.classList.add(`bl-h${hm[1].length}`);
   const spans = styledSpans(blockObj);
   let i = 0;
   let pos = 0;
@@ -1520,6 +1539,24 @@ function makeBlockRow(obj) {
     }
   });
   ta.addEventListener('keydown', (e) => {
+    // Slash menu takes keyboard priority when open.
+    if (slashState && slashState.ta === ta) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveSlash(e.key === 'ArrowDown' ? 1 : -1);
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        runSlash(slashState.active);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideSlash();
+        return;
+      }
+    }
     if (e.key !== 'Enter') return;
     e.preventDefault();
     if (e.metaKey || e.ctrlKey) {
@@ -1598,6 +1635,7 @@ function makeBlockRow(obj) {
   ta.addEventListener('input', (e) => {
     if (e.isComposing) return;
     commitBlockEdit();
+    if (updateSlash(ta)) return; // slash menu owns this keystroke
     const ruled = maybeInputRule(ta, obj, e.data);
     if (ruled != null) {
       clearTimeout(normalizeTimer);
@@ -1618,6 +1656,9 @@ function makeBlockRow(obj) {
   ta.onfocus = () => {
     focusedBlockObj = obj;
   };
+  ta.addEventListener('blur', () => setTimeout(() => {
+    if (slashState && slashState.ta === ta && !slashMenu.matches(':hover')) hideSlash();
+  }, 120));
 
   const del = document.createElement('span');
   del.className = 'b-del';
@@ -2150,11 +2191,6 @@ function focusedTA() {
   return null;
 }
 
-// Keep editor focus/selection through toolbar clicks.
-document.getElementById('fmt-tools').addEventListener('mousedown', (e) => {
-  if (e.target.tagName === 'BUTTON') e.preventDefault();
-});
-
 let titleTimer = null;
 titleEl.addEventListener('input', () => {
   if (!current) return;
@@ -2221,12 +2257,8 @@ function selectionLines(text, selStart, selEnd) {
   return [start, nl === -1 ? text.length : nl];
 }
 
-document.getElementById('insert-table').onclick = () => {
-  if (!current || viewMode === 'view') return;
-  const ta = focusedTA();
-  if (!ta) return;
+function insertTableAt(ta, at) {
   const blockObj = ta.dataset.blockObj;
-  const at = caretOffsetIn(ta) ?? extractText(ta).length;
   // A table is a seq of row refs; a row is a seq of cell refs; a cell is a
   // text seq — a hashseq of hashseqs, embedded as a link atom.
   const tableOrigin = randOrigin();
@@ -2245,7 +2277,7 @@ document.getElementById('insert-table').onclick = () => {
   persistSoon();
   rerenderBlock(ta, blockObj, at + 1); // the table appears in place
   if (viewMode === 'split') renderPreview();
-};
+}
 
 function toBlobAsync(canvas, type, quality) {
   return new Promise((res) => canvas.toBlob(res, type, quality));
@@ -2316,10 +2348,6 @@ async function insertImageFile(file, ta, at) {
 }
 
 const imageFileEl = document.getElementById('image-file');
-document.getElementById('insert-image').onclick = () => {
-  if (!current || viewMode === 'view') return;
-  imageFileEl.click(); // target block is resolved at change time
-};
 imageFileEl.onchange = async () => {
   const file = imageFileEl.files?.[0];
   imageFileEl.value = '';
@@ -2343,12 +2371,8 @@ imageFileEl.onchange = async () => {
   await insertImageFile(file, ta, at);
 };
 
-document.getElementById('insert-link').onclick = (e) => {
-  if (!current || viewMode === 'view') return;
-  const ta = focusedTA();
-  if (!ta) return;
+function openLinkPicker(ta, at, anchorRect) {
   const blockObj = ta.dataset.blockObj;
-  const at = caretOffsetIn(ta) ?? extractText(ta).length;
   document.getElementById('link-menu')?.remove();
 
   const menu = document.createElement('div');
@@ -2383,64 +2407,241 @@ document.getElementById('insert-link').onclick = (e) => {
     none.textContent = '(no pages)';
     menu.appendChild(none);
   }
-  const r = e.target.getBoundingClientRect();
-  menu.style.left = `${r.left}px`;
-  menu.style.top = `${r.bottom + 4}px`;
+  menu.style.left = `${anchorRect.left}px`;
+  menu.style.top = `${anchorRect.bottom + 4}px`;
   document.body.appendChild(menu);
   setTimeout(() => {
     document.addEventListener('click', () => menu.remove(), { once: true });
   }, 0);
-};
-
-for (const btn of document.querySelectorAll('#fmt-tools button')) {
-  if (!btn.dataset.mark) continue;
-  btn.onclick = () => {
-    if (!current || viewMode === 'view') return;
-    if (btn.dataset.mark === 'comment') {
-      // Composite: the selection may span blocks. One identity (a fresh
-      // 32-byte tag), one mark fragment per touched block, and the
-      // discussion thread is the seq opened AT the tag — no pointer.
-      const frags = selectionFragments();
-      if (frags.length === 0) return;
-      const tag = randOrigin();
-      web.createSeq(tag); // the thread starts empty — composed in the panel
-      for (const f of frags) {
-        web.markRange(f.obj, f.a, f.b, `comment:${tag}`, 'on');
-      }
-      activeCommentTag = `comment:${tag}`;
-      pendingComposeTag = `comment:${tag}`;
-      persistSoon();
-      render();
-      return;
-    }
-    const ta = focusedTA();
-    if (!ta) return;
-    const blockObj = ta.dataset.blockObj;
-    const sel = selectionOffsetsIn(ta);
-    if (!sel) return;
-    let [a, b] = sel;
-    const kind = btn.dataset.mark;
-    if (kind === 'codeblock' || kind === 'eqblock') {
-      [a, b] = selectionLines(extractText(ta), a, b);
-    }
-    if (a >= b) return; // formatting needs a selection
-    if (kind === 'clear') {
-      for (const k of MARK_KINDS) web.unmarkRange(blockObj, a, b, k);
-    } else if (kind === 'codeblock') {
-      web.markRange(blockObj, a, b, 'codeblock', '');
-    } else {
-      web.markRange(blockObj, a, b, kind, 'on');
-    }
-    persistSoon();
-    rerenderBlock(ta, blockObj, null); // formatting appears in place
-    setSelectionRangeIn(ta, a, b);
-    ta.focus();
-    if (viewMode === 'split') {
-      renderPreview();
-      renderComments();
-    }
-  };
 }
+
+// ---- floating selection toolbar (inline formatting) --------------------------
+//
+// Appears just above a text selection inside a block; no fixed chrome. The
+// selection is what these ops need, so they live where the selection is.
+
+const selToolbar = document.getElementById('sel-toolbar');
+selToolbar.addEventListener('mousedown', (e) => e.preventDefault());
+
+function applyInlineMark(kind) {
+  if (!current || viewMode === 'view') return;
+  if (kind === 'comment') {
+    const frags = selectionFragments();
+    if (frags.length === 0) return;
+    const tag = randOrigin();
+    web.createSeq(tag);
+    for (const f of frags) web.markRange(f.obj, f.a, f.b, `comment:${tag}`, 'on');
+    activeCommentTag = `comment:${tag}`;
+    pendingComposeTag = `comment:${tag}`;
+    persistSoon();
+    hideSelToolbar();
+    render();
+    return;
+  }
+  const ta = focusedTA();
+  if (!ta) return;
+  const blockObj = ta.dataset.blockObj;
+  const sel = selectionOffsetsIn(ta);
+  if (!sel) return;
+  const [a, b] = sel;
+  if (a >= b) return;
+  if (kind === 'clear') {
+    for (const k of MARK_KINDS) web.unmarkRange(blockObj, a, b, k);
+  } else {
+    web.markRange(blockObj, a, b, kind, 'on');
+  }
+  persistSoon();
+  rerenderBlock(ta, blockObj, null);
+  setSelectionRangeIn(ta, a, b);
+  ta.focus();
+  hideSelToolbar();
+  if (viewMode === 'split') {
+    renderPreview();
+    renderComments();
+  }
+}
+
+for (const btn of selToolbar.querySelectorAll('button')) {
+  btn.onclick = () => applyInlineMark(btn.dataset.act);
+}
+
+function hideSelToolbar() {
+  selToolbar.classList.remove('show');
+}
+
+function positionSelToolbar() {
+  if (viewMode === 'view') return hideSelToolbar();
+  const sel = window.getSelection();
+  if (!sel.rangeCount || sel.isCollapsed) return hideSelToolbar();
+  const inEd =
+    sel.anchorNode?.parentElement?.closest?.('.block-ed') ||
+    sel.focusNode?.parentElement?.closest?.('.block-ed');
+  if (!inEd) return hideSelToolbar();
+  const rect = sel.getRangeAt(0).getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) return hideSelToolbar();
+  selToolbar.classList.add('show');
+  const tw = selToolbar.offsetWidth || 140;
+  let left = rect.left + rect.width / 2 - tw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+  let top = rect.top - selToolbar.offsetHeight - 8;
+  if (top < 8) top = rect.bottom + 8;
+  selToolbar.style.left = `${left}px`;
+  selToolbar.style.top = `${top}px`;
+}
+
+document.addEventListener('selectionchange', () => {
+  clearTimeout(selToolbar._t);
+  selToolbar._t = setTimeout(positionSelToolbar, 10);
+});
+document.addEventListener('scroll', hideSelToolbar, true);
+
+// ---- slash command menu (block insertions) -----------------------------------
+//
+// Type "/" at the start of an empty block to insert a block-level thing.
+
+const SLASH_ITEMS = [
+  { key: 'H', label: 'Heading', desc: 'section title', run: (ta) => makeHeading(ta) },
+  { key: '<>', label: 'Code block', desc: 'monospace', run: (ta) => makeBlockKind(ta, 'codeblock') },
+  { key: 'S', label: 'Equation', desc: 'display math', run: (ta) => makeBlockKind(ta, 'eqblock') },
+  { key: '#', label: 'Table', desc: '2 by 2 grid', run: (ta) => insertTableAt(ta, caretNow(ta)) },
+  { key: 'I', label: 'Image', desc: 'upload or paste', run: () => imageFileEl.click() },
+  { key: 'P', label: 'Page link', desc: 'link a page', run: (ta, rect) => openLinkPicker(ta, caretNow(ta), rect) },
+];
+
+const slashMenu = document.getElementById('slash-menu');
+let slashState = null;
+
+function caretNow(ta) {
+  return caretOffsetIn(ta) ?? extractText(ta).length;
+}
+
+function makeHeading(ta) {
+  const obj = ta.dataset.blockObj;
+  if (!extractText(ta).startsWith('# ')) web.textInsert(obj, 0, '# ');
+  persistSoon();
+  rerenderBlock(ta, obj, extractText(ta).length);
+}
+
+function makeBlockKind(ta, kind) {
+  const obj = ta.dataset.blockObj;
+  if (web.textLen(obj) === 0) web.textInsert(obj, 0, ' ');
+  const len = web.textLen(obj);
+  web.markRangeClosed(obj, 0, len, kind, '');
+  persistSoon();
+  rerenderBlock(ta, obj, len);
+  if (viewMode === 'split') renderPreview();
+}
+
+function renderSlash(query) {
+  const q = query.toLowerCase();
+  const items = SLASH_ITEMS.filter((it) => it.label.toLowerCase().includes(q));
+  slashState.filtered = items;
+  slashState.active = 0;
+  slashMenu.innerHTML = '';
+  if (items.length === 0) return hideSlash();
+  items.forEach((it, i) => {
+    const row = document.createElement('div');
+    row.className = 'sl-item' + (i === 0 ? ' sel' : '');
+    const k = document.createElement('span');
+    k.className = 'sl-key';
+    k.textContent = it.key;
+    const l = document.createElement('span');
+    l.textContent = it.label;
+    const d = document.createElement('span');
+    d.className = 'sl-desc';
+    d.textContent = it.desc;
+    row.append(k, l, d);
+    row.onmousedown = (e) => {
+      e.preventDefault();
+      runSlash(i);
+    };
+    slashMenu.appendChild(row);
+  });
+  slashMenu.classList.add('show');
+}
+
+function positionSlash(ta) {
+  const sel = window.getSelection();
+  const base = ta.getBoundingClientRect();
+  let x = base.left;
+  let y = base.top;
+  if (sel.rangeCount) {
+    const r = sel.getRangeAt(0).getBoundingClientRect();
+    if (r.left || r.bottom) {
+      x = r.left;
+      y = r.bottom;
+    }
+  }
+  slashMenu.style.left = `${Math.min(x, window.innerWidth - 230)}px`;
+  slashMenu.style.top = `${y + 6}px`;
+}
+
+function hideSlash() {
+  slashMenu.classList.remove('show');
+  slashState = null;
+}
+
+function moveSlash(dir) {
+  const st = slashState;
+  if (!st) return;
+  st.active = (st.active + dir + st.filtered.length) % st.filtered.length;
+  [...slashMenu.children].forEach((row, i) => row.classList.toggle('sel', i === st.active));
+}
+
+/// Called from a block's input handler: manages the slash menu lifecycle.
+/// Returns true iff the menu is active (owns the keystroke).
+function updateSlash(ta) {
+  const text = extractText(ta);
+  const caret = caretNow(ta);
+  // Trigger: "/" typed at the very start of an otherwise-empty-ish block.
+  if (!slashState) {
+    if (text === '/' && caret === 1) {
+      slashState = { ta, slashAt: 0, filtered: [], active: 0 };
+      positionSlash(ta);
+      renderSlash('');
+      return true;
+    }
+    return false;
+  }
+  if (slashState.ta !== ta) {
+    hideSlash();
+    return false;
+  }
+  // Query is everything after the slash up to the caret.
+  if (caret < slashState.slashAt + 1 || !text.startsWith('/', slashState.slashAt)) {
+    hideSlash();
+    return false;
+  }
+  const query = text.slice(slashState.slashAt + 1, caret);
+  if (query.includes(' ') || query.includes('\n')) {
+    hideSlash();
+    return false;
+  }
+  positionSlash(ta);
+  renderSlash(query);
+  return !!slashState;
+}
+
+function runSlash(i) {
+  const st = slashState;
+  if (!st) return;
+  const it = st.filtered[i];
+  if (!it) return;
+  const ta = st.ta;
+  const obj = ta.dataset.blockObj;
+  const cur = extractText(ta);
+  if (st.slashAt != null && cur.length >= st.slashAt) {
+    const caret = caretNow(ta);
+    if (caret > st.slashAt) {
+      web.textRemove(obj, st.slashAt, caret - st.slashAt);
+      rerenderBlock(ta, obj, st.slashAt);
+    }
+  }
+  const rect = slashMenu.getBoundingClientRect();
+  hideSlash();
+  it.run(ta, rect);
+}
+
 
 // ---- responsive panel toggles -------------------------------------------------
 
