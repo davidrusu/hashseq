@@ -145,6 +145,26 @@
     --shadow-panel-r:4px 0 14px rgba(67,66,61,0.1);
     --radius:2px;
   }
+  /* FABLE — twilight manuscript: serif prose, mono structure, candlelight on indigo */
+  body[data-theme="fable"] {
+    --paper:#191722; --paper2:#221F2E; --ink:#E8E0D0; --muted:#8B8497;
+    --red:#D97A6C; --green:#9BB98A; --amber:#D9A84E; --grid:#2A2740; --line:#3A3450;
+    --blue:#8F9FE8;
+    --hover:#2A2638; --code-bg:#2A2638;
+    --card:#1E1B28; --panel:#15131D; --chrome:rgba(21,19,29,0.9);
+    --focus-bg:#242030; --backdrop:rgba(10,9,15,0.55); --dot:#2A2740;
+    --tb-bg:#D9A84E; --tb-fg:#191722; --tb-hover:#c5943c;
+    --c-underline:rgba(217,168,78,0.5); --c-active:rgba(217,168,78,0.24);
+    --math-live:rgba(143,159,232,0.12); --danger-soft:rgba(217,122,108,0.08);
+    --shadow-card:0 0 0 1px rgba(217,168,78,0.12), 0 10px 34px rgba(0,0,0,0.5);
+    --shadow-menu:0 6px 22px rgba(0,0,0,0.55);
+    --shadow-pop:0 4px 14px rgba(0,0,0,0.55);
+    --shadow-img:0 4px 18px rgba(0,0,0,0.5);
+    --shadow-panel:-6px 0 20px rgba(0,0,0,0.55);
+    --shadow-panel-r:6px 0 20px rgba(0,0,0,0.55);
+    --font:'Charter','Iowan Old Style',Georgia,'Times New Roman',serif;
+    --radius:3px;
+  }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
   body {
@@ -552,13 +572,42 @@
   body[data-theme="zen"] #crumbs { opacity:0.45; }
   body[data-theme="zen"] .fmt-hint { display:none; }
   body[data-theme="zen"] .block-ed { line-height:1.95; }
+
+  /* ---- theme structure: FABLE ---- */
+  body[data-theme="fable"] {
+    background-image:
+      radial-gradient(1100px 500px at 50% -8%, rgba(143,159,232,0.07), transparent 70%),
+      radial-gradient(var(--dot) 0.7px, transparent 0.7px);
+    background-size:100% 100%, 22px 22px;
+  }
+  body[data-theme="fable"] header .brand { color:var(--amber); letter-spacing:4px; }
+  body[data-theme="fable"] #page { padding-top:30px; position:relative; }
+  body[data-theme="fable"] #page::after {
+    content:'\2042'; display:block; text-align:center; margin-top:36px;
+    color:var(--amber); opacity:0.65; font-size:15px; letter-spacing:6px;
+  }
+  body[data-theme="fable"] #title {
+    font-size:32px; font-weight:600; font-style:italic; letter-spacing:0.5px;
+    border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:8px;
+  }
+  body[data-theme="fable"] .block-ed { font-size:16px; line-height:1.85; }
+  body[data-theme="fable"] .block-ed.bl-h1, body[data-theme="fable"] .block-ed.bl-h2,
+  body[data-theme="fable"] .block-ed.bl-h3 {
+    font-family:var(--mono); text-transform:uppercase; color:var(--amber);
+    letter-spacing:3px; line-height:1.6;
+  }
+  body[data-theme="fable"] .block-ed.bl-h1 { font-size:16px; }
+  body[data-theme="fable"] .block-ed.bl-h2 { font-size:14px; }
+  body[data-theme="fable"] .block-ed.bl-h3 { font-size:12.5px; }
+  body[data-theme="fable"] .page-row.active { border-left-color:var(--amber); }
+  body[data-theme="fable"] .fmt-hint { display:none; }
 </style>
 </head>
 <body>
   <script>
     try {
       var t = localStorage.getItem('hashweb-kb-theme');
-      var ok = ['gallery','editorial','poster','zen','terminal','nord'];
+      var ok = ['gallery','editorial','poster','zen','terminal','nord','fable'];
       document.body.dataset.theme = ok.indexOf(t) >= 0 ? t : 'gallery';
     } catch (e) { document.body.dataset.theme = 'gallery'; }
   </script>

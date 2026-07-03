@@ -2872,7 +2872,7 @@ document.getElementById('panel-backdrop').onclick = () => {
 // Themes are CSS-variable sets plus structural overrides on body[data-theme],
 // cycled with the header button and remembered per-browser. Device state, not
 // document state — deliberately never synced.
-const THEMES = ['gallery', 'editorial', 'poster', 'zen', 'terminal', 'nord'];
+const THEMES = ['gallery', 'editorial', 'poster', 'zen', 'terminal', 'nord', 'fable'];
 const THEME_KEY = 'hashweb-kb-theme';
 const themeToggleEl = document.getElementById('theme-toggle');
 
