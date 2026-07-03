@@ -416,3 +416,34 @@ Also: Enter = new block after (plain tails split into it; tails carrying
 marks/embeds stay — their anchors live in the old block's elements);
 cmd+Enter = literal newline. And `window.__kb` now exposes the store to
 the console — indispensable for verifying seq truth vs DOM appearance.
+
+## 18. Caret affinity is the intent (2026-07-03)
+
+The user's report — "typing at a code span's edge extends it, then arrow
+keys make the typed text jump out" — was the WYSIWYG view and the seq
+disagreeing at boundaries and reconciling a second later. Resolution, in
+three layers, all app-side:
+
+1. **The browser's rendering of a boundary keystroke is the user's
+   intent.** If Chrome drew the char inside the span, the mark extends
+   (markRangeClosed over the union); if outside, the mark stays put
+   (partial unmark if the seq disagreed). Nothing ever retroactively
+   moves.
+2. **Chrome normalizes boundary inserts into the previous inline
+   element**, even when the caret was programmatically placed outside
+   (verified: range in the next text node at offset 0 still inserted into
+   the preceding <code>). DOM positioning cannot express "outside" at an
+   element boundary — hence ZWSP filler text nodes after every styled
+   span (the ProseMirror cursor-wrapper trick), stripped by extraction
+   and skipped by offset mapping. With a filler, the post-conversion
+   caret is mid-text-node and typing continues plain.
+3. **Escape is native**: ArrowRight from a span's inside-end crosses the
+   filler; typing right after a fresh `x` conversion is plain by default
+   (preferAfter placement); clicking mid-span joins, clicking the edge
+   doesn't. Boundary policy became: conversion exits, click follows the
+   pixel, arrows move affinity.
+
+Also from this session: the extension's synthesized input needs a real
+click after a page reload before keystrokes route (automation quirk, not
+app); coordinates go stale as KaTeX/layout settle — element-rect lookups
+immediately before clicking are mandatory.

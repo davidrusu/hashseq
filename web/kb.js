@@ -343,7 +343,7 @@ function applyDiffAt(obj, prev, next, caret) {
       prev.slice(p) === next.slice(p + n)
     ) {
       web.textInsert(obj, p, next.slice(p, p + n));
-      return;
+      return { kind: 'insert', p, n };
     }
   } else if (caret != null && next.length < prev.length) {
     const n = prev.length - next.length;
@@ -354,10 +354,80 @@ function applyDiffAt(obj, prev, next, caret) {
       prev.slice(caret + n) === next.slice(caret)
     ) {
       web.textRemove(obj, caret, n);
-      return;
+      return { kind: 'remove', p: caret, n };
     }
   }
-  applyDiff(obj, prev, next);
+  if (prev !== next) {
+    applyDiff(obj, prev, next);
+    return { kind: 'fallback' };
+  }
+  return null;
+}
+
+/// WYSIWYG affinity: the browser decides whether boundary-typed text
+/// renders inside or outside a styled span — treat that as the user's
+/// intent and reconcile the marks to match, instead of letting the
+/// normalize pass "correct" the visual a second later.
+function reconcileMarkAffinity(ta, obj, p, n) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return;
+  let node = sel.getRangeAt(0).startContainer;
+  if (node.nodeType === Node.TEXT_NODE) node = node.parentNode;
+  if (!ta.contains(node)) return;
+  const f = flagsAt(obj, p); // seq truth for the inserted chars
+  if (!f) return;
+  const len = ta.dataset.prev.length;
+  const spanExtent = (pred) => {
+    let s = p;
+    while (s > 0) {
+      const g = flagsAt(obj, s - 1);
+      if (g && pred(g)) s--;
+      else break;
+    }
+    let e = p + n;
+    while (e < len) {
+      const g = flagsAt(obj, e);
+      if (g && pred(g)) e++;
+      else break;
+    }
+    return [s, e];
+  };
+
+  // Inline code.
+  const inCode = !!node.closest?.('code');
+  if (inCode && !f.code) {
+    const [a, b] = spanExtent((g) => g.code);
+    web.markRangeClosed(obj, a, b, 'code', 'on');
+  } else if (!inCode && f.code) {
+    web.unmarkRange(obj, p, p + n, 'code');
+  }
+
+  // Code block regions (language value preserved from the neighbor).
+  const inCb = !!node.closest?.('.cb-region');
+  if (inCb && f.codeblock === null) {
+    const [a, b] = spanExtent((g) => g.codeblock !== null);
+    const lang =
+      (a > 0 && flagsAt(obj, a)?.codeblock) ||
+      (b < len && flagsAt(obj, b - 1)?.codeblock) ||
+      '';
+    web.markRangeClosed(obj, a, b, 'codeblock', lang);
+  } else if (!inCb && f.codeblock !== null) {
+    web.unmarkRange(obj, p, p + n, 'codeblock');
+  }
+
+  // Comments: the highlight wrapper names its exact kinds.
+  const hl = node.closest?.('.comment-hl');
+  const domKinds = new Set((hl?.dataset.tags ?? '').split(',').filter(Boolean));
+  const seqKinds = new Set(f.comments.map((c) => c.kind));
+  for (const k of seqKinds) {
+    if (!domKinds.has(k)) web.unmarkRange(obj, p, p + n, k);
+  }
+  for (const k of domKinds) {
+    if (!seqKinds.has(k)) {
+      const [a, b] = spanExtent((g) => g.comments.some((c) => c.kind === k));
+      web.markRange(obj, a, b, k, 'on');
+    }
+  }
 }
 
 /// A single-span text diff applied as seq ops.
@@ -838,10 +908,12 @@ function blocksOf(bodyObj) {
 // contribute data-text) and diffed into seq ops — the DOM is a *view* of
 // the seq, and the seq stays the source of truth.
 
+const FILLER = '​'; // DOM-only caret landing pads; never content
+
 function extractText(node) {
   let out = '';
   for (const child of node.childNodes) {
-    if (child.nodeType === Node.TEXT_NODE) out += child.data;
+    if (child.nodeType === Node.TEXT_NODE) out += child.data.replaceAll(FILLER, '');
     else if (child.nodeType !== Node.ELEMENT_NODE) continue;
     else if (child.dataset && child.dataset.text != null) out += child.dataset.text;
     else if (child.tagName === 'BR') {
@@ -883,14 +955,32 @@ function selectionOffsetsIn(blockEl) {
   ];
 }
 
-/// Locate text offset `target` as a (node, offset) DOM point.
-function locateOffset(blockEl, target) {
+/// Locate text offset `target` as a (node, offset) DOM point. With
+/// `preferAfter`, a target at the exact end of a text node resolves past
+/// it — placing the caret OUTSIDE any styled wrapper ending there (the
+/// affinity decides whether the next keystroke joins the span).
+function locateOffset(blockEl, target, preferAfter = false) {
   let remaining = target;
   const visit = (node) => {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
-        if (remaining <= child.data.length) return { node: child, offset: remaining };
-        remaining -= child.data.length;
+        const clean = child.data.replaceAll(FILLER, '').length;
+        if (remaining < clean || (!preferAfter && remaining === clean)) {
+          // Map the cleaned offset to a raw one, stepping past fillers —
+          // landing AFTER a filler keeps the caret off element boundaries
+          // (Chrome normalizes boundary inserts into the previous span).
+          let raw = 0;
+          let seen = 0;
+          while (
+            raw < child.data.length &&
+            (seen < remaining || child.data[raw] === FILLER)
+          ) {
+            if (child.data[raw] !== FILLER) seen++;
+            raw++;
+          }
+          return { node: child, offset: raw };
+        }
+        remaining -= clean;
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         if (child.dataset && child.dataset.text != null) {
           const len = child.dataset.text.length;
@@ -911,10 +1001,10 @@ function locateOffset(blockEl, target) {
   return visit(blockEl);
 }
 
-function setSelectionRangeIn(blockEl, a, b) {
+function setSelectionRangeIn(blockEl, a, b, preferAfter = false) {
   const r = document.createRange();
   const place = (target, setter) => {
-    const hit = locateOffset(blockEl, target);
+    const hit = locateOffset(blockEl, target, preferAfter);
     if (!hit) {
       r[setter === 'start' ? 'setStart' : 'setEnd'](blockEl, blockEl.childNodes.length);
     } else if (hit.after) {
@@ -1078,6 +1168,23 @@ function renderEditableInto(ed, blockObj) {
     br.dataset.sentinel = '1';
     ed.appendChild(br);
   }
+  // Filler landing pads (ZWSP, stripped from extraction) after every
+  // styled element and before a leading one: they keep caret positions
+  // off element boundaries, where Chrome would normalize the insertion
+  // into the adjacent span.
+  for (const child of [...ed.childNodes]) {
+    if (
+      child.nodeType === Node.ELEMENT_NODE &&
+      child.tagName !== 'BR' &&
+      !(child.nextSibling?.nodeType === Node.TEXT_NODE &&
+        child.nextSibling.data.startsWith(FILLER))
+    ) {
+      child.after(document.createTextNode(FILLER));
+    }
+  }
+  if (ed.firstChild?.nodeType === Node.ELEMENT_NODE && ed.firstChild.tagName !== 'BR') {
+    ed.insertBefore(document.createTextNode(FILLER), ed.firstChild);
+  }
 }
 
 function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
@@ -1148,12 +1255,17 @@ function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
   }
 }
 
-function rerenderBlock(ed, blockObj, caretOff) {
+function rerenderBlock(ed, blockObj, caretOff, preferAfter = false) {
   renderEditableInto(ed, blockObj);
   ed.dataset.prev = extractText(ed);
   if (caretOff != null) {
     ed.focus();
-    setSelectionRangeIn(ed, Math.min(caretOff, ed.dataset.prev.length));
+    setSelectionRangeIn(
+      ed,
+      Math.min(caretOff, ed.dataset.prev.length),
+      undefined,
+      preferAfter,
+    );
   }
 }
 
@@ -1248,13 +1360,15 @@ function renderBlocks() {
     };
     const commitBlockEdit = () => {
       const next = extractText(ta);
-      applyDiffAt(b.obj, ta.dataset.prev, next, caretOffsetIn(ta));
+      const did = applyDiffAt(b.obj, ta.dataset.prev, next, caretOffsetIn(ta));
       ta.dataset.prev = next;
+      if (did?.kind === 'insert') reconcileMarkAffinity(ta, b.obj, did.p, did.n);
       if (viewMode === 'split') {
         renderPreview();
         renderComments();
       }
       persistSoon();
+      return did;
     };
     ta.addEventListener('beforeinput', (e) => {
       if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
@@ -1306,7 +1420,8 @@ function renderBlocks() {
     });
     ta.addEventListener('paste', (e) => {
       e.preventDefault();
-      document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
+      const clean = e.clipboardData.getData('text/plain').replaceAll(FILLER, '');
+      document.execCommand('insertText', false, clean);
     });
     ta.addEventListener('input', (e) => {
       if (e.isComposing) return;
@@ -1316,7 +1431,7 @@ function renderBlocks() {
       const ruled = maybeInputRule(ta, b.obj, e.data);
       if (ruled != null) {
         clearTimeout(normalizeTimer);
-        rerenderBlock(ta, b.obj, ruled);
+        rerenderBlock(ta, b.obj, ruled, true); // caret outside the new span
       }
       // Reconcile styling drift (typing at mark edges) once typing pauses.
       clearTimeout(normalizeTimer);
