@@ -4,26 +4,33 @@ Framework: FRAMEWORK.md (one reference set + honest frontier rule; Law I/II;
 resource → conflict → resolution). Design rationale: HETEROGENEITY.md
 (composition by reference, one namespace) and LAYERING.md (frontiers).
 
-HashWeb is the **composition**: one op DAG hosting many objects. It adds *no
-new conflict type* — every op routes to a per-object projection that resolves
-per its own spec (HASHSEQ_SPEC.md, HASHKV_SPEC.md, MARKS.md). What this spec
-defines is objects and creation, routing, per-object tips, the schema gate,
-the value side store, and deletion.
+HashWeb is a **flat store of objects**: it holds every object this replica
+knows about — roots opened out-of-band and children born by creation ops
+alike — and adds *no new conflict type*. Every op is delivered in a routing
+envelope to a per-object projection that resolves per its own spec
+(HASHSEQ_SPEC.md, HASHKV_SPEC.md, MARKS.md). The store itself has no
+identity, no root, and no state beyond its objects: merge is an
+unconditional union of knowledge. What this spec defines is objects and
+creation, the routing envelope, per-object tips, the schema gate, the value
+side store, and deletion.
 
 ## Objects
 
 ```rust
-enum Object {
-    Seq(SeqState),   // HASHSEQ_SPEC.md — ONE sequence kind: text, lists, mixed
-    Map(HashKv),     // HASHKV_SPEC.md
-}
+seqs: Map<Id, HashSeq>,   // HASHSEQ_SPEC.md — ONE sequence kind: text, lists, mixed
+kvs:  Map<Id, HashKv>,    // HASHKV_SPEC.md
 ```
+
+Per-kind maps keyed by **object id** — no `Object` enum, no store-level
+type tag: an object's kind is committed inside its id
+(`object_id(kind ‖ seed)`, GRAMMAR_SPEC.md), so which map an id lives in
+is derived, never negotiated.
 
 There is no `Value` enum anywhere in the op layer: payloads, keys, and map
 values are **ids** of content-addressed artifacts (HASHSEQ_SPEC.md
 "Payload"; HASHKV_SPEC.md "Keys and values are ids") — scalar value
-artifacts, blobs, creation artifacts, op nodes, or origin ids (object
-links; naming a *foreign* object's origin id is transclusion).
+artifacts, blobs, creation artifacts, op nodes, or object ids (object
+links; naming a *foreign* object's id is transclusion).
 
 **Text and List are unified**: one seq kind, any payload in any slot.
 "Textness" is a rendering and export convention — a seq whose payloads are
@@ -39,26 +46,24 @@ No new op shape.
   (`NewSeq`/`NewKv` — ordinary derived value ids, computed constants)
   creates a child object: `Insert { at, payload: New* }` from a sequence
   slot, `Put { key, value: New* }` from a map slot, identically. The
-  object's identity is its **origin id**,
-  `object_id = derive_key(OBJECT_CONTEXT, X)` for creating op `X` — a
-  virtual node, never an op, generalizing origin unification (a root
-  object's origin is the recursion's out-of-band base — chosen with its
-  kind, one agreement). Child ops anchor at and ref the origin id; the
-  closure of an origin id is defined as `{X} ∪ closure(X)`, so the
-  creation bridge welds each root's tree into one connected DAG,
-  and buffering resolves origin ids by derivation when creation ops apply.
-  Because `X` (the parent element) and `object_id` (the child origin) are
-  distinct ids, refs are never ambiguous between parent and child.
+  child's identity is `object_id(kind ‖ id(X))` for creating op `X`
+  (GRAMMAR_SPEC.md) — a virtual node, never an op. A root object's seed is
+  the recursion's out-of-band base; its kind rides inside the derived id,
+  so there is nothing else to agree on. Child ops anchor at and ref the
+  object id; the closure of an object id is defined as `{X} ∪ closure(X)`,
+  so the creation bridge welds each root's tree into one connected DAG,
+  and store-level buffering resolves object ids by derivation when
+  creation ops apply. Because `X` (the parent element) and the derived
+  object id are distinct, refs are never ambiguous between parent and
+  child.
 - **Edit**: the seq (insert/remove/move), map, or mark op of the target
-  object. **Routing**: an op's object is *derived* — from its named refs
-  (anchor/target/overwrites are same-object by the edge table) whenever it
-  has any, else from its refs as a whole (a fresh `Put`'s refs are the
-  object's own frontier, which begins at the origin id — the origin-id
-  split above is what makes this unambiguous). There is no route field
-  (GRAMMAR_SPEC.md). Refs that determine no single object fail the
-  apply-time gate (each ref's object is hash-committed — stable). Handles
-  (`NodeIdx`) are replica-local and never appear in artifacts (the
-  interning invariant).
+  object, delivered in the **routing envelope** `obj_id ‖ node` — pure
+  transport metadata, never hashed (there is no route field in the
+  preimage — GRAMMAR_SPEC.md). The envelope needs no trust: an op
+  enveloped to the wrong object never applies there (its refs never
+  arrive inside that object), the same fate as any garbage ref — bounded
+  and attributable, no verdict required. Handles (`NodeIdx`) are
+  replica-local and never appear in artifacts (the interning invariant).
 
 ```
 refs(u) = named(u) ∪ frontier pins   // honest: pins = the object's observed
@@ -85,9 +90,10 @@ Each object keeps **its own tips**. The run/write-run fast path needs
 `tips = {previous op of this object}`; a document-global tips set would
 thread every concurrent edit anywhere in the document through this object's
 deps — the frontier-granularity trade is LAYERING.md's subject. First op of
-a child refs its origin id. Orphan buffering stays **global** (one
-`missing_ref_id → waiting ops` map) since refs cross objects at creation
-bridges and anchors.
+a child refs its object id. Buffering is **two-level**: envelopes naming
+an object id the store does not know park store-wide (birth or adoption
+wakes them — the store's only delivery state); ops inside a live object
+park on their first missing ref in that object's own buffer.
 
 ## The edge table (the apply-time gate)
 
@@ -106,15 +112,14 @@ verdicts that are total, convergent, and stable:
 
 | op . role | admits | otherwise |
 |---|---|---|
-| `Insert . at` | insert, move op (its splice point), or the object's origin id — in one `Seq` | gate |
-| `Remove . target` | insert, in the op's own `Seq` | inert (non-insert); gate (cross-object, via routing) |
+| `Insert . at` | insert, move op (its splice point), or the object's own id — in one `Seq` | gate |
+| `Remove . target` | insert, in the op's own `Seq` | inert (non-insert); a ref living in another object never arrives here — parks forever, no verdict |
 | `Move . target` | insert, in the object `to` resolves in (same-container rule) | gate |
-| `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the origin id — in `target`'s object; not `target` itself (self-move) | gate |
-| `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the origin id, in one `Seq`; inverted spans gate (MARKS.md) | gate |
+| `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the object's own id — in `target`'s object; not `target` itself (self-move) | gate |
+| `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the object's own id, in one `Seq`; inverted spans gate (MARKS.md) | gate |
 | `Mark . overwrites` | — | never gated: entries that are not covering same-kind marks are ignored by the definitional suppression filter (same class as `Put . overwrites` — kind- and coverage-scoping live in the read, not the gate) |
 | `Put . overwrites` | — | never gated: entries that are not puts on the same key are ignored by the definitional head-set filter |
-| op kind vs object type | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv` | gate |
-| routing | the op's refs must determine one object | gate |
+| op kind vs object kind | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv` | gate (reachable only by enveloping ops at a wrong-kind or colliding out-of-band seed — the kind is inside the derived object id, so honest kind mis-agreement is unrepresentable) |
 | pins (unroled refs) | anything | always meaningful — pure frontier pins |
 | payloads / keys / values | any id | never edge-checked: values are not references, and payload kinds are not schema-gated (Objects, above) — schema is the renderer's concern |
 

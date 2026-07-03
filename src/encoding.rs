@@ -1911,14 +1911,17 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
         buf.extend_from_slice(&inner);
     }
 
-    let mut held: Vec<(Id, HashNode)> = web
-        .delivery
-        .held()
-        .map(|(i, n)| (*i, n.clone()))
+    // Trailing section: store-parked envelopes, `obj_id ‖ node`, sorted by
+    // (object, node id) for canonicality.
+    let mut parked: Vec<(Id, Id, &HashNode)> = web
+        .parked
+        .iter()
+        .flat_map(|(obj, envs)| envs.iter().map(move |(id, n)| (*obj, *id, n)))
         .collect();
-    held.sort_by_key(|(id, _)| *id);
-    encode_varint(held.len(), &mut buf);
-    for (_, node) in &held {
+    parked.sort_by_key(|(obj, id, _)| (*obj, *id));
+    encode_varint(parked.len(), &mut buf);
+    for (obj, _, node) in &parked {
+        encode_id(obj, &mut buf);
         encode_hash_node(node, &mut buf);
     }
     buf
@@ -1949,33 +1952,27 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
             .get(c.pos..c.pos + len)
             .ok_or(DecodeError::UnexpectedEof)?;
         c.pos += len;
-        // Rebuild the replica-local routing table from the object's
-        // applied ids (never on the wire).
         match kind {
             OBJ_KV => {
-                let m = decode_hashkv(inner)?;
-                for id in m.nodes.keys() {
-                    web.node_home.insert(*id, origin);
-                }
-                web.kvs.insert(origin, m);
+                web.kvs.insert(origin, decode_hashkv(inner)?);
             }
             OBJ_SEQ => {
-                let s = decode_hashseq(inner)?;
-                for id in s.ids.iter().skip(1) {
-                    web.node_home.insert(*id, origin);
-                }
-                web.seqs.insert(origin, s);
+                web.seqs.insert(origin, decode_hashseq(inner)?);
             }
             other => return Err(DecodeError::InvalidOpTag(other)),
         }
+        // Creation ops parked inside the object must re-enter the pending
+        // birth list (apply-time knowledge, not on the wire).
+        web.pend_held_creations(origin);
     }
 
-    let held = c.step(decode_varint)?;
-    for _ in 0..held {
+    let parked = c.step(decode_varint)?;
+    for _ in 0..parked {
+        let obj = c.step(decode_id)?;
         let (op, used) = decode_op(&bytes[c.pos..])?;
         c.pos += used;
         match op {
-            EncodableOp::Node(node) => web.apply(node),
+            EncodableOp::Node(node) => web.apply_to(obj, node),
             EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
         }
     }
@@ -2605,8 +2602,9 @@ mod family_wire {
 
     #[test]
     fn web_parked_orphans_roundtrip() {
-        // A child's ops without their creation op park document-wide; the
-        // snapshot carries them and decode re-parks.
+        // A child's ops without their creation op park store-wide on the
+        // child's object id; the snapshot carries the envelopes and decode
+        // re-parks.
         let mut a = HashWeb::new();
         let root = Id([9; 32]);
         a.create_kv(root);
@@ -2616,7 +2614,7 @@ mod family_wire {
 
         let mut fresh = HashWeb::new();
         for (id, node) in child_nodes {
-            fresh.apply_with_id(id, node);
+            fresh.apply_to_with_id(child, id, node);
         }
         assert_eq!(fresh.orphans().count(), 1);
 
@@ -2627,7 +2625,7 @@ mod family_wire {
         let mut decoded = decoded;
         decoded.create_kv(root);
         for (id, node) in a.kv(&root).unwrap().all_nodes() {
-            decoded.apply_with_id(id, node);
+            decoded.apply_to_with_id(root, id, node);
         }
         assert_eq!(decoded.orphans().count(), 0);
         assert_eq!(decoded.text(&child).unwrap(), "x");

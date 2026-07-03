@@ -95,7 +95,7 @@ impl HashKv {
         &self.tips
     }
 
-    fn contains_node(&self, id: &Id) -> bool {
+    pub(crate) fn contains_node(&self, id: &Id) -> bool {
         *id == self.origin || self.nodes.contains_key(id)
     }
 

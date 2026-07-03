@@ -49,15 +49,22 @@ pub fn value_id_of_bytes(artifact: &[u8]) -> Id {
     Id(*hasher.finalize().as_bytes())
 }
 
-/// An object's origin id, derived from its creation op id
-/// (GRAMMAR_SPEC.md: `object_id(X) = derive_key(OBJECT_CONTEXT, id(X))`).
-/// The origin is a virtual node — never an op — so a creation op has no dual
-/// role: refs to `X` mean the parent element, refs to `object_id(X)` mean the
-/// child object.
-pub fn object_id(creation_op: &Id) -> Id {
+/// An object's identity:
+/// `object_id(kind, seed) = derive_key(OBJECT_CONTEXT, kind_tag ‖ seed)`.
+///
+/// `seed` distinguishes origins from object ids: it is a creation op's id
+/// for children, or an arbitrary out-of-band id for roots — naming input,
+/// never itself an addressable identity. The kind tag (`VK_NEW_SEQ` /
+/// `VK_NEW_KV`) is inside the derivation, so the same seed opened as a Seq
+/// and as a Kv are two *different* objects — kind mis-agreement is
+/// unrepresentable. The object id is a virtual node — never an op — so a
+/// creation op has no dual role: refs to `X` mean the parent element, refs
+/// to `object_id(kind, X)` mean the child object.
+pub fn object_id(kind_tag: u8, seed: &Id) -> Id {
     use blake3::hazmat::HasherExt;
     let mut hasher = blake3::Hasher::new_from_context_key(&OBJECT_KEY);
-    hasher.update(&creation_op.0);
+    hasher.update(&[kind_tag]);
+    hasher.update(&seed.0);
     Id(*hasher.finalize().as_bytes())
 }
 
@@ -324,10 +331,12 @@ mod tests {
     #[test]
     fn object_ids_are_distinct_from_their_creation_ops() {
         let x = Id([7; 32]);
-        let oid = object_id(&x);
+        let oid = object_id(VK_NEW_SEQ, &x);
         assert_ne!(oid, x);
         // deterministic
-        assert_eq!(oid, object_id(&x));
+        assert_eq!(oid, object_id(VK_NEW_SEQ, &x));
+        // the kind is inside the derivation: same seed, different object
+        assert_ne!(oid, object_id(VK_NEW_KV, &x));
     }
 
     #[test]

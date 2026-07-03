@@ -21,8 +21,7 @@ use rustc_hash::FxHashMap;
 
 use crate::hashkv::HashKv;
 use crate::hashseq::IdMap;
-use crate::delivery::Delivery;
-use crate::value::{NEW_KV, NEW_SEQ, Value, object_id};
+use crate::value::{NEW_KV, NEW_SEQ, VK_NEW_KV, VK_NEW_SEQ, Value, object_id};
 use crate::{HashNode, HashSeq, Id, Op, Payload};
 
 #[derive(Debug, Clone, Default)]
@@ -32,15 +31,14 @@ pub struct HashWeb {
     pub(crate) seqs: FxHashMap<Id, HashSeq>,
     /// Every map object, likewise.
     pub(crate) kvs: FxHashMap<Id, HashKv>,
-    /// node id -> the origin id of the object it belongs to (the routing
-    /// table — replica-local, derived, never on the wire).
-    pub(crate) node_home: IdMap<Id>,
-    /// Document-wide delivery: refs cross objects at creation bridges, so
-    /// parking is global (each object's own buffer stays empty). The gate
-    /// here holds ops whose refs determine no single object; kind-vs-object
-    /// verdicts quarantine in their routed object instead. Both re-present
-    /// on merge.
-    pub(crate) delivery: Delivery,
+    /// Envelopes parked on object ids this store does not know yet; birth
+    /// or adoption wakes them. Node-level parking lives inside each
+    /// object's own delivery — the store keeps no per-node state at all.
+    pub(crate) parked: FxHashMap<Id, Vec<(Id, HashNode)>>,
+    /// Creation-valued ops seen enveloped to an object but not yet
+    /// observed applied there (they may be parked inside it); `pump`
+    /// births their children the moment they apply.
+    pending_creations: FxHashMap<Id, Vec<(Id, bool)>>,
     /// Value-artifact side store shared across objects.
     pub(crate) values: IdMap<Vec<u8>>,
 }
@@ -66,7 +64,7 @@ impl HashWeb {
             return false;
         }
         self.seqs.insert(origin, HashSeq::new(origin));
-        self.wake_origin(origin);
+        self.pump(origin);
         true
     }
 
@@ -76,17 +74,8 @@ impl HashWeb {
             return false;
         }
         self.kvs.insert(origin, HashKv::new(origin));
-        self.wake_origin(origin);
+        self.pump(origin);
         true
-    }
-
-    /// Adopting an origin may wake ops that parked on it.
-    fn wake_origin(&mut self, origin: Id) {
-        let mut queue: Vec<(Id, HashNode)> = Vec::new();
-        self.delivery.wake(&origin, &mut queue);
-        while let Some((id, node)) = queue.pop() {
-            self.park_or_dispatch(id, node, &mut queue);
-        }
     }
 
     pub fn seq(&self, origin: &Id) -> Option<&HashSeq> {
@@ -112,11 +101,6 @@ impl HashWeb {
         self.seqs.contains_key(id) || self.kvs.contains_key(id)
     }
 
-    /// An id is present if it is an applied node or a live object origin.
-    fn contains(&self, id: &Id) -> bool {
-        self.node_home.contains_key(id) || self.is_origin(id)
-    }
-
     pub fn provide_value(&mut self, v: &Value) -> Id {
         let id = v.value_id();
         self.values.entry(id).or_insert_with(|| v.encoded());
@@ -140,7 +124,7 @@ impl HashWeb {
             m.provide_value(&value);
             m.make_put(key_id, value_id)
         };
-        self.apply(node.clone());
+        self.apply_to(*origin, node.clone());
         Some(node)
     }
 
@@ -149,10 +133,13 @@ impl HashWeb {
     /// `object_id(creation op id)` — a virtual origin, never an op.
     pub fn create_child(&mut self, parent: &Id, key: Value, kind: Value) -> Option<Id> {
         debug_assert!(matches!(kind, Value::NewSeq | Value::NewKv));
-        let node = self.put(parent, key, kind.clone())?;
-        let creation = node.id();
-        // put() routed the node; creation additionally births the child.
-        let child = object_id(&creation);
+        let tag = match kind {
+            Value::NewSeq => VK_NEW_SEQ,
+            _ => VK_NEW_KV,
+        };
+        let node = self.put(parent, key, kind)?;
+        // put() delivered the node; creation additionally births the child.
+        let child = object_id(tag, &node.id());
         debug_assert!(self.is_origin(&child), "creation birthed");
         Some(child)
     }
@@ -172,7 +159,7 @@ impl HashWeb {
     pub fn seq_insert_value(&mut self, origin: &Id, idx: usize, value: &Value) -> Option<HashNode> {
         let vid = self.provide_value(value);
         let node = self.seqs.get(origin)?.make_insert_value(idx, vid)?;
-        self.apply(node.clone());
+        self.apply_to(*origin, node.clone());
         Some(node)
     }
 
@@ -189,8 +176,12 @@ impl HashWeb {
     }
 
     fn create_child_at(&mut self, parent: &Id, idx: usize, kind: Value) -> Option<Id> {
+        let tag = match kind {
+            Value::NewSeq => VK_NEW_SEQ,
+            _ => VK_NEW_KV,
+        };
         let node = self.seq_insert_value(parent, idx, &kind)?;
-        let child = object_id(&node.id());
+        let child = object_id(tag, &node.id());
         debug_assert!(self.is_origin(&child), "creation birthed");
         Some(child)
     }
@@ -200,13 +191,7 @@ impl HashWeb {
         let Some(seq) = self.seqs.get_mut(origin) else {
             return false;
         };
-        let pre = seq.ids.len();
         seq.insert_batch(idx, text.chars());
-        // Register the fresh nodes' home (replica-local routing table).
-        let fresh: Vec<Id> = seq.ids[pre..].to_vec();
-        for id in fresh {
-            self.node_home.insert(id, *origin);
-        }
         true
     }
 
@@ -214,13 +199,7 @@ impl HashWeb {
         let Some(seq) = self.seqs.get_mut(origin) else {
             return false;
         };
-        let pre = seq.ids.len();
-        let removed = seq.remove_batch(idx, len).is_some();
-        let fresh: Vec<Id> = seq.ids[pre..].to_vec();
-        for id in fresh {
-            self.node_home.insert(id, *origin);
-        }
-        removed
+        seq.remove_batch(idx, len).is_some()
     }
 
     pub fn text(&self, origin: &Id) -> Option<String> {
@@ -240,84 +219,40 @@ impl HashWeb {
         }
     }
 
-    // ---- routing + apply ----
+    // ---- delivery (the routing envelope: `obj_id ‖ HashNode`) ----
 
-    /// Derive the op's object: the single object its refs resolve in —
-    /// named refs first, else the pins (a fresh put's frontier is its
-    /// object's own, beginning at the origin id). `None` = underdetermined
-    /// or contradictory → gate (stable: every ref's home is hash-committed).
-    fn route(&self, node: &HashNode) -> Option<Id> {
-        let mut home: Option<Id> = None;
-        for r in node.iter_refs() {
-            let h = if self.is_origin(r) {
-                *r // an origin id names its object directly
-            } else {
-                *self.node_home.get(r)?
-            };
-            match home {
-                None => home = Some(h),
-                Some(prev) if prev == h => {}
-                Some(_) => return None, // refs span objects
-            }
-        }
-        home
-    }
-
-    pub fn apply(&mut self, node: HashNode) {
+    /// Deliver an enveloped op: `obj ‖ node`. The envelope replaces both a
+    /// route field (there is none — GRAMMAR_SPEC.md) and any per-node
+    /// routing table; it is transport metadata that needs no trust: an op
+    /// enveloped to the wrong object simply never applies there (its refs
+    /// never arrive in that object), the same fate as any garbage ref —
+    /// bounded, attributable, and correct by construction. Envelopes for
+    /// unknown object ids park store-wide and wake on birth or adoption.
+    pub fn apply_to(&mut self, obj: Id, node: HashNode) {
         let id = node.id();
-        self.apply_with_id(id, node);
+        self.apply_to_with_id(obj, id, node);
     }
 
-    /// Apply with a pre-computed id (`id` must be the node's true hash).
-    /// Iterative worklist: applying a node wakes exactly the orphans parked
-    /// on its id.
-    pub fn apply_with_id(&mut self, id: Id, node: HashNode) {
-        debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
-        if self.contains(&id) || self.delivery.holds(&id) {
+    pub fn apply_to_with_id(&mut self, obj: Id, id: Id, node: HashNode) {
+        debug_assert_eq!(id, node.id(), "apply_to_with_id called with a wrong id");
+        if let Some(kind) = Self::creation_kind(&node) {
+            self.pending_creations.entry(obj).or_default().push((id, kind));
+        }
+        if let Some(seq) = self.seqs.get_mut(&obj) {
+            seq.apply_with_id(id, node);
+        } else if let Some(kv) = self.kvs.get_mut(&obj) {
+            kv.apply_with_id(id, node);
+        } else {
+            self.parked.entry(obj).or_default().push((id, node));
             return;
         }
-        let mut queue: Vec<(Id, HashNode)> = Vec::new();
-        self.park_or_dispatch(id, node, &mut queue);
-        while let Some((id, node)) = queue.pop() {
-            self.park_or_dispatch(id, node, &mut queue);
-        }
+        self.pump(obj);
     }
 
-    /// One step of the worklist. Parking is document-wide: origin ids count
-    /// as present once their object exists (the derive-and-wake in
-    /// `interpret` makes that true). A gated node wakes nothing — its
-    /// dependents stay parked (the quarantine cascade).
-    fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
-        let missing = node.iter_refs().find(|d| !self.contains(d)).copied();
-        if let Some(missing) = missing {
-            self.delivery.park(missing, id, node);
-            return;
-        }
-        self.delivery.unpark(&id);
-        match self.interpret(id, node, queue) {
-            Ok(()) => self.delivery.wake(&id, queue),
-            Err(node) => self.delivery.gate(id, node),
-        }
-    }
-
-    /// Interpret one node whose refs are all present — routing, creation,
-    /// and dispatch to the routed object. `Err` hands the node back for
-    /// quarantine (refs spanning objects).
-    #[allow(clippy::result_large_err)]
-    fn interpret(
-        &mut self,
-        id: Id,
-        node: HashNode,
-        queue: &mut Vec<(Id, HashNode)>,
-    ) -> Result<(), HashNode> {
-        // Routing (stable gate on refs spanning objects).
-        let Some(home) = self.route(&node) else {
-            return Err(node);
-        };
-
-        // Creation: an op whose payload/value is a creation artifact births
-        // a child object whose origin is object_id(creation op).
-        let creation_kind = match &node.op {
+    /// Is this op a creation (value/payload = a creation artifact)?
+    /// `Some(is_seq)`.
+    fn creation_kind(node: &HashNode) -> Option<bool> {
+        match &node.op {
             Op::Put { value, .. } if *value == *NEW_SEQ => Some(true),
             Op::Put { value, .. } if *value == *NEW_KV => Some(false),
             Op::Insert {
@@ -329,42 +264,64 @@ impl HashWeb {
                 ..
             } if *v == *NEW_KV => Some(false),
             _ => None,
-        };
-
-        // Dispatch to the routed object; its own edge-table gate handles
-        // op-kind-vs-object-type (a Put into a Seq quarantines there).
-        if let Some(seq) = self.seqs.get_mut(&home) {
-            seq.apply_with_id(id, node);
-        } else if let Some(map) = self.kvs.get_mut(&home) {
-            map.apply_with_id(id, node);
-        } else {
-            unreachable!("routed to a live object");
         }
-        self.node_home.insert(id, home);
+    }
 
-        if let Some(is_seq) = creation_kind {
-            let child = object_id(&id);
-            if !self.is_origin(&child) {
-                if is_seq {
-                    self.seqs.insert(child, HashSeq::new(child));
-                } else {
-                    self.kvs.insert(child, HashKv::new(child));
+    /// Settle an object after delivery: birth the children of creation ops
+    /// observed applied in it (derive-and-wake), deliver envelopes parked
+    /// on the newly-live ids, and repeat for every object this touches.
+    fn pump(&mut self, start: Id) {
+        let mut work = vec![start];
+        while let Some(o) = work.pop() {
+            // Envelopes parked on o deliver now that it exists.
+            if self.is_origin(&o)
+                && let Some(envelopes) = self.parked.remove(&o)
+            {
+                for (id, node) in envelopes {
+                    if let Some(kind) = Self::creation_kind(&node) {
+                        self.pending_creations.entry(o).or_default().push((id, kind));
+                    }
+                    if let Some(seq) = self.seqs.get_mut(&o) {
+                        seq.apply_with_id(id, node);
+                    } else if let Some(kv) = self.kvs.get_mut(&o) {
+                        kv.apply_with_id(id, node);
+                    }
                 }
             }
-            // Derive-and-wake: the origin id just became present; wake any
-            // ops parked on it (no inversion needed — we derived it).
-            self.delivery.wake(&child, queue);
+            // Birth children of creations that have applied in o.
+            let Some(pending) = self.pending_creations.remove(&o) else {
+                continue;
+            };
+            let mut still = Vec::new();
+            for (id, is_seq) in pending {
+                let applied = self.seqs.get(&o).is_some_and(|x| x.contains_node(&id))
+                    || self.kvs.get(&o).is_some_and(|x| x.contains_node(&id));
+                if !applied {
+                    still.push((id, is_seq));
+                    continue;
+                }
+                let tag = if is_seq { VK_NEW_SEQ } else { VK_NEW_KV };
+                let child = object_id(tag, &id);
+                if !self.is_origin(&child) {
+                    if is_seq {
+                        self.seqs.insert(child, HashSeq::new(child));
+                    } else {
+                        self.kvs.insert(child, HashKv::new(child));
+                    }
+                }
+                work.push(child);
+            }
+            if !still.is_empty() {
+                self.pending_creations.insert(o, still);
+            }
         }
-        Ok(())
     }
 
     /// Merge = union of knowledge. Unconditional: there is no store
-    /// identity to compare. Shared objects merge pairwise (their per-object
-    /// commitment domains make cross-object confusion impossible); unknown
-    /// origins are adopted — a root object's `(origin, kind)` is knowledge,
-    /// not ops, since no creation op exists for it. A kind mis-agreement on
-    /// an out-of-band origin degrades gracefully: the other side's ops
-    /// quarantine in the local object's own gate, op by op.
+    /// identity to compare. Missing origins are adopted with their kind
+    /// (for roots, the (seed, kind) agreement is baked into the derived
+    /// object id — a kind mis-agreement is a different object, not a
+    /// conflict); every op re-delivers in its own envelope.
     pub fn merge(&mut self, other: Self) {
         for (vid, bytes) in other.values {
             self.values.entry(vid).or_insert(bytes);
@@ -382,34 +339,61 @@ impl HashWeb {
             } else {
                 self.kvs.insert(origin, HashKv::new(origin));
             }
-            let mut queue: Vec<(Id, HashNode)> = Vec::new();
-            self.delivery.wake(&origin, &mut queue);
-            while let Some((id, node)) = queue.pop() {
-                self.park_or_dispatch(id, node, &mut queue);
-            }
+            self.pump(origin);
         }
-        // Re-apply everything through the global buffer; ordering resolves
-        // itself (creation ops wake their children's parked ops).
-        for seq in other.seqs.values() {
+        for (origin, seq) in &other.seqs {
             for (id, node) in seq.all_nodes() {
-                self.apply_with_id(id, node);
+                self.apply_to_with_id(*origin, id, node);
+            }
+            for (id, node) in seq.delivery.held() {
+                self.apply_to_with_id(*origin, *id, node.clone());
             }
         }
-        for m in other.kvs.values() {
+        for (origin, m) in &other.kvs {
             for (vid, bytes) in m.value_store() {
                 self.values.entry(*vid).or_insert_with(|| bytes.clone());
             }
             for (id, node) in m.all_nodes() {
-                self.apply_with_id(id, node);
+                self.apply_to_with_id(*origin, id, node);
+            }
+            for (id, node) in m.delivery.held() {
+                self.apply_to_with_id(*origin, *id, node.clone());
             }
         }
-        for (id, node) in other.delivery.into_held() {
-            self.apply_with_id(id, node);
+        for (obj, envelopes) in other.parked {
+            for (id, node) in envelopes {
+                self.apply_to_with_id(obj, id, node);
+            }
         }
     }
 
+    /// Envelopes parked on unknown object ids.
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
-        self.delivery.orphans()
+        self.parked.values().flatten().map(|(_, node)| node)
+    }
+
+    /// Re-register creation-valued ops parked *inside* an object (its own
+    /// orphan/gate buffers) as pending births. Decode needs this: the
+    /// pending list is apply-time knowledge, and a decoded object carries
+    /// its held ops without ever passing through `apply_to`.
+    pub(crate) fn pend_held_creations(&mut self, obj: Id) {
+        let mut found: Vec<(Id, bool)> = Vec::new();
+        let held: Box<dyn Iterator<Item = (&Id, &HashNode)>> =
+            if let Some(seq) = self.seqs.get(&obj) {
+                Box::new(seq.delivery.held())
+            } else if let Some(kv) = self.kvs.get(&obj) {
+                Box::new(kv.delivery.held())
+            } else {
+                return;
+            };
+        for (id, node) in held {
+            if let Some(kind) = Self::creation_kind(node) {
+                found.push((*id, kind));
+            }
+        }
+        if !found.is_empty() {
+            self.pending_creations.entry(obj).or_default().extend(found);
+        }
     }
 }
 
@@ -450,9 +434,9 @@ mod tests {
         let nodes = a.seq(&oid(1)).unwrap().all_nodes();
         let mut fresh = HashWeb::new();
         for (id, node) in nodes {
-            fresh.apply_with_id(id, node);
+            fresh.apply_to_with_id(oid(1), id, node);
         }
-        assert_eq!(fresh.orphans().count(), 2, "'h' on the origin, 'i' on 'h'");
+        assert_eq!(fresh.orphans().count(), 2, "both envelopes park on the unknown object id");
         fresh.create_seq(oid(1));
         assert_eq!(fresh.orphans().count(), 0, "adoption wakes transitively");
         assert_eq!(fresh.text(&oid(1)).unwrap(), "hi");
@@ -551,22 +535,22 @@ mod tests {
 
         let mut fresh = HashWeb::new();
         fresh.create_kv(root);
-        // Child op first: parks (its ref — the origin id — is unknown).
+        // Child op first: its envelope names an unknown object — parks.
         for (id, node) in &child_nodes {
-            fresh.apply_with_id(*id, node.clone());
+            fresh.apply_to_with_id(child, *id, node.clone());
         }
         assert_eq!(fresh.orphans().count(), 1);
         assert!(fresh.seq(&child).is_none());
         // The creation chain arrives: derive-and-wake, transitively.
         for (id, node) in creation_chain {
-            fresh.apply_with_id(id, node);
+            fresh.apply_to_with_id(root, id, node);
         }
         assert_eq!(fresh.orphans().count(), 0);
         assert_eq!(fresh.text(&child).unwrap(), "x");
     }
 
     #[test]
-    fn refs_spanning_objects_gate() {
+    fn refs_spanning_objects_park_in_their_object() {
         let mut doc = HashWeb::new();
         let root = oid(9);
         doc.create_kv(root);
@@ -577,13 +561,15 @@ mod tests {
         let a0 = doc.seq(&a).unwrap().id_at(0).unwrap();
         let b0 = doc.seq(&b).unwrap().id_at(0).unwrap();
 
-        // A remove naming elements of two objects: routing underdetermined.
+        // A remove naming elements of two objects, enveloped to `a`: the
+        // foreign ref never arrives inside `a`, so the op parks there
+        // forever — the same fate as any garbage ref, no verdict needed.
         let node = HashNode {
             pins: Default::default(),
             op: Op::Remove([a0, b0].into_iter().collect()),
         };
-        doc.apply(node);
-        assert_eq!(doc.delivery.gated.len(), 1);
+        doc.apply_to(a, node);
+        assert_eq!(doc.seq(&a).unwrap().delivery.orphans().count(), 1);
         assert_eq!(doc.text(&a).unwrap(), "a"); // untouched
         assert_eq!(doc.text(&b).unwrap(), "b");
     }
@@ -610,7 +596,10 @@ mod tests {
         let seq = doc.seq(&text).unwrap();
         let atom_id = seq.id_at(5).unwrap();
         assert_eq!(seq.payload_of(&atom_id), Some(*crate::value::NEW_SEQ));
-        assert_eq!(crate::value::object_id(&atom_id), inner);
+        assert_eq!(
+            crate::value::object_id(crate::value::VK_NEW_SEQ, &atom_id),
+            inner
+        );
 
         // Merges carry the whole shape both ways.
         let mut other = HashWeb::new();
@@ -636,7 +625,7 @@ mod tests {
             let seq = doc.seq(&a).unwrap();
             seq.make_insert_value(6, b).unwrap()
         };
-        doc.apply(node.clone());
+        doc.apply_to(a, node.clone());
         let seq = doc.seq(&a).unwrap();
         let atom = seq.id_at(6).unwrap();
         assert_eq!(seq.payload_of(&atom), Some(b), "the link target's origin id");
