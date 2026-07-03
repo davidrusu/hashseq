@@ -667,3 +667,26 @@ a block into a code region, the conversion re-render replaces the DOM node
 the caret was in — the next keystrokes go to a detached node and are
 silently lost (same family as the just-converted-region focus quirk fixed
 for math). Needs a caret re-anchor after input-rule block conversion.
+
+---
+
+## 26 — Structural theming: layout and shape, not just palette
+
+FIELD (sepia) dropped at the user's request; three new themes explore how
+far body[data-theme] CSS can reshape the app without touching a line of JS
+or the store:
+
+- **EDITORIAL** — serif magazine. The page card disappears entirely; a
+  42px display title sits on a 3px rule; prose is 17px Charter/Georgia.
+- **POSTER** — neo-brutalist. Every *block* becomes its own white card
+  with a thick border and hard offset shadow; buttons physically depress
+  on hover. The layout tree reads as a deck of cards, which makes the
+  drag-to-subdivide feature much more discoverable.
+- **ZEN** — the chrome fades to near-invisible until hovered; 40rem
+  centered measure, 1.95 leading. The app becomes just the text.
+
+**Feedback**: the block-based DOM (one element per tree leaf) is what made
+POSTER possible — "each block is a card" was one CSS rule because blocks
+are already discrete nodes. A textarea-per-page design could never have
+done this. View/model separation keeps paying: six themes, zero data
+migrations.
