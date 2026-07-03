@@ -25,27 +25,13 @@ use crate::delivery::Delivery;
 use crate::value::{NEW_MAP, NEW_SEQ, Value, object_id};
 use crate::{HashNode, HashSeq, Id, Op, Payload};
 
-/// A routed projection.
-#[derive(Debug, Clone)]
-pub enum Object {
-    Seq(HashSeq),
-    Map(HashKv),
-}
-
-impl Object {
-    fn apply_with_id(&mut self, id: Id, node: HashNode) {
-        match self {
-            Object::Seq(seq) => seq.apply_with_id(id, node),
-            Object::Map(map) => map.apply_with_id(id, node),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct HashWeb {
-    /// Every object this replica knows, by origin id: roots opened
+    /// Every seq object this replica knows, by origin id: roots opened
     /// out-of-band and children born by creation ops alike.
-    pub(crate) objects: FxHashMap<Id, Object>,
+    pub(crate) seqs: FxHashMap<Id, HashSeq>,
+    /// Every map object, likewise.
+    pub(crate) maps: FxHashMap<Id, HashKv>,
     /// node id -> the origin id of the object it belongs to (the routing
     /// table — replica-local, derived, never on the wire).
     pub(crate) node_home: IdMap<Id>,
@@ -61,16 +47,7 @@ pub struct HashWeb {
 
 impl PartialEq for HashWeb {
     fn eq(&self, other: &Self) -> bool {
-        if self.objects.len() != other.objects.len() {
-            return false;
-        }
-        self.objects.iter().all(|(k, v)| {
-            other.objects.get(k).is_some_and(|o| match (v, o) {
-                (Object::Seq(a), Object::Seq(b)) => a == b,
-                (Object::Map(a), Object::Map(b)) => a == b,
-                _ => false,
-            })
-        })
+        self.seqs == other.seqs && self.maps == other.maps
     }
 }
 impl Eq for HashWeb {}
@@ -86,14 +63,17 @@ impl HashWeb {
     /// false if an object already lives at that origin.
     pub fn create_root(&mut self, origin: Id, kind: Value) -> bool {
         debug_assert!(matches!(kind, Value::NewSeq | Value::NewMap));
-        if self.objects.contains_key(&origin) {
+        if self.is_origin(&origin) {
             return false;
         }
-        let obj = match kind {
-            Value::NewSeq => Object::Seq(HashSeq::new(origin)),
-            _ => Object::Map(HashKv::new(origin)),
-        };
-        self.objects.insert(origin, obj);
+        match kind {
+            Value::NewSeq => {
+                self.seqs.insert(origin, HashSeq::new(origin));
+            }
+            _ => {
+                self.maps.insert(origin, HashKv::new(origin));
+            }
+        }
         // Adopting an origin may wake ops that parked on it.
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
         self.delivery.wake(&origin, &mut queue);
@@ -104,27 +84,31 @@ impl HashWeb {
     }
 
     pub fn seq(&self, origin: &Id) -> Option<&HashSeq> {
-        match self.objects.get(origin)? {
-            Object::Seq(s) => Some(s),
-            _ => None,
-        }
+        self.seqs.get(origin)
     }
 
     pub fn map(&self, origin: &Id) -> Option<&HashKv> {
-        match self.objects.get(origin)? {
-            Object::Map(m) => Some(m),
-            _ => None,
-        }
+        self.maps.get(origin)
     }
 
-    pub fn objects(&self) -> impl Iterator<Item = (&Id, &Object)> {
-        self.objects.iter()
+    /// Every known origin id (seqs and maps).
+    pub fn origins(&self) -> impl Iterator<Item = &Id> {
+        self.seqs.keys().chain(self.maps.keys())
     }
 
-    /// An id is present if it is an applied node or a live object origin
-    /// (roots adopted out-of-band and creation-derived children alike).
+    pub fn object_count(&self) -> usize {
+        self.seqs.len() + self.maps.len()
+    }
+
+    /// Is this id a live object origin (roots adopted out-of-band and
+    /// creation-derived children alike)?
+    fn is_origin(&self, id: &Id) -> bool {
+        self.seqs.contains_key(id) || self.maps.contains_key(id)
+    }
+
+    /// An id is present if it is an applied node or a live object origin.
     fn contains(&self, id: &Id) -> bool {
-        self.objects.contains_key(id) || self.node_home.contains_key(id)
+        self.node_home.contains_key(id) || self.is_origin(id)
     }
 
     pub fn provide_value(&mut self, v: &Value) -> Id {
@@ -144,13 +128,11 @@ impl HashWeb {
     pub fn put(&mut self, origin: &Id, key: Value, value: Value) -> Option<HashNode> {
         let key_id = self.provide_value(&key);
         let value_id = self.provide_value(&value);
-        let node = match self.objects.get_mut(origin)? {
-            Object::Map(m) => {
-                m.provide_value(&key);
-                m.provide_value(&value);
-                m.make_put(key_id, value_id)
-            }
-            _ => return None,
+        let node = {
+            let m = self.maps.get_mut(origin)?;
+            m.provide_value(&key);
+            m.provide_value(&value);
+            m.make_put(key_id, value_id)
         };
         self.apply(node.clone());
         Some(node)
@@ -165,7 +147,7 @@ impl HashWeb {
         let creation = node.id();
         // put() routed the node; creation additionally births the child.
         let child = object_id(&creation);
-        debug_assert!(self.objects.contains_key(&child), "creation birthed");
+        debug_assert!(self.is_origin(&child), "creation birthed");
         Some(child)
     }
 
@@ -183,10 +165,7 @@ impl HashWeb {
     /// composition's apply so creation semantics fire.
     pub fn seq_insert_value(&mut self, origin: &Id, idx: usize, value: &Value) -> Option<HashNode> {
         let vid = self.provide_value(value);
-        let node = match self.objects.get(origin)? {
-            Object::Seq(s) => s.make_insert_value(idx, vid)?,
-            _ => return None,
-        };
+        let node = self.seqs.get(origin)?.make_insert_value(idx, vid)?;
         self.apply(node.clone());
         Some(node)
     }
@@ -197,13 +176,13 @@ impl HashWeb {
         debug_assert!(matches!(kind, Value::NewSeq | Value::NewMap));
         let node = self.seq_insert_value(parent, idx, &kind)?;
         let child = object_id(&node.id());
-        debug_assert!(self.objects.contains_key(&child), "creation birthed");
+        debug_assert!(self.is_origin(&child), "creation birthed");
         Some(child)
     }
 
     /// Edit a child text object.
     pub fn text_insert(&mut self, origin: &Id, idx: usize, text: &str) -> bool {
-        let Some(Object::Seq(seq)) = self.objects.get_mut(origin) else {
+        let Some(seq) = self.seqs.get_mut(origin) else {
             return false;
         };
         let pre = seq.ids.len();
@@ -217,7 +196,7 @@ impl HashWeb {
     }
 
     pub fn text_remove(&mut self, origin: &Id, idx: usize, len: usize) -> bool {
-        let Some(Object::Seq(seq)) = self.objects.get_mut(origin) else {
+        let Some(seq) = self.seqs.get_mut(origin) else {
             return false;
         };
         let pre = seq.ids.len();
@@ -255,7 +234,7 @@ impl HashWeb {
     fn route(&self, node: &HashNode) -> Option<Id> {
         let mut home: Option<Id> = None;
         for r in node.iter_refs() {
-            let h = if self.objects.contains_key(r) {
+            let h = if self.is_origin(r) {
                 *r // an origin id names its object directly
             } else {
                 *self.node_home.get(r)?
@@ -339,21 +318,24 @@ impl HashWeb {
 
         // Dispatch to the routed object; its own edge-table gate handles
         // op-kind-vs-object-type (a Put into a Seq quarantines there).
-        self.objects
-            .get_mut(&home)
-            .expect("routed to a live object")
-            .apply_with_id(id, node);
+        if let Some(seq) = self.seqs.get_mut(&home) {
+            seq.apply_with_id(id, node);
+        } else if let Some(map) = self.maps.get_mut(&home) {
+            map.apply_with_id(id, node);
+        } else {
+            unreachable!("routed to a live object");
+        }
         self.node_home.insert(id, home);
 
         if let Some(is_seq) = creation_kind {
             let child = object_id(&id);
-            self.objects.entry(child).or_insert_with(|| {
+            if !self.is_origin(&child) {
                 if is_seq {
-                    Object::Seq(HashSeq::new(child))
+                    self.seqs.insert(child, HashSeq::new(child));
                 } else {
-                    Object::Map(HashKv::new(child))
+                    self.maps.insert(child, HashKv::new(child));
                 }
-            });
+            }
             // Derive-and-wake: the origin id just became present; wake any
             // ops parked on it (no inversion needed — we derived it).
             self.delivery.wake(&child, queue);
@@ -372,33 +354,37 @@ impl HashWeb {
         for (vid, bytes) in other.values {
             self.values.entry(vid).or_insert(bytes);
         }
-        for (origin, obj) in &other.objects {
-            if !self.objects.contains_key(origin) {
-                let fresh = match obj {
-                    Object::Seq(_) => Object::Seq(HashSeq::new(*origin)),
-                    Object::Map(_) => Object::Map(HashKv::new(*origin)),
-                };
-                self.objects.insert(*origin, fresh);
-                let mut queue: Vec<(Id, HashNode)> = Vec::new();
-                self.delivery.wake(origin, &mut queue);
-                while let Some((id, node)) = queue.pop() {
-                    self.park_or_dispatch(id, node, &mut queue);
-                }
+        let adopt: Vec<(Id, bool)> = other
+            .seqs
+            .keys()
+            .map(|o| (*o, true))
+            .chain(other.maps.keys().map(|o| (*o, false)))
+            .filter(|(o, _)| !self.is_origin(o))
+            .collect();
+        for (origin, is_seq) in adopt {
+            if is_seq {
+                self.seqs.insert(origin, HashSeq::new(origin));
+            } else {
+                self.maps.insert(origin, HashKv::new(origin));
+            }
+            let mut queue: Vec<(Id, HashNode)> = Vec::new();
+            self.delivery.wake(&origin, &mut queue);
+            while let Some((id, node)) = queue.pop() {
+                self.park_or_dispatch(id, node, &mut queue);
             }
         }
         // Re-apply everything through the global buffer; ordering resolves
         // itself (creation ops wake their children's parked ops).
-        for (_, obj) in other.objects.iter() {
-            let nodes = match obj {
-                Object::Seq(s) => s.all_nodes(),
-                Object::Map(m) => {
-                    for (vid, bytes) in m.value_store() {
-                        self.values.entry(*vid).or_insert_with(|| bytes.clone());
-                    }
-                    m.all_nodes()
-                }
-            };
-            for (id, node) in nodes {
+        for seq in other.seqs.values() {
+            for (id, node) in seq.all_nodes() {
+                self.apply_with_id(id, node);
+            }
+        }
+        for m in other.maps.values() {
+            for (vid, bytes) in m.value_store() {
+                self.values.entry(*vid).or_insert_with(|| bytes.clone());
+            }
+            for (id, node) in m.all_nodes() {
                 self.apply_with_id(id, node);
             }
         }
@@ -440,7 +426,7 @@ mod tests {
         b.put(&oid(2), s("k"), s("v"));
 
         a.merge(b.clone());
-        assert_eq!(a.objects().count(), 2);
+        assert_eq!(a.object_count(), 2);
         assert_eq!(a.text(&oid(1)).unwrap(), "hi");
         assert_eq!(a.get(&oid(2), &s("k")), Some(s("v")));
 
@@ -489,7 +475,7 @@ mod tests {
         // The root links to the block by... the creation op is the value; the
         // child object id is derived from it.
         assert!(doc.map(&block).is_some());
-        assert_eq!(doc.objects().count(), 3); // root + block + content
+        assert_eq!(doc.object_count(), 3); // root + block + content
     }
 
     #[test]

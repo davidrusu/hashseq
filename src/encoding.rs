@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::hashkv::HashKv;
 use crate::hashseq::{CausalRemove, Loc};
-use crate::hashweb::{HashWeb, Object};
+use crate::hashweb::HashWeb;
 use crate::run::FirstOp;
 use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
 
@@ -1865,18 +1865,16 @@ const OBJ_SEQ: u8 = 1;
 pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
     let mut buf = Vec::new();
 
-    // One document-wide artifact section: the web store unioned with every
-    // inner map's local store (inner stores are excluded from the nested
+    // One store-wide artifact section: the store's values unioned with
+    // every map's local store (inner stores are excluded from the nested
     // streams — they are replica-local views, not canonical state).
     let mut artifacts: BTreeMap<Id, &Vec<u8>> = BTreeMap::new();
     for (id, bytes) in web.values.iter() {
         artifacts.insert(*id, bytes);
     }
-    for obj in web.objects.values() {
-        if let Object::Map(m) = obj {
-            for (id, bytes) in m.values.iter() {
-                artifacts.entry(*id).or_insert(bytes);
-            }
+    for m in web.maps.values() {
+        for (id, bytes) in m.values.iter() {
+            artifacts.entry(*id).or_insert(bytes);
         }
     }
     encode_varint(artifacts.len(), &mut buf);
@@ -1885,17 +1883,26 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
         buf.extend_from_slice(bytes);
     }
 
-    let mut objects: Vec<(&Id, &Object)> = web.objects.iter().collect();
+    enum ObjRef<'a> {
+        Map(&'a HashKv),
+        Seq(&'a HashSeq),
+    }
+    let mut objects: Vec<(&Id, ObjRef)> = web
+        .maps
+        .iter()
+        .map(|(o, m)| (o, ObjRef::Map(m)))
+        .chain(web.seqs.iter().map(|(o, s)| (o, ObjRef::Seq(s))))
+        .collect();
     objects.sort_by_key(|(id, _)| **id);
     encode_varint(objects.len(), &mut buf);
     for (origin, obj) in objects {
         encode_id(origin, &mut buf);
         let inner = match obj {
-            Object::Map(m) => {
+            ObjRef::Map(m) => {
                 buf.push(OBJ_MAP);
                 encode_hashkv_with_store(m, false)
             }
-            Object::Seq(s) => {
+            ObjRef::Seq(s) => {
                 buf.push(OBJ_SEQ);
                 encode_hashseq(s)
             }
@@ -1942,26 +1949,25 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
             .get(c.pos..c.pos + len)
             .ok_or(DecodeError::UnexpectedEof)?;
         c.pos += len;
-        let obj = match kind {
-            OBJ_MAP => Object::Map(decode_hashkv(inner)?),
-            OBJ_SEQ => Object::Seq(decode_hashseq(inner)?),
-            other => return Err(DecodeError::InvalidOpTag(other)),
-        };
         // Rebuild the replica-local routing table from the object's
         // applied ids (never on the wire).
-        match &obj {
-            Object::Seq(s) => {
-                for id in s.ids.iter().skip(1) {
-                    web.node_home.insert(*id, origin);
-                }
-            }
-            Object::Map(m) => {
+        match kind {
+            OBJ_MAP => {
+                let m = decode_hashkv(inner)?;
                 for id in m.nodes.keys() {
                     web.node_home.insert(*id, origin);
                 }
+                web.maps.insert(origin, m);
             }
+            OBJ_SEQ => {
+                let s = decode_hashseq(inner)?;
+                for id in s.ids.iter().skip(1) {
+                    web.node_home.insert(*id, origin);
+                }
+                web.seqs.insert(origin, s);
+            }
+            other => return Err(DecodeError::InvalidOpTag(other)),
         }
-        web.objects.insert(origin, obj);
     }
 
     let held = c.step(decode_varint)?;
