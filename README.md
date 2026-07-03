@@ -175,7 +175,9 @@ to moved content. Marks render: Peritext-style span annotations with
 anchor-encoded edge expansion and add-wins concurrent unmark; marks are
 regional — points stay glued to base slots, elements moved out of a span
 shed it, elements moved in acquire it (`marks_at` / `marked_spans`). Snapshots are
-canonical: blocks derive from the op set, never replica storage — equal op
-sets encode to identical bytes across replicas and delivery orders
-(quickcheck'd, hash-locked), with `decode_hashseq_strict` as the verifying
-acceptance mode.
+canonical across the whole family: blocks derive from the op set, never
+replica storage — equal op sets encode to identical bytes across replicas
+and delivery orders (quickcheck'd, hash-locked), with strict decode modes
+(`decode_*_strict`) as the verifying acceptance path. HashKv and HashWeb
+snapshots nest per-object canonical streams with one document-wide
+artifact section.

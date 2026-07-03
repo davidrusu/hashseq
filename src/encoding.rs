@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::hashkv::HashKv;
 use crate::hashseq::{CausalRemove, Loc};
+use crate::hashweb::{HashWeb, Object};
 use crate::run::FirstOp;
 use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
 
@@ -1651,6 +1653,338 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
     Ok(seq)
 }
 
+// --- HashKv snapshot encoding/decoding ---
+//
+// Format: [origin][puts][trailing][artifacts]. Applied kv nodes are all
+// puts, and put refs are causal (always to already-applied puts or the
+// origin), so the node-level dependency graph is acyclic: the stream is a
+// plain topological order (smallest id first among ready nodes) with no
+// cycle machinery and a one-entry implicit dictionary (the origin). Refs
+// encode as `varint(0)` = origin, `varint(rank + 1)` = the rank-th put in
+// the stream. Keys and values are commitments — raw 32 B, never refs.
+// Trailing nodes (orphans + gated, id-sorted) carry full ids. The artifact
+// section (id-sorted canonical value encodings) makes the snapshot
+// self-contained; it is a function of the replica's artifact store, so the
+// canonicality claim is scoped: equal op sets AND equal artifact stores
+// encode identically.
+
+pub fn encode_hashkv(kv: &HashKv) -> Vec<u8> {
+    encode_hashkv_with_store(kv, true)
+}
+
+/// `include_store = false` for web-nested maps: the composition snapshot
+/// carries one document-wide artifact section instead (inner stores are
+/// replica-local views — what the object happened to see — and would break
+/// byte canonicality across merge orders).
+fn encode_hashkv_with_store(kv: &HashKv, include_store: bool) -> Vec<u8> {
+    let origin = kv.origin();
+    let mut nodes: Vec<(Id, &HashNode)> = kv.nodes.iter().map(|(i, n)| (*i, n)).collect();
+    nodes.sort_by_key(|(id, _)| *id);
+    let index_of: FxHashMap<Id, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i))
+        .collect();
+
+    // Kahn order, smallest id first among ready puts.
+    let n = nodes.len();
+    let mut indeg = vec![0usize; n];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, (_, node)) in nodes.iter().enumerate() {
+        for r in node.iter_refs() {
+            if let Some(&p) = index_of.get(r) {
+                indeg[i] += 1;
+                children[p].push(i);
+            }
+        }
+    }
+    let mut ready: BTreeSet<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut rank = vec![usize::MAX; n];
+    while let Some(i) = ready.pop_first() {
+        rank[i] = order.len();
+        order.push(i);
+        for &c in &children[i] {
+            indeg[c] -= 1;
+            if indeg[c] == 0 {
+                ready.insert(c);
+            }
+        }
+    }
+    debug_assert_eq!(order.len(), n, "put refs are causal, hence acyclic");
+
+    let mut buf = Vec::new();
+    encode_id(&origin, &mut buf);
+    let put_ref = |id: &Id, buf: &mut Vec<u8>| {
+        if *id == origin {
+            encode_varint(0, buf);
+        } else {
+            encode_varint(rank[index_of[id]] + 1, buf);
+        }
+    };
+    encode_varint(n, &mut buf);
+    for &i in &order {
+        let (_, node) = nodes[i];
+        let Op::Put {
+            key,
+            value,
+            overwrites,
+        } = &node.op
+        else {
+            unreachable!("applied kv nodes are puts");
+        };
+        encode_varint(node.pins.len(), &mut buf);
+        for r in &node.pins {
+            put_ref(r, &mut buf);
+        }
+        encode_id(key, &mut buf);
+        encode_id(value, &mut buf);
+        encode_varint(overwrites.len(), &mut buf);
+        for r in overwrites {
+            put_ref(r, &mut buf);
+        }
+    }
+
+    // Trailing: parked + gated, id-sorted, full ids.
+    let mut held: Vec<(Id, &HashNode)> = kv.delivery.held().map(|(i, n)| (*i, n)).collect();
+    held.sort_by_key(|(id, _)| *id);
+    encode_varint(held.len(), &mut buf);
+    for (_, node) in &held {
+        encode_hash_node(node, &mut buf);
+    }
+
+    // Artifact store, id-sorted canonical encodings.
+    if include_store {
+        let mut artifacts: Vec<(&Id, &Vec<u8>)> = kv.values.iter().collect();
+        artifacts.sort_by_key(|(id, _)| **id);
+        encode_varint(artifacts.len(), &mut buf);
+        for (_, bytes) in &artifacts {
+            encode_varint(bytes.len(), &mut buf);
+            buf.extend_from_slice(bytes);
+        }
+    } else {
+        encode_varint(0, &mut buf);
+    }
+    buf
+}
+
+pub fn decode_hashkv(bytes: &[u8]) -> Result<HashKv, DecodeError> {
+    let mut c = Cursor { bytes, pos: 0 };
+    let origin = c.step(decode_id)?;
+    let mut kv = HashKv::new(origin);
+
+    let n = c.step(decode_varint)?;
+    let mut emitted: Vec<Id> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let get_ref = |c: &mut Cursor| -> Result<Id, DecodeError> {
+            let v = c.step(decode_varint)?;
+            if v == 0 {
+                Ok(origin)
+            } else {
+                emitted
+                    .get(v - 1)
+                    .copied()
+                    .ok_or(DecodeError::InvalidIdIndex(v - 1))
+            }
+        };
+        let mut pins = BTreeSet::new();
+        let np = c.step(decode_varint)?;
+        for _ in 0..np {
+            pins.insert(get_ref(&mut c)?);
+        }
+        let key = c.step(decode_id)?;
+        let value = c.step(decode_id)?;
+        let mut overwrites = BTreeSet::new();
+        let no = c.step(decode_varint)?;
+        for _ in 0..no {
+            overwrites.insert(get_ref(&mut c)?);
+        }
+        let node = HashNode {
+            pins,
+            op: Op::Put {
+                key,
+                value,
+                overwrites,
+            },
+        };
+        // Recomputed ids are the authoritative derivation.
+        let id = node.id();
+        emitted.push(id);
+        kv.apply_with_id(id, node);
+    }
+
+    let held = c.step(decode_varint)?;
+    for _ in 0..held {
+        let (op, used) = decode_op(&bytes[c.pos..])?;
+        c.pos += used;
+        match op {
+            EncodableOp::Node(node) => kv.apply(node),
+            EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
+        }
+    }
+
+    let na = c.step(decode_varint)?;
+    for _ in 0..na {
+        let len = c.step(decode_varint)?;
+        let b = bytes
+            .get(c.pos..c.pos + len)
+            .ok_or(DecodeError::UnexpectedEof)?
+            .to_vec();
+        c.pos += len;
+        let vid = crate::value::value_id_of_bytes(&b);
+        kv.values.entry(vid).or_insert(b);
+    }
+    Ok(kv)
+}
+
+/// Strict acceptance for kv snapshots (see `decode_hashseq_strict`).
+pub fn decode_hashkv_strict(bytes: &[u8]) -> Result<HashKv, DecodeError> {
+    let kv = decode_hashkv(bytes)?;
+    if encode_hashkv(&kv) != bytes {
+        return Err(DecodeError::NotCanonical);
+    }
+    Ok(kv)
+}
+
+// --- HashWeb snapshot encoding/decoding ---
+//
+// Format: [root][artifacts][objects][trailing]. Each object nests its own
+// canonical stream (`encode_hashseq` / `encode_hashkv`), objects sorted by
+// origin id; the composition-level trailing section (document-wide orphans
+// + the routing gate's quarantine) carries full ids. Nesting keeps every
+// object self-contained (holonic — any object is a replica root); the
+// spec's fully interleaved cross-object stream is a future refinement of
+// this same canonical form (ENCODING_SPEC.md "Interaction with the
+// family").
+
+const OBJ_MAP: u8 = 0;
+const OBJ_SEQ: u8 = 1;
+
+pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_id(&web.root_id(), &mut buf);
+
+    // One document-wide artifact section: the web store unioned with every
+    // inner map's local store (inner stores are excluded from the nested
+    // streams — they are replica-local views, not canonical state).
+    let mut artifacts: BTreeMap<Id, &Vec<u8>> = BTreeMap::new();
+    for (id, bytes) in web.values.iter() {
+        artifacts.insert(*id, bytes);
+    }
+    for obj in web.objects.values() {
+        if let Object::Map(m) = obj {
+            for (id, bytes) in m.values.iter() {
+                artifacts.entry(*id).or_insert(bytes);
+            }
+        }
+    }
+    encode_varint(artifacts.len(), &mut buf);
+    for bytes in artifacts.values() {
+        encode_varint(bytes.len(), &mut buf);
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut objects: Vec<(&Id, &Object)> = web.objects.iter().collect();
+    objects.sort_by_key(|(id, _)| **id);
+    encode_varint(objects.len(), &mut buf);
+    for (origin, obj) in objects {
+        encode_id(origin, &mut buf);
+        let inner = match obj {
+            Object::Map(m) => {
+                buf.push(OBJ_MAP);
+                encode_hashkv_with_store(m, false)
+            }
+            Object::Seq(s) => {
+                buf.push(OBJ_SEQ);
+                encode_hashseq(s)
+            }
+        };
+        encode_varint(inner.len(), &mut buf);
+        buf.extend_from_slice(&inner);
+    }
+
+    let mut held: Vec<(Id, HashNode)> = web
+        .delivery
+        .held()
+        .map(|(i, n)| (*i, n.clone()))
+        .collect();
+    held.sort_by_key(|(id, _)| *id);
+    encode_varint(held.len(), &mut buf);
+    for (_, node) in &held {
+        encode_hash_node(node, &mut buf);
+    }
+    buf
+}
+
+pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
+    let mut c = Cursor { bytes, pos: 0 };
+    let root = c.step(decode_id)?;
+    let mut web = HashWeb::new(root);
+
+    let na = c.step(decode_varint)?;
+    for _ in 0..na {
+        let len = c.step(decode_varint)?;
+        let b = bytes
+            .get(c.pos..c.pos + len)
+            .ok_or(DecodeError::UnexpectedEof)?
+            .to_vec();
+        c.pos += len;
+        let vid = crate::value::value_id_of_bytes(&b);
+        web.values.entry(vid).or_insert(b);
+    }
+
+    let no = c.step(decode_varint)?;
+    for _ in 0..no {
+        let origin = c.step(decode_id)?;
+        let kind = c.byte()?;
+        let len = c.step(decode_varint)?;
+        let inner = bytes
+            .get(c.pos..c.pos + len)
+            .ok_or(DecodeError::UnexpectedEof)?;
+        c.pos += len;
+        let obj = match kind {
+            OBJ_MAP => Object::Map(decode_hashkv(inner)?),
+            OBJ_SEQ => Object::Seq(decode_hashseq(inner)?),
+            other => return Err(DecodeError::InvalidOpTag(other)),
+        };
+        // Rebuild the replica-local routing table from the object's
+        // applied ids (never on the wire).
+        match &obj {
+            Object::Seq(s) => {
+                for id in s.ids.iter().skip(1) {
+                    web.node_home.insert(*id, origin);
+                }
+            }
+            Object::Map(m) => {
+                for id in m.nodes.keys() {
+                    web.node_home.insert(*id, origin);
+                }
+            }
+        }
+        web.objects.insert(origin, obj);
+    }
+
+    let held = c.step(decode_varint)?;
+    for _ in 0..held {
+        let (op, used) = decode_op(&bytes[c.pos..])?;
+        c.pos += used;
+        match op {
+            EncodableOp::Node(node) => web.apply(node),
+            EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
+        }
+    }
+    Ok(web)
+}
+
+/// Strict acceptance for web snapshots (see `decode_hashseq_strict`).
+pub fn decode_hashweb_strict(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
+    let web = decode_hashweb(bytes)?;
+    if encode_hashweb(&web) != bytes {
+        return Err(DecodeError::NotCanonical);
+    }
+    Ok(web)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2147,6 +2481,165 @@ mod tests {
         let decoded = decode_hashseq(&encoded).unwrap();
 
         original_str == decoded.iter().collect::<String>() && seq == decoded
+    }
+}
+
+#[cfg(test)]
+mod family_wire {
+    use super::*;
+    use crate::value::Value;
+    use quickcheck_macros::quickcheck;
+
+    fn s(v: &str) -> Value {
+        Value::String(v.into())
+    }
+
+    fn kv_script(kv: &mut HashKv, ops: &[(u8, u8, bool)]) {
+        for &(k, v, del) in ops {
+            let key = Value::Int(k as i64 % 4);
+            if del {
+                kv.del(key);
+            } else {
+                kv.put(key, Value::Int(v as i64));
+            }
+        }
+    }
+
+    fn kv_reads(kv: &HashKv) -> Vec<(i64, crate::hashkv::Read)> {
+        (0..4).map(|k| (k, kv.read(&Value::Int(k)))).collect()
+    }
+
+    #[test]
+    fn kv_roundtrip_preserves_reads_and_values() {
+        let mut kv = HashKv::default();
+        kv.put(s("name"), s("david"));
+        kv.put(s("n"), Value::Int(7));
+        kv.del(s("n"));
+        kv.put(s("n"), Value::Int(9));
+
+        let bytes = encode_hashkv(&kv);
+        let decoded = decode_hashkv_strict(&bytes).expect("strict");
+        assert_eq!(decoded, kv);
+        assert_eq!(kv_reads(&decoded), kv_reads(&kv));
+        assert_eq!(decoded.get(&s("name")), Some(s("david")), "artifacts travel");
+        assert_eq!(decoded.get(&s("n")), Some(Value::Int(9)));
+        assert_eq!(decoded.tips(), kv.tips());
+    }
+
+    #[test]
+    fn kv_gated_and_conflicts_roundtrip() {
+        let mut a = HashKv::default();
+        let mut b = HashKv::default();
+        a.put(s("k"), s("from-a"));
+        b.put(s("k"), s("from-b"));
+        a.merge(b);
+        // a seq op gates in a map — must survive the wire as quarantine
+        let origin = a.origin();
+        a.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(origin, 'x'),
+        });
+        assert_eq!(a.delivery.gated.len(), 1);
+
+        let decoded = decode_hashkv_strict(&encode_hashkv(&a)).expect("strict");
+        assert_eq!(decoded, a);
+        assert_eq!(decoded.delivery.gated.len(), 1);
+        assert!(matches!(
+            decoded.read(&s("k")),
+            crate::hashkv::Read::Conflict(_)
+        ));
+    }
+
+    /// Equal op sets (and stores) encode identically across merge orders.
+    #[quickcheck]
+    fn prop_kv_bytes_canonical(a: Vec<(u8, u8, bool)>, b: Vec<(u8, u8, bool)>) -> bool {
+        let mut kv_a = HashKv::default();
+        let mut kv_b = HashKv::default();
+        kv_script(&mut kv_a, &a);
+        kv_script(&mut kv_b, &b);
+        let mut ab = kv_a.clone();
+        ab.merge(kv_b.clone());
+        let mut ba = kv_b;
+        ba.merge(kv_a);
+        let bytes = encode_hashkv(&ab);
+        bytes == encode_hashkv(&ba)
+            && encode_hashkv(&decode_hashkv(&bytes).unwrap()) == bytes
+            && decode_hashkv_strict(&bytes).is_ok()
+    }
+
+    #[test]
+    fn web_roundtrip_block_document() {
+        let mut doc = HashWeb::default();
+        let root = doc.root_id();
+        let block = doc.new_map(&root, s("block-1")).unwrap();
+        let content = doc.new_seq(&block, s("content")).unwrap();
+        doc.put(&block, s("color"), s("blue"));
+        doc.text_insert(&content, 0, "hello world");
+        let inner = doc.seq_new_object(&content, 5, Value::NewSeq).unwrap();
+        doc.text_insert(&inner, 0, "embedded");
+
+        let bytes = encode_hashweb(&doc);
+        let decoded = decode_hashweb_strict(&bytes).expect("strict");
+        assert_eq!(decoded, doc);
+        assert_eq!(decoded.text(&inner).unwrap(), "embedded");
+        // Register state is intact in the inner map; artifact bytes resolve
+        // through the document-wide store (inner stores are replica-local
+        // views and deliberately not canonical snapshot state).
+        assert!(matches!(
+            decoded.map(&block).unwrap().read(&s("color")),
+            crate::hashkv::Read::One(_)
+        ));
+        assert_eq!(decoded.get(&block, &s("color")), Some(s("blue")));
+        // Routing survives: an edit applied to the decoded copy routes home.
+        let mut decoded = decoded;
+        decoded.text_insert(&inner, 8, "!");
+        assert_eq!(decoded.text(&inner).unwrap(), "embedded!");
+    }
+
+    #[test]
+    fn web_parked_orphans_roundtrip() {
+        // A child's ops without their creation op park document-wide; the
+        // snapshot carries them and decode re-parks.
+        let mut a = HashWeb::default();
+        let root = a.root_id();
+        let child = a.new_seq(&root, s("t")).unwrap();
+        a.text_insert(&child, 0, "x");
+        let child_nodes = a.seq(&child).unwrap().all_nodes();
+
+        let mut fresh = HashWeb::new(root);
+        for (id, node) in child_nodes {
+            fresh.apply_with_id(id, node);
+        }
+        assert_eq!(fresh.orphans().count(), 1);
+
+        let decoded = decode_hashweb_strict(&encode_hashweb(&fresh)).expect("strict");
+        assert_eq!(decoded.orphans().count(), 1);
+        // Delivering the root ops to the decoded copy wakes the parked op.
+        let mut decoded = decoded;
+        for (id, node) in a.root().all_nodes() {
+            decoded.apply_with_id(id, node);
+        }
+        assert_eq!(decoded.orphans().count(), 0);
+        assert_eq!(decoded.text(&child).unwrap(), "x");
+    }
+
+    #[test]
+    fn web_bytes_canonical_across_merge_orders() {
+        let mut base = HashWeb::default();
+        let root = base.root_id();
+        let text = base.new_seq(&root, s("text")).unwrap();
+        let meta = base.new_map(&root, s("meta")).unwrap();
+
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.text_insert(&text, 0, "hello");
+        r2.put(&meta, s("status"), s("draft"));
+
+        let mut m1 = r1.clone();
+        m1.merge(r2.clone());
+        let mut m2 = r2;
+        m2.merge(r1);
+        assert_eq!(encode_hashweb(&m1), encode_hashweb(&m2));
     }
 }
 

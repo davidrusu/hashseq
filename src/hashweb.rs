@@ -41,10 +41,10 @@ pub struct HashWeb {
     /// Objects by origin id. The root is a `Map` (the block-document
     /// default); children are created by ops whose payload/value is a
     /// creation artifact.
-    objects: FxHashMap<Id, Object>,
+    pub(crate) objects: FxHashMap<Id, Object>,
     /// node id -> the origin id of the object it belongs to (the routing
     /// table — replica-local, derived, never on the wire).
-    node_home: IdMap<Id>,
+    pub(crate) node_home: IdMap<Id>,
     /// Document-wide delivery: refs cross objects at creation bridges, so
     /// parking is global (each object's own buffer stays empty). The gate
     /// here holds ops whose refs determine no single object; kind-vs-object
@@ -52,7 +52,7 @@ pub struct HashWeb {
     /// on merge.
     pub(crate) delivery: Delivery,
     /// Value-artifact side store shared across objects.
-    values: IdMap<Vec<u8>>,
+    pub(crate) values: IdMap<Vec<u8>>,
 }
 
 impl PartialEq for HashWeb {

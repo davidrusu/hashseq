@@ -202,15 +202,33 @@ it and costs the stream one dict spill. No input makes decode superlinear.
 
 ## Interaction with the family
 
-One stream, one order, all layers: HashWeb snapshots interleave blocks of
-all objects and layers (creation bridges connect the DAG, so the dependency
-order spans objects; blocks carry their object route per HASHWEB_SPEC.md).
-Each layer brings its chain analog as a block kind — kv write-runs (session
-chains), mark ops (individually encoded, MARKS.md), move chains — with the
-same ref forms addressing into any earlier block. Standalone hashseq is the
-one-object special case. Blob payloads are content-addressed side objects,
-not op-stream bytes (their hashes are; erasability per HASHWEB_SPEC.md is
-unaffected).
+*Code today* (2026-07-02): the family formats are canonical and nested.
+A **kv snapshot** is `[origin][puts][trailing][artifacts]` — applied kv
+nodes are all puts with causal refs, so the stream is a plain topological
+order (smallest id first among ready nodes; no cycle machinery) with a
+one-entry implicit dictionary (the origin) and rank refs; trailing
+(orphans + gated, id-sorted) carries full ids. A **web snapshot** is
+`[root][artifacts][objects][trailing]`: each object nests its own
+canonical stream, objects sorted by origin id — holonic: any object
+section is a complete replica root. Inner maps carry **no** artifact
+store; the composition has one document-wide artifact section (the union
+of the web store and inner stores — inner stores are replica-local views
+and would break byte canonicality across merge orders). Strict acceptance
+mirrors the seq (`decode_hashkv_strict` / `decode_hashweb_strict`).
+
+**Scope of the canonicality claim with artifacts**: op-stream sections are
+pure functions of the op set; artifact sections are functions of the
+replica's content-addressed store — equal op sets AND equal artifact
+stores encode identically (availability is not op-set state; blob
+payloads remain side objects, only their hashes are op-stream bytes, and
+erasability per HASHWEB_SPEC.md is unaffected).
+
+The fully interleaved single-stream form — blocks of all objects and
+layers in one dependency order, creation bridges connecting the DAG,
+blocks carrying their object route, kv write-run chains as a block kind —
+remains the target refinement of this same canonical form, worth taking
+when cross-object volumes justify shared dictionaries and positional refs
+across sections.
 
 ## Conformance obligations
 

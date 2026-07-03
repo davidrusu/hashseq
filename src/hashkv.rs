@@ -45,14 +45,14 @@ pub struct HashKv {
     origin: Id,
     /// Applied puts by node id (the register history — retention: keep all;
     /// the supersession spine is what the read rules walk).
-    nodes: IdMap<HashNode>,
+    pub(crate) nodes: IdMap<HashNode>,
     /// key value-id -> register. Keyed by the key's id — already a BLAKE3
     /// output, so FxHash is safe (the HASHKV_SPEC key rule: adversarial key
     /// bytes cost their author derivation, never a table).
     keys: IdMap<KeyState>,
     /// Value-artifact side store: artifact bytes by value id, for the ids
     /// this replica has seen bytes for. Reads without bytes are `pending`.
-    values: IdMap<Vec<u8>>,
+    pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Parked orphans + the gate (non-map ops quarantine — the edge table).
     pub(crate) delivery: Delivery,
