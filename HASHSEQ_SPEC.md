@@ -226,9 +226,11 @@ placement:
 
 ### Self-move
 
-`to` resolving into `target`'s own move chain is syntactically checkable and
-stable → apply-time quarantine (same gate class as inverted spans,
-MARKS.md).
+`to` naming `target` itself is contentless and stable → apply-time
+quarantine (same gate class as inverted spans, MARKS.md). Destinations on
+move ops — including ops of `target`'s own chain — are well-defined and
+admitted: excision precedes placement and an op's rank is permanent, so
+"move x to where that op placed it" renders at the op's splice point.
 
 ## Apply
 

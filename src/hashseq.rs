@@ -2024,10 +2024,18 @@ impl HashSeq {
         // quarantined before touching tips or the index. They never intern,
         // so dependents stay parked (the correct edge-table semantics).
         let admitted = match &node.op {
-            // Inserts of any payload: a char, or an opaque value commitment
-            // id (validation-free by design — availability-independent
-            // identity, HASHSEQ_SPEC "Payload"). Removes likewise.
-            Op::Insert { .. } | Op::Remove(_) => true,
+            // The Insert.at row: the anchor must be a glued point — an
+            // element, a move op's splice point, or the origin. Anything
+            // else (a remove op, a mark op) gates: there is no gap to claim
+            // at a node that never renders. Payloads are never checked
+            // (opaque commitments — HASHSEQ_SPEC "Payload").
+            Op::Insert { at, .. } => self.idx_of(at.id()).is_some_and(|a| {
+                matches!(self.loc_of(a), Loc::Run { .. } | Loc::Origin | Loc::MoveOp)
+            }),
+            // Removes admit unconditionally: a target that is not an insert
+            // is inert (its tombstone bit references nothing rendered),
+            // never an error.
+            Op::Remove(_) => true,
             // The Move rows of the edge table (all stable — every input is a
             // hash-committed fact about already-applied referents):
             // target must be an element of THIS seq; the destination must be
@@ -4439,6 +4447,39 @@ mod test {
         seq.remove(pos);
         assert_eq!(seq.iter().collect::<String>(), "ab");
         assert_eq!(seq.payload_of(&atom), Some(v), "column persists for tombstones");
+    }
+
+    /// The Insert.at gate row: anchors must be glued points (elements,
+    /// move ops, the origin) — an insert anchored at a remove or mark op
+    /// quarantines instead of creating unrenderable content (or worse).
+    #[test]
+    fn insert_at_non_glued_anchor_gates() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let rm = seq.remove_batch(0, 1).unwrap();
+        let a = seq.id_at(0).unwrap();
+        let mk = seq.mark_range(
+            Anchor::Before(a),
+            Anchor::After(a),
+            crate::value::Value::String("b".into()).value_id(),
+            crate::value::Value::Bool(true).value_id(),
+        );
+
+        for anchor in [rm.id(), mk.id()] {
+            seq.apply(HashNode {
+                pins: BTreeSet::new(),
+                op: Op::insert_after(anchor, 'X'),
+            });
+        }
+        assert_eq!(seq.delivery.gated.len(), 2);
+        assert_eq!(seq.iter().collect::<String>(), "b");
+        check_index_matches_iter(&seq);
+        // ...and the doc still roundtrips with the quarantined pair aboard.
+        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
+            &seq,
+        ))
+        .expect("strict");
+        assert_eq!(decoded.delivery.gated.len(), 2);
     }
 
     // ---- marks (the span-annotation projection, MARKS.md) ----

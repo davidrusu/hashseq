@@ -108,9 +108,9 @@ verdicts that are total, convergent, and stable:
 | `Insert . at` | insert, move op (its splice point), or the object's origin id — in one `Seq` | gate |
 | `Remove . target` | insert, in the op's own `Seq` | inert (non-insert); gate (cross-object, via routing) |
 | `Move . target` | insert, in the object `to` resolves in (same-container rule) | gate |
-| `Move . to` | insert, move op, or the origin id — in `target`'s object; not inside `target`'s own move chain (self-move) | gate |
-| `Mark . anchor` (start, end) | insert or the origin id, in one `Seq`; inverted spans gate (MARKS.md) | gate — including move-op splice points, for now (loosening candidate, below) |
-| `Mark . overwrites` | mark ops | gate (non-mark). Suppression additionally filters to same `kind_v` and overlapping coverage — definitional, never gated |
+| `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the origin id — in `target`'s object; not `target` itself (self-move) | gate |
+| `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the origin id, in one `Seq`; inverted spans gate (MARKS.md) | gate |
+| `Mark . overwrites` | — | never gated: entries that are not covering same-kind marks are ignored by the definitional suppression filter (same class as `Put . overwrites` — kind- and coverage-scoping live in the read, not the gate) |
 | `Put . overwrites` | — | never gated: entries that are not puts on the same key are ignored by the definitional head-set filter |
 | op kind vs object type | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Map` | gate |
 | routing | the op's refs must determine one object | gate |
