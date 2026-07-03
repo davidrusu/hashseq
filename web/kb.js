@@ -152,7 +152,10 @@ function persistNow(broadcast) {
     bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
   }
   localStorage.setItem(STORAGE_KEY, btoa(bin));
-  if (broadcast) channel.postMessage(bytes);
+  if (broadcast) {
+    channel.postMessage(bytes);
+    if (wsReady) ws.send(bytes);
+  }
   statObjects.textContent = web.objectCount();
   statBytes.textContent = fmtBytes(bytes.length);
   statParked.textContent = web.orphanCount();
@@ -170,11 +173,72 @@ channel.onmessage = (e) => {
   const mine = persistNow(false);
   // Canonical bytes: equal op sets ⟺ identical snapshots. Re-broadcast only
   // while we know something they don't; equality ends the exchange.
-  if (mine.length !== theirs.length || !mine.every((b, i) => b === theirs[i])) {
+  if (!bytesEqual(mine, theirs)) {
     channel.postMessage(mine);
   }
   render();
 };
+
+// ---- server sync (hashweb-sync relay) ----------------------------------------
+//
+// Same protocol as the tab channel, over a WebSocket: on join the server
+// sends its canonical state; local changes send our snapshot; the server
+// merges (it is a replica, not a proxy of trust) and broadcasts the
+// merged canonical bytes. We reply only while our bytes differ — byte
+// equality quiesces the exchange.
+
+let ws = null;
+let wsReady = false;
+let wsRetry = 1000;
+
+function bytesEqual(a, b) {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+function setSyncStatus(live) {
+  const dot = document.getElementById('sync-dot');
+  if (live) {
+    dot.style.color = 'var(--green)';
+    dot.textContent = '● LIVE — synced via server; other tabs merge locally too';
+  } else {
+    dot.style.color = 'var(--amber)';
+    dot.textContent = '◌ LOCAL — no sync server; tabs on this machine still merge';
+  }
+}
+
+function connectSync() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  let sock;
+  try {
+    sock = new WebSocket(`${proto}://${location.host}/sync`);
+  } catch (_) {
+    return; // file:// etc.
+  }
+  sock.binaryType = 'arraybuffer';
+  sock.onopen = () => {
+    ws = sock;
+    wsReady = true;
+    wsRetry = 1000;
+    setSyncStatus(true);
+    sock.send(snapshotBytes()); // offer what we know
+  };
+  sock.onmessage = (e) => {
+    const theirs = new Uint8Array(e.data);
+    web.mergeEncoded(theirs);
+    const mine = persistNow(false);
+    if (!bytesEqual(mine, theirs)) sock.send(mine);
+    render();
+  };
+  sock.onclose = () => {
+    wsReady = false;
+    setSyncStatus(false);
+    setTimeout(connectSync, wsRetry);
+    wsRetry = Math.min(wsRetry * 2, 15000);
+  };
+  sock.onerror = () => sock.close();
+}
+
+if (location.protocol.startsWith('http')) connectSync();
 
 function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
