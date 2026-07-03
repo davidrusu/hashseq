@@ -256,3 +256,26 @@ The deterministic-migration idea (derive new origins from existing op ids,
 so concurrent migrations converge) falls out of the identity design for
 free and should be the blessed idiom — worth an APP-conventions section
 somewhere once there are two apps.
+
+## 13. Links: names vs capabilities, now visible in the UI (2026-07-03)
+
+Page links are link atoms whose payload is the target page's **object id**
+— a pure name. Embeds (tables) carry **origins** — instantiation
+capabilities. Note #1's asymmetry became a live UI distinction:
+
+- A link to a page that exists renders as navigation; a link to a page
+  that was unlinked from the tree renders as a struck-through name (the
+  object may still exist — the link is honest about reachability, and the
+  ops behind it still verify). Dangling links are a *rendering state*, not
+  an error.
+- The renderer must classify a raw 32-byte payload with heuristics: known
+  page object id → link; id whose derived seq object exists → table embed;
+  otherwise an inert chip. Crucially the unknown case must NOT auto-open —
+  `createSeq(payload)` on an arbitrary id is a write that mints a bogus
+  object (the first embed renderer did exactly this bug). Classification
+  by probing is workable but smells; the clean fix remains a tagged value
+  artifact (`link:<id>` vs `embed:<origin>`) — an app-vocabulary change,
+  no system change.
+
+**Feedback**: reinforces #1 and #6. If a second app appears, the tagged
+value vocabulary should be shared, not re-invented.

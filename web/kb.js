@@ -327,12 +327,42 @@ function applyDiff(obj, prev, next) {
   if (endNext > start) web.textInsert(obj, start, next.slice(start, endNext));
 }
 
-/// An embedded object at body position `idx` — by app convention a table:
-/// a seq of row refs, each row a seq of cell refs, each cell a text seq.
+/// An embedded object at position `idx`. The payload is a raw id — the
+/// app's conventions decide its face: a known page's OBJECT id is a link
+/// (pure name, navigates); a table's ORIGIN renders the table inline; an
+/// id we can't classify renders as an inert chip (never auto-opened —
+/// opening is a write).
 function renderEmbed(idx) {
-  const origin = web.payloadAt(renderTargetObj, idx);
-  if (!origin) return document.createTextNode(ATOM);
-  return objTableNode(web.createSeq(origin));
+  const payload = web.payloadAt(renderTargetObj, idx);
+  if (!payload) return document.createTextNode(ATOM);
+  if (pageMeta.has(payload) || web.isKv(payload)) return pageLinkNode(payload);
+  const tableObj = WasmHashWeb.seqId(payload);
+  if (web.isSeq(tableObj)) return objTableNode(tableObj);
+  const chip = document.createElement('span');
+  chip.className = 'page-link broken';
+  chip.textContent = `⟨${payload.slice(0, 8)}…⟩`;
+  chip.title = 'unknown object reference';
+  return chip;
+}
+
+function pageLinkNode(pageObj) {
+  const inTree = pageMeta.has(pageObj);
+  const title = inTree
+    ? pageMeta.get(pageObj).title
+    : (stringsOf(pageObj, 'title')[0] ?? 'untitled');
+  const a = document.createElement('span');
+  a.className = 'page-link' + (inTree ? '' : ' broken');
+  a.textContent = `§ ${title}`;
+  if (inTree) {
+    a.title = 'go to page';
+    a.onclick = () => {
+      current = pageObj;
+      render();
+    };
+  } else {
+    a.title = 'page object exists but is not reachable from the workspace tree';
+  }
+  return a;
 }
 
 function objTableNode(tableObj) {
@@ -1023,6 +1053,56 @@ document.getElementById('insert-table').onclick = () => {
   web.seqInsertRef(blockObj, at, tableOrigin);
   persistSoon();
   setViewMode(viewMode === 'edit' ? 'split' : viewMode); // show the table, keep editing
+};
+
+document.getElementById('insert-link').onclick = (e) => {
+  if (!current || viewMode === 'view') return;
+  const ta = focusedTA();
+  if (!ta) return;
+  const blockObj = ta.dataset.blockObj;
+  const at = Math.min(ta.selectionStart ?? ta.value.length, ta.value.length);
+  document.getElementById('link-menu')?.remove();
+
+  const menu = document.createElement('div');
+  menu.id = 'link-menu';
+  const head = document.createElement('div');
+  head.className = 'lm-head';
+  head.textContent = 'LINK TO PAGE';
+  menu.appendChild(head);
+  const emit = (pages, depth) => {
+    for (const p of pages) {
+      const meta = pageMeta.get(p);
+      const item = document.createElement('div');
+      item.className = 'lm-item';
+      item.style.paddingLeft = `${10 + depth * 14}px`;
+      item.textContent = (p === current ? '◦ ' : '') + meta.title;
+      item.onclick = () => {
+        menu.remove();
+        // The link atom's payload is the page's OBJECT id — a pure name.
+        web.seqInsertRef(blockObj, at, p);
+        persistSoon();
+        if (viewMode === 'split') renderPreview();
+        ta.focus();
+        ta.setSelectionRange(at + 1, at + 1);
+      };
+      menu.appendChild(item);
+      emit(meta.subpages, depth + 1);
+    }
+  };
+  emit(rootPages, 0);
+  if (rootPages.length === 0) {
+    const none = document.createElement('div');
+    none.className = 'lm-item';
+    none.textContent = '(no pages)';
+    menu.appendChild(none);
+  }
+  const r = e.target.getBoundingClientRect();
+  menu.style.left = `${r.left}px`;
+  menu.style.top = `${r.bottom + 4}px`;
+  document.body.appendChild(menu);
+  setTimeout(() => {
+    document.addEventListener('click', () => menu.remove(), { once: true });
+  }, 0);
 };
 
 for (const btn of document.querySelectorAll('#fmt-tools button')) {

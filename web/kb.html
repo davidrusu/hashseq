@@ -153,6 +153,24 @@
   #preview td:focus { background:#ece5d3; }
   #preview .table-tools { display:flex; gap:6px; margin-top:4px; }
   #preview .table-tools button { font-size:10px; letter-spacing:1px; }
+  .page-link {
+    color:var(--blue); cursor:pointer; text-decoration:underline dotted;
+    text-underline-offset:3px;
+  }
+  .page-link:hover { background:#ece5d3; }
+  .page-link.broken { color:var(--muted); cursor:default; text-decoration:line-through; }
+  #link-menu {
+    position:absolute; z-index:10; background:var(--paper2); border:1px solid var(--ink);
+    box-shadow:3px 3px 0 rgba(27,24,22,0.15); font-size:12px; min-width:180px;
+    max-height:260px; overflow-y:auto;
+  }
+  #link-menu .lm-head {
+    padding:5px 10px; font-size:10px; letter-spacing:2px; color:var(--muted);
+    font-weight:600; border-bottom:1px solid var(--grid);
+  }
+  #link-menu .lm-item { padding:5px 10px; cursor:pointer; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }
+  #link-menu .lm-item:hover { background:#ece5d3; }
   #preview .comment-hl {
     background:rgba(200,120,45,0.22); border-bottom:1.5px solid var(--amber);
     cursor:help;
@@ -223,6 +241,7 @@
           <button data-mark="clear" title="remove formatting marks">CLEAR</button>
           <button data-mark="comment" title="comment on the selection (mark)">COMMENT</button>
           <button id="insert-table" title="insert a table object at the caret">TABLE</button>
+          <button id="insert-link" title="link to another page (a link atom naming its object id)">LINK</button>
         </div>
       </div>
       <div id="work">
