@@ -447,3 +447,27 @@ Also from this session: the extension's synthesized input needs a real
 click after a page reload before keystrokes route (automation quirk, not
 app); coordinates go stale as KaTeX/layout settle — element-rect lookups
 immediately before clicking are mandatory.
+
+## 19. Images: the value side store earns its keep (2026-07-03)
+
+An image is nothing new: a `Value::Bytes` artifact, embedded as an atom
+whose payload is the artifact's value id. Everything the side store
+promised showed up in practice: identical images dedupe to one artifact;
+content-addressing makes the blob-URL cache sound forever (bytes can
+never change under an id); artifacts ride the existing snapshot artifact
+section, so images sync through the relay server with zero new protocol;
+and the erasability story (drop bytes, keep id — ops still verify)
+applies to images exactly as HASHWEB_SPEC describes.
+
+The cost is also exactly where the spec said it would be: **snapshots
+carry every artifact**, so each sync exchange now hauls all images. The
+app mitigates (client-side downscale to ≤1400px WebP), but this is the
+"large values sync lazily" gap made concrete — the wire has no
+have/want negotiation for artifacts. Together with #8 (delta outbox),
+that's the sync-protocol work the live-collab deployment will motivate
+first.
+
+**Feedback**: the pending/unavailable value state (HASHWEB_SPEC) now has
+an obvious UI: an image whose bytes were erased or haven't arrived
+should render as a placeholder chip with its id — worth adding when
+lazy artifact sync exists.
