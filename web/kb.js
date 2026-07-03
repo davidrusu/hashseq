@@ -1118,6 +1118,11 @@ function renderBlocks() {
       const next = extractText(ta);
       applyDiff(b.obj, ta.dataset.prev, next);
       ta.dataset.prev = next;
+      const ruled = maybeInputRule(ta, b.obj, e.data);
+      if (ruled != null) {
+        clearTimeout(normalizeTimer);
+        rerenderBlock(ta, b.obj, ruled);
+      }
       if (viewMode === 'split') {
         renderPreview();
         renderComments();
@@ -1406,6 +1411,100 @@ function ensureBody() {
   web.putRef(current, 'body', origin);
   currentBody = web.createSeq(origin);
   return currentBody;
+}
+
+// ---- input rules: markup typed inline becomes marks -------------------------
+//
+// Typing the closing delimiter converts the span to a MARK and deletes the
+// delimiters from the seq: `x` → code, $x$ → math, $$x$$ → equation block,
+// a closing ``` fence → code block (language from the opening fence). The
+// mark is authored BEFORE the delimiters are removed — their elements are
+// live anchors at mark time, and the regional points survive on their
+// ghosts after the tombstone.
+
+function flagsAt(blockObj, pos) {
+  let off = 0;
+  for (const sp of styledSpans(blockObj)) {
+    off += sp.text.length;
+    if (pos < off) return sp;
+  }
+  return null;
+}
+
+function plainAt(blockObj, pos) {
+  const f = flagsAt(blockObj, pos);
+  return !f || (!f.code && !f.math && f.codeblock === null && !f.eqblock);
+}
+
+/// Ran after the typed char is already in the seq. Returns the new caret
+/// offset when a rule fired, else null.
+function maybeInputRule(ed, blockObj, typed) {
+  if (typed !== '`' && typed !== '$') return null;
+  const text = ed.dataset.prev;
+  const caret = caretOffsetIn(ed);
+  if (caret == null || caret === 0) return null;
+  const p = caret - 1;
+  if (text[p] !== typed) return null;
+
+  if (typed === '`') {
+    // Closing fence: the line up to the caret is exactly ``` .
+    const lineStart = text.lastIndexOf('\n', p - 1) + 1;
+    if (text.slice(lineStart, caret) === '```' && (caret === text.length || text[caret] === '\n')) {
+      let at = lineStart - 1;
+      while (at > 0) {
+        const os = text.lastIndexOf('\n', at - 1) + 1;
+        const line = text.slice(os, at);
+        if (line.startsWith('```')) {
+          const lang = line.slice(3).trim();
+          const co = os + line.length + 1; // content start (after fence newline)
+          const ce = lineStart - 1; // the newline before the closing fence
+          if (ce <= co) return null; // empty fence
+          web.markRange(blockObj, co, ce, 'codeblock', lang);
+          web.textRemove(blockObj, ce, caret - ce); // "\n```"
+          web.textRemove(blockObj, os, co - os); // "```lang\n"
+          return ce - (co - os);
+        }
+        at = os - 1;
+      }
+      return null;
+    }
+    // Inline code: `content`
+    const i = text.lastIndexOf('`', p - 1);
+    if (i === -1) return null;
+    const content = text.slice(i + 1, p);
+    if (!content || content.includes('\n') || content.includes(ATOM)) return null;
+    if (!plainAt(blockObj, i + 1) || !plainAt(blockObj, i)) return null;
+    web.markRange(blockObj, i + 1, p, 'code', 'on');
+    web.textRemove(blockObj, p, 1);
+    web.textRemove(blockObj, i, 1);
+    return p - 1;
+  }
+
+  // '$' rules.
+  if (text[p - 1] === '$') {
+    // $$content$$ on one line → equation block.
+    const k = text.lastIndexOf('$$', p - 2);
+    if (k === -1) return null;
+    const content = text.slice(k + 2, p - 1);
+    if (!content || content.includes('\n') || content.includes('$') || content.includes(ATOM)) {
+      return null;
+    }
+    if (!plainAt(blockObj, k + 2) || !plainAt(blockObj, k)) return null;
+    web.markRange(blockObj, k + 2, p - 1, 'eqblock', 'on');
+    web.textRemove(blockObj, p - 1, 2);
+    web.textRemove(blockObj, k, 2);
+    return p - 3;
+  }
+  // $content$ → inline math.
+  const i = text.lastIndexOf('$', p - 1);
+  if (i === -1 || text[i - 1] === '$') return null;
+  const content = text.slice(i + 1, p);
+  if (!content || content.includes('\n') || content.includes(ATOM)) return null;
+  if (!plainAt(blockObj, i + 1) || !plainAt(blockObj, i)) return null;
+  web.markRange(blockObj, i + 1, p, 'math', 'on');
+  web.textRemove(blockObj, p, 1);
+  web.textRemove(blockObj, i, 1);
+  return p - 1;
 }
 
 /// Every block the current selection touches, with per-block offsets —
