@@ -109,15 +109,18 @@
   /* ---- editor ---- */
   #editor-pane { flex:1; display:flex; flex-direction:column; min-width:0; }
   #crumbs {
-    padding:8px 22px; font-size:11px; color:var(--muted); letter-spacing:1px;
-    border-bottom:1px solid var(--grid); display:flex; gap:6px; align-items:center;
+    padding:8px 32px; font-size:11px; color:var(--muted); letter-spacing:1px;
+    display:flex; gap:6px; align-items:center;
+    max-width:var(--measure); margin:0 auto; width:100%;
   }
   #crumbs span.link { cursor:pointer; text-decoration:underline dotted; }
   #crumbs span.link:hover { color:var(--ink); }
+  :root { --measure: 46rem; }
   #title {
     font-family:inherit; font-size:24px; font-weight:600; color:var(--ink);
-    background:transparent; border:none; outline:none; padding:18px 22px 6px;
-    letter-spacing:0.5px; width:100%;
+    background:transparent; border:none; outline:none; padding:18px 0 6px;
+    letter-spacing:0.5px; width:100%; max-width:var(--measure); margin:0 auto;
+    display:block; padding-left:32px; padding-right:32px;
   }
   #title::placeholder { color:var(--muted); }
   #conflict-bar {
@@ -125,7 +128,7 @@
     border:1px solid var(--red); color:var(--red); background:rgba(178,58,46,0.06);
   }
   #conflict-bar b { letter-spacing:2px; }
-  #fmt-row { display:flex; align-items:center; gap:16px; margin:12px 22px 0; }
+  #fmt-row { display:flex; align-items:center; gap:16px; margin:2px auto 8px; max-width:var(--measure); width:100%; padding:0 32px; }
   .fmt-hint { color:var(--muted); font-size:11px; letter-spacing:0.5px; }
   .fmt-hint b { color:var(--ink); border:1px solid var(--grid); padding:0 4px; }
   #view-tabs { display:flex; width:fit-content; border:1px solid var(--ink); }
@@ -158,12 +161,13 @@
   #view-tabs button { border:none; border-right:1px solid var(--ink); }
   #view-tabs button:last-child { border-right:none; }
   #view-tabs button.active { background:var(--ink); color:var(--paper); }
-  #work { flex:1; display:flex; gap:10px; margin:8px 22px 10px; min-height:0; }
-  #blocks, #preview {
-    flex:1; min-width:0; padding:10px; outline:none;
+  #work { flex:1; display:flex; margin:0 22px 14px; min-height:0; overflow-y:auto; padding-top:2px; }
+  #blocks {
+    flex:1; min-width:0; max-width:var(--measure); margin:0 auto; height:fit-content;
+    padding:22px 32px 40px;
+    background:rgba(246,241,229,0.85); border:1px solid var(--ink);
+    box-shadow:2px 3px 0 rgba(27,24,22,0.10);
     font-family:inherit; font-size:14px; line-height:1.65; color:var(--ink);
-    background:rgba(246,241,229,0.75); border:1px solid var(--ink);
-    overflow-y:auto;
   }
   .block-row { display:flex; align-items:flex-start; gap:4px; padding:2px 0; position:relative; }
   .block-row.drop-above::before {
@@ -369,11 +373,6 @@
       <input id="title" placeholder="Untitled" spellcheck="false" autocomplete="off">
       <div id="conflict-bar"></div>
       <div id="fmt-row">
-        <div id="view-tabs">
-          <button id="tab-edit" class="active">EDIT</button>
-          <button id="tab-split">SPLIT</button>
-          <button id="tab-view">VIEW</button>
-        </div>
         <div class="fmt-hint">Select text to format · type <b>/</b> for blocks</div>
         <input id="image-file" type="file" accept="image/*" style="display:none">
       </div>
@@ -386,7 +385,6 @@
       <div id="slash-menu"></div>
       <div id="work">
         <div id="blocks"></div>
-        <div id="preview" style="display:none"></div>
       </div>
       <div id="page-tools">
         <button id="new-subpage">+ SUBPAGE</button>

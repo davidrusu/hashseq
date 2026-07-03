@@ -284,10 +284,7 @@ const crumbsEl = document.getElementById('crumbs');
 const titleEl = document.getElementById('title');
 const conflictEl = document.getElementById('conflict-bar');
 const blocksEl = document.getElementById('blocks');
-const previewEl = document.getElementById('preview');
-const tabEditEl = document.getElementById('tab-edit');
-const tabSplitEl = document.getElementById('tab-split');
-const tabViewEl = document.getElementById('tab-view');
+
 const toolsEl = document.getElementById('page-tools');
 const noPageEl = document.getElementById('no-page');
 const statObjects = document.getElementById('stat-objects');
@@ -296,7 +293,7 @@ const statParked = document.getElementById('stat-parked');
 
 let current = null; // pageObj hex
 let currentBody = null; // body seq obj hex (a seq of block refs)
-let viewMode = 'edit'; // 'edit' | 'split' | 'view'
+const viewMode = 'edit'; // WYSIWYG is the only mode now
 let renderTargetObj = null; // the seq renderBody is currently rendering
 let focusedBlockObj = null; // last-focused block (toolbar target)
 let dragFrom = null; // block index a drag started from
@@ -335,7 +332,7 @@ import('https://esm.sh/katex@0.16.11')
         if (ed === document.activeElement || ed.contains(document.activeElement)) continue;
         if (hasMath(ed.dataset.blockObj)) rerenderBlock(ed, ed.dataset.blockObj, null);
       }
-      if (viewMode !== 'edit') renderPreview();
+
     };
     if (document.activeElement?.closest?.('.block-ed, [contenteditable]')) {
       window.addEventListener('focusout', repaintMath, { once: true });
@@ -796,17 +793,7 @@ function renderBody(el, bodyObj) {
   }
 }
 
-function setViewMode(mode) {
-  viewMode = mode;
-  tabEditEl.classList.toggle('active', mode === 'edit');
-  tabSplitEl.classList.toggle('active', mode === 'split');
-  tabViewEl.classList.toggle('active', mode === 'view');
-  renderEditor();
-}
 
-tabEditEl.onclick = () => setViewMode('edit');
-tabSplitEl.onclick = () => setViewMode('split');
-tabViewEl.onclick = () => setViewMode('view');
 
 // ---- rendering ---------------------------------------------------------------
 
@@ -959,7 +946,6 @@ function renderEditor() {
   titleEl.style.display = has ? '' : 'none';
   document.getElementById('fmt-row').style.display = has ? '' : 'none';
   blocksEl.style.display = has ? '' : 'none';
-  previewEl.style.display = 'none';
   toolsEl.style.display = has ? '' : 'none';
   crumbsEl.style.display = has ? '' : 'none';
   noPageEl.style.display = has ? 'none' : '';
@@ -1020,12 +1006,7 @@ function renderEditor() {
 
   // Body: a seq of block refs. Each block is its own text seq.
   currentBody = bodyOf(current);
-  const editing = viewMode !== 'view';
-  const showPreview = viewMode !== 'edit';
-  blocksEl.style.display = editing ? '' : 'none';
-  previewEl.style.display = showPreview ? '' : 'none';
-  if (editing) renderBlocks();
-  if (showPreview) renderPreview();
+  renderBlocks();
   renderComments();
 }
 
@@ -1201,7 +1182,6 @@ function exposeRegion(ed, blockObj, kind, ord, caretOff) {
   if (ext) web.markRange(blockObj, ext[0], ext[1], kind, 'on');
   exposedRegion = { blockObj, kind, ord };
   rerenderBlock(ed, blockObj, caretOff);
-  if (viewMode === 'split') renderPreview();
   persistSoon();
 }
 
@@ -1524,10 +1504,6 @@ function makeBlockRow(obj) {
     ta.dataset.prev = next;
     if (did?.kind === 'insert') reconcileMarkAffinity(ta, obj, did.p, did.n);
     refreshSig(); // local edits are already on screen — no rebuild needed
-    if (viewMode === 'split') {
-      renderPreview();
-      renderComments();
-    }
     persistSoon();
     return did;
   };
@@ -1806,16 +1782,7 @@ function addBlockAtEnd(focus = true) {
   }
 }
 
-function renderPreview() {
-  previewEl.innerHTML = '';
-  if (!currentBody) return;
-  for (const b of blocksOf(currentBody)) {
-    const div = document.createElement('div');
-    div.className = 'block-view';
-    renderBody(div, b.obj);
-    previewEl.appendChild(div);
-  }
-}
+
 
 // ---- comments ----------------------------------------------------------------
 
@@ -2276,7 +2243,6 @@ function insertTableAt(ta, at) {
   web.seqInsertRef(blockObj, at, tableOrigin);
   persistSoon();
   rerenderBlock(ta, blockObj, at + 1); // the table appears in place
-  if (viewMode === 'split') renderPreview();
 }
 
 function toBlobAsync(canvas, type, quality) {
@@ -2339,7 +2305,6 @@ async function insertImageFile(file, ta, at) {
     web.seqInsertRef(blockObj, at, imgId);
     persistSoon();
     rerenderBlock(ta, blockObj, at + 1);
-    if (viewMode === 'split') renderPreview();
     toast(`Image added (${fmtBytes(bytes.length)})`);
   } catch (e) {
     console.error('[kb] image insert failed:', e);
@@ -2394,8 +2359,7 @@ function openLinkPicker(ta, at, anchorRect) {
         web.seqInsertRef(blockObj, at, p);
         persistSoon();
         rerenderBlock(ta, blockObj, at + 1); // the link appears in place
-        if (viewMode === 'split') renderPreview();
-      };
+          };
       menu.appendChild(item);
       emit(meta.subpages, depth + 1);
     }
@@ -2455,10 +2419,6 @@ function applyInlineMark(kind) {
   setSelectionRangeIn(ta, a, b);
   ta.focus();
   hideSelToolbar();
-  if (viewMode === 'split') {
-    renderPreview();
-    renderComments();
-  }
 }
 
 for (const btn of selToolbar.querySelectorAll('button')) {
@@ -2529,7 +2489,6 @@ function makeBlockKind(ta, kind) {
   web.markRangeClosed(obj, 0, len, kind, '');
   persistSoon();
   rerenderBlock(ta, obj, len);
-  if (viewMode === 'split') renderPreview();
 }
 
 function renderSlash(query) {
