@@ -82,6 +82,11 @@ under rules that are functions of `S` alone:
   Choosing the shallowest keeps blocks temporally contiguous, which keeps
   the block dependency graph near-acyclic and the dictionary small
   (measured: beats even arrival-order grouping — see Open problems 5).
+  Normatively: `refs(u)` is the node's full reference set (`pins ∪ named`,
+  FRAMEWORK.md) over every op kind, so depth — hence the whole derivation —
+  is a pure function of the op set; the rule governs insert chains and
+  remove chains alike (a remove link's extenders are the removes whose
+  pins are exactly its id).
 
 Block derivation must not consult replica storage. Stored chain groupings
 are arrival-order artifacts (under concurrency, whichever extension applied
