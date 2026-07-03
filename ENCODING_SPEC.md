@@ -47,14 +47,15 @@ id(u) = BLAKE3::derive_key(NODE_CONTEXT, encode_node(u))
 encoder; `HashNode::id` streams the identical bytes (locked by
 `id_preimage_is_the_canonical_encoding`), with a single-buffer fast path for
 the typing chain. The Part B stream is normalized: blocks derive from the
-op set (smallest-id chain continuation for insert chains; the pins-exactly-
-`{prev}` relation for remove chains, same fork rule) — equal op sets encode
-to identical bytes across replicas and delivery orders, asserted by the
-merge props and locked by the `canonical_snapshot_vector` test. Strict
-acceptance is `decode_hashseq_strict` (re-encode and compare). Measured
-cost of canonical grouping vs arrival grouping on the editing traces:
-encode-time unchanged, wire +4–8% on edit-heavy traces (dictionary spills
-from force-broken soft cycles — fork-rule-independent; see Open problems 5).
+op set (shallowest-extender chain continuation for insert chains; the
+pins-exactly-`{prev}` relation for remove chains, same fork rule) — equal
+op sets encode to identical bytes across replicas and delivery orders,
+asserted by the merge props and locked by the `canonical_snapshot_vector`
+test. Strict acceptance is `decode_hashseq_strict` (re-encode and
+compare). Measured on the editing traces: encode-time unchanged, wire
+1.6–5.1% SMALLER than the old arrival-order grouping (canonical joins
+chains storage kept split; causal-depth continuation keeps blocks
+temporally contiguous).
 
 ## Canonical snapshot
 
@@ -72,10 +73,15 @@ under rules that are functions of `S` alone:
   (anchor/target-link = prev). Members may carry additional refs: a run
   extends *through* interior extra-deps, which attach at their interior
   offset — typing across a delete does not split the canonical run.
-- **Fork rule: at a fork, the smallest-id extender continues the chain**;
-  every other extender heads its own block. Forks are true-concurrency
-  events and rare on honest edits; letting one branch continue keeps chains
-  as long and contiguous as sequential typing produces them.
+- **Fork rule: at a fork, the causally shallowest extender continues the
+  chain** (ties by smallest id); every other extender heads its own block.
+  Causal depth — `depth(u) = 1 + max depth(refs(u))`, origin 0 — is the
+  op-set-visible proxy for authoring time: the true typing continuation
+  was authored the moment after its anchor (depth ≈ anchor+1), while a
+  come-back-later fork child pins a later frontier and sits deeper.
+  Choosing the shallowest keeps blocks temporally contiguous, which keeps
+  the block dependency graph near-acyclic and the dictionary small
+  (measured: beats even arrival-order grouping — see Open problems 5).
 
 Block derivation must not consult replica storage. Stored chain groupings
 are arrival-order artifacts (under concurrency, whichever extension applied
@@ -232,18 +238,17 @@ unaffected).
 4. **Chunk alignment.** Byte-level dedupe across *versions* wants chunk
    boundaries that survive appends; blocks give natural boundaries — decide
    whether to spec a chunking discipline or leave it to storage.
-5. **Encoder cost — measured; fork rule exonerated.** Block derivation
-   from the op set is encode-time-only (build times and structure
-   checksums unchanged). Canonical bytes run +4–8% over arrival grouping
-   on edit-heavy traces, and the experiment (2026-07-02) shows the fork
-   rule is not the lever: a longest-continuation rule moves totals ±0.5%
-   (slightly worse). The entire delta is **dictionary growth** —
-   op-set-derived blocks span wider time ranges than arrival-order
-   storage, producing more force-broken soft cycles in the emission
-   order, each spilling full ids. Arrival grouping is near-optimal on
-   single-replica histories because it *is* the temporal order — exactly
-   what canonical derivation must not consult. Candidate levers if the
-   4–8% ever matters: same-block backward positional refs (needs a
-   two-pass run decode), or a cycle-aware emission heuristic (must stay
-   deterministic). The smallest-id rule stays — simplest, and as good as
-   anything measured.
+5. **Encoder cost — measured; resolved by the causal-depth fork rule.**
+   Block derivation from the op set is encode-time-only (build times and
+   structure checksums unchanged). The experiments (2026-07-02): a
+   smallest-id fork rule cost +4–8% wire vs arrival grouping, and a
+   longest-continuation rule was no better — the delta was never chain
+   cuts but **dictionary growth**: rules uncorrelated with authoring time
+   glue temporally distant segments into one block, producing
+   force-broken soft cycles in the emission order, each spilling full
+   ids. Causal depth is the op-set-visible proxy for authoring time;
+   the shallowest-extender rule reconstructs first-arrival grouping on
+   honest histories and additionally joins chains storage kept split —
+   final bytes 1.6–5.1% below the old arrival-order encoder. Residual
+   levers if ever needed: same-block backward positional refs (needs a
+   two-pass run decode), cycle-aware emission (must stay deterministic).

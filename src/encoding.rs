@@ -696,11 +696,96 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         elements: Vec<NodeIdx>,
     }
 
-    // Smallest-id After-child of an element. Stored-interior elements never
-    // carry explicit afters (forks split the stored run), so their stored
-    // successor is their only extender; at stored tails the Id-ordered
-    // `afters` set decides (move-op siblings are not extenders).
-    let smallest_after_child = |p: NodeIdx| -> Option<NodeIdx> {
+    // Causal depth of every applied node: depth(u) = 1 + max depth(refs(u)),
+    // origin = 0. Handles are allocated in apply order and a node's refs are
+    // always applied before it, so one forward pass suffices. The fork rule
+    // uses depth as the op-set-visible proxy for authoring time: the true
+    // typing continuation of p was authored the moment after p (its refs
+    // reach only ops that existed then, so depth ≈ depth(p)+1), while a
+    // come-back-later fork child pins a later frontier and sits deeper.
+    // Choosing the shallowest extender reconstructs first-arrival grouping
+    // on honest histories — from the op set alone — which keeps blocks
+    // temporally contiguous and the block graph near-acyclic (few dict
+    // spills; ENCODING_SPEC.md open problem 5).
+    let mut depth: Vec<u64> = vec![0; seq.ids.len()];
+    for i in 0..seq.ids.len() {
+        let idx = NodeIdx(i as u32);
+        let mut d = 0u64;
+        {
+            let mut bump = |r: NodeIdx| d = d.max(depth[r.0 as usize] + 1);
+            match seq.loc_of(idx) {
+                Loc::Origin => {}
+                Loc::Run { run, pos } => {
+                    let r = &seq.runs[&run];
+                    if pos > 0 {
+                        bump(r.elements[pos as usize - 1]);
+                        if let Some(p) = r.interior_extra_deps.get(&(pos as usize)) {
+                            for h in p.iter() {
+                                bump(h);
+                            }
+                        }
+                    } else {
+                        if let Some(a) = seq.idx_of(&r.anchor) {
+                            bump(a);
+                        }
+                        for h in r.first_extra_deps.iter() {
+                            bump(h);
+                        }
+                    }
+                }
+                Loc::RemoveChain { chain, pos } => {
+                    let c = &seq.remove_runs[&chain];
+                    bump(c.targets[pos as usize]);
+                    if pos > 0 {
+                        bump(c.links[pos as usize - 1]);
+                    } else {
+                        for h in c.first_extra_deps.iter() {
+                            bump(h);
+                        }
+                    }
+                }
+                Loc::MultiRemove => {
+                    let m = &seq.remove_nodes[&idx];
+                    for h in m.pins.iter() {
+                        bump(h);
+                    }
+                    for &t in m.nodes.iter() {
+                        bump(t);
+                    }
+                }
+                Loc::MoveOp => {
+                    let mv = &seq.move_nodes[&idx];
+                    bump(mv.target);
+                    bump(mv.to_anchor);
+                    for h in mv.overwrites.iter() {
+                        bump(h);
+                    }
+                    for h in mv.pins.iter() {
+                        bump(h);
+                    }
+                }
+                Loc::MarkOp => {
+                    let mk = &seq.mark_nodes[&idx];
+                    bump(mk.start_anchor);
+                    bump(mk.end_anchor);
+                    for h in mk.overwrites.iter() {
+                        bump(h);
+                    }
+                    for h in mk.pins.iter() {
+                        bump(h);
+                    }
+                }
+            }
+        }
+        depth[i] = d;
+    }
+
+    // The canonical extender of an element: the causally shallowest
+    // After-child continues (ties by smallest id). Stored-interior elements
+    // never carry explicit afters (forks split the stored run), so their
+    // stored successor is their only extender; at stored tails the `afters`
+    // set decides (move-op siblings are not extenders).
+    let chain_child = |p: NodeIdx| -> Option<NodeIdx> {
         if let Loc::Run { run, pos } = seq.loc_of(p) {
             let r = &seq.runs[&run];
             if (pos as usize) + 1 < r.elements.len() {
@@ -711,7 +796,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             .get(&p)
             .into_iter()
             .flatten()
-            .find(|a| matches!(seq.loc_of(*a), Loc::Run { .. }))
+            .filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }))
+            .min_by_key(|h| (depth[h.0 as usize], seq.id_of(*h)))
     };
     // Pins of one insert element, from wherever its stored run keeps them.
     let elem_pins = |e: NodeIdx| -> BTreeSet<Id> {
@@ -752,7 +838,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         for &e in &stored.elements {
             let (first_op, anchor, anchor_elem) = elem_anchor(e);
             let continues = first_op == FirstOp::After
-                && anchor_elem.is_some_and(|p| smallest_after_child(p) == Some(e));
+                && anchor_elem.is_some_and(|p| chain_child(p) == Some(e));
             if continues {
                 continue; // an interior member of some canonical chain
             }
@@ -772,7 +858,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 }
                 elements.push(cur);
                 text.push(seq.char_at(cur));
-                match smallest_after_child(cur) {
+                match chain_child(cur) {
                     Some(next) => cur = next,
                     None => break,
                 }
@@ -826,10 +912,11 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         let (key, i) = link_pos[&r];
         let stored_next = seq.remove_runs[&key].links.get(i + 1).copied();
         let contenders = heads_pinning.get(&r).into_iter().flatten().copied();
+        // Same shallowest-continues rule as insert chains.
         stored_next
             .into_iter()
             .chain(contenders)
-            .min_by_key(|l| seq.id_of(*l))
+            .min_by_key(|l| (depth[l.0 as usize], seq.id_of(*l)))
     };
     // Does r canonically continue its pinned predecessor?
     let link_continues = |r: NodeIdx| -> bool {
