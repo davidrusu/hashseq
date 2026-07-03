@@ -14,8 +14,12 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::encoding::{decode_hashseq, decode_op, encode_hashseq, encode_op};
+use crate::encoding::{
+    decode_hashseq, decode_hashweb, decode_op, encode_hashseq, encode_hashweb, encode_op,
+};
 use crate::hashseq::{Cursor, Loc};
+use crate::hashweb::HashWeb;
+use crate::value::{KIND_KV, KIND_SEQ, TOMBSTONE, Value, object_id};
 use crate::{EncodableOp, HashSeq, Id, Run};
 
 fn id_to_hex(id: &Id) -> String {
@@ -384,6 +388,73 @@ impl WasmHashSeq {
 mod tests {
     use super::*;
 
+    /// The knowledge-base app's whole object model, end to end: a
+    /// workspace kv opened at a well-known origin; pages as kv objects at
+    /// app-chosen origins carried as ref values; bodies as seq children;
+    /// snapshot persistence and two-store merge.
+    #[test]
+    fn kb_app_conventions_end_to_end() {
+        let ws_origin = "11".repeat(32);
+        let page_origin = "22".repeat(32);
+        let body_origin = "33".repeat(32);
+
+        let mut web = WasmHashWeb::new();
+        let ws = web.create_kv(&ws_origin).unwrap();
+
+        // New page: register under the workspace, open, title it, give it
+        // a body.
+        web.put_ref(&ws, "page:abc", &page_origin).unwrap();
+        let page = web.create_kv(&page_origin).unwrap();
+        web.put_string(&page, "title", "My Page").unwrap();
+        web.put_ref(&page, "body", &body_origin).unwrap();
+        let body = web.create_seq(&body_origin).unwrap();
+        web.text_insert(&body, 0, "hello world").unwrap();
+        web.text_insert(&body, 5, ",").unwrap();
+        web.text_remove(&body, 0, 1).unwrap();
+        assert_eq!(web.text(&body).unwrap(), "ello, world");
+
+        // Discovery walk: keys -> refs -> derived object ids.
+        let keys: Vec<String> = serde_json::from_str(&web.keys(&ws).unwrap()).unwrap();
+        assert_eq!(keys, vec!["page:abc"]);
+        let read: serde_json::Value =
+            serde_json::from_str(&web.read_key(&ws, "page:abc").unwrap()).unwrap();
+        assert_eq!(read["kind"], "one");
+        assert_eq!(read["values"][0]["type"], "ref");
+        assert_eq!(read["values"][0]["id"], page_origin);
+        assert_eq!(WasmHashWeb::kv_id(&page_origin).unwrap(), page);
+        let title: serde_json::Value =
+            serde_json::from_str(&web.read_key(&page, "title").unwrap()).unwrap();
+        assert_eq!(title["values"][0]["value"], "My Page");
+
+        // Snapshot roundtrip carries everything (objects, values, text).
+        let snap = web.encode();
+        let restored = WasmHashWeb::decode(&snap).unwrap();
+        assert_eq!(restored.object_count(), 3);
+        assert_eq!(restored.text(&body).unwrap(), "ello, world");
+        let title: serde_json::Value =
+            serde_json::from_str(&restored.read_key(&page, "title").unwrap()).unwrap();
+        assert_eq!(title["values"][0]["value"], "My Page");
+
+        // A second store merges to the same state; concurrent title edits
+        // surface as a conflict, never a silent winner.
+        let mut other = WasmHashWeb::decode(&snap).unwrap();
+        other.put_string(&page, "title", "Renamed").unwrap();
+        web.put_string(&page, "title", "Also Renamed").unwrap();
+        web.merge_encoded(&other.encode()).unwrap();
+        let title: serde_json::Value =
+            serde_json::from_str(&web.read_key(&page, "title").unwrap()).unwrap();
+        assert_eq!(title["kind"], "conflict");
+        assert_eq!(title["values"].as_array().unwrap().len(), 2);
+
+        // Deletion reads as absent; the key drops from the live key list.
+        web.del(&ws, "page:abc").unwrap();
+        let read: serde_json::Value =
+            serde_json::from_str(&web.read_key(&ws, "page:abc").unwrap()).unwrap();
+        assert_eq!(read["kind"], "absent");
+        let keys: Vec<String> = serde_json::from_str(&web.keys(&ws).unwrap()).unwrap();
+        assert!(keys.is_empty());
+    }
+
     /// A mid-text burst becomes one Before-run box anchored at an interior
     /// element of its (unsplit) parent run — structureJson must report the
     /// burst text and the anchor's offset within the parent box.
@@ -483,5 +554,275 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0]["box"], run["id"], "dep lands in the run's box");
         assert_eq!(deps[0]["off"], 4, "...at the tip 'o', not the anchor offset");
+    }
+}
+
+// ---- HashWeb: the app-facing store binding ----
+//
+// The Rust store deliberately has no authoring or read wrappers (objects
+// carry their own APIs). This binding is an *app-side adapter*: it owns the
+// store, reaches objects through `seq_mut`/`kv_mut`, and speaks the app's
+// value vocabulary (string keys; string or raw-id values). Ids cross the
+// boundary as 64-char hex.
+
+fn app_err(msg: &str) -> JsValue {
+    JsValue::from_str(msg)
+}
+
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct WasmHashWeb {
+    inner: HashWeb,
+}
+
+#[wasm_bindgen]
+impl WasmHashWeb {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // --- derivation (pure; usable before anything is open) ---
+
+    /// `object_id(KIND_SEQ ‖ origin)` as hex.
+    #[wasm_bindgen(js_name = seqId)]
+    pub fn seq_id(origin_hex: &str) -> Result<String, JsValue> {
+        Ok(id_to_hex(&object_id(KIND_SEQ, &hex_to_id(origin_hex)?)))
+    }
+
+    /// `object_id(KIND_KV ‖ origin)` as hex.
+    #[wasm_bindgen(js_name = kvId)]
+    pub fn kv_id(origin_hex: &str) -> Result<String, JsValue> {
+        Ok(id_to_hex(&object_id(KIND_KV, &hex_to_id(origin_hex)?)))
+    }
+
+    // --- opening ---
+
+    /// Open (idempotently) the seq at `origin`; returns the object id.
+    #[wasm_bindgen(js_name = createSeq)]
+    pub fn create_seq(&mut self, origin_hex: &str) -> Result<String, JsValue> {
+        Ok(id_to_hex(&self.inner.create_seq(hex_to_id(origin_hex)?)))
+    }
+
+    /// Open (idempotently) the kv at `origin`; returns the object id.
+    #[wasm_bindgen(js_name = createKv)]
+    pub fn create_kv(&mut self, origin_hex: &str) -> Result<String, JsValue> {
+        Ok(id_to_hex(&self.inner.create_kv(hex_to_id(origin_hex)?)))
+    }
+
+    #[wasm_bindgen(js_name = isSeq)]
+    pub fn is_seq(&self, obj_hex: &str) -> Result<bool, JsValue> {
+        Ok(self.inner.seq(&hex_to_id(obj_hex)?).is_some())
+    }
+
+    #[wasm_bindgen(js_name = isKv)]
+    pub fn is_kv(&self, obj_hex: &str) -> Result<bool, JsValue> {
+        Ok(self.inner.kv(&hex_to_id(obj_hex)?).is_some())
+    }
+
+    #[wasm_bindgen(js_name = objectCount)]
+    pub fn object_count(&self) -> usize {
+        self.inner.object_count()
+    }
+
+    /// Envelopes parked on unknown object ids (waiting for an open).
+    #[wasm_bindgen(js_name = orphanCount)]
+    pub fn orphan_count(&self) -> usize {
+        self.inner.orphans().count()
+    }
+
+    // --- seq objects (text) ---
+
+    pub fn text(&self, obj_hex: &str) -> Result<String, JsValue> {
+        let seq = self
+            .inner
+            .seq(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        Ok(seq.iter().collect())
+    }
+
+    #[wasm_bindgen(js_name = textLen)]
+    pub fn text_len(&self, obj_hex: &str) -> Result<usize, JsValue> {
+        let seq = self
+            .inner
+            .seq(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        Ok(seq.len())
+    }
+
+    #[wasm_bindgen(js_name = textInsert)]
+    pub fn text_insert(&mut self, obj_hex: &str, idx: usize, text: &str) -> Result<(), JsValue> {
+        let seq = self
+            .inner
+            .seq_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        seq.insert_batch(idx, text.chars());
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = textRemove)]
+    pub fn text_remove(&mut self, obj_hex: &str, idx: usize, len: usize) -> Result<(), JsValue> {
+        let seq = self
+            .inner
+            .seq_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        seq.remove_batch(idx, len);
+        Ok(())
+    }
+
+    // --- kv objects (string keys; string or raw-id values) ---
+
+    /// `obj[key] = value` (both strings). Returns the put op id (hex) — the
+    /// composition convention's input when a child anchors at this op.
+    #[wasm_bindgen(js_name = putString)]
+    pub fn put_string(&mut self, obj_hex: &str, key: &str, value: &str) -> Result<String, JsValue> {
+        let k = Value::String(key.to_owned());
+        let v = Value::String(value.to_owned());
+        self.inner.provide_value(&k);
+        self.inner.provide_value(&v);
+        let kv = self
+            .inner
+            .kv_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such kv object"))?;
+        Ok(id_to_hex(&kv.put(k, v).id()))
+    }
+
+    /// `obj[key] = <raw id>` — a link / origin reference; the value is an id,
+    /// not an artifact. Returns the put op id (hex).
+    #[wasm_bindgen(js_name = putRef)]
+    pub fn put_ref(&mut self, obj_hex: &str, key: &str, ref_hex: &str) -> Result<String, JsValue> {
+        let k = Value::String(key.to_owned());
+        let vid = hex_to_id(ref_hex)?;
+        self.inner.provide_value(&k);
+        let kv = self
+            .inner
+            .kv_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such kv object"))?;
+        let key_id = kv.provide_value(&k);
+        Ok(id_to_hex(&kv.put_ids(key_id, vid).id()))
+    }
+
+    pub fn del(&mut self, obj_hex: &str, key: &str) -> Result<(), JsValue> {
+        let kv = self
+            .inner
+            .kv_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such kv object"))?;
+        kv.del(Value::String(key.to_owned()));
+        Ok(())
+    }
+
+    /// Read a key. JSON:
+    /// `{"kind":"absent"}` |
+    /// `{"kind":"one","values":[v]}` |
+    /// `{"kind":"conflict","values":[v...]}` — every head surfaced (MVR).
+    /// Each v: `{"type":"string","value":s}` | `{"type":"ref","id":hex}` |
+    /// `{"type":"pending","id":hex}` (artifact bytes not yet known) |
+    /// `{"type":"deleted"}`.
+    #[wasm_bindgen(js_name = readKey)]
+    pub fn read_key(&self, obj_hex: &str, key: &str) -> Result<String, JsValue> {
+        let obj = hex_to_id(obj_hex)?;
+        let kv = self
+            .inner
+            .kv(&obj)
+            .ok_or_else(|| app_err("no such kv object"))?;
+        let describe = |vid: &Id| -> serde_json::Value {
+            if *vid == *TOMBSTONE {
+                return serde_json::json!({"type": "deleted"});
+            }
+            match self.inner.resolve(vid).or_else(|| kv.resolve(vid)) {
+                Some(Value::String(s)) => serde_json::json!({"type": "string", "value": s}),
+                Some(other) => serde_json::json!({
+                    "type": "string",
+                    "value": format!("{other:?}")
+                }),
+                // Unresolvable: either a raw-id value (a link/origin — by
+                // construction never a provided artifact) or an artifact
+                // whose bytes have not arrived. The app's key conventions
+                // distinguish them; we surface both faces.
+                None => serde_json::json!({"type": "ref", "id": id_to_hex(vid)}),
+            }
+        };
+        let read = kv.read(&Value::String(key.to_owned()));
+        let json = match read {
+            crate::hashkv::Read::Absent => serde_json::json!({"kind": "absent"}),
+            crate::hashkv::Read::One(vid) => {
+                serde_json::json!({"kind": "one", "values": [describe(&vid)]})
+            }
+            crate::hashkv::Read::Conflict(vids) => serde_json::json!({
+                "kind": "conflict",
+                "values": vids.iter().map(describe).collect::<Vec<_>>()
+            }),
+        };
+        Ok(json.to_string())
+    }
+
+    /// Live string keys of a kv, as a JSON array (id-ordered; display
+    /// ordering is the app's concern). Keys whose artifact bytes are
+    /// unknown are skipped.
+    pub fn keys(&self, obj_hex: &str) -> Result<String, JsValue> {
+        let obj = hex_to_id(obj_hex)?;
+        let kv = self
+            .inner
+            .kv(&obj)
+            .ok_or_else(|| app_err("no such kv object"))?;
+        let mut out: Vec<String> = Vec::new();
+        for kid in kv.keys() {
+            if let Some(Value::String(s)) = self.inner.resolve(kid).or_else(|| kv.resolve(kid)) {
+                out.push(s);
+            }
+        }
+        Ok(serde_json::to_string(&out).expect("plain data serializes"))
+    }
+
+    /// The live put-op ids for a key (hex, id-ordered) — the anchoring
+    /// input for op-id-welded composition.
+    #[wasm_bindgen(js_name = headIds)]
+    pub fn head_ids(&self, obj_hex: &str, key: &str) -> Result<Vec<String>, JsValue> {
+        let obj = hex_to_id(obj_hex)?;
+        let kv = self
+            .inner
+            .kv(&obj)
+            .ok_or_else(|| app_err("no such kv object"))?;
+        let key_id = Value::String(key.to_owned()).value_id();
+        Ok(kv.heads(&key_id).iter().map(id_to_hex).collect())
+    }
+
+    // --- sync ---
+
+    /// Deliver a remote enveloped op: `obj_id ‖ encoded node`.
+    #[wasm_bindgen(js_name = applyTo)]
+    pub fn apply_to(&mut self, obj_hex: &str, op_bytes: &[u8]) -> Result<(), JsValue> {
+        let obj = hex_to_id(obj_hex)?;
+        let (op, _) =
+            decode_op(op_bytes).map_err(|e| app_err(&format!("decode op: {e}")))?;
+        match op {
+            EncodableOp::Node(node) => self.inner.apply_to(obj, node),
+            EncodableOp::Run(run) => {
+                for (id, node) in run.decompress_with_ids() {
+                    self.inner.apply_to_with_id(obj, id, node);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical whole-store snapshot.
+    pub fn encode(&self) -> Vec<u8> {
+        encode_hashweb(&self.inner)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<WasmHashWeb, JsValue> {
+        let inner =
+            decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
+        Ok(WasmHashWeb { inner })
+    }
+
+    /// Merge a peer snapshot: union of knowledge.
+    #[wasm_bindgen(js_name = mergeEncoded)]
+    pub fn merge_encoded(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+        let other =
+            decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
+        self.inner.merge(other);
+        Ok(())
     }
 }

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HashWeb — Knowledge Base</title>
+<style>
+  @font-face { font-family:'PM'; font-weight:400; src:url('./fonts/ibm-plex-mono-400.woff2') format('woff2'); }
+  @font-face { font-family:'PM'; font-weight:500; src:url('./fonts/ibm-plex-mono-500.woff2') format('woff2'); }
+  @font-face { font-family:'PM'; font-weight:600; src:url('./fonts/ibm-plex-mono-600.woff2') format('woff2'); }
+
+  :root {
+    --paper:#EFE9DB; --paper2:#F6F1E5; --ink:#1B1816; --muted:#7C7361;
+    --red:#B23A2E; --green:#2F5D43; --amber:#C8782D; --grid:#D2C8B2; --line:#1B1816;
+    --blue:#3F5C86;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    font-family:'PM','IBM Plex Mono',monospace; color:var(--ink); background:var(--paper);
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+    background-image:radial-gradient(var(--grid) 0.7px, transparent 0.7px);
+    background-size:22px 22px;
+  }
+  header {
+    display:flex; align-items:baseline; justify-content:space-between;
+    padding:10px 16px; border-bottom:1.25px solid var(--line); background:rgba(239,233,219,0.9);
+  }
+  header .brand { font-weight:600; letter-spacing:3px; font-size:12px; }
+  header .fig { color:var(--muted); font-size:11px; letter-spacing:1px; }
+
+  main { flex:1; display:flex; min-height:0; }
+
+  /* ---- sidebar ---- */
+  #sidebar {
+    width:280px; min-width:280px; border-right:1.25px solid var(--line);
+    background:rgba(246,241,229,0.92); display:flex; flex-direction:column;
+  }
+  #sidebar .side-head {
+    display:flex; justify-content:space-between; align-items:center;
+    padding:10px 12px; border-bottom:1px solid var(--line);
+    font-size:11px; letter-spacing:2px; color:var(--muted); font-weight:600;
+  }
+  button {
+    font-family:inherit; font-size:11px; color:var(--ink); background:var(--paper2);
+    border:1px solid var(--ink); padding:3px 9px; cursor:pointer; letter-spacing:0.5px;
+  }
+  button:hover { background:#ece5d3; }
+  #tree { flex:1; overflow-y:auto; padding:6px 0; font-size:13px; }
+  .page-row {
+    display:flex; align-items:center; gap:6px; padding:4px 12px; cursor:pointer;
+    border-left:3px solid transparent; user-select:none;
+  }
+  .page-row:hover { background:#ece5d3; }
+  .page-row.active { border-left-color:var(--red); background:#ece5d3; font-weight:600; }
+  .page-row .twirl { color:var(--muted); width:12px; text-align:center; flex:none; }
+  .page-row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .page-row .sub { color:var(--muted); font-size:10px; }
+  .empty-note { color:var(--muted); font-size:12px; padding:14px; letter-spacing:0.5px; }
+
+  /* ---- editor ---- */
+  #editor-pane { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #crumbs {
+    padding:8px 22px; font-size:11px; color:var(--muted); letter-spacing:1px;
+    border-bottom:1px solid var(--grid); display:flex; gap:6px; align-items:center;
+  }
+  #crumbs span.link { cursor:pointer; text-decoration:underline dotted; }
+  #crumbs span.link:hover { color:var(--ink); }
+  #title {
+    font-family:inherit; font-size:24px; font-weight:600; color:var(--ink);
+    background:transparent; border:none; outline:none; padding:18px 22px 6px;
+    letter-spacing:0.5px; width:100%;
+  }
+  #title::placeholder { color:var(--muted); }
+  #conflict-bar {
+    display:none; margin:0 22px; padding:6px 10px; font-size:11px; letter-spacing:0.5px;
+    border:1px solid var(--red); color:var(--red); background:rgba(178,58,46,0.06);
+  }
+  #conflict-bar b { letter-spacing:2px; }
+  #body {
+    flex:1; margin:12px 22px 10px; padding:14px; resize:none; outline:none;
+    font-family:inherit; font-size:14px; line-height:1.65; color:var(--ink);
+    background:rgba(246,241,229,0.75); border:1px solid var(--ink);
+  }
+  #page-tools { display:flex; gap:8px; padding:0 22px 12px; }
+  #page-tools .danger { color:var(--red); border-color:var(--red); }
+  #no-page {
+    flex:1; display:flex; align-items:center; justify-content:center;
+    color:var(--muted); font-size:13px; letter-spacing:1px;
+  }
+
+  /* ---- status bar ---- */
+  footer {
+    display:flex; gap:22px; padding:7px 16px; border-top:1.25px solid var(--line);
+    background:rgba(239,233,219,0.92); font-size:11px; color:var(--muted); letter-spacing:1px;
+  }
+  footer b { color:var(--ink); font-weight:500; }
+  #sync-dot { color:var(--green); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">HASHWEB</div>
+    <div class="fig">FIG. 03 — KNOWLEDGE BASE ON A FLAT STORE OF OBJECTS</div>
+  </header>
+  <main>
+    <nav id="sidebar">
+      <div class="side-head"><span>PAGES</span><button id="new-page">+ NEW</button></div>
+      <div id="tree"></div>
+    </nav>
+    <section id="editor-pane">
+      <div id="crumbs"></div>
+      <input id="title" placeholder="Untitled" spellcheck="false" autocomplete="off">
+      <div id="conflict-bar"></div>
+      <textarea id="body" spellcheck="false"
+        placeholder="Type here. Every keystroke is a content-addressed op."></textarea>
+      <div id="page-tools">
+        <button id="new-subpage">+ SUBPAGE</button>
+        <button id="delete-page" class="danger">DELETE PAGE</button>
+      </div>
+      <div id="no-page" style="display:none">no page selected — create one</div>
+    </section>
+  </main>
+  <footer>
+    <span>OBJECTS <b id="stat-objects">0</b></span>
+    <span>SNAPSHOT <b id="stat-bytes">0 B</b></span>
+    <span>PARKED <b id="stat-parked">0</b></span>
+    <span id="sync-dot">● LIVE — open this page in a second tab to watch merge</span>
+  </footer>
+  <script type="module" src="./kb.js"></script>
+</body>
+</html>
