@@ -2491,6 +2491,7 @@ mod tests {
 #[cfg(test)]
 mod family_wire {
     use super::*;
+    use crate::hashweb::tests::{get, insert_value, put, read_text, type_text};
     use crate::value::Value;
     use quickcheck_macros::quickcheck;
 
@@ -2575,20 +2576,20 @@ mod family_wire {
     fn web_roundtrip_block_document() {
         let mut doc = HashWeb::new();
         let root = doc.create_kv(Id([9; 32]));
-        let p1 = doc.put(&root, s("block-1"), s("kv")).unwrap();
+        let p1 = put(&mut doc, &root, s("block-1"), s("kv"));
         let block = doc.create_kv(p1.id());
-        let p2 = doc.put(&block, s("content"), s("seq")).unwrap();
+        let p2 = put(&mut doc, &block, s("content"), s("seq"));
         let content = doc.create_seq(p2.id());
-        doc.put(&block, s("color"), s("blue"));
-        doc.text_insert(&content, 0, "hello world");
-        let pi = doc.seq_insert_value(&content, 5, &s("embed")).unwrap();
+        put(&mut doc, &block, s("color"), s("blue"));
+        type_text(&mut doc, &content, 0, "hello world");
+        let pi = insert_value(&mut doc, &content, 5, &s("embed"));
         let inner = doc.create_seq(pi.id());
-        doc.text_insert(&inner, 0, "embedded");
+        type_text(&mut doc, &inner, 0, "embedded");
 
         let bytes = encode_hashweb(&doc);
         let decoded = decode_hashweb_strict(&bytes).expect("strict");
         assert_eq!(decoded, doc);
-        assert_eq!(decoded.text(&inner).unwrap(), "embedded");
+        assert_eq!(read_text(&decoded, &inner), "embedded");
         // Register state is intact in the inner map; artifact bytes resolve
         // through the document-wide store (inner stores are replica-local
         // views and deliberately not canonical snapshot state).
@@ -2596,11 +2597,11 @@ mod family_wire {
             decoded.kv(&block).unwrap().read(&s("color")),
             crate::hashkv::Read::One(_)
         ));
-        assert_eq!(decoded.get(&block, &s("color")), Some(s("blue")));
+        assert_eq!(get(&decoded, &block, &s("color")), Some(s("blue")));
         // Routing survives: an edit applied to the decoded copy routes home.
         let mut decoded = decoded;
-        decoded.text_insert(&inner, 8, "!");
-        assert_eq!(decoded.text(&inner).unwrap(), "embedded!");
+        type_text(&mut decoded, &inner, 8, "!");
+        assert_eq!(read_text(&decoded, &inner), "embedded!");
     }
 
     #[test]
@@ -2610,9 +2611,9 @@ mod family_wire {
         // envelopes and decode re-parks.
         let mut a = HashWeb::new();
         let root = a.create_kv(Id([9; 32]));
-        let p = a.put(&root, s("t"), s("seq")).unwrap();
+        let p = put(&mut a, &root, s("t"), s("seq"));
         let child = a.create_seq(p.id());
-        a.text_insert(&child, 0, "x");
+        type_text(&mut a, &child, 0, "x");
         let child_nodes = a.seq(&child).unwrap().all_nodes();
 
         let mut fresh = HashWeb::new();
@@ -2627,22 +2628,22 @@ mod family_wire {
         let mut decoded = decoded;
         assert_eq!(decoded.create_seq(p.id()), child);
         assert_eq!(decoded.orphans().count(), 0);
-        assert_eq!(decoded.text(&child).unwrap(), "x");
+        assert_eq!(read_text(&decoded, &child), "x");
     }
 
     #[test]
     fn web_bytes_canonical_across_merge_orders() {
         let mut base = HashWeb::new();
         let root = base.create_kv(Id([9; 32]));
-        let pt = base.put(&root, s("text"), s("seq")).unwrap();
+        let pt = put(&mut base, &root, s("text"), s("seq"));
         let text = base.create_seq(pt.id());
-        let pm = base.put(&root, s("meta"), s("kv")).unwrap();
+        let pm = put(&mut base, &root, s("meta"), s("kv"));
         let meta = base.create_kv(pm.id());
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        r1.text_insert(&text, 0, "hello");
-        r2.put(&meta, s("status"), s("draft"));
+        type_text(&mut r1, &text, 0, "hello");
+        put(&mut r2, &meta, s("status"), s("draft"));
 
         let mut m1 = r1.clone();
         m1.merge(r2.clone());

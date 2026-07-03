@@ -83,12 +83,33 @@ impl HashWeb {
         obj
     }
 
+    /// The full object, for reading. The store has no read API of its
+    /// own — iterate, index, and resolve on the object directly.
     pub fn seq(&self, obj: &Id) -> Option<&HashSeq> {
         self.seqs.get(obj)
     }
 
+    /// See [`Self::seq`].
     pub fn kv(&self, obj: &Id) -> Option<&HashKv> {
         self.kvs.get(obj)
+    }
+
+    /// The full object, for authoring. The store has no authoring API of
+    /// its own either: edit the object with its own mutating surface
+    /// (`insert_batch`, `remove_batch`, `insert_value`, `put`, `del`, the
+    /// cursor…), which builds *and applies* each op in one step — an edit
+    /// can never be built and then forgotten, and consecutive edits
+    /// anchor on each other instead of mis-anchoring at a stale snapshot.
+    /// Build-without-apply (`make_*`) is the *wire* vocabulary: a remote
+    /// node arrives already built and is delivered with
+    /// [`Self::apply_to`].
+    pub fn seq_mut(&mut self, obj: &Id) -> Option<&mut HashSeq> {
+        self.seqs.get_mut(obj)
+    }
+
+    /// See [`Self::seq_mut`].
+    pub fn kv_mut(&mut self, obj: &Id) -> Option<&mut HashKv> {
+        self.kvs.get_mut(obj)
     }
 
     /// Every known object id (seqs and kvs).
@@ -113,64 +134,6 @@ impl HashWeb {
 
     pub fn resolve(&self, value_id: &Id) -> Option<Value> {
         self.values.get(value_id).and_then(|b| Value::decode(b))
-    }
-
-    // ---- authoring ----
-
-    /// Write `key = value` in the map object `origin`.
-    pub fn put(&mut self, origin: &Id, key: Value, value: Value) -> Option<HashNode> {
-        let key_id = self.provide_value(&key);
-        let value_id = self.provide_value(&value);
-        let node = {
-            let m = self.kvs.get_mut(origin)?;
-            m.provide_value(&key);
-            m.provide_value(&value);
-            m.make_put(key_id, value_id)
-        };
-        self.apply_to(*origin, node.clone());
-        Some(node)
-    }
-
-    /// Insert a value commitment into a seq at `idx` — an artifact or a
-    /// link (another object's id carried as a value).
-    pub fn seq_insert_value(&mut self, origin: &Id, idx: usize, value: &Value) -> Option<HashNode> {
-        let vid = self.provide_value(value);
-        let node = self.seqs.get(origin)?.make_insert_value(idx, vid)?;
-        self.apply_to(*origin, node.clone());
-        Some(node)
-    }
-
-    /// Edit a child text object.
-    pub fn text_insert(&mut self, origin: &Id, idx: usize, text: &str) -> bool {
-        let Some(seq) = self.seqs.get_mut(origin) else {
-            return false;
-        };
-        seq.insert_batch(idx, text.chars());
-        true
-    }
-
-    pub fn text_remove(&mut self, origin: &Id, idx: usize, len: usize) -> bool {
-        let Some(seq) = self.seqs.get_mut(origin) else {
-            return false;
-        };
-        seq.remove_batch(idx, len).is_some()
-    }
-
-    pub fn text(&self, origin: &Id) -> Option<String> {
-        Some(self.seq(origin)?.iter().collect())
-    }
-
-    /// Read `key` in kv `origin`, resolving artifacts through the store's
-    /// value store (store-wide; inner projections keep only what they saw
-    /// locally). Conflicts and pending values are not collapsed — `None`
-    /// (use the kv's `read` to surface).
-    pub fn get(&self, origin: &Id, key: &Value) -> Option<Value> {
-        match self.kv(origin)?.read(key) {
-            crate::hashkv::Read::One(vid) => self
-                .resolve(&vid)
-                .or_else(|| self.kv(origin)?.resolve(&vid)),
-            _ => None,
-        }
     }
 
     // ---- delivery (the routing envelope: `obj_id ‖ HashNode`) ----
@@ -266,7 +229,7 @@ impl HashWeb {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Op;
 
@@ -276,6 +239,38 @@ mod tests {
 
     fn oid(n: u8) -> Id {
         Id([n; 32])
+    }
+
+    // App-level helpers over the public surface: author on the object via
+    // `seq_mut`/`kv_mut` (each edit applies as it is built), read on the
+    // object via `seq`/`kv`, resolve values through both the store-wide
+    // and the object's own artifact store.
+    pub(crate) fn put(web: &mut HashWeb, obj: &Id, key: Value, value: Value) -> HashNode {
+        web.provide_value(&key);
+        web.provide_value(&value);
+        web.kv_mut(obj).unwrap().put(key, value)
+    }
+
+    pub(crate) fn type_text(web: &mut HashWeb, obj: &Id, idx: usize, text: &str) {
+        web.seq_mut(obj).unwrap().insert_batch(idx, text.chars());
+    }
+
+    pub(crate) fn insert_value(web: &mut HashWeb, obj: &Id, idx: usize, value: &Value) -> HashNode {
+        let vid = web.provide_value(value);
+        web.seq_mut(obj).unwrap().insert_value(idx, vid)
+    }
+
+    pub(crate) fn read_text(web: &HashWeb, obj: &Id) -> String {
+        web.seq(obj).unwrap().iter().collect()
+    }
+
+    pub(crate) fn get(web: &HashWeb, obj: &Id, key: &Value) -> Option<Value> {
+        match web.kv(obj)?.read(key) {
+            crate::hashkv::Read::One(vid) => {
+                web.resolve(&vid).or_else(|| web.kv(obj)?.resolve(&vid))
+            }
+            _ => None,
+        }
     }
 
     /// The store is knowledge, not an object: merge is an unconditional
@@ -291,13 +286,13 @@ mod tests {
         assert_eq!(a.create_seq(oid(1)), s1, "idempotent: same seed, same object");
         assert_ne!(s1, oid(1), "the handle is the derived object id, not the seed");
         let k2 = b.create_kv(oid(2));
-        a.text_insert(&s1, 0, "hi");
-        b.put(&k2, s("k"), s("v"));
+        type_text(&mut a, &s1, 0, "hi");
+        put(&mut b, &k2, s("k"), s("v"));
 
         a.merge(b.clone());
         assert_eq!(a.object_count(), 2);
-        assert_eq!(a.text(&s1).unwrap(), "hi");
-        assert_eq!(a.get(&k2, &s("k")), Some(s("v")));
+        assert_eq!(read_text(&a, &s1), "hi");
+        assert_eq!(get(&a, &k2, &s("k")), Some(s("v")));
 
         // Ops arriving before their root is known park; adopting the root
         // wakes them.
@@ -309,7 +304,7 @@ mod tests {
         assert_eq!(fresh.orphans().count(), 2, "both envelopes park on the unknown object id");
         fresh.create_seq(oid(1));
         assert_eq!(fresh.orphans().count(), 0, "adoption wakes transitively");
-        assert_eq!(fresh.text(&s1).unwrap(), "hi");
+        assert_eq!(read_text(&fresh, &s1), "hi");
 
         // Kind "mis-agreement" is unrepresentable: the same seed opened as
         // a Kv derives a different object id — the two coexist, nothing
@@ -319,7 +314,7 @@ mod tests {
         assert_ne!(k1, s1);
         confused.merge(a.clone());
         assert_eq!(confused.object_count(), 3);
-        assert_eq!(confused.text(&s1).unwrap(), "hi");
+        assert_eq!(read_text(&confused, &s1), "hi");
         assert!(confused.kv(&k1).unwrap().delivery.gated.is_empty());
 
         // Roundtrip of a multi-root store.
@@ -339,14 +334,14 @@ mod tests {
         let mut doc = HashWeb::new();
         let root = doc.create_kv(oid(9));
 
-        let p1 = doc.put(&root, s("block-1"), s("kv")).unwrap();
+        let p1 = put(&mut doc, &root, s("block-1"), s("kv"));
         let block = doc.create_kv(p1.id());
-        let p2 = doc.put(&block, s("content"), s("seq")).unwrap();
+        let p2 = put(&mut doc, &block, s("content"), s("seq"));
         let content = doc.create_seq(p2.id());
-        doc.put(&block, s("color"), s("blue"));
-        doc.text_insert(&content, 0, "hello world");
+        put(&mut doc, &block, s("color"), s("blue"));
+        type_text(&mut doc, &content, 0, "hello world");
 
-        assert_eq!(doc.text(&content).unwrap(), "hello world");
+        assert_eq!(read_text(&doc, &content), "hello world");
         assert_eq!(doc.kv(&block).unwrap().get(&s("color")), Some(s("blue")));
         assert_eq!(doc.object_count(), 3); // root + block + content
         // The convention is reproducible from the ops: anyone holding the
@@ -359,13 +354,13 @@ mod tests {
         // Editing one object never enters another's tips (per-object tips).
         let mut doc = HashWeb::new();
         let root = doc.create_kv(oid(9));
-        let pa = doc.put(&root, s("a"), s("seq")).unwrap();
+        let pa = put(&mut doc, &root, s("a"), s("seq"));
         let a = doc.create_seq(pa.id());
-        let pb = doc.put(&root, s("b"), s("seq")).unwrap();
+        let pb = put(&mut doc, &root, s("b"), s("seq"));
         let b = doc.create_seq(pb.id());
 
-        doc.text_insert(&a, 0, "aaa");
-        doc.text_insert(&b, 0, "bbb");
+        type_text(&mut doc, &a, 0, "aaa");
+        type_text(&mut doc, &b, 0, "bbb");
 
         // Each seq's frontier is a single run tail — no cross-contamination.
         assert_eq!(doc.seq(&a).unwrap().tips().len(), 1);
@@ -376,15 +371,15 @@ mod tests {
     fn concurrent_edits_in_different_objects_merge_cleanly() {
         let mut base = HashWeb::new();
         let root = base.create_kv(oid(9));
-        let pt = base.put(&root, s("text"), s("seq")).unwrap();
+        let pt = put(&mut base, &root, s("text"), s("seq"));
         let text = base.create_seq(pt.id());
-        let pm = base.put(&root, s("meta"), s("kv")).unwrap();
+        let pm = put(&mut base, &root, s("meta"), s("kv"));
         let meta = base.create_kv(pm.id());
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        r1.text_insert(&text, 0, "hello");
-        r2.put(&meta, s("status"), s("draft"));
+        type_text(&mut r1, &text, 0, "hello");
+        put(&mut r2, &meta, s("status"), s("draft"));
 
         let mut m1 = r1.clone();
         m1.merge(r2.clone());
@@ -392,9 +387,9 @@ mod tests {
         m2.merge(r1);
 
         assert_eq!(m1, m2);
-        assert_eq!(m1.text(&text).unwrap(), "hello");
-        assert_eq!(m1.get(&meta, &s("status")), Some(s("draft")));
-        assert_eq!(m2.get(&meta, &s("status")), Some(s("draft")));
+        assert_eq!(read_text(&m1, &text), "hello");
+        assert_eq!(get(&m1, &meta, &s("status")), Some(s("draft")));
+        assert_eq!(get(&m2, &meta, &s("status")), Some(s("draft")));
     }
 
     #[test]
@@ -403,9 +398,9 @@ mod tests {
         // the envelopes park store-wide; opening the object wakes them.
         let mut a = HashWeb::new();
         let root = a.create_kv(oid(9));
-        let p = a.put(&root, s("t"), s("seq")).unwrap();
+        let p = put(&mut a, &root, s("t"), s("seq"));
         let child = a.create_seq(p.id());
-        a.text_insert(&child, 0, "x");
+        type_text(&mut a, &child, 0, "x");
         let child_nodes = a.seq(&child).unwrap().all_nodes();
 
         let mut fresh = HashWeb::new();
@@ -418,7 +413,7 @@ mod tests {
         // opens the child: parked envelopes deliver.
         assert_eq!(fresh.create_seq(p.id()), child);
         assert_eq!(fresh.orphans().count(), 0);
-        assert_eq!(fresh.text(&child).unwrap(), "x");
+        assert_eq!(read_text(&fresh, &child), "x");
     }
 
     #[test]
@@ -426,8 +421,8 @@ mod tests {
         let mut doc = HashWeb::new();
         let a = doc.create_seq(oid(1));
         let b = doc.create_seq(oid(2));
-        doc.text_insert(&a, 0, "a");
-        doc.text_insert(&b, 0, "b");
+        type_text(&mut doc, &a, 0, "a");
+        type_text(&mut doc, &b, 0, "b");
         let a0 = doc.seq(&a).unwrap().id_at(0).unwrap();
         let b0 = doc.seq(&b).unwrap().id_at(0).unwrap();
 
@@ -440,8 +435,8 @@ mod tests {
         };
         doc.apply_to(a, node);
         assert_eq!(doc.seq(&a).unwrap().delivery.orphans().count(), 1);
-        assert_eq!(doc.text(&a).unwrap(), "a"); // untouched
-        assert_eq!(doc.text(&b).unwrap(), "b");
+        assert_eq!(read_text(&doc, &a), "a"); // untouched
+        assert_eq!(read_text(&doc, &b), "b");
     }
 
     /// Child-in-seq, user-space: an inline element op is the child's
@@ -451,14 +446,14 @@ mod tests {
     fn child_object_opened_at_an_inline_element() {
         let mut doc = HashWeb::new();
         let text = doc.create_seq(oid(7));
-        doc.text_insert(&text, 0, "see [] here");
+        type_text(&mut doc, &text, 0, "see [] here");
 
-        let node = doc.seq_insert_value(&text, 5, &s("embed")).unwrap();
+        let node = insert_value(&mut doc, &text, 5, &s("embed"));
         let inner = doc.create_seq(node.id());
-        doc.text_insert(&inner, 0, "the embedded doc");
+        type_text(&mut doc, &inner, 0, "the embedded doc");
 
-        assert_eq!(doc.text(&inner).unwrap(), "the embedded doc");
-        let body = doc.text(&text).unwrap();
+        assert_eq!(read_text(&doc, &inner), "the embedded doc");
+        let body = read_text(&doc, &text);
         assert_eq!(body, format!("see [{}] here", crate::hashseq::ATOM_CHAR));
         // The atom's payload is the app's marker; the child's address
         // derives from the element op's id.
@@ -471,7 +466,7 @@ mod tests {
         let mut other = HashWeb::new();
         other.merge(doc.clone());
         assert_eq!(other, doc);
-        assert_eq!(other.text(&inner).unwrap(), "the embedded doc");
+        assert_eq!(read_text(&other, &inner), "the embedded doc");
     }
 
     /// A link atom: a seq element whose payload is another object's origin
@@ -481,8 +476,8 @@ mod tests {
         let mut doc = HashWeb::new();
         let a = doc.create_seq(oid(3));
         let b = doc.create_seq(oid(4));
-        doc.text_insert(&a, 0, "link: ");
-        doc.text_insert(&b, 0, "the target");
+        type_text(&mut doc, &a, 0, "link: ");
+        type_text(&mut doc, &b, 0, "the target");
 
         // Insert a link to b inside a (the origin id as a Ref-like value:
         // carried as raw payload id — no artifact bytes needed).
@@ -494,7 +489,7 @@ mod tests {
         let seq = doc.seq(&a).unwrap();
         let atom = seq.id_at(6).unwrap();
         assert_eq!(seq.payload_of(&atom), Some(b), "the link target's origin id");
-        assert_eq!(doc.text(&b).unwrap(), "the target");
+        assert_eq!(read_text(&doc, &b), "the target");
     }
 
     #[test]
@@ -507,11 +502,11 @@ mod tests {
         let root = base.create_kv(oid(9));
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        let p1 = r1.put(&root, s("content"), s("seq")).unwrap();
+        let p1 = put(&mut r1, &root, s("content"), s("seq"));
         let c1 = r1.create_seq(p1.id());
-        let p2 = r2.put(&root, s("content"), s("kv")).unwrap();
+        let p2 = put(&mut r2, &root, s("content"), s("kv"));
         let c2 = r2.create_kv(p2.id());
-        r1.text_insert(&c1, 0, "one");
+        type_text(&mut r1, &c1, 0, "one");
 
         base.merge(r1);
         base.merge(r2);
@@ -521,6 +516,6 @@ mod tests {
             base.kv(&root).unwrap().read(&s("content")),
             crate::hashkv::Read::Conflict(_)
         ));
-        assert_eq!(base.text(&c1).unwrap(), "one");
+        assert_eq!(read_text(&base, &c1), "one");
     }
 }

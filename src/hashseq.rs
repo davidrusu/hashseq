@@ -933,6 +933,14 @@ impl HashSeq {
     /// re-broadcast the op over the wire. Returns `None` if `amount == 0` or if
     /// `idx` is past the end (no characters were actually removed).
     pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
+        let node = self.make_remove_batch(idx, amount)?;
+        self.apply(node.clone());
+        Some(node)
+    }
+
+    /// Build (without applying) the removal of `amount` characters starting
+    /// at visible position `idx`. `None` if nothing is there to remove.
+    pub fn make_remove_batch(&self, idx: usize, amount: usize) -> Option<HashNode> {
         if amount == 0 {
             return None;
         }
@@ -951,14 +959,10 @@ impl HashSeq {
         }
 
         let pins = BTreeSet::from_iter(self.tips.difference(&to_remove).cloned());
-        let node = HashNode {
+        Some(HashNode {
             pins,
             op: Op::Remove(to_remove),
-        };
-
-        let node_for_return = node.clone();
-        self.apply(node);
-        Some(node_for_return)
+        })
     }
 
     /// Resolve "directly before/after node `el`" into an index target.
