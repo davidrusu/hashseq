@@ -1187,12 +1187,22 @@ function collapseExposedRegion() {
 
 // Collapse the exposed source the moment the caret leaves it.
 document.addEventListener('selectionchange', () => {
-  if (!exposedRegion) return;
   const sel = window.getSelection();
   if (!sel.rangeCount) return;
   let node = sel.getRangeAt(0).startContainer;
   if (node.nodeType === Node.TEXT_NODE) node = node.parentNode;
-  if (!node.closest?.('.region-live')) collapseExposedRegion();
+  if (exposedRegion && !node.closest?.('.region-live')) collapseExposedRegion();
+  // Caret inside a commented span counts as focusing the comment.
+  const hl = node.closest?.('.comment-hl');
+  const next = new Set(
+    hl && node.closest('.block-ed')
+      ? (hl.dataset.tags ?? '').split(',').filter((t) => t.startsWith('comment:'))
+      : [],
+  );
+  if (!setsEqual(next, caretCommentKinds)) {
+    caretCommentKinds = next;
+    updateCommentHighlights();
+  }
 });
 
 /// Render a block's content as editable, formatted DOM.
@@ -1780,7 +1790,48 @@ function collectComments() {
   return out;
 }
 
-let activeCommentTag = null;
+let activeCommentTag = null; // pinned by clicking a card
+let hoverCommentKinds = new Set(); // hovering a span or a card
+let caretCommentKinds = new Set(); // caret sitting inside a commented span
+
+/// One source of truth: a span (and its card) lights up iff its kind is
+/// hovered, caret-focused, or pinned — otherwise it stays dimmed.
+function updateCommentHighlights() {
+  const lit = new Set([...hoverCommentKinds, ...caretCommentKinds]);
+  if (activeCommentTag) lit.add(activeCommentTag);
+  for (const el of document.querySelectorAll('.comment-hl')) {
+    const tags = (el.dataset.tags ?? '').split(',');
+    el.classList.toggle('hl-active', tags.some((t) => lit.has(t)));
+  }
+  for (const card of document.querySelectorAll('.cc-card')) {
+    card.classList.toggle('lit', lit.has(card.dataset.kind) && card.dataset.kind !== activeCommentTag);
+    card.classList.toggle('active', card.dataset.kind === activeCommentTag);
+  }
+}
+
+function setsEqual(a, b) {
+  return a.size === b.size && [...a].every((x) => b.has(x));
+}
+
+// Hovering a commented span lights it (and its card) up.
+document.addEventListener('mouseover', (e) => {
+  const hl = e.target.closest?.('.comment-hl');
+  const next = new Set(
+    hl ? (hl.dataset.tags ?? '').split(',').filter((t) => t.startsWith('comment:')) : [],
+  );
+  if (!setsEqual(next, hoverCommentKinds)) {
+    hoverCommentKinds = next;
+    updateCommentHighlights();
+  }
+});
+
+// Clicking anywhere outside the cards unpins.
+document.addEventListener('click', (e) => {
+  if (activeCommentTag && !e.target.closest?.('.cc-card')) {
+    activeCommentTag = null;
+    updateCommentHighlights();
+  }
+});
 let pendingComposeTag = null; // focus this comment's composer after render
 
 /// Replace (or delete, when `next` is empty) message `idx` in a thread —
@@ -1807,23 +1858,20 @@ function replaceThreadMessage(thread, idx, next) {
   }
 }
 
-function setCommentHighlight(kind, on) {
-  for (const el of document.querySelectorAll('.comment-hl')) {
-    const tags = (el.dataset.tags ?? '').split(',');
-    if (tags.includes(kind)) el.classList.toggle('hl-active', on);
-  }
-}
-
 function renderComments() {
   const panel = document.getElementById('comments');
   const comments = current ? collectComments() : [];
   const toggle = document.getElementById('comments-toggle');
   document.getElementById('ct-count').textContent = comments.length;
   toggle.style.visibility = comments.length === 0 ? 'hidden' : '';
-  if (comments.length === 0) {
+  const collapsed =
+    !commentsIsOverlay() && document.body.classList.contains('collapse-comments');
+  if (comments.length === 0 || collapsed) {
     panel.style.display = 'none';
-    activeCommentTag = null;
-    document.body.classList.remove('show-comments');
+    if (comments.length === 0) {
+      activeCommentTag = null;
+      document.body.classList.remove('show-comments');
+    }
     return;
   }
   panel.style.display = 'flex';
@@ -1836,6 +1884,7 @@ function renderComments() {
   for (const cm of comments) {
     const card = document.createElement('div');
     card.className = 'cc-card' + (cm.kind === activeCommentTag ? ' active' : '');
+    card.dataset.kind = cm.kind;
 
     const quote = document.createElement('div');
     quote.className = 'cc-quote';
@@ -1910,18 +1959,18 @@ function renderComments() {
     tools.appendChild(resolve);
     card.appendChild(tools);
 
-    // Hover or activate the card → light up every fragment it references.
-    card.onmouseenter = () => setCommentHighlight(cm.kind, true);
+    // Hover or pin the card → light up every fragment it references.
+    card.onmouseenter = () => {
+      hoverCommentKinds = new Set([cm.kind]);
+      updateCommentHighlights();
+    };
     card.onmouseleave = () => {
-      if (activeCommentTag !== cm.kind) setCommentHighlight(cm.kind, false);
+      hoverCommentKinds = new Set();
+      updateCommentHighlights();
     };
     card.onclick = () => {
-      const was = activeCommentTag;
-      activeCommentTag = was === cm.kind ? null : cm.kind;
-      if (was) setCommentHighlight(was, false);
-      if (activeCommentTag) setCommentHighlight(activeCommentTag, true);
-      for (const c of panel.querySelectorAll('.cc-card')) c.classList.remove('active');
-      if (activeCommentTag) card.classList.add('active');
+      activeCommentTag = activeCommentTag === cm.kind ? null : cm.kind;
+      updateCommentHighlights();
     };
     panel.appendChild(card);
     if (pendingComposeTag === cm.kind) {
@@ -1929,7 +1978,7 @@ function renderComments() {
       setTimeout(() => reply.focus(), 0);
     }
   }
-  if (activeCommentTag) setCommentHighlight(activeCommentTag, true);
+  updateCommentHighlights();
 }
 
 // ---- editing -----------------------------------------------------------------
@@ -2314,13 +2363,48 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
 
 // ---- responsive panel toggles -------------------------------------------------
 
+// Narrow widths: the buttons open slide-in overlays. Wide widths: they
+// collapse the panels in-flow, remembered across sessions.
+const navIsOverlay = () => matchMedia('(max-width: 900px)').matches;
+const commentsIsOverlay = () => matchMedia('(max-width: 1150px)').matches;
+
+const PANEL_PREFS_KEY = 'hashweb-kb-panels';
+
+function savePanelPrefs() {
+  localStorage.setItem(
+    PANEL_PREFS_KEY,
+    JSON.stringify({
+      nav: document.body.classList.contains('collapse-nav'),
+      comments: document.body.classList.contains('collapse-comments'),
+    }),
+  );
+}
+try {
+  const prefs = JSON.parse(localStorage.getItem(PANEL_PREFS_KEY) ?? '{}');
+  document.body.classList.toggle('collapse-nav', !!prefs.nav);
+  document.body.classList.toggle('collapse-comments', !!prefs.comments);
+} catch (_) {
+  /* fresh */
+}
+
 document.getElementById('nav-toggle').onclick = () => {
-  document.body.classList.toggle('show-nav');
-  document.body.classList.remove('show-comments');
+  if (navIsOverlay()) {
+    document.body.classList.toggle('show-nav');
+    document.body.classList.remove('show-comments');
+  } else {
+    document.body.classList.toggle('collapse-nav');
+    savePanelPrefs();
+  }
 };
 document.getElementById('comments-toggle').onclick = () => {
-  document.body.classList.toggle('show-comments');
-  document.body.classList.remove('show-nav');
+  if (commentsIsOverlay()) {
+    document.body.classList.toggle('show-comments');
+    document.body.classList.remove('show-nav');
+  } else {
+    document.body.classList.toggle('collapse-comments');
+    savePanelPrefs();
+    renderComments();
+  }
 };
 document.getElementById('panel-backdrop').onclick = () => {
   document.body.classList.remove('show-nav', 'show-comments');
