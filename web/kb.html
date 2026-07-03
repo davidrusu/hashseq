@@ -84,8 +84,9 @@
   #view-tabs button { border:none; border-right:1px solid var(--ink); }
   #view-tabs button:last-child { border-right:none; }
   #view-tabs button.active { background:var(--ink); color:var(--paper); }
+  #work { flex:1; display:flex; gap:10px; margin:8px 22px 10px; min-height:0; }
   #blocks, #preview {
-    flex:1; margin:8px 22px 10px; padding:10px; outline:none;
+    flex:1; min-width:0; padding:10px; outline:none;
     font-family:inherit; font-size:14px; line-height:1.65; color:var(--ink);
     background:rgba(246,241,229,0.75); border:1px solid var(--ink);
     overflow-y:auto;
@@ -211,6 +212,7 @@
       <div id="fmt-row">
         <div id="view-tabs">
           <button id="tab-edit" class="active">EDIT</button>
+          <button id="tab-split">SPLIT</button>
           <button id="tab-view">VIEW</button>
         </div>
         <div id="fmt-tools">
@@ -223,8 +225,10 @@
           <button id="insert-table" title="insert a table object at the caret">TABLE</button>
         </div>
       </div>
-      <div id="blocks"></div>
-      <div id="preview" style="display:none"></div>
+      <div id="work">
+        <div id="blocks"></div>
+        <div id="preview" style="display:none"></div>
+      </div>
       <div id="comments"></div>
       <div id="page-tools">
         <button id="new-subpage">+ SUBPAGE</button>

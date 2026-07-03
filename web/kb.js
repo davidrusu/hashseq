@@ -185,6 +185,7 @@ const conflictEl = document.getElementById('conflict-bar');
 const blocksEl = document.getElementById('blocks');
 const previewEl = document.getElementById('preview');
 const tabEditEl = document.getElementById('tab-edit');
+const tabSplitEl = document.getElementById('tab-split');
 const tabViewEl = document.getElementById('tab-view');
 const toolsEl = document.getElementById('page-tools');
 const noPageEl = document.getElementById('no-page');
@@ -194,7 +195,7 @@ const statParked = document.getElementById('stat-parked');
 
 let current = null; // pageObj hex
 let currentBody = null; // body seq obj hex (a seq of block refs)
-let viewMode = 'edit'; // 'edit' | 'view'
+let viewMode = 'edit'; // 'edit' | 'split' | 'view'
 let renderTargetObj = null; // the seq renderBody is currently rendering
 let focusedBlockObj = null; // last-focused block (toolbar target)
 let dragFrom = null; // block index a drag started from
@@ -509,11 +510,13 @@ function renderBody(el, bodyObj) {
 function setViewMode(mode) {
   viewMode = mode;
   tabEditEl.classList.toggle('active', mode === 'edit');
+  tabSplitEl.classList.toggle('active', mode === 'split');
   tabViewEl.classList.toggle('active', mode === 'view');
   renderEditor();
 }
 
 tabEditEl.onclick = () => setViewMode('edit');
+tabSplitEl.onclick = () => setViewMode('split');
 tabViewEl.onclick = () => setViewMode('view');
 
 // ---- rendering ---------------------------------------------------------------
@@ -649,11 +652,12 @@ function renderEditor() {
   // Body: a seq of block refs. Each block is its own text seq.
   currentBody = bodyOf(current);
   if (currentBody) migrateLegacyBody(currentBody);
-  const editing = viewMode === 'edit';
+  const editing = viewMode !== 'view';
+  const showPreview = viewMode !== 'edit';
   blocksEl.style.display = editing ? '' : 'none';
-  previewEl.style.display = editing ? 'none' : '';
+  previewEl.style.display = showPreview ? '' : 'none';
   if (editing) renderBlocks();
-  else renderPreview();
+  if (showPreview) renderPreview();
   renderComments();
 }
 
@@ -779,6 +783,10 @@ function renderBlocks() {
       applyDiff(b.obj, ta.dataset.prev, ta.value);
       ta.dataset.prev = ta.value;
       autosize(ta);
+      if (viewMode === 'split') {
+        renderPreview();
+        renderComments();
+      }
       persistSoon();
     };
     ta.onfocus = () => {
@@ -885,7 +893,7 @@ function collectComments() {
 
 function renderComments() {
   const panel = document.getElementById('comments');
-  const comments = viewMode === 'view' && current ? collectComments() : [];
+  const comments = viewMode !== 'edit' && current ? collectComments() : [];
   if (comments.length === 0) {
     panel.style.display = 'none';
     return;
@@ -993,7 +1001,7 @@ function selectionLines(text, selStart, selEnd) {
 }
 
 document.getElementById('insert-table').onclick = () => {
-  if (!current || viewMode !== 'edit') return;
+  if (!current || viewMode === 'view') return;
   const ta = focusedTA();
   if (!ta) return;
   const blockObj = ta.dataset.blockObj;
@@ -1014,13 +1022,13 @@ document.getElementById('insert-table').onclick = () => {
   }
   web.seqInsertRef(blockObj, at, tableOrigin);
   persistSoon();
-  setViewMode('view'); // tables live in the rendered face
+  setViewMode(viewMode === 'edit' ? 'split' : viewMode); // show the table, keep editing
 };
 
 for (const btn of document.querySelectorAll('#fmt-tools button')) {
   if (!btn.dataset.mark) continue;
   btn.onclick = () => {
-    if (!current || viewMode !== 'edit') return;
+    if (!current || viewMode === 'view') return;
     const ta = focusedTA();
     if (!ta) return;
     const blockObj = ta.dataset.blockObj;
@@ -1045,6 +1053,10 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
       web.markRange(blockObj, a, b, kind, 'on');
     }
     persistSoon();
+    if (viewMode === 'split') {
+      renderPreview();
+      renderComments();
+    }
     ta.focus();
     ta.setSelectionRange(a, b);
   };
