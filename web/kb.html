@@ -170,21 +170,34 @@
   #blocks {
     font-family:inherit; font-size:14px; line-height:1.65; color:var(--ink);
   }
-  .block-row { display:flex; align-items:flex-start; gap:4px; padding:2px 0; position:relative; }
-  .block-row.drop-above::before {
-    content:''; position:absolute; top:0; left:24px; right:0; height:0;
+  .doc-row { display:flex; align-items:flex-start; gap:14px; }
+  .block-col {
+    display:flex; align-items:flex-start; gap:4px; padding:2px 0;
+    position:relative; flex:1 1 0; min-width:0;
+  }
+  .block-col.drop-above::before {
+    content:''; position:absolute; top:0; left:20px; right:0; height:0;
     border-top:2px solid var(--red);
   }
-  .block-row.drop-below::after {
-    content:''; position:absolute; bottom:0; left:24px; right:0; height:0;
+  .block-col.drop-below::after {
+    content:''; position:absolute; bottom:0; left:20px; right:0; height:0;
     border-top:2px solid var(--red);
   }
-  .block-row .handle {
+  .block-col.drop-left::before {
+    content:''; position:absolute; top:2px; bottom:2px; left:-8px; width:0;
+    border-left:2px solid var(--red);
+  }
+  .block-col.drop-right::after {
+    content:''; position:absolute; top:2px; bottom:2px; right:-8px; width:0;
+    border-left:2px solid var(--red);
+  }
+  .block-col .handle {
     color:var(--muted); cursor:grab; user-select:none; padding:6px 4px 0 0;
-    font-size:13px; flex:none; letter-spacing:-2px;
+    font-size:13px; flex:none; letter-spacing:-2px; opacity:0;
   }
-  .block-row .handle:hover { color:var(--ink); }
-  .block-row.dragging { opacity:0.4; }
+  .doc-row:hover .handle { opacity:1; }
+  .block-col .handle:hover { color:var(--ink); }
+  .block-col.dragging { opacity:0.4; }
   .block-ed {
     flex:1; min-width:0; outline:none; border:1px solid transparent;
     font-family:inherit; font-size:14px; line-height:1.6; color:var(--ink);
@@ -228,12 +241,12 @@
     font-size:13px; padding:0 2px;
   }
   .region-live.eq-live { display:inline; background:var(--paper2); box-shadow:0 0 0 1px var(--blue); }
-  .block-row .b-del {
+  .block-col .b-del {
     color:var(--muted); cursor:pointer; flex:none; padding:6px 2px 0 2px;
     font-size:11px; visibility:hidden;
   }
-  .block-row:hover .b-del { visibility:visible; }
-  .block-row .b-del:hover { color:var(--red); }
+  .block-col:hover .b-del { visibility:visible; }
+  .block-col .b-del:hover { color:var(--red); }
   #blocks .add-block {
     margin:6px 0 0 24px; font-size:10px; letter-spacing:1px; color:var(--muted);
     background:transparent; border:1px dashed var(--grid);

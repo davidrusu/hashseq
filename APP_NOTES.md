@@ -570,3 +570,35 @@ work over the same marks/atoms model. Confirms the projection API is the
 right shape; the app layer is where the product lives. Still owed: vendor
 KaTeX so first-paint math needs no network (the load race is now handled,
 but offline still shows source).
+
+## 23. Multi-column rows: the seq-of-seqs shape, a third time (2026-07-03)
+
+Side-by-side blocks. The body went from a flat seq of blocks to a seq of
+ROWS, each row a seq of COLUMN blocks — the exact seq-of-seqs shape
+already used for tables (rows→cells) and the page tree (children). A block
+is still a text seq; most rows hold one column (full width); dragging a
+block onto the left/right quarter of another splits its row into columns,
+onto the top/bottom makes a new row. All moves are the primitives we
+already had: within-row reorder is one seqMove; cross-row is remove +
+insert; the block object (its text, marks, comments) is never touched —
+only which row-atom points at it.
+
+- **No new merge semantics.** Rows and columns are more atoms in more
+  seqs, so canonical encoding and union merge converge them for free — the
+  third feature to ride the same model with zero store changes.
+- **Migration converged by derivation.** Legacy flat bodies wrap each
+  block in a row whose origin is `seqId(block)` — deterministic, so two
+  replicas migrating concurrently produce the *same* row objects; a
+  per-page `bodySchema` kv flag makes it idempotent, and `rowsOf`/
+  `columnsOf` dedup by origin so any duplicate row-atoms from concurrent
+  migration collapse to one on render. This is APP_NOTES #12's
+  deterministic-migration idiom finally exercised on real content
+  (preserved intact through the wrap).
+- Empty rows self-clean when their last column leaves; drop zones are
+  quarter-based (left/right = column, top/bottom = new row).
+
+**Feedback**: the store's "everything is a seq of refs" really is the
+whole product's structural grammar now — text, blocks, rows, columns,
+tables, trees are one recursive shape. The app never needed a new
+primitive; it needed to nest the one it has. Strongest validation yet of
+the flat-store + seq-projection design.

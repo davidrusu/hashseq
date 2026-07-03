@@ -296,7 +296,6 @@ let currentBody = null; // body seq obj hex (a seq of block refs)
 const viewMode = 'edit'; // WYSIWYG is the only mode now
 let renderTargetObj = null; // the seq renderBody is currently rendering
 let focusedBlockObj = null; // last-focused block (toolbar target)
-let dragFrom = null; // block index a drag started from
 let exposedRegion = null; // {blockObj, kind:'math'|'eqblock', ord} — source shown for editing
 let treeDrag = null; // { pageObj, listObj, idx } — a sidebar drag in flight
 
@@ -1002,20 +1001,24 @@ function renderEditor() {
     conflictEl.style.display = 'none';
   }
 
-  // Body: a seq of block refs. Each block is its own text seq.
+  // Body: a seq of ROW refs; each row a seq of column blocks.
   currentBody = bodyOf(current);
+  if (currentBody) ensureRowSchema(current, currentBody);
   renderBlocks();
   renderComments();
 }
 
 // ---- blocks ------------------------------------------------------------------
 
-function blocksOf(bodyObj) {
+function blocksOf(seqObj) {
   const out = [];
-  const n = web.textLen(bodyObj);
+  const seen = new Set();
+  const n = web.textLen(seqObj);
   for (let i = 0; i < n; i++) {
-    const origin = web.payloadAt(bodyObj, i);
-    if (origin) out.push({ idx: i, obj: web.createSeq(origin) });
+    const origin = web.payloadAt(seqObj, i);
+    if (!origin || seen.has(origin)) continue; // dedup (concurrent migration)
+    seen.add(origin);
+    out.push({ idx: i, origin, obj: web.createSeq(origin) });
   }
   return out;
 }
@@ -1410,58 +1413,176 @@ function rerenderBlock(ed, blockObj, caretOff, preferAfter = false) {
 let normalizeTimer = null;
 
 function clearDropMarks() {
-  for (const r of blocksEl.querySelectorAll('.block-row')) {
-    r.classList.remove('drop-above', 'drop-below');
+  for (const el of blocksEl.querySelectorAll('.doc-row, .block-col')) {
+    el.classList.remove('drop-above', 'drop-below', 'drop-left', 'drop-right');
   }
 }
 
-/// Build a block row ONCE; renders and index assignments happen in
-/// renderBlocks. Rows persist across renders so an untouched block keeps
-/// its DOM — and with it the browser's own caret and selection.
-function makeBlockRow(obj) {
-  const row = document.createElement('div');
-  row.className = 'block-row';
-  row.dataset.obj = obj;
-  const curIdx = () => Number(row.dataset.idx);
+// ---- rows and columns --------------------------------------------------------
+//
+// The body is a seq of ROW refs; each row is a seq of COLUMN refs; each
+// column is a text-seq block. Most rows hold one column (a full-width
+// block); dragging a block onto the left/right edge of another splits its
+// row into side-by-side columns. All three levels are the same seq-of-refs
+// shape used by the tree and tables.
+
+function rowsOf(body) {
+  return blocksOf(body); // atoms of the body are rows
+}
+function columnsOf(rowObj) {
+  return blocksOf(rowObj); // atoms of a row are column blocks
+}
+function allColumns(body) {
+  const out = [];
+  for (const r of rowsOf(body)) {
+    for (const c of columnsOf(r.obj)) {
+      out.push({ ...c, rowOrigin: r.origin, rowObj: r.obj, rowIdx: r.idx });
+    }
+  }
+  return out;
+}
+
+/// One-time migration: legacy bodies are a flat seq of block refs. Wrap
+/// each block in a derived row (origin = seqId(block) → convergent across
+/// concurrent migrations). Idempotent per page via the bodySchema flag.
+function ensureRowSchema(page, body) {
+  if (stringsOf(page, 'bodySchema').includes('rows')) return;
+  const n = web.textLen(body);
+  const origins = [];
+  for (let i = 0; i < n; i++) {
+    const o = web.payloadAt(body, i);
+    if (o) origins.push(o);
+  }
+  if (n > 0) web.textRemove(body, 0, n);
+  for (const bo of origins) {
+    const rowOrigin = WasmHashWeb.seqId(bo); // deterministic
+    const row = web.createSeq(rowOrigin);
+    if (web.textLen(row) === 0) web.seqInsertRef(row, 0, bo);
+    web.seqInsertRef(body, web.textLen(body), rowOrigin);
+  }
+  web.putString(page, 'bodySchema', 'rows');
+  persistSoon();
+}
+
+let dragCol = null; // { blockOrigin, rowOrigin, colIdx }
+
+function rowRecord(rowOrigin) {
+  return rowsOf(currentBody).find((r) => r.origin === rowOrigin);
+}
+
+/// Remove a row from the body if it has no columns left. Returns the body
+/// index it occupied, or -1.
+function cleanupEmptyRow(rowOrigin) {
+  const row = web.createSeq(rowOrigin);
+  if (web.textLen(row) > 0) return -1;
+  const r = rowRecord(rowOrigin);
+  if (r) {
+    web.textRemove(currentBody, r.idx, 1);
+    return r.idx;
+  }
+  return -1;
+}
+
+/// Move the dragged block to be a column of `targetRowOrigin` at column
+/// slot `targetColIdx` (a Move within a row, or remove+insert across).
+function moveColumnInto(targetRowOrigin, targetColIdx) {
+  const src = dragCol;
+  dragCol = null;
+  if (!src) return;
+  if (src.rowOrigin === targetRowOrigin) {
+    const row = web.createSeq(targetRowOrigin);
+    let to = targetColIdx;
+    if (to > src.colIdx) to -= 1;
+    if (to === src.colIdx) return; // no movement
+    web.seqMove(row, src.colIdx, to); // reorder columns: one Move op
+  } else {
+    const srcRow = web.createSeq(src.rowOrigin);
+    web.textRemove(srcRow, src.colIdx, 1);
+    const tRow = web.createSeq(targetRowOrigin);
+    web.seqInsertRef(tRow, Math.min(targetColIdx, web.textLen(tRow)), src.blockOrigin);
+    cleanupEmptyRow(src.rowOrigin);
+  }
+  persistSoon();
+  render();
+}
+
+/// Move the dragged block to a brand-new single-column row at body index.
+function moveColumnToNewRow(bodyIdx) {
+  const src = dragCol;
+  dragCol = null;
+  if (!src) return;
+  const srcRow = web.createSeq(src.rowOrigin);
+  web.textRemove(srcRow, src.colIdx, 1);
+  const removedAt = cleanupEmptyRow(src.rowOrigin);
+  let at = bodyIdx;
+  if (removedAt !== -1 && removedAt < bodyIdx) at -= 1;
+  const rowOrigin = randOrigin();
+  const row = web.createSeq(rowOrigin);
+  web.seqInsertRef(row, 0, src.blockOrigin);
+  web.seqInsertRef(currentBody, Math.min(at, web.textLen(currentBody)), rowOrigin);
+  persistSoon();
+  render();
+}
+
+/// Build a column (block editor) ONCE; renderBlocks keeps its row context
+/// (rowOrigin/colIdx/rowIdx) updated via dataset. Columns persist across
+/// renders so an untouched block keeps its DOM caret and selection.
+function makeColumn(obj, origin) {
+  const col = document.createElement('div');
+  col.className = 'block-col';
+  col.dataset.obj = obj;
+  col.dataset.origin = origin;
 
   const handle = document.createElement('span');
   handle.className = 'handle';
   handle.textContent = '⠿';
-  handle.title = 'drag to reorder (a Move op)';
+  handle.title = 'drag to reorder or drop beside another block';
   handle.draggable = true;
   handle.ondragstart = (e) => {
-    dragFrom = curIdx();
-    row.classList.add('dragging');
+    dragCol = {
+      blockOrigin: col.dataset.origin,
+      rowOrigin: col.dataset.rowOrigin,
+      colIdx: Number(col.dataset.colIdx),
+    };
+    col.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', String(curIdx()));
+    e.dataTransfer.setData('text/plain', 'block');
   };
   handle.ondragend = () => {
-    row.classList.remove('dragging');
+    col.classList.remove('dragging');
     clearDropMarks();
+    dragCol = null;
   };
 
-  row.ondragover = (e) => {
-    if (dragFrom === null) return;
+  // Drop zones on a column: left/right → column beside; top/bottom → new row.
+  col.ondragover = (e) => {
+    if (!dragCol) return;
     e.preventDefault();
-    const rect = row.getBoundingClientRect();
-    const above = e.clientY < rect.top + rect.height / 2;
+    e.stopPropagation();
+    const rect = col.getBoundingClientRect();
+    const fx = (e.clientX - rect.left) / rect.width;
+    const fy = (e.clientY - rect.top) / rect.height;
     clearDropMarks();
-    row.classList.add(above ? 'drop-above' : 'drop-below');
+    if (fx < 0.25) col.classList.add('drop-left');
+    else if (fx > 0.75) col.classList.add('drop-right');
+    else col.classList.add(fy < 0.5 ? 'drop-above' : 'drop-below');
   };
-  row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
-  row.ondrop = (e) => {
+  col.ondragleave = () =>
+    col.classList.remove('drop-above', 'drop-below', 'drop-left', 'drop-right');
+  col.ondrop = (e) => {
+    if (!dragCol) return;
     e.preventDefault();
+    e.stopPropagation();
     clearDropMarks();
-    if (dragFrom === null) return;
-    const rect = row.getBoundingClientRect();
-    const above = e.clientY < rect.top + rect.height / 2;
-    const slot = curIdx() + (above ? 0 : 1);
-    const from = dragFrom;
-    dragFrom = null;
-    if (slot === from || slot === from + 1) return; // no movement
-    web.seqMove(currentBody, from, slot); // drag-reorder IS a Move op
-    persistSoon();
-    render();
+    const rect = col.getBoundingClientRect();
+    const fx = (e.clientX - rect.left) / rect.width;
+    const fy = (e.clientY - rect.top) / rect.height;
+    const rowOrigin = col.dataset.rowOrigin;
+    const colIdx = Number(col.dataset.colIdx);
+    const rowIdx = Number(col.dataset.rowIdx);
+    if (fx < 0.25) moveColumnInto(rowOrigin, colIdx);
+    else if (fx > 0.75) moveColumnInto(rowOrigin, colIdx + 1);
+    else moveColumnToNewRow(rowIdx + (fy < 0.5 ? 0 : 1));
   };
 
   const ta = document.createElement('div');
@@ -1471,12 +1592,9 @@ function makeBlockRow(obj) {
   ta.dataset.blockObj = obj;
 
   const refreshSig = () => {
-    row.dataset.sig = web.markedSpans(obj);
+    col.dataset.sig = web.markedSpans(obj);
   };
 
-  // Insert a literal newline text node at the caret (Chrome's own
-  // insertParagraph wraps <div>s the extractor would miscount), then
-  // commit manually — no input event fires for programmatic changes.
   const insertNewlineAtCaret = () => {
     const sel = window.getSelection();
     if (!sel.rangeCount) return;
@@ -1501,7 +1619,7 @@ function makeBlockRow(obj) {
     const did = applyDiffAt(obj, ta.dataset.prev, next, caretOffsetIn(ta));
     ta.dataset.prev = next;
     if (did?.kind === 'insert') reconcileMarkAffinity(ta, obj, did.p, did.n);
-    refreshSig(); // local edits are already on screen — no rebuild needed
+    refreshSig();
     persistSoon();
     return did;
   };
@@ -1513,7 +1631,6 @@ function makeBlockRow(obj) {
     }
   });
   ta.addEventListener('keydown', (e) => {
-    // Slash menu takes keyboard priority when open.
     if (slashState && slashState.ta === ta) {
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault();
@@ -1537,8 +1654,8 @@ function makeBlockRow(obj) {
       insertNewlineAtCaret();
       return;
     }
-    // Enter: a new block after this one. A plain tail after the caret
-    // moves into it; tails carrying marks or embeds stay put.
+    // Enter: a new single-column row after this column's row. A plain tail
+    // after the caret moves into the new block.
     const caret = caretOffsetIn(ta) ?? extractText(ta).length;
     const text = extractText(ta);
     const tail = text.slice(caret);
@@ -1553,14 +1670,18 @@ function makeBlockRow(obj) {
         }
         return true;
       })();
-    const origin = randOrigin();
-    const nb = web.createSeq(origin);
+    const blockOrigin = randOrigin();
+    const nb = web.createSeq(blockOrigin);
     if (tail && tailPlain) {
       web.textRemove(obj, caret, text.length - caret);
       web.textInsert(nb, 0, tail);
       refreshSig();
     }
-    web.seqInsertRef(currentBody, curIdx() + 1, origin);
+    const rowOrigin = randOrigin();
+    const nr = web.createSeq(rowOrigin);
+    web.seqInsertRef(nr, 0, blockOrigin);
+    const rr = rowRecord(col.dataset.rowOrigin);
+    web.seqInsertRef(currentBody, (rr ? rr.idx : web.textLen(currentBody) - 1) + 1, rowOrigin);
     persistSoon();
     render();
     for (const ed of blocksEl.querySelectorAll('.block-ed')) {
@@ -1609,13 +1730,12 @@ function makeBlockRow(obj) {
   ta.addEventListener('input', (e) => {
     if (e.isComposing) return;
     commitBlockEdit();
-    if (updateSlash(ta)) return; // slash menu owns this keystroke
+    if (updateSlash(ta)) return;
     const ruled = maybeInputRule(ta, obj, e.data);
     if (ruled != null) {
       clearTimeout(normalizeTimer);
-      rerenderBlock(ta, obj, ruled, true); // caret outside the new span
+      rerenderBlock(ta, obj, ruled, true);
     } else {
-      // Reconcile styling drift (typing at mark edges) once typing pauses.
       clearTimeout(normalizeTimer);
       normalizeTimer = setTimeout(() => {
         if (document.activeElement === ta || ta.contains(document.activeElement)) {
@@ -1625,104 +1745,116 @@ function makeBlockRow(obj) {
     }
   });
   ta.addEventListener('drop', (e) => {
-    if (dragFrom === null) e.preventDefault();
+    if (dragCol) e.preventDefault();
   });
   ta.onfocus = () => {
     focusedBlockObj = obj;
   };
-  ta.addEventListener('blur', () => setTimeout(() => {
-    if (slashState && slashState.ta === ta && !slashMenu.matches(':hover')) hideSlash();
-  }, 120));
+  ta.addEventListener('blur', () =>
+    setTimeout(() => {
+      if (slashState && slashState.ta === ta && !slashMenu.matches(':hover')) hideSlash();
+    }, 120),
+  );
 
   const del = document.createElement('span');
   del.className = 'b-del';
   del.textContent = '✕';
-  del.title = 'remove block (tombstones the ref; the block object remains)';
+  del.title = 'remove block';
   del.onclick = () => {
-    web.textRemove(currentBody, curIdx(), 1);
+    const row = web.createSeq(col.dataset.rowOrigin);
+    web.textRemove(row, Number(col.dataset.colIdx), 1);
+    cleanupEmptyRow(col.dataset.rowOrigin);
     persistSoon();
     render();
   };
 
-  row.append(handle, ta, del);
-  return row;
+  col.append(handle, ta, del);
+  return col;
 }
 
-/// Incremental: rows persist keyed by block object; only blocks whose
-/// spans actually changed re-render, so a remote merge never touches the
-/// DOM (or the caret) of blocks it didn't change.
+/// Incremental: columns persist keyed by block object across renders (so a
+/// remote merge never touches a caret it didn't change); rows are rebuilt
+/// as lightweight flex containers holding the persistent columns.
 function renderBlocks() {
-  const blocks = blocksOf(currentBody);
-  const prevRows = new Map();
-  for (const r of blocksEl.querySelectorAll('.block-row')) prevRows.set(r.dataset.obj, r);
+  for (const d of blocksEl.querySelectorAll('.dragging')) d.classList.remove('dragging');
+  const rows = rowsOf(currentBody);
+  const cols = allColumns(currentBody);
+  const single = cols.length === 1;
 
-  const rows = [];
-  blocks.forEach((b, i) => {
-    let row = prevRows.get(b.obj);
-    if (!row) row = makeBlockRow(b.obj);
-    else prevRows.delete(b.obj);
-    row.dataset.idx = i;
-    const ed = row.querySelector('.block-ed');
-    if (i === 0 && blocks.length === 1) ed.dataset.placeholder = 'Type here…';
-    else delete ed.dataset.placeholder;
-    const sig = web.markedSpans(b.obj);
-    if (row.dataset.sig !== sig) {
-      const focused = ed === document.activeElement || ed.contains(document.activeElement);
-      const seqText = JSON.parse(sig)
-        .map((sp) => sp.text)
-        .join('');
-      if (focused && extractText(ed) === seqText) {
-        // Same text, different styling (e.g. a remote mark): let the
-        // normalize pass repaint shortly; don't steal the caret now.
-        row.dataset.sig = sig;
-        clearTimeout(normalizeTimer);
-        normalizeTimer = setTimeout(() => {
-          if (ed === document.activeElement || ed.contains(document.activeElement)) {
-            rerenderBlock(ed, b.obj, caretOffsetIn(ed));
-          } else {
-            rerenderBlock(ed, b.obj, null);
-          }
-        }, 400);
-      } else {
-        renderEditableInto(ed, b.obj);
-        ed.dataset.prev = extractText(ed);
-        row.dataset.sig = sig;
+  const prev = new Map();
+  for (const c of blocksEl.querySelectorAll('.block-col')) prev.set(c.dataset.obj, c);
+
+  const rowEls = [];
+  for (const r of rows) {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'doc-row';
+    rowEl.dataset.rowOrigin = r.origin;
+    for (const c of columnsOf(r.obj)) {
+      let col = prev.get(c.obj);
+      if (!col) col = makeColumn(c.obj, c.origin);
+      else prev.delete(c.obj);
+      col.dataset.rowOrigin = r.origin;
+      col.dataset.colIdx = c.idx;
+      col.dataset.rowIdx = r.idx;
+      const ed = col.querySelector('.block-ed');
+      if (single) ed.dataset.placeholder = 'Type here…';
+      else delete ed.dataset.placeholder;
+      const sig = web.markedSpans(c.obj);
+      if (col.dataset.sig !== sig) {
+        const focused = ed === document.activeElement || ed.contains(document.activeElement);
+        const seqText = JSON.parse(sig)
+          .map((sp) => sp.text)
+          .join('');
+        if (focused && extractText(ed) === seqText) {
+          col.dataset.sig = sig;
+          clearTimeout(normalizeTimer);
+          normalizeTimer = setTimeout(() => {
+            rerenderBlock(
+              ed,
+              c.obj,
+              ed === document.activeElement || ed.contains(document.activeElement)
+                ? caretOffsetIn(ed)
+                : null,
+            );
+          }, 400);
+        } else {
+          renderEditableInto(ed, c.obj);
+          ed.dataset.prev = extractText(ed);
+          col.dataset.sig = sig;
+        }
       }
+      rowEl.appendChild(col);
     }
-    rows.push(row);
-  });
-
-  for (const stale of prevRows.values()) stale.remove();
-
-  // Minimal reordering: only move rows that are out of place (moving a
-  // node would drop any selection inside it).
-  let cursor = blocksEl.firstChild;
-  for (const row of rows) {
-    if (cursor === row) {
-      cursor = cursor.nextSibling;
-      continue;
-    }
-    blocksEl.insertBefore(row, cursor);
+    rowEls.push(rowEl);
   }
 
-  let add = blocksEl.querySelector('.add-block');
+  for (const stale of prev.values()) stale.remove();
+
+  // Rows are cheap containers — rebuild the list wholesale, but reuse the
+  // persistent column nodes (moved into fresh row wrappers keeps their DOM
+  // and any selection inside them).
+  const addBtn = blocksEl.querySelector('.add-block');
+  blocksEl.querySelectorAll('.doc-row').forEach((r) => r.remove());
+  const anchor = addBtn ?? null;
+  for (const rowEl of rowEls) blocksEl.insertBefore(rowEl, anchor);
+
+  let add = addBtn;
   if (!add) {
     add = document.createElement('button');
     add.className = 'add-block';
     add.textContent = '+ BLOCK';
     add.onclick = () => addBlockAtEnd();
+    blocksEl.appendChild(add);
   }
   if (blocksEl.lastChild !== add) blocksEl.appendChild(add);
 
-  blocksEl.ondragover = (e) => e.preventDefault();
+  // Dropping below all rows (on the container) makes a new row at the end.
+  blocksEl.ondragover = (e) => {
+    if (dragCol) e.preventDefault();
+  };
   blocksEl.ondrop = (e) => {
-    if (dragFrom === null) return;
-    if (e.target === blocksEl || e.target === add) {
-      const from = dragFrom;
-      dragFrom = null;
-      web.seqMove(currentBody, from, blocksOf(currentBody).length);
-      persistSoon();
-      render();
+    if (dragCol && (e.target === blocksEl || e.target === add)) {
+      moveColumnToNewRow(rowsOf(currentBody).length);
     }
   };
 }
@@ -1769,9 +1901,12 @@ function restoreEditState(st) {
 
 function addBlockAtEnd(focus = true) {
   const body = ensureBody();
-  const origin = randOrigin();
-  web.createSeq(origin);
-  web.seqInsertRef(body, web.textLen(body), origin);
+  const blockOrigin = randOrigin();
+  web.createSeq(blockOrigin);
+  const rowOrigin = randOrigin();
+  const row = web.createSeq(rowOrigin);
+  web.seqInsertRef(row, 0, blockOrigin);
+  web.seqInsertRef(body, web.textLen(body), rowOrigin);
   persistSoon();
   render();
   if (focus) {
@@ -1790,7 +1925,7 @@ function addBlockAtEnd(focus = true) {
 function collectComments() {
   if (!currentBody) return [];
   const byKind = new Map();
-  for (const b of blocksOf(currentBody)) {
+  for (const b of allColumns(currentBody)) {
     let pos = 0;
     for (const s of styledSpans(b.obj)) {
       for (const c of s.text) {
@@ -2178,7 +2313,11 @@ function createPage(parentObj) {
   const body = web.createSeq(bodyOrigin);
   const blockOrigin = randOrigin();
   web.createSeq(blockOrigin);
-  web.seqInsertRef(body, 0, blockOrigin);
+  const rowOrigin = randOrigin();
+  const row = web.createSeq(rowOrigin);
+  web.seqInsertRef(row, 0, blockOrigin);
+  web.seqInsertRef(body, 0, rowOrigin);
+  web.putString(page, 'bodySchema', 'rows');
   current = page;
   persistSoon();
   render();
@@ -2661,7 +2800,7 @@ window.__kb = {
   WS,
   spans: (obj) => JSON.parse(web.markedSpans(obj)),
   text: (obj) => web.text(obj),
-  blocks: () => blocksOf(currentBody).map((b) => b.obj),
+  blocks: () => allColumns(currentBody).map((b) => b.obj),
   persist: () => persistNow(true),
   render,
 };
