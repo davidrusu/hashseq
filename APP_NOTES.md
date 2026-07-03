@@ -382,3 +382,37 @@ registry, no new system surface.
 **Feedback**: the derived-origin idiom (#15) plus minted-kind idiom (#11)
 compose. An app-conventions document should present them as one pattern:
 "mint a 32-byte identity; hang marks, objects, and grouping off it."
+
+## 17. First live-browser session: what real DOM editing taught us (2026-07-03)
+
+First session driving the app in an actual Chrome (via automation). Five
+findings, all app-layer; zero system changes needed:
+
+- **`prompt()` froze the tab** (and any automation with it). All dialogs
+  removed: math/equations edit inline (click or arrow-in exposes the
+  source; caret-out re-renders), delete is arm-then-confirm.
+- **Text diffs need the caret.** A prefix/suffix diff is ambiguous when
+  typed text borders equal text (` \cdot k` before ` \cdot 42` shares
+  ` \cdot `) and can slide an insertion across a mark boundary. The caret
+  position disambiguates; fall back to the plain diff only when the caret
+  story doesn't check out.
+- **Anchor side is a live UX lever, not just a schema choice.** Typed-
+  markup conversions author CLOSED ends (After(last)) so typing after a
+  rendered widget stays plain — the expanding end would race the
+  tombstoned delimiter's ghost in sibling id order (observed live:
+  " which is neat" swallowed into a math region). But while a region's
+  source is EXPOSED for editing it must accept appends, so expose
+  re-authors the mark open-ended and collapse re-closes it: two ops,
+  same-kind overwrite hygiene does the rest. MARKS.md's anchor table
+  turned out to be an interaction-design table.
+- **Trailing newlines need a sentinel line box** (contenteditable can't
+  put a caret after a trailing `\n`; Chrome types *before* it, reordering
+  the text). A `<br data-sentinel>` the extractor ignores fixes it.
+- **Async re-renders eat keystrokes**: KaTeX's late arrival rebuilt all
+  rows under the user's first click. Any full rebuild must yield to an
+  in-flight edit (defer to focusout).
+
+Also: Enter = new block after (plain tails split into it; tails carrying
+marks/embeds stay — their anchors live in the old block's elements);
+cmd+Enter = literal newline. And `window.__kb` now exposes the store to
+the console — indispensable for verifying seq truth vs DOM appearance.

@@ -825,6 +825,36 @@ impl WasmHashWeb {
         Ok(id_to_hex(&seq.mark_range(s, e, kind_id, value_id).id()))
     }
 
+    /// Like `markRange`, but with a CLOSED end: the end anchor is
+    /// `After(last covered element)`, so text typed immediately after the
+    /// region deterministically lands OUTSIDE it. This is what typed-markup
+    /// conversions want (`Before(next)` ends would race the tombstoned
+    /// delimiter's ghost in sibling id order — nondeterministic growth).
+    #[wasm_bindgen(js_name = markRangeClosed)]
+    pub fn mark_range_closed(
+        &mut self,
+        obj_hex: &str,
+        start: usize,
+        end: usize,
+        kind: &str,
+        value: &str,
+    ) -> Result<String, JsValue> {
+        let k = Value::String(kind.to_owned());
+        let v = Value::String(value.to_owned());
+        let kind_id = self.inner.provide_value(&k);
+        let value_id = self.inner.provide_value(&v);
+        let seq = self
+            .inner
+            .seq_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        if start >= end || end > seq.len() {
+            return Err(app_err("mark range out of bounds"));
+        }
+        let s = Anchor::Before(seq.id_at(start).expect("start < len"));
+        let e = Anchor::After(seq.id_at(end - 1).expect("end-1 < len"));
+        Ok(id_to_hex(&seq.mark_range(s, e, kind_id, value_id).id()))
+    }
+
     /// Remove `kind` formatting over `[start, end)` — a tombstone-valued
     /// mark (partial unmark works: the overwritten mark keeps applying
     /// outside the range).

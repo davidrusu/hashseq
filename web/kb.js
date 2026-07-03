@@ -205,6 +205,7 @@ let viewMode = 'edit'; // 'edit' | 'split' | 'view'
 let renderTargetObj = null; // the seq renderBody is currently rendering
 let focusedBlockObj = null; // last-focused block (toolbar target)
 let dragFrom = null; // block index a drag started from
+let exposedRegion = null; // {blockObj, kind:'math'|'eqblock', ord} — source shown for editing
 let treeDrag = null; // { pageObj, listObj, idx } — a sidebar drag in flight
 
 // ---- rendering: marks + light markup ----------------------------------------
@@ -226,7 +227,13 @@ import('https://esm.sh/katex@0.16.11')
     link.rel = 'stylesheet';
     link.href = 'https://esm.sh/katex@0.16.11/dist/katex.min.css';
     document.head.appendChild(link);
-    if (viewMode === 'view') renderEditor();
+    // Gentle arrival: never rebuild rows underneath an in-flight edit —
+    // a rebuild mid-interaction drops focus and eats keystrokes.
+    if (document.activeElement?.closest?.('.block-ed, [contenteditable]')) {
+      window.addEventListener('focusout', () => render(), { once: true });
+    } else {
+      render();
+    }
   })
   .catch((e) => console.warn('[kb] KaTeX unavailable — math renders as source:', e));
 
@@ -318,6 +325,39 @@ function chunkNodes(chars) {
     out.push(node);
   }
   return out;
+}
+
+/// Caret-aware diff: a plain prefix/suffix diff is ambiguous when the
+/// typed text borders equal text ("​ \cdot k" before " \cdot 42" shares
+/// " \cdot ") and can slide the insertion point across a mark boundary.
+/// The caret says where the edit really happened — trust it when it
+/// checks out, fall back to the plain diff otherwise.
+function applyDiffAt(obj, prev, next, caret) {
+  if (caret != null && next.length > prev.length) {
+    const n = next.length - prev.length;
+    const p = caret - n;
+    if (
+      p >= 0 &&
+      p <= prev.length &&
+      prev.slice(0, p) === next.slice(0, p) &&
+      prev.slice(p) === next.slice(p + n)
+    ) {
+      web.textInsert(obj, p, next.slice(p, p + n));
+      return;
+    }
+  } else if (caret != null && next.length < prev.length) {
+    const n = prev.length - next.length;
+    if (
+      caret >= 0 &&
+      caret + n <= prev.length &&
+      prev.slice(0, caret) === next.slice(0, caret) &&
+      prev.slice(caret + n) === next.slice(caret)
+    ) {
+      web.textRemove(obj, caret, n);
+      return;
+    }
+  }
+  applyDiff(obj, prev, next);
 }
 
 /// A single-span text diff applied as seq ops.
@@ -804,8 +844,11 @@ function extractText(node) {
     if (child.nodeType === Node.TEXT_NODE) out += child.data;
     else if (child.nodeType !== Node.ELEMENT_NODE) continue;
     else if (child.dataset && child.dataset.text != null) out += child.dataset.text;
-    else if (child.tagName === 'BR') out += '\n';
-    else out += extractText(child);
+    else if (child.tagName === 'BR') {
+      // Sentinel <br>s give a trailing newline a caret-addressable line
+      // box; they are presentation, not content.
+      if (!child.dataset.sentinel) out += '\n';
+    } else out += extractText(child);
   }
   return out;
 }
@@ -854,6 +897,7 @@ function locateOffset(blockEl, target) {
           if (remaining < len) return { node: child.parentNode, after: child };
           remaining -= len;
         } else if (child.tagName === 'BR') {
+          if (child.dataset.sentinel) continue;
           if (remaining <= 0) return { node: child.parentNode, before: child };
           remaining -= 1;
         } else {
@@ -897,25 +941,68 @@ function makeWidget(inner, text, cls) {
   return w;
 }
 
-/// Double-click a math/equation widget to edit its source: replace the
-/// region's chars in place — the mark's regional points survive, so the
-/// new source stays inside the math region.
-function widgetSourceEditor(w, blockObj, ed, label) {
-  w.ondblclick = () => {
-    const src = prompt(`${label}:`, w.dataset.text);
-    if (src == null || src === w.dataset.text) return;
-    const off = offsetOfPoint(ed, ...rangePointBefore(w));
-    web.textRemove(blockObj, off, [...w.dataset.text].length);
-    if (src.length > 0) web.textInsert(blockObj, off, src);
-    persistSoon();
-    rerenderBlock(ed, blockObj, off + [...src].length);
-    if (viewMode === 'split') renderPreview();
-  };
+/// Click a math/equation widget (or arrow into it) to expose its source
+/// in place: the region's chars render as editable text instead of KaTeX
+/// until the caret leaves. No dialogs — the seq is edited directly, and
+/// the mark's regional points keep the region alive throughout.
+/// Region extent [start, end) of the ord'th region of `kind` in a block.
+function regionExtent(blockObj, kind, ord) {
+  let pos = 0;
+  let n = -1;
+  let start = null;
+  for (const sp of styledSpans(blockObj)) {
+    const inRegion = kind === 'math' ? sp.math && sp.codeblock === null && !sp.eqblock : sp.eqblock;
+    if (inRegion && start === null) {
+      n++;
+      if (n === ord) start = pos;
+    }
+    if (!inRegion && start !== null && n === ord) return [start, pos];
+    if (!inRegion) start = null;
+    pos += sp.text.length;
+  }
+  return start !== null ? [start, pos] : null;
 }
 
-function rangePointBefore(node) {
-  return [node.parentNode, [...node.parentNode.childNodes].indexOf(node)];
+function exposeRegion(ed, blockObj, kind, ord, caretOff) {
+  // Re-author the mark OPEN-ended while editing: appended source must
+  // join the region. (Collapse re-closes it.)
+  const ext = regionExtent(blockObj, kind, ord);
+  if (ext) web.markRange(blockObj, ext[0], ext[1], kind, 'on');
+  exposedRegion = { blockObj, kind, ord };
+  rerenderBlock(ed, blockObj, caretOff);
+  if (viewMode === 'split') renderPreview();
+  persistSoon();
 }
+
+function collapseExposedRegion() {
+  if (!exposedRegion) return;
+  const { blockObj, kind, ord } = exposedRegion;
+  exposedRegion = null;
+  // Re-close the end anchor: typing after the rendered widget stays plain.
+  const ext = regionExtent(blockObj, kind, ord);
+  if (ext && ext[1] > ext[0]) {
+    web.markRangeClosed(blockObj, ext[0], ext[1], kind, 'on');
+    persistSoon();
+  }
+  for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+    if (ed.dataset.blockObj === blockObj) {
+      const focused = ed.contains(document.activeElement) || document.activeElement === ed;
+      rerenderBlock(ed, blockObj, focused ? caretOffsetIn(ed) : null);
+      if (!focused) ed.blur?.();
+      break;
+    }
+  }
+}
+
+// Collapse the exposed source the moment the caret leaves it.
+document.addEventListener('selectionchange', () => {
+  if (!exposedRegion) return;
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return;
+  let node = sel.getRangeAt(0).startContainer;
+  if (node.nodeType === Node.TEXT_NODE) node = node.parentNode;
+  if (!node.closest?.('.region-live')) collapseExposedRegion();
+});
 
 /// Render a block's content as editable, formatted DOM.
 function renderEditableInto(ed, blockObj) {
@@ -924,6 +1011,12 @@ function renderEditableInto(ed, blockObj) {
   const spans = styledSpans(blockObj);
   let i = 0;
   let pos = 0;
+  const ords = { math: 0, eqblock: 0 };
+  const isExposed = (kind, ord) =>
+    exposedRegion &&
+    exposedRegion.blockObj === blockObj &&
+    exposedRegion.kind === kind &&
+    exposedRegion.ord === ord;
   while (i < spans.length) {
     if (spans[i].codeblock !== null) {
       let text = '';
@@ -939,16 +1032,28 @@ function renderEditableInto(ed, blockObj) {
       region.appendChild(document.createTextNode(text));
       ed.appendChild(region);
     } else if (spans[i].eqblock) {
+      const start = pos;
       let tex = '';
       while (i < spans.length && spans[i].eqblock) {
         tex += spans[i].text;
         pos += [...spans[i].text].length;
         i++;
       }
-      const w = makeWidget(mathNode(tex.trim(), true), tex, 'w-eq');
-      w.title = 'double-click to edit the equation source';
-      widgetSourceEditor(w, blockObj, ed, 'Equation (TeX)');
-      ed.appendChild(w);
+      const ord = ords.eqblock++;
+      if (isExposed('eqblock', ord)) {
+        const live = document.createElement('span');
+        live.className = 'region-live eq-live';
+        live.appendChild(document.createTextNode(tex));
+        ed.appendChild(live);
+      } else {
+        const w = makeWidget(mathNode(tex.trim(), true), tex, 'w-eq');
+        w.title = 'click to edit the equation source';
+        w.dataset.start = start;
+        w.dataset.kind = 'eqblock';
+        w.dataset.ord = ord;
+        w.onclick = () => exposeRegion(ed, blockObj, 'eqblock', ord, start + tex.length);
+        ed.appendChild(w);
+      }
     } else {
       const chars = [];
       while (i < spans.length && spans[i].codeblock === null && !spans[i].eqblock) {
@@ -964,12 +1069,18 @@ function renderEditableInto(ed, blockObj) {
         }
         i++;
       }
-      emitEditableChunks(ed, chars, blockObj);
+      emitEditableChunks(ed, chars, blockObj, ords, isExposed);
     }
+  }
+  // A trailing newline needs a line box for the caret to land on.
+  if (extractText(ed).endsWith('\n')) {
+    const br = document.createElement('br');
+    br.dataset.sentinel = '1';
+    ed.appendChild(br);
   }
 }
 
-function emitEditableChunks(ed, chars, blockObj) {
+function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
   let k = 0;
   while (k < chars.length) {
     const first = chars[k];
@@ -982,15 +1093,27 @@ function emitEditableChunks(ed, chars, blockObj) {
       continue;
     }
     if (first.math) {
+      const start = first.idx;
       let src = '';
       while (k < chars.length && chars[k].math && chars[k].c !== ATOM) {
         src += chars[k].c;
         k++;
       }
-      const w = makeWidget(mathNode(src, false), src, 'w-math');
-      w.title = 'double-click to edit the math source';
-      widgetSourceEditor(w, blockObj, ed, 'Math (TeX)');
-      ed.appendChild(w);
+      const ord = ords.math++;
+      if (isExposed('math', ord)) {
+        const live = document.createElement('span');
+        live.className = 'region-live math-live';
+        live.appendChild(document.createTextNode(src));
+        ed.appendChild(live);
+      } else {
+        const w = makeWidget(mathNode(src, false), src, 'w-math');
+        w.title = 'click to edit the math source';
+        w.dataset.start = start;
+        w.dataset.kind = 'math';
+        w.dataset.ord = ord;
+        w.onclick = () => exposeRegion(ed, blockObj, 'math', ord, start + src.length);
+        ed.appendChild(w);
+      }
       continue;
     }
     const { code } = first;
@@ -1100,11 +1223,85 @@ function renderBlocks() {
     renderEditableInto(ta, b.obj);
     ta.dataset.prev = extractText(ta);
     ta.dataset.blockObj = b.obj;
+    // Insert a literal newline text node at the caret (Chrome's own
+    // insertParagraph/insertText('\n') wraps <div>s, which the extractor
+    // would miscount), then commit the edit pipeline manually — no input
+    // event fires for programmatic DOM changes.
+    const insertNewlineAtCaret = () => {
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return;
+      const r = sel.getRangeAt(0);
+      if (!ta.contains(r.startContainer)) return;
+      r.deleteContents();
+      const tn = document.createTextNode('\n');
+      r.insertNode(tn);
+      r.setStartAfter(tn);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      if (extractText(ta).endsWith('\n') && !ta.querySelector('br[data-sentinel]')) {
+        const br = document.createElement('br');
+        br.dataset.sentinel = '1';
+        ta.appendChild(br);
+      }
+      commitBlockEdit();
+    };
+    const commitBlockEdit = () => {
+      const next = extractText(ta);
+      applyDiffAt(b.obj, ta.dataset.prev, next, caretOffsetIn(ta));
+      ta.dataset.prev = next;
+      if (viewMode === 'split') {
+        renderPreview();
+        renderComments();
+      }
+      persistSoon();
+    };
     ta.addEventListener('beforeinput', (e) => {
       if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
-        // Keep the DOM plain: newlines are text, never <div>/<br> soup.
         e.preventDefault();
-        document.execCommand('insertText', false, '\n');
+        insertNewlineAtCaret();
+      }
+    });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (e.metaKey || e.ctrlKey) {
+        // cmd+Enter: a newline within this block.
+        insertNewlineAtCaret();
+        return;
+      }
+      // Enter: a new block after this one. A plain tail after the caret
+      // moves into the new block (a true split); tails carrying marks or
+      // embeds stay put — their anchors live in this block's elements.
+      const caret = caretOffsetIn(ta) ?? extractText(ta).length;
+      const text = extractText(ta);
+      const tail = text.slice(caret);
+      const tailPlain =
+        !tail.includes(ATOM) &&
+        (() => {
+          for (let q = caret; q < text.length; q++) {
+            const f = flagsAt(b.obj, q);
+            if (f && (f.code || f.math || f.codeblock !== null || f.eqblock || f.comments.length)) {
+              return false;
+            }
+          }
+          return true;
+        })();
+      const origin = randOrigin();
+      const nb = web.createSeq(origin);
+      if (tail && tailPlain) {
+        web.textRemove(b.obj, caret, text.length - caret);
+        web.textInsert(nb, 0, tail);
+      }
+      web.seqInsertRef(currentBody, i + 1, origin);
+      persistSoon();
+      render();
+      for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+        if (ed.dataset.blockObj === nb) {
+          ed.focus();
+          setSelectionRangeIn(ed, 0);
+          break;
+        }
       }
     });
     ta.addEventListener('paste', (e) => {
@@ -1115,19 +1312,12 @@ function renderBlocks() {
       if (e.isComposing) return;
       // Table cells inside embed widgets stopPropagation; anything else
       // reaching here edits the block's own text.
-      const next = extractText(ta);
-      applyDiff(b.obj, ta.dataset.prev, next);
-      ta.dataset.prev = next;
+      commitBlockEdit();
       const ruled = maybeInputRule(ta, b.obj, e.data);
       if (ruled != null) {
         clearTimeout(normalizeTimer);
         rerenderBlock(ta, b.obj, ruled);
       }
-      if (viewMode === 'split') {
-        renderPreview();
-        renderComments();
-      }
-      persistSoon();
       // Reconcile styling drift (typing at mark edges) once typing pauses.
       clearTimeout(normalizeTimer);
       normalizeTimer = setTimeout(() => {
@@ -1135,6 +1325,25 @@ function renderBlocks() {
           rerenderBlock(ta, b.obj, caretOffsetIn(ta));
         }
       }, 900);
+    });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const caret = caretOffsetIn(ta);
+      if (caret == null) return;
+      for (const w of ta.querySelectorAll('.inline-widget.w-math, .inline-widget.w-eq')) {
+        const start = Number(w.dataset.start);
+        const len = w.dataset.text.length;
+        if (e.key === 'ArrowRight' && caret === start) {
+          e.preventDefault();
+          exposeRegion(ta, b.obj, w.dataset.kind, Number(w.dataset.ord), start + 1);
+          return;
+        }
+        if (e.key === 'ArrowLeft' && caret === start + len) {
+          e.preventDefault();
+          exposeRegion(ta, b.obj, w.dataset.kind, Number(w.dataset.ord), start + len);
+          return;
+        }
+      }
     });
     ta.addEventListener('drop', (e) => {
       // Text drops would splice DOM we don't control; block reorders are
@@ -1459,7 +1668,7 @@ function maybeInputRule(ed, blockObj, typed) {
           const co = os + line.length + 1; // content start (after fence newline)
           const ce = lineStart - 1; // the newline before the closing fence
           if (ce <= co) return null; // empty fence
-          web.markRange(blockObj, co, ce, 'codeblock', lang);
+          web.markRangeClosed(blockObj, co, ce, 'codeblock', lang);
           web.textRemove(blockObj, ce, caret - ce); // "\n```"
           web.textRemove(blockObj, os, co - os); // "```lang\n"
           return ce - (co - os);
@@ -1474,7 +1683,7 @@ function maybeInputRule(ed, blockObj, typed) {
     const content = text.slice(i + 1, p);
     if (!content || content.includes('\n') || content.includes(ATOM)) return null;
     if (!plainAt(blockObj, i + 1) || !plainAt(blockObj, i)) return null;
-    web.markRange(blockObj, i + 1, p, 'code', 'on');
+    web.markRangeClosed(blockObj, i + 1, p, 'code', 'on');
     web.textRemove(blockObj, p, 1);
     web.textRemove(blockObj, i, 1);
     return p - 1;
@@ -1490,7 +1699,7 @@ function maybeInputRule(ed, blockObj, typed) {
       return null;
     }
     if (!plainAt(blockObj, k + 2) || !plainAt(blockObj, k)) return null;
-    web.markRange(blockObj, k + 2, p - 1, 'eqblock', 'on');
+    web.markRangeClosed(blockObj, k + 2, p - 1, 'eqblock', 'on');
     web.textRemove(blockObj, p - 1, 2);
     web.textRemove(blockObj, k, 2);
     return p - 3;
@@ -1501,7 +1710,7 @@ function maybeInputRule(ed, blockObj, typed) {
   const content = text.slice(i + 1, p);
   if (!content || content.includes('\n') || content.includes(ATOM)) return null;
   if (!plainAt(blockObj, i + 1) || !plainAt(blockObj, i)) return null;
-  web.markRange(blockObj, i + 1, p, 'math', 'on');
+  web.markRangeClosed(blockObj, i + 1, p, 'math', 'on');
   web.textRemove(blockObj, p, 1);
   web.textRemove(blockObj, i, 1);
   return p - 1;
@@ -1582,10 +1791,26 @@ function createPage(parentObj) {
 document.getElementById('new-page').onclick = () => createPage(WS);
 document.getElementById('new-subpage').onclick = () => current && createPage(current);
 
-document.getElementById('delete-page').onclick = () => {
+// Inline confirmation: first click arms the button, second click (within
+// 3s) deletes. No dialogs anywhere in the app.
+let deleteArmTimer = null;
+document.getElementById('delete-page').onclick = (e) => {
   if (!current) return;
+  const btn = e.target;
+  if (!btn.dataset.armed) {
+    btn.dataset.armed = '1';
+    btn.textContent = 'REALLY DELETE?';
+    clearTimeout(deleteArmTimer);
+    deleteArmTimer = setTimeout(() => {
+      delete btn.dataset.armed;
+      btn.textContent = 'DELETE PAGE';
+    }, 3000);
+    return;
+  }
+  clearTimeout(deleteArmTimer);
+  delete btn.dataset.armed;
+  btn.textContent = 'DELETE PAGE';
   const meta = pageMeta.get(current);
-  if (!confirm(`Delete "${meta.title}"? (Tombstones its tree entry; ops remain in the DAG.)`)) return;
   web.textRemove(meta.listObj, meta.idx, 1);
   current = null;
   persistSoon();
@@ -1710,8 +1935,7 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
     if (kind === 'clear') {
       for (const k of MARK_KINDS) web.unmarkRange(blockObj, a, b, k);
     } else if (kind === 'codeblock') {
-      const lang = prompt('language label (optional):', '') ?? '';
-      web.markRange(blockObj, a, b, 'codeblock', lang);
+      web.markRange(blockObj, a, b, 'codeblock', '');
     } else {
       web.markRange(blockObj, a, b, kind, 'on');
     }
@@ -1731,3 +1955,12 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
 render();
 persistNow(false);
 console.log('[kb] workspace object:', WS);
+
+// Dev handle: inspect the store from the console.
+window.__kb = {
+  web,
+  WS,
+  spans: (obj) => JSON.parse(web.markedSpans(obj)),
+  text: (obj) => web.text(obj),
+  blocks: () => blocksOf(currentBody).map((b) => b.obj),
+};
