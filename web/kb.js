@@ -824,6 +824,7 @@ function renderTree() {
       }
       row.onclick = () => {
         current = p;
+        document.body.classList.remove('show-nav'); // overlay mode closes on pick
         render();
       };
 
@@ -1724,9 +1725,13 @@ function setCommentHighlight(kind, on) {
 function renderComments() {
   const panel = document.getElementById('comments');
   const comments = current ? collectComments() : [];
+  const toggle = document.getElementById('comments-toggle');
+  document.getElementById('ct-count').textContent = comments.length;
+  toggle.style.visibility = comments.length === 0 ? 'hidden' : '';
   if (comments.length === 0) {
     panel.style.display = 'none';
     activeCommentTag = null;
+    document.body.classList.remove('show-comments');
     return;
   }
   panel.style.display = 'flex';
@@ -2214,6 +2219,20 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
     }
   };
 }
+
+// ---- responsive panel toggles -------------------------------------------------
+
+document.getElementById('nav-toggle').onclick = () => {
+  document.body.classList.toggle('show-nav');
+  document.body.classList.remove('show-comments');
+};
+document.getElementById('comments-toggle').onclick = () => {
+  document.body.classList.toggle('show-comments');
+  document.body.classList.remove('show-nav');
+};
+document.getElementById('panel-backdrop').onclick = () => {
+  document.body.classList.remove('show-nav', 'show-comments');
+};
 
 // ---- go ----------------------------------------------------------------------
 

@@ -28,6 +28,42 @@
   }
   header .brand { font-weight:600; letter-spacing:3px; font-size:12px; }
   header .fig { color:var(--muted); font-size:11px; letter-spacing:1px; }
+  header .h-left, header .h-right { display:flex; align-items:center; gap:12px; }
+  #nav-toggle, #comments-toggle { display:none; font-size:13px; padding:3px 8px; }
+  #panel-backdrop {
+    display:none; position:fixed; inset:0; z-index:15;
+    background:rgba(27,24,22,0.25);
+  }
+
+  /* ---- responsive: panels collapse into slide-in overlays ---- */
+  @media (max-width: 1150px) {
+    #comments-toggle { display:inline-block; }
+    #comments {
+      position:fixed; top:0; right:0; bottom:0; z-index:20;
+      transform:translateX(100%); transition:transform 0.18s ease-out;
+      box-shadow:-4px 0 14px rgba(27,24,22,0.25);
+    }
+    body.show-comments #comments { transform:none; background:var(--paper2); }
+    body.show-comments #panel-backdrop { display:block; }
+  }
+  @media (max-width: 900px) {
+    #nav-toggle { display:inline-block; }
+    #sidebar {
+      position:fixed; top:0; left:0; bottom:0; z-index:20;
+      transform:translateX(-100%); transition:transform 0.18s ease-out;
+      box-shadow:4px 0 14px rgba(27,24,22,0.25);
+    }
+    body.show-nav #sidebar { transform:none; background:var(--paper2); }
+    body.show-nav #panel-backdrop, body.show-comments #panel-backdrop { display:block; }
+    header .fig { display:none; }
+    #crumbs, #title { padding-left:14px; }
+    #fmt-row, #work { margin-left:12px; margin-right:12px; }
+    #page-tools { padding-left:12px; }
+  }
+  @media (max-width: 640px) {
+    #fmt-tools { flex-wrap:wrap; }
+    .fig { display:none; }
+  }
 
   main { flex:1; display:flex; min-height:0; }
 
@@ -273,9 +309,16 @@
 </head>
 <body>
   <header>
-    <div class="brand">HASHWEB</div>
-    <div class="fig">FIG. 03 — KNOWLEDGE BASE ON A FLAT STORE OF OBJECTS</div>
+    <div class="h-left">
+      <button id="nav-toggle" title="pages">☰</button>
+      <div class="brand">HASHWEB</div>
+    </div>
+    <div class="h-right">
+      <div class="fig">FIG. 03 — KNOWLEDGE BASE ON A FLAT STORE OF OBJECTS</div>
+      <button id="comments-toggle" title="comments">💬 <span id="ct-count">0</span></button>
+    </div>
   </header>
+  <div id="panel-backdrop"></div>
   <main>
     <nav id="sidebar">
       <div class="side-head"><span>PAGES</span><button id="new-page">+ NEW</button></div>
