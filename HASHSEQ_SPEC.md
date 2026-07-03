@@ -77,9 +77,10 @@ markable, removable; creation values birth HashWeb children inline).
 Splice-point anchors are fully live: insert anchors, mark span endpoints
 (op points bracket wherever the target renders; anchored ops retain their
 rank fragment for life), and Move destinations (drag-next-to-moved-content
-lands at the rendered position). The remaining Move gate row is
-self-splice: an element moved adjacent to its own placement quarantines
-(stable, hash-committed check). Move's rendered index relocation is wired per "Apply" below:
+lands at the rendered position) — including self-splice: moving an
+element to one of its own ops' splice points is well-defined ("put x
+where that op placed it" — excision precedes placement and op ranks are
+permanent), so no extra gate row exists for it. Move's rendered index relocation is wired per "Apply" below:
 origin ghosts (base slots live forever), one relocation per rendered-
 placement change, the deciding move op an ordinary insert sibling in its
 anchor's fork order; `prop_index_matches_iterator_with_moves` pins the

@@ -2039,16 +2039,13 @@ impl HashSeq {
                 let target_ok =
                     t.is_some_and(|t| matches!(self.loc_of(t), Loc::Run { .. }));
                 // Destination: an element, the origin, or another move op's
-                // splice point. Self-splice gates: placing an element
-                // adjacent to its own placement is degenerate (the op
-                // fragment being placed relative to is the one being torn
-                // down), and the facts are hash-committed — stable verdict.
+                // splice point — including an op that moves this same
+                // target ("put x where that op placed it"): the excision of
+                // the old rendering precedes placement, and a superseded
+                // op's rank is permanent, so the case is well-defined, not
+                // special.
                 let anchor_ok = self.idx_of(to.id()).is_some_and(|a| {
-                    match self.loc_of(a) {
-                        Loc::Run { .. } | Loc::Origin => true,
-                        Loc::MoveOp => Some(self.move_nodes[&a].target) != t,
-                        _ => false,
-                    }
+                    matches!(self.loc_of(a), Loc::Run { .. } | Loc::Origin | Loc::MoveOp)
                 });
                 target_ok && anchor_ok && to.id() != target
             }
@@ -4801,25 +4798,39 @@ mod test {
         assert_eq!(decoded.iter().collect::<String>(), "axy");
     }
 
-    /// Self-splice gates: an element moved adjacent to its own placement.
+    /// Self-splice is well-defined, not special: moving an element to its
+    /// own (superseded) placement's splice point renders it at that op's
+    /// permanent rank — "put x back where that op placed it".
     #[test]
-    fn self_splice_move_gates() {
+    fn self_splice_move_renders_at_the_ops_rank() {
         let mut seq = HashSeq::default();
-        seq.insert_batch(0, "xa".chars());
+        seq.insert_batch(0, "xab".chars());
         let x = seq.id_at(0).unwrap();
         let a = seq.id_at(1).unwrap();
-        let op = seq.move_element(x, Anchor::After(a));
+        let b = seq.id_at(2).unwrap();
+        let op1 = seq.move_element(x, Anchor::After(b));
+        assert_eq!(seq.iter().collect::<String>(), "abx");
+        seq.move_element(x, Anchor::Before(a));
+        assert_eq!(seq.iter().collect::<String>(), "xab");
 
-        seq.apply(HashNode {
-            pins: BTreeSet::new(),
-            op: Op::Move {
-                target: x,
-                to: Anchor::After(op.id()),
-                overwrites: BTreeSet::new(),
-            },
-        });
-        assert_eq!(seq.delivery.gated.len(), 1, "self-splice quarantines");
-        assert_eq!(seq.iter().collect::<String>(), "ax", "rendering untouched");
+        // Move x to op1's splice point: back adjacent to op1's rank.
+        seq.move_element(x, Anchor::After(op1.id()));
+        assert_eq!(seq.iter().collect::<String>(), "abx");
+        assert_eq!(seq.placement_of(&x), Some(Anchor::After(op1.id())));
+        check_index_matches_iter(&seq);
+
+        // The reaffirmation shape: anchor at the CURRENT decider works too.
+        let op3 = seq.move_heads(&x)[0];
+        seq.move_element(x, Anchor::After(op3));
+        assert_eq!(seq.iter().collect::<String>(), "abx");
+        check_index_matches_iter(&seq);
+
+        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
+            &seq,
+        ))
+        .expect("strict");
+        assert_eq!(decoded, seq);
+        assert_eq!(decoded.iter().collect::<String>(), "abx");
     }
 
     /// A mark delivered before its text parks and applies on arrival.
