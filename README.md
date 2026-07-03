@@ -42,9 +42,11 @@ references:
   arranges the grinder's *own* content — the locality invariant);
 - **zero per-collaborator state** — no vector clocks, no actor registry;
   anyone can join anonymously;
-- **self-certifying webs** — every op hash transitively commits to the
-  web's genesis id (an arbitrary out-of-band anchor, not an object);
-  different webs can never merge;
+- **self-certifying objects** — every op hash transitively commits to its
+  object-closure's root origin (an out-of-band id, holonically per
+  object); one object's ops can never merge into another, and the object
+  store (`HashWeb`) is pure knowledge — store merge is unconditional
+  union;
 - **honest conflicts** — contested registers surface every head (MVR) and
   freeze at the last agreed value rather than silently picking a winner.
 

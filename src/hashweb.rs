@@ -1,25 +1,21 @@
-//! HashWeb: the composition — one op DAG hosting many objects
-//! (HASHWEB_SPEC.md). It adds no new conflict type: every op routes to a
-//! per-object projection (`HashSeq` or `HashKv`) that resolves per its own
-//! spec. What lives here is objects and creation, routing, per-object
-//! frontiers, the origin-id derive-and-wake, and the schema gate's
-//! op-kind-vs-object-type row.
+//! HashWeb: a flat store of every object this replica knows about.
 //!
-//! A web is opened at a **genesis**: an arbitrary, typeless, meaningless
-//! id chosen out-of-band. No object lives at it — it is the induction
-//! base for origin ids (every other origin derives from a creation op,
-//! and creation ops live inside objects; the recursion needs one
-//! axiomatic anchor) and the commitment domain (every op transitively
-//! commits to it, so different webs never merge). The only meaningful
-//! ops anchored at the genesis are creations — each births its own
-//! object; anything else gates, since there is no projection there.
+//! The store has **no identity and no semantics of its own** — it is not a
+//! datastructure. All composition lives in the ops: a `Put`/`Insert` whose
+//! value is a creation artifact births a child object (`object_id` of the
+//! creating op); a link is an id carried as a value. What the store does
+//! is mechanics: instantiate objects, route each incoming op to its object
+//! (derived from the op's refs — never a field), buffer store-wide on
+//! missing refs, and quarantine ops whose refs determine no single object.
 //!
-//! Objects are **holonic**: identified by origin ids (`object_id` of the
-//! creating op), and any object is a complete replica root from its own
-//! perspective. "Document" is not a protocol concept — only which entry
-//! point a replica opened.
-
-use std::collections::BTreeSet;
+//! Objects are **holonic**: each is a complete replica rooted at its own
+//! origin. A root object's `(origin, kind)` is chosen out-of-band —
+//! agreeing on the kind is the same class of agreement as the 32 origin
+//! bytes themselves, since no creation op exists to commit it; child
+//! objects' origins and kinds are hash-committed by their creation ops.
+//! Every op commits transitively to its object-closure's root origin, so
+//! one object's ops can never merge into another — the commitment domain
+//! is per object, and store merge is unconditional: a union of knowledge.
 
 use rustc_hash::FxHashMap;
 
@@ -45,23 +41,10 @@ impl Object {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HashWeb {
-    /// The web's genesis: a typeless out-of-band id, present axiomatically
-    /// (GRAMMAR_SPEC.md `ref_count >= 1`). Not an object.
-    genesis: Id,
-    /// Applied genesis-anchored creation ops, by node id (the web's
-    /// top-level layer; each birthed its object).
-    pub(crate) genesis_nodes: IdMap<HashNode>,
-    /// The genesis layer's frontier: creations pin it, which makes
-    /// successive local creations mint distinct objects (content-addressed
-    /// creation is idempotent given identical context — two replicas
-    /// authoring the byte-identical first creation converge on the same
-    /// object, deterministically).
-    pub(crate) genesis_tips: BTreeSet<Id>,
-    /// Objects by origin id. The root is a `Map` (the block-document
-    /// default); children are created by ops whose payload/value is a
-    /// creation artifact.
+    /// Every object this replica knows, by origin id: roots opened
+    /// out-of-band and children born by creation ops alike.
     pub(crate) objects: FxHashMap<Id, Object>,
     /// node id -> the origin id of the object it belongs to (the routing
     /// table — replica-local, derived, never on the wire).
@@ -78,10 +61,7 @@ pub struct HashWeb {
 
 impl PartialEq for HashWeb {
     fn eq(&self, other: &Self) -> bool {
-        if self.genesis != other.genesis
-            || self.genesis_tips != other.genesis_tips
-            || self.objects.len() != other.objects.len()
-        {
+        if self.objects.len() != other.objects.len() {
             return false;
         }
         self.objects.iter().all(|(k, v)| {
@@ -95,51 +75,32 @@ impl PartialEq for HashWeb {
 }
 impl Eq for HashWeb {}
 
-impl Default for HashWeb {
-    fn default() -> Self {
-        Self::new(Id::default())
-    }
-}
-
 impl HashWeb {
-    /// Open the web rooted at `genesis` — an arbitrary id with no type and
-    /// no object. Objects come into being only through creation ops.
-    pub fn new(genesis: Id) -> Self {
-        Self {
-            genesis,
-            genesis_nodes: IdMap::default(),
-            genesis_tips: BTreeSet::new(),
-            objects: FxHashMap::default(),
-            node_home: IdMap::default(),
-            delivery: Delivery::default(),
-            values: IdMap::default(),
-        }
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn genesis(&self) -> Id {
-        self.genesis
-    }
-
-    /// Create a top-level object anchored at the genesis; returns its
-    /// origin id. The creating op pins the genesis layer's frontier, so
-    /// successive creations are distinct ops (and distinct objects), while
-    /// identical creations from identical contexts converge on one object.
-    pub fn create(&mut self, kind: Value) -> Id {
+    /// Open a root object at `origin` with the given kind — both chosen
+    /// out-of-band ("each object is free to set its own root"). Returns
+    /// false if an object already lives at that origin.
+    pub fn create_root(&mut self, origin: Id, kind: Value) -> bool {
         debug_assert!(matches!(kind, Value::NewSeq | Value::NewMap));
-        let vid = self.provide_value(&kind);
-        let mut pins = self.genesis_tips.clone();
-        pins.remove(&self.genesis);
-        let node = HashNode {
-            pins,
-            op: Op::Insert {
-                at: crate::Anchor::After(self.genesis),
-                payload: crate::Payload::Id(vid),
-            },
+        if self.objects.contains_key(&origin) {
+            return false;
+        }
+        let obj = match kind {
+            Value::NewSeq => Object::Seq(HashSeq::new(origin)),
+            _ => Object::Map(HashKv::new(origin)),
         };
-        let child = object_id(&node.id());
-        self.apply(node);
-        debug_assert!(self.objects.contains_key(&child), "creation birthed");
-        child
+        self.objects.insert(origin, obj);
+        // Adopting an origin may wake ops that parked on it.
+        let mut queue: Vec<(Id, HashNode)> = Vec::new();
+        self.delivery.wake(&origin, &mut queue);
+        while let Some((id, node)) = queue.pop() {
+            self.park_or_dispatch(id, node, &mut queue);
+        }
+        true
     }
 
     pub fn seq(&self, origin: &Id) -> Option<&HashSeq> {
@@ -160,10 +121,10 @@ impl HashWeb {
         self.objects.iter()
     }
 
-    /// An id is present if it is the genesis (axiomatic), an applied node,
-    /// or a live object origin.
+    /// An id is present if it is an applied node or a live object origin
+    /// (roots adopted out-of-band and creation-derived children alike).
     fn contains(&self, id: &Id) -> bool {
-        *id == self.genesis || self.objects.contains_key(id) || self.node_home.contains_key(id)
+        self.objects.contains_key(id) || self.node_home.contains_key(id)
     }
 
     pub fn provide_value(&mut self, v: &Value) -> Id {
@@ -294,9 +255,7 @@ impl HashWeb {
     fn route(&self, node: &HashNode) -> Option<Id> {
         let mut home: Option<Id> = None;
         for r in node.iter_refs() {
-            let h = if *r == self.genesis {
-                self.genesis // the typeless anchor is its own pseudo-home
-            } else if self.objects.contains_key(r) {
+            let h = if self.objects.contains_key(r) {
                 *r // an origin id names its object directly
             } else {
                 *self.node_home.get(r)?
@@ -378,28 +337,13 @@ impl HashWeb {
             _ => None,
         };
 
-        if home == self.genesis && !self.objects.contains_key(&home) {
-            // The typeless anchor: only creations mean anything here — an
-            // op that births its own object. Everything else gates (there
-            // is no projection at the genesis to interpret it).
-            if creation_kind.is_none() {
-                return Err(node);
-            }
-            for r in node.iter_refs() {
-                self.genesis_tips.remove(r);
-            }
-            self.genesis_tips.insert(id);
-            self.genesis_nodes.insert(id, node);
-            self.node_home.insert(id, home);
-        } else {
-            // Dispatch to the routed object; its own edge-table gate handles
-            // op-kind-vs-object-type (a Put into a Seq quarantines there).
-            self.objects
-                .get_mut(&home)
-                .expect("routed to a live object")
-                .apply_with_id(id, node);
-            self.node_home.insert(id, home);
-        }
+        // Dispatch to the routed object; its own edge-table gate handles
+        // op-kind-vs-object-type (a Put into a Seq quarantines there).
+        self.objects
+            .get_mut(&home)
+            .expect("routed to a live object")
+            .apply_with_id(id, node);
+        self.node_home.insert(id, home);
 
         if let Some(is_seq) = creation_kind {
             let child = object_id(&id);
@@ -417,13 +361,30 @@ impl HashWeb {
         Ok(())
     }
 
+    /// Merge = union of knowledge. Unconditional: there is no store
+    /// identity to compare. Shared objects merge pairwise (their per-object
+    /// commitment domains make cross-object confusion impossible); unknown
+    /// origins are adopted — a root object's `(origin, kind)` is knowledge,
+    /// not ops, since no creation op exists for it. A kind mis-agreement on
+    /// an out-of-band origin degrades gracefully: the other side's ops
+    /// quarantine in the local object's own gate, op by op.
     pub fn merge(&mut self, other: Self) {
-        assert_eq!(self.genesis, other.genesis, "different webs never merge");
         for (vid, bytes) in other.values {
             self.values.entry(vid).or_insert(bytes);
         }
-        for (id, node) in &other.genesis_nodes {
-            self.apply_with_id(*id, node.clone());
+        for (origin, obj) in &other.objects {
+            if !self.objects.contains_key(origin) {
+                let fresh = match obj {
+                    Object::Seq(_) => Object::Seq(HashSeq::new(*origin)),
+                    Object::Map(_) => Object::Map(HashKv::new(*origin)),
+                };
+                self.objects.insert(*origin, fresh);
+                let mut queue: Vec<(Id, HashNode)> = Vec::new();
+                self.delivery.wake(origin, &mut queue);
+                while let Some((id, node)) = queue.pop() {
+                    self.park_or_dispatch(id, node, &mut queue);
+                }
+            }
         }
         // Re-apply everything through the global buffer; ordering resolves
         // itself (creation ops wake their children's parked ops).
@@ -459,59 +420,64 @@ mod tests {
         Value::String(v.into())
     }
 
-    /// The genesis is a typeless, meaningless id: creations anchored at it
-    /// birth top-level objects; every other op gates (no projection lives
-    /// there). Content-addressing makes creation contextual: identical
-    /// context + intent = the same object (deterministic bootstrap), while
-    /// the genesis-layer frontier makes successive creations distinct.
+    fn oid(n: u8) -> Id {
+        Id([n; 32])
+    }
+
+    /// The store is knowledge, not an object: merge is an unconditional
+    /// union — unknown origins are adopted (waking anything parked on
+    /// them), shared objects merge pairwise, and a kind mis-agreement on
+    /// an out-of-band origin degrades to per-op quarantine, never a panic.
     #[test]
-    fn genesis_is_typeless() {
-        let mut web = HashWeb::default();
+    fn store_merge_is_union_of_knowledge() {
+        // Two stores with unrelated roots merge unconditionally.
+        let mut a = HashWeb::new();
+        let mut b = HashWeb::new();
+        assert!(a.create_root(oid(1), Value::NewSeq));
+        assert!(!a.create_root(oid(1), Value::NewSeq), "already occupied");
+        b.create_root(oid(2), Value::NewMap);
+        a.text_insert(&oid(1), 0, "hi");
+        b.put(&oid(2), s("k"), s("v"));
 
-        // A char insert anchored at the genesis: nothing to interpret — gate.
-        let g = web.genesis();
-        web.apply(HashNode {
-            pins: BTreeSet::new(),
-            op: Op::insert_after(g, 'x'),
-        });
-        assert_eq!(web.delivery.gated.len(), 1);
-        assert!(web.objects().count() == 0);
+        a.merge(b.clone());
+        assert_eq!(a.objects().count(), 2);
+        assert_eq!(a.text(&oid(1)).unwrap(), "hi");
+        assert_eq!(a.get(&oid(2), &s("k")), Some(s("v")));
+
+        // Ops arriving before their root is known park; adopting the root
+        // wakes them.
+        let nodes = a.seq(&oid(1)).unwrap().all_nodes();
+        let mut fresh = HashWeb::new();
+        for (id, node) in nodes {
+            fresh.apply_with_id(id, node);
+        }
+        assert_eq!(fresh.orphans().count(), 2, "'h' on the origin, 'i' on 'h'");
+        fresh.create_root(oid(1), Value::NewSeq);
+        assert_eq!(fresh.orphans().count(), 0, "adoption wakes transitively");
+        assert_eq!(fresh.text(&oid(1)).unwrap(), "hi");
+
+        // Kind mis-agreement: the same out-of-band origin opened as a Map
+        // elsewhere — the seq ops quarantine in the local map's gate.
+        let mut confused = HashWeb::new();
+        confused.create_root(oid(1), Value::NewMap);
+        confused.merge(a.clone());
+        assert!(confused.map(&oid(1)).is_some());
+        assert!(!confused.map(&oid(1)).unwrap().delivery.gated.is_empty());
+
+        // Roundtrip of a multi-root store.
         let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(
-            &web,
+            &a,
         ))
         .expect("strict");
-        assert_eq!(decoded.delivery.gated.len(), 1, "quarantine carried");
-
-        // Two replicas' identical first creations converge on one object.
-        let mut r1 = HashWeb::default();
-        let mut r2 = HashWeb::default();
-        let a1 = r1.create(Value::NewMap);
-        let a2 = r2.create(Value::NewMap);
-        assert_eq!(a1, a2, "same context, same intent, same object");
-        r1.merge(r2);
-        assert_eq!(r1.objects().count(), 1);
-
-        // Successive local creations are distinct (the genesis frontier
-        // differentiates them).
-        let b = r1.create(Value::NewMap);
-        assert_ne!(a1, b);
-        assert_eq!(r1.objects().count(), 2);
-
-        // And the whole shape survives the wire.
-        r1.put(&b, s("k"), s("v"));
-        let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(
-            &r1,
-        ))
-        .expect("strict");
-        assert_eq!(decoded, r1);
-        assert_eq!(decoded.get(&b, &s("k")), Some(s("v")));
+        assert_eq!(decoded, a);
     }
 
     #[test]
     fn block_document_shape() {
         // A Notion-style block: a map with "content" -> Text child.
-        let mut doc = HashWeb::default();
-        let root = doc.create(Value::NewMap);
+        let mut doc = HashWeb::new();
+        let root = oid(9);
+        doc.create_root(root, Value::NewMap);
 
         let block = doc.new_map(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
@@ -529,8 +495,9 @@ mod tests {
     #[test]
     fn per_object_frontiers_stay_lean() {
         // Editing one object never enters another's tips (per-object tips).
-        let mut doc = HashWeb::default();
-        let root = doc.create(Value::NewMap);
+        let mut doc = HashWeb::new();
+        let root = oid(9);
+        doc.create_root(root, Value::NewMap);
         let a = doc.new_seq(&root, s("a")).unwrap();
         let b = doc.new_seq(&root, s("b")).unwrap();
 
@@ -544,8 +511,9 @@ mod tests {
 
     #[test]
     fn concurrent_edits_in_different_objects_merge_cleanly() {
-        let mut base = HashWeb::default();
-        let root = base.create(Value::NewMap);
+        let mut base = HashWeb::new();
+        let root = oid(9);
+        base.create_root(root, Value::NewMap);
         let text = base.new_seq(&root, s("text")).unwrap();
         let meta = base.new_map(&root, s("meta")).unwrap();
 
@@ -569,22 +537,19 @@ mod tests {
     fn child_ops_park_until_creation_arrives() {
         // Deliver a child's ops before the creation op: they park on the
         // origin id; applying the creation op derives it and wakes them.
-        let mut a = HashWeb::default();
-        let root = a.create(Value::NewMap);
+        let mut a = HashWeb::new();
+        let root = oid(9);
+        a.create_root(root, Value::NewMap);
         let child = a.new_seq(&root, s("t")).unwrap();
         a.text_insert(&child, 0, "x");
 
         // Extract the child's inserts and the creation chain separately
-        // (genesis creation -> root map's put -> child).
+        // (root adoption -> root map's put -> child).
         let child_nodes = a.seq(&child).unwrap().all_nodes();
-        let mut creation_chain: Vec<(Id, HashNode)> = a
-            .genesis_nodes
-            .iter()
-            .map(|(i, n)| (*i, n.clone()))
-            .collect();
-        creation_chain.extend(a.map(&root).unwrap().all_nodes());
+        let creation_chain: Vec<(Id, HashNode)> = a.map(&root).unwrap().all_nodes();
 
-        let mut fresh = HashWeb::new(a.genesis());
+        let mut fresh = HashWeb::new();
+        fresh.create_root(root, Value::NewMap);
         // Child op first: parks (its ref — the origin id — is unknown).
         for (id, node) in &child_nodes {
             fresh.apply_with_id(*id, node.clone());
@@ -601,8 +566,9 @@ mod tests {
 
     #[test]
     fn refs_spanning_objects_gate() {
-        let mut doc = HashWeb::default();
-        let root = doc.create(Value::NewMap);
+        let mut doc = HashWeb::new();
+        let root = oid(9);
+        doc.create_root(root, Value::NewMap);
         let a = doc.new_seq(&root, s("a")).unwrap();
         let b = doc.new_seq(&root, s("b")).unwrap();
         doc.text_insert(&a, 0, "a");
@@ -627,8 +593,9 @@ mod tests {
     /// origin derives from the creating op.
     #[test]
     fn child_object_born_inline_in_a_seq() {
-        let mut doc = HashWeb::default();
-        let text = doc.create(Value::NewSeq);
+        let mut doc = HashWeb::new();
+        let text = oid(7);
+        doc.create_root(text, Value::NewSeq);
         doc.text_insert(&text, 0, "see [] here");
 
         let inner = doc
@@ -647,7 +614,7 @@ mod tests {
         assert_eq!(crate::value::object_id(&atom_id), inner);
 
         // Merges carry the whole shape both ways.
-        let mut other = HashWeb::new(doc.genesis());
+        let mut other = HashWeb::new();
         other.merge(doc.clone());
         assert_eq!(other, doc);
         assert_eq!(other.text(&inner).unwrap(), "the embedded doc");
@@ -657,9 +624,10 @@ mod tests {
     /// id — rendering resolves it by id, nothing embeds.
     #[test]
     fn link_atoms_reference_other_objects()  {
-        let mut doc = HashWeb::default();
-        let a = doc.create(Value::NewSeq);
-        let b = doc.create(Value::NewSeq);
+        let mut doc = HashWeb::new();
+        let (a, b) = (oid(3), oid(4));
+        doc.create_root(a, Value::NewSeq);
+        doc.create_root(b, Value::NewSeq);
         doc.text_insert(&a, 0, "link: ");
         doc.text_insert(&b, 0, "the target");
 
@@ -681,8 +649,9 @@ mod tests {
         // Two replicas concurrently create a child at the same key: the key
         // register conflicts (MVR), but BOTH child objects exist — creation
         // is never lost, the app resolves the register.
-        let mut base = HashWeb::default();
-        let root = base.create(Value::NewMap);
+        let mut base = HashWeb::new();
+        let root = oid(9);
+        base.create_root(root, Value::NewMap);
         let mut r1 = base.clone();
         let mut r2 = base.clone();
         let c1 = r1.new_seq(&root, s("content")).unwrap();

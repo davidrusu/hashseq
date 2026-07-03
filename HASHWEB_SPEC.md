@@ -41,11 +41,11 @@ No new op shape.
   slot, `Put { key, value: New* }` from a map slot, identically. The
   object's identity is its **origin id**,
   `object_id = derive_key(OBJECT_CONTEXT, X)` for creating op `X` — a
-  virtual node, never an op, generalizing origin unification (the web's
-  typeless genesis is the recursion's out-of-band base). Child ops anchor
-  at and ref the origin id; the closure of an origin id is defined as
-  `{X} ∪ closure(X)`, so the creation bridge welds the web into one
-  connected DAG,
+  virtual node, never an op, generalizing origin unification (a root
+  object's origin is the recursion's out-of-band base — chosen with its
+  kind, one agreement). Child ops anchor at and ref the origin id; the
+  closure of an origin id is defined as `{X} ∪ closure(X)`, so the
+  creation bridge welds each root's tree into one connected DAG,
   and buffering resolves origin ids by derivation when creation ops apply.
   Because `X` (the parent element) and `object_id` (the child origin) are
   distinct ids, refs are never ambiguous between parent and child.

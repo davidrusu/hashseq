@@ -70,17 +70,17 @@ is pinned by test to this layout.
 
 `ref_count ≥ 1`: every op pins at least its frontier, and a frontier is
 never empty (every object has an origin id from birth). A zero-ref node is
-malformed. Refs may be op ids or origin ids — one namespace; an object's
-origin id is recognized by derivation once its creation op is known, while
-the recursion's base is the **genesis**: an arbitrary, typeless,
-meaningless id chosen out-of-band when a web is opened — not an object, no
-creation op, present axiomatically on every replica of the web. The only
-ops that anchor at the genesis are creations (each births its own object;
-anything else fails the edge table — there is no projection there). A
-web's first op is therefore `refs = {genesis}` — causally empty, but never
-anchor-free. That is the rule's real content: no op floats outside the
-commitment chain, which is what roots routing and confines ops to their
-web (an op bottoming at web A's genesis orphans forever in web B).
+malformed. Refs may be op ids or origin ids — one namespace; a child
+object's origin id is recognized by derivation once its creation op is
+known, while a **root object's** origin is the recursion's base: an
+arbitrary id chosen out-of-band together with the object's kind — the two
+are one agreement, since no creation op exists to commit either. There is
+no store-level anchor above root objects; each object's closure is its own
+commitment domain. An object's first op is `refs = {origin}` — causally
+empty, but never anchor-free. That is the rule's real content: no op
+floats outside a commitment chain, which is what roots routing and
+confines ops to their object (an op bottoming at object A's origin can
+never merge into object B).
 
 ### Op kinds
 
