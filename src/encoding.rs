@@ -786,6 +786,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // stored successor is their only extender; at stored tails the `afters`
     // set decides (move-op siblings are not extenders).
     let chain_child = |p: NodeIdx| -> Option<NodeIdx> {
+        if seq.is_atom(p) {
+            return None; // atoms never chain: their text is a placeholder
+        }
         if let Loc::Run { run, pos } = seq.loc_of(p) {
             let r = &seq.runs[&run];
             if (pos as usize) + 1 < r.elements.len() {
@@ -796,7 +799,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             .get(&p)
             .into_iter()
             .flatten()
-            .filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }))
+            .filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }) && !seq.is_atom(*a))
             .min_by_key(|h| (depth[h.0 as usize], seq.id_of(*h)))
     };
     // Pins of one insert element, from wherever its stored run keeps them.
@@ -836,6 +839,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let mut elem_canon: Vec<(u32, u32)> = vec![(u32::MAX, 0); seq.ids.len()];
     for stored in seq.runs.values() {
         for &e in &stored.elements {
+            if seq.is_atom(e) {
+                continue; // atoms travel as individual trailing nodes
+            }
             let (first_op, anchor, anchor_elem) = elem_anchor(e);
             let continues = first_op == FirstOp::After
                 && anchor_elem.is_some_and(|p| chain_child(p) == Some(e));
@@ -1265,6 +1271,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
         for (idx, mk) in &seq.mark_nodes {
             nodes.push((seq.id_of(*idx), seq.mark_node(mk)));
+        }
+        for &e in seq.elem_payloads.keys() {
+            nodes.push((seq.id_of(e), seq.atom_node(e)));
         }
         nodes.sort_by_key(|(id, _)| *id);
         nodes.into_iter().map(|(_, node)| node).collect()

@@ -177,6 +177,30 @@ impl HashWeb {
         self.create_child(parent, key, Value::NewSeq)
     }
 
+    /// Insert a value commitment into a child seq at `idx` — an artifact,
+    /// a link (another object's origin id), or a creation value
+    /// (`NewSeq`/`NewMap` births a child object inline). Routes through the
+    /// composition's apply so creation semantics fire.
+    pub fn seq_insert_value(&mut self, origin: &Id, idx: usize, value: &Value) -> Option<HashNode> {
+        let vid = self.provide_value(value);
+        let node = match self.objects.get(origin)? {
+            Object::Seq(s) => s.make_insert_value(idx, vid)?,
+            _ => return None,
+        };
+        self.apply(node.clone());
+        Some(node)
+    }
+
+    /// Create a child object as an inline element of a seq (creation-in-seq:
+    /// the element IS the creation op; the child's origin id derives from it).
+    pub fn seq_new_object(&mut self, parent: &Id, idx: usize, kind: Value) -> Option<Id> {
+        debug_assert!(matches!(kind, Value::NewSeq | Value::NewMap));
+        let node = self.seq_insert_value(parent, idx, &kind)?;
+        let child = object_id(&node.id());
+        debug_assert!(self.objects.contains_key(&child), "creation birthed");
+        Some(child)
+    }
+
     /// Edit a child text object.
     pub fn text_insert(&mut self, origin: &Id, idx: usize, text: &str) -> bool {
         let Some(Object::Seq(seq)) = self.objects.get_mut(origin) else {
@@ -482,6 +506,63 @@ mod tests {
         assert_eq!(doc.delivery.gated.len(), 1);
         assert_eq!(doc.text(&a).unwrap(), "a"); // untouched
         assert_eq!(doc.text(&b).unwrap(), "b");
+    }
+
+    /// Creation-in-seq: a child object born as an inline element of a text
+    /// object — the transclusion shape. The element renders as the atom
+    /// placeholder; the payload id is the creation value, and the child's
+    /// origin derives from the creating op.
+    #[test]
+    fn child_object_born_inline_in_a_seq() {
+        let mut doc = HashWeb::default();
+        let root = doc.root_id();
+        let text = doc.new_seq(&root, s("body")).unwrap();
+        doc.text_insert(&text, 0, "see [] here");
+
+        let inner = doc
+            .seq_new_object(&text, 5, Value::NewSeq)
+            .expect("inline creation");
+        doc.text_insert(&inner, 0, "the embedded doc");
+
+        assert_eq!(doc.text(&inner).unwrap(), "the embedded doc");
+        let body = doc.text(&text).unwrap();
+        assert_eq!(body, format!("see [{}] here", crate::hashseq::ATOM_CHAR));
+        // The atom's payload is the creation value; the child origin
+        // derives from the creating op's id.
+        let seq = doc.seq(&text).unwrap();
+        let atom_id = seq.id_at(5).unwrap();
+        assert_eq!(seq.payload_of(&atom_id), Some(*crate::value::NEW_SEQ));
+        assert_eq!(crate::value::object_id(&atom_id), inner);
+
+        // Merges carry the whole shape both ways.
+        let mut other = HashWeb::new(doc.root_id());
+        other.merge(doc.clone());
+        assert_eq!(other, doc);
+        assert_eq!(other.text(&inner).unwrap(), "the embedded doc");
+    }
+
+    /// A link atom: a seq element whose payload is another object's origin
+    /// id — rendering resolves it by id, nothing embeds.
+    #[test]
+    fn link_atoms_reference_other_objects()  {
+        let mut doc = HashWeb::default();
+        let root = doc.root_id();
+        let a = doc.new_seq(&root, s("a")).unwrap();
+        let b = doc.new_seq(&root, s("b")).unwrap();
+        doc.text_insert(&a, 0, "link: ");
+        doc.text_insert(&b, 0, "the target");
+
+        // Insert a link to b inside a (the origin id as a Ref-like value:
+        // carried as raw payload id — no artifact bytes needed).
+        let node = {
+            let seq = doc.seq(&a).unwrap();
+            seq.make_insert_value(6, b).unwrap()
+        };
+        doc.apply(node.clone());
+        let seq = doc.seq(&a).unwrap();
+        let atom = seq.id_at(6).unwrap();
+        assert_eq!(seq.payload_of(&atom), Some(b), "the link target's origin id");
+        assert_eq!(doc.text(&b).unwrap(), "the target");
     }
 
     #[test]

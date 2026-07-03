@@ -68,10 +68,14 @@ moves arriving before `target` or `to`.
 this spec exactly (GRAMMAR_SPEC.md Part A; `tests/grammar_vectors.rs` locks
 the vectors). Storage keeps the normalized split — `HashNode { pins, op }`
 with `pins = refs ∖ named` and `iter_refs()` yielding `refs(u)` — a
-replica-local layout choice, not a wire or identity one. Known gaps, gated
-(quarantined pending re-evaluation, the loosening path): non-char insert
-payloads (the value-column generalization), and inserts anchored on move-op
-splice points. Move's rendered index relocation is wired per "Apply" below:
+replica-local layout choice, not a wire or identity one. Non-char insert payloads render (the value column):
+an atom is a single-element run holding the U+FFFC placeholder with its
+commitment id in `elem_payloads` — atoms never chain (their text is not
+identity input), ride the wire as individual trailing nodes in the payload
+elision form, and are ordinary elements to every projection (movable,
+markable, removable; creation values birth HashWeb children inline).
+Remaining gate rows: mark anchors and Move destinations on move-op splice
+points (loosenings). Move's rendered index relocation is wired per "Apply" below:
 origin ghosts (base slots live forever), one relocation per rendered-
 placement change, the deciding move op an ordinary insert sibling in its
 anchor's fork order; `prop_index_matches_iterator_with_moves` pins the

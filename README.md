@@ -11,7 +11,9 @@ set; every order-sensitive decision resolves at read time*.
 Projections implemented here:
 
 - **HashSeq** — the sequence CRDT (text, lists): `Insert` / `Remove` /
-  `Move`, run-compressed, ~2M+ ops/sec on real editing traces.
+  `Move` / `Mark`, run-compressed, heterogeneous (elements are chars or
+  value commitments — links, artifacts, embedded objects), ~2M+ ops/sec
+  on real editing traces.
 - **HashKv** — the key-value CRDT: `Put` with explicit supersession,
   multi-value registers, no LWW.
 

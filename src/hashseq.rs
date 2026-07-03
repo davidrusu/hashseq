@@ -174,11 +174,20 @@ impl Cursor {
     /// Build the first `HashNode` of an insertion at this cursor.
     /// Subsequent chars of a burst chain `InsertAfter` from this node.
     pub fn first_node(self, ch: char) -> HashNode {
-        let (pins, op) = match self {
-            Cursor::After { anchor, extra_deps } => (extra_deps, Op::insert_after(anchor, ch)),
-            Cursor::Before { anchor, extra_deps } => (extra_deps, Op::insert_before(anchor, ch)),
+        self.payload_node(Payload::Char(ch))
+    }
+
+    /// Build the insert node for any payload — a char, or a value
+    /// commitment id (a link, an artifact, a creation value).
+    pub fn payload_node(self, payload: Payload) -> HashNode {
+        let (pins, at) = match self {
+            Cursor::After { anchor, extra_deps } => (extra_deps, Anchor::After(anchor)),
+            Cursor::Before { anchor, extra_deps } => (extra_deps, Anchor::Before(anchor)),
         };
-        HashNode { pins, op }
+        HashNode {
+            pins,
+            op: Op::Insert { at, payload },
+        }
     }
 
     /// Build a `Run` starting at this cursor with `first` as its first character.
@@ -195,7 +204,15 @@ pub struct CausalInsert {
     pub pins: BTreeSet<Id>,
     pub anchor: Id,
     pub ch: char,
+    /// `Some(value id)` for an atom (a non-char payload): `ch` is then the
+    /// U+FFFC placeholder and the commitment id lives in the value column.
+    pub payload: Option<Id>,
 }
+
+/// The placeholder char an atom occupies in run text and `iter()` output —
+/// U+FFFC OBJECT REPLACEMENT CHARACTER; renderers substitute the resolved
+/// value (the payload id is the identity, `payload_of` reads it).
+pub const ATOM_CHAR: char = '\u{FFFC}';
 
 /// Storage form of a multi-target remove (`remove_batch` spanning several
 /// chars). Single-target removes live in `RemoveRun` chains instead.
@@ -488,6 +505,11 @@ pub struct HashSeq {
     /// `befores_by_anchor`).
     pub afters: FxHashMap<NodeIdx, SortedIdVec>,
 
+    /// The value column: atom elements' payload commitment ids (HASHSEQ_SPEC
+    /// "Payload"). Atoms are single-element runs holding `ATOM_CHAR` as
+    /// placeholder text; empty in char-only documents — hot paths guard on
+    /// that first.
+    pub elem_payloads: FxHashMap<NodeIdx, Id>,
     /// Applied mark ops, by their own handle (MARKS.md).
     pub mark_nodes: FxHashMap<NodeIdx, StoredMark>,
     /// Anchor events for the mark sweep: anchor element (or origin) ->
@@ -555,6 +577,7 @@ impl HashSeq {
             moves: FxHashMap::default(),
             remove_runs: FxHashMap::default(),
             afters: FxHashMap::default(),
+            elem_payloads: FxHashMap::default(),
             mark_nodes: FxHashMap::default(),
             mark_events: FxHashMap::default(),
             tips: BTreeSet::new(),
@@ -620,6 +643,39 @@ impl HashSeq {
     /// Check if a node ID exists (insert, remove, or root) — one map probe.
     pub fn contains_node(&self, id: &Id) -> bool {
         self.idx_of(id).is_some()
+    }
+
+    /// Is this element an atom (a non-char payload)?
+    pub(crate) fn is_atom(&self, e: NodeIdx) -> bool {
+        !self.elem_payloads.is_empty() && self.elem_payloads.contains_key(&e)
+    }
+
+    /// The value commitment id of the element, if it is an atom. Chars
+    /// answer `None` (their value ids derive from the char; the wire and
+    /// preimage layers handle that).
+    pub fn payload_of(&self, id: &Id) -> Option<Id> {
+        let e = self.idx_of(id)?;
+        self.elem_payloads.get(&e).copied()
+    }
+
+    /// Reconstruct an atom's `HashNode` (for merge / re-broadcast / wire).
+    pub(crate) fn atom_node(&self, e: NodeIdx) -> HashNode {
+        let Loc::Run { run, .. } = self.loc_of(e) else {
+            unreachable!("atoms are single-element runs")
+        };
+        let r = &self.runs[&run];
+        debug_assert_eq!(r.elements.len(), 1, "atoms never chain");
+        let at = match r.first_op {
+            FirstOp::After => Anchor::After(r.anchor),
+            FirstOp::Before => Anchor::Before(r.anchor),
+        };
+        HashNode {
+            pins: r.first_extra_deps.to_id_set(&self.ids),
+            op: Op::Insert {
+                at,
+                payload: Payload::Id(self.elem_payloads[&e]),
+            },
+        }
     }
 
     pub(crate) fn char_at(&self, idx: NodeIdx) -> char {
@@ -845,6 +901,24 @@ impl HashSeq {
         }
     }
 
+    /// Build (without applying) an insert of a value commitment id at
+    /// visible position `idx` — an atom: a link, an artifact id, or a
+    /// creation value (HashWeb births the child object).
+    pub fn make_insert_value(&self, idx: usize, payload: Id) -> Option<HashNode> {
+        let cursor = self.cursor_at(idx.min(self.len()))?;
+        Some(cursor.payload_node(Payload::Id(payload)))
+    }
+
+    /// Insert a value commitment id at visible position `idx`. The atom
+    /// renders as `ATOM_CHAR`; `payload_of` reads its id back.
+    pub fn insert_value(&mut self, idx: usize, payload: Id) -> HashNode {
+        let node = self
+            .make_insert_value(idx, payload)
+            .expect("cursor_at is total for clamped idx");
+        self.apply(node.clone());
+        node
+    }
+
     pub fn remove(&mut self, idx: usize) {
         self.remove_batch(idx, 1);
     }
@@ -943,7 +1017,8 @@ impl HashSeq {
             // Check for explicit forks first (cheap u32-keyed lookup)
             let has_explicit_afters = self.afters.get(&anchor).is_some_and(|ns| !ns.is_empty());
 
-            if !has_explicit_afters && pos as usize + 1 == self.runs[&run].len() {
+            let atomic = after.payload.is_some() || self.is_atom(anchor);
+            if !has_explicit_afters && !atomic && pos as usize + 1 == self.runs[&run].len() {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
                 let deps = SortedIdVec::from_id_set(&after.pins, |d| self.idx_of_known(d));
@@ -984,6 +1059,10 @@ impl HashSeq {
                 elements: vec![idx],
             },
         );
+
+        if let Some(v) = after.payload {
+            self.elem_payloads.insert(idx, v);
+        }
 
         // run extension is handled in the fast path above, fork/split updates the afters set
         self.afters.entry(anchor).or_default().insert(idx, &self.ids);
@@ -1778,6 +1857,10 @@ impl HashSeq {
             },
         );
 
+        if let Some(v) = before.payload {
+            self.elem_payloads.insert(idx, v);
+        }
+
         self.befores_by_anchor
             .entry(anchor)
             .or_default()
@@ -1845,11 +1928,10 @@ impl HashSeq {
         // quarantined before touching tips or the index. They never intern,
         // so dependents stay parked (the correct edge-table semantics).
         let admitted = match &node.op {
-            Op::Insert {
-                payload: Payload::Char(_),
-                ..
-            }
-            | Op::Remove(_) => true,
+            // Inserts of any payload: a char, or an opaque value commitment
+            // id (validation-free by design — availability-independent
+            // identity, HASHSEQ_SPEC "Payload"). Removes likewise.
+            Op::Insert { .. } | Op::Remove(_) => true,
             // The Move rows of the edge table (all stable — every input is a
             // hash-committed fact about already-applied referents):
             // target must be an element of THIS seq; the destination must be
@@ -1903,28 +1985,22 @@ impl HashSeq {
         self.tips.insert(id);
 
         match node.op {
-            Op::Insert {
-                at: Anchor::After(anchor),
-                payload: Payload::Char(ch),
-            } => self.insert_after(
-                id,
-                CausalInsert {
+            Op::Insert { at, payload } => {
+                let (ch, payload) = match payload {
+                    Payload::Char(c) => (c, None),
+                    Payload::Id(v) => (ATOM_CHAR, Some(v)),
+                };
+                let ci = |anchor| CausalInsert {
                     pins: node.pins,
                     anchor,
                     ch,
-                },
-            ),
-            Op::Insert {
-                at: Anchor::Before(anchor),
-                payload: Payload::Char(ch),
-            } => self.insert_before(
-                id,
-                CausalInsert {
-                    pins: node.pins,
-                    anchor,
-                    ch,
-                },
-            ),
+                    payload,
+                };
+                match at {
+                    Anchor::After(anchor) => self.insert_after(id, ci(anchor)),
+                    Anchor::Before(anchor) => self.insert_before(id, ci(anchor)),
+                }
+            }
             Op::Remove(nodes) => self.apply_remove(id, node.pins, nodes),
             Op::Move {
                 target,
@@ -1960,7 +2036,13 @@ impl HashSeq {
     pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
         let mut out: Vec<(Id, HashNode)> = Vec::new();
         for run in self.runs.values() {
+            if self.is_atom(run.head()) {
+                continue;
+            }
             out.extend(run.to_run(&self.ids).decompress_with_ids());
+        }
+        for &e in self.elem_payloads.keys() {
+            out.push((self.id_of(e), self.atom_node(e)));
         }
         for rr in self.remove_runs.values() {
             for (i, node) in self.remove_run_nodes(rr).into_iter().enumerate() {
@@ -1998,11 +2080,19 @@ impl HashSeq {
 
         // Covers both After- and Before-anchored runs: decompress reconstructs
         // the anchoring first node for either kind. Ids come from `other`'s
-        // id table — no rehashing on the merge path.
+        // id table — no rehashing on the merge path. Atom runs are excluded:
+        // their text is the U+FFFC placeholder, not the identity input —
+        // they re-present as reconstructed nodes below.
         for run in other.runs.values() {
+            if other.is_atom(run.head()) {
+                continue;
+            }
             for (id, node) in run.to_run(&other.ids).decompress_with_ids() {
                 self.apply_with_id(id, node);
             }
+        }
+        for &e in other.elem_payloads.keys() {
+            self.apply_with_id(other.id_of(e), other.atom_node(e));
         }
 
         for remove_run in other.remove_runs.values() {
@@ -3886,7 +3976,7 @@ mod test {
     /// generated and must be harmless).
     fn seq_from_move_ops(seq: &mut HashSeq, ops: &[(u8, u8, u8)]) {
         for &(kind, x, y) in ops {
-            match kind % 6 {
+            match kind % 7 {
                 0 | 3 => {
                     let at = if seq.is_empty() {
                         0
@@ -3935,6 +4025,16 @@ mod test {
                             op,
                         });
                     }
+                }
+                5 => {
+                    // Insert an atom (a value commitment id) at a position.
+                    let at = if seq.is_empty() {
+                        0
+                    } else {
+                        x as usize % (seq.len() + 1)
+                    };
+                    let v = crate::value::Value::Int(y as i64).value_id();
+                    seq.insert_value(at, v);
                 }
                 _ => {
                     // Mark or unmark a range (possibly inverted — gates
@@ -4106,6 +4206,111 @@ mod test {
         assert_eq!(decoded, seq);
         assert_eq!(decoded.iter().collect::<String>(), "amy!");
         check_index_matches_iter(&decoded);
+    }
+
+    // ---- atoms (the value column: non-char payloads) ----
+
+    #[test]
+    fn atom_inserts_render_and_read_back() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let link = crate::value::Value::String("target-doc".into()).value_id();
+        let node = seq.insert_value(1, link);
+
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq.iter().collect::<String>(), format!("a{ATOM_CHAR}b"));
+        let atom_id = node.id();
+        assert_eq!(seq.payload_of(&atom_id), Some(link));
+        assert_eq!(seq.id_at(1), Some(atom_id));
+        assert_eq!(seq.payload_of(&seq.id_at(0).unwrap()), None, "chars have no column entry");
+        check_index_matches_iter(&seq);
+    }
+
+    /// Typing adjacent to an atom never extends through it — the atom's
+    /// placeholder text is not identity input, so chains must not absorb it.
+    #[test]
+    fn typing_never_chains_through_atoms() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "a".chars());
+        let v = crate::value::Value::Int(7).value_id();
+        seq.insert_value(1, v);
+        seq.insert_batch(2, "bc".chars());
+
+        assert_eq!(seq.iter().collect::<String>(), format!("a{ATOM_CHAR}bc"));
+        // the atom is its own single-element run; "bc" is a separate run
+        let atom = seq.idx_of(&seq.id_at(1).unwrap()).unwrap();
+        let Loc::Run { run, .. } = seq.loc_of(atom) else {
+            panic!()
+        };
+        assert_eq!(seq.runs[&run].elements.len(), 1);
+        check_index_matches_iter(&seq);
+    }
+
+    #[test]
+    fn atoms_roundtrip_and_merge_commute() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "hello".chars());
+        let v = crate::value::Value::Bytes(vec![1, 2, 3]).value_id();
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.insert_value(2, v);
+        r2.insert(5, '!');
+
+        let mut m1 = r1.clone();
+        m1.merge(r2.clone());
+        let mut m2 = r2;
+        m2.merge(r1);
+        assert_eq!(m1, m2);
+        assert_eq!(
+            m1.iter().collect::<String>(),
+            m2.iter().collect::<String>()
+        );
+        let e1 = crate::encoding::encode_hashseq(&m1);
+        assert_eq!(e1, crate::encoding::encode_hashseq(&m2), "byte-canonical with atoms");
+        let decoded = crate::encoding::decode_hashseq_strict(&e1).expect("strict");
+        assert_eq!(decoded, m1);
+        let atom_pos = decoded
+            .iter()
+            .position(|c| c == ATOM_CHAR)
+            .expect("atom rendered");
+        assert_eq!(
+            decoded.payload_of(&decoded.id_at(atom_pos).unwrap()),
+            Some(v),
+            "value column survives the wire"
+        );
+        check_index_matches_iter(&decoded);
+    }
+
+    /// Atoms are ordinary elements to the other projections: movable,
+    /// markable, removable.
+    #[test]
+    fn atoms_move_mark_and_remove() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let v = crate::value::Value::Int(42).value_id();
+        let node = seq.insert_value(1, v);
+        let atom = node.id();
+        assert_eq!(seq.iter().collect::<String>(), format!("a{ATOM_CHAR}b"));
+
+        // move the atom to the end
+        let b = seq.id_at(2).unwrap();
+        seq.move_element(atom, Anchor::After(b));
+        assert_eq!(seq.iter().collect::<String>(), format!("ab{ATOM_CHAR}"));
+        assert_eq!(seq.payload_of(&atom), Some(v));
+        check_index_matches_iter(&seq);
+
+        // mark a range containing its rendered position
+        let a = seq.id_at(0).unwrap();
+        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes());
+        // regional membership: the atom moved beyond the end point — not marked
+        assert!(kinds_at(&seq, 2).is_empty());
+        assert_eq!(kinds_at(&seq, 0), vec![bold()]);
+
+        // remove it
+        let pos = seq.position_of(&atom).unwrap();
+        seq.remove(pos);
+        assert_eq!(seq.iter().collect::<String>(), "ab");
+        assert_eq!(seq.payload_of(&atom), Some(v), "column persists for tombstones");
     }
 
     // ---- marks (the span-annotation projection, MARKS.md) ----
