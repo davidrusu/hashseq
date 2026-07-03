@@ -145,13 +145,30 @@ function snapshotBytes() {
   return web.encode();
 }
 
+let localCacheOff = false;
+
 function persistNow(broadcast) {
   const bytes = snapshotBytes();
-  let bin = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  // localStorage is a *cache*, not the source of truth — the server and
+  // the op DAG are. If the snapshot outgrows the ~5MB quota, drop the
+  // cache and keep running; never let a cache write break sync or render.
+  if (!localCacheOff) {
+    try {
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      localStorage.setItem(STORAGE_KEY, btoa(bin));
+    } catch (e) {
+      localCacheOff = true;
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch (_) {
+        /* ignore */
+      }
+      console.warn('[kb] local cache disabled (snapshot exceeds quota):', e.name);
+    }
   }
-  localStorage.setItem(STORAGE_KEY, btoa(bin));
   if (broadcast) {
     channel.postMessage(bytes);
     if (wsReady) ws.send(bytes);
@@ -2265,6 +2282,8 @@ async function processImageFile(file) {
   return raw;
 }
 
+const MAX_IMAGE_BYTES = 1_500_000; // whole snapshots sync, so cap hard
+
 async function insertImageFile(file, ta, at) {
   try {
     if (!file.type.startsWith('image/')) {
@@ -2272,8 +2291,15 @@ async function insertImageFile(file, ta, at) {
       return;
     }
     const bytes = await processImageFile(file);
-    if (bytes.length > 6_000_000) {
-      toast(`Image too large (${fmtBytes(bytes.length)}) — snapshots carry every artifact`, true);
+    if (bytes.length > MAX_IMAGE_BYTES) {
+      // Almost always an undecodable format (HEIC) that fell back to raw
+      // and couldn't be downscaled — guide the user rather than bloat the
+      // shared state.
+      toast(
+        `Image too large (${fmtBytes(bytes.length)}). ` +
+          `If it's a HEIC/iPhone photo, export or screenshot it as JPEG/PNG first.`,
+        true,
+      );
       return;
     }
     const imgId = web.provideBytes(bytes);
