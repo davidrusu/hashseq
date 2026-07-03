@@ -84,12 +84,45 @@
   #view-tabs button { border:none; border-right:1px solid var(--ink); }
   #view-tabs button:last-child { border-right:none; }
   #view-tabs button.active { background:var(--ink); color:var(--paper); }
-  #body, #preview {
-    flex:1; margin:8px 22px 10px; padding:14px; resize:none; outline:none;
+  #blocks, #preview {
+    flex:1; margin:8px 22px 10px; padding:10px; outline:none;
     font-family:inherit; font-size:14px; line-height:1.65; color:var(--ink);
     background:rgba(246,241,229,0.75); border:1px solid var(--ink);
+    overflow-y:auto;
   }
-  #preview { overflow-y:auto; }
+  .block-row { display:flex; align-items:flex-start; gap:4px; padding:2px 0; position:relative; }
+  .block-row.drop-above::before {
+    content:''; position:absolute; top:0; left:24px; right:0; height:0;
+    border-top:2px solid var(--red);
+  }
+  .block-row.drop-below::after {
+    content:''; position:absolute; bottom:0; left:24px; right:0; height:0;
+    border-top:2px solid var(--red);
+  }
+  .block-row .handle {
+    color:var(--muted); cursor:grab; user-select:none; padding:6px 4px 0 0;
+    font-size:13px; flex:none; letter-spacing:-2px;
+  }
+  .block-row .handle:hover { color:var(--ink); }
+  .block-row.dragging { opacity:0.4; }
+  .block-row textarea {
+    flex:1; resize:none; outline:none; border:1px solid transparent;
+    font-family:inherit; font-size:14px; line-height:1.6; color:var(--ink);
+    background:transparent; padding:4px 8px; overflow:hidden; min-height:30px;
+  }
+  .block-row textarea:focus { border-color:var(--grid); background:rgba(246,241,229,0.9); }
+  .block-row .b-del {
+    color:var(--muted); cursor:pointer; flex:none; padding:6px 2px 0 2px;
+    font-size:11px; visibility:hidden;
+  }
+  .block-row:hover .b-del { visibility:visible; }
+  .block-row .b-del:hover { color:var(--red); }
+  #blocks .add-block {
+    margin:6px 0 0 24px; font-size:10px; letter-spacing:1px; color:var(--muted);
+    background:transparent; border:1px dashed var(--grid);
+  }
+  #blocks .add-block:hover { color:var(--ink); border-color:var(--ink); }
+  #preview .block-view { padding:2px 8px; }
   #preview p { margin:0 0 10px; }
   #preview h2, #preview h3, #preview h4 { margin:16px 0 8px; letter-spacing:0.5px; }
   #preview code {
@@ -190,10 +223,7 @@
           <button id="insert-table" title="insert a table object at the caret">TABLE</button>
         </div>
       </div>
-      <textarea id="body" spellcheck="false"
-        placeholder="Type here. Every keystroke is a content-addressed op.
-Formatting is marks: select text, then `CODE` / $MATH$ / CODE BLOCK / EQUATION — it travels with the text through concurrent edits.
-Structure is markup: | pipe | tables | and # headings."></textarea>
+      <div id="blocks"></div>
       <div id="preview" style="display:none"></div>
       <div id="comments"></div>
       <div id="page-tools">

@@ -502,6 +502,17 @@ mod tests {
         assert_eq!(web.payload_at(&body, 1).unwrap(), None, "plain char");
         assert!(web.text(&body).unwrap().starts_with('\u{FFFC}'));
 
+        // Drag-reorder is a Move op: block-shaped atoms reorder without
+        // losing identity, and the move survives a merge round-trip.
+        let list = web.create_seq(&"99".repeat(32)).unwrap();
+        web.text_insert(&list, 0, "abc").unwrap();
+        web.seq_move(&list, 0, 3).unwrap(); // a → end
+        assert_eq!(web.text(&list).unwrap(), "bca");
+        web.seq_move(&list, 2, 0).unwrap(); // a → front
+        assert_eq!(web.text(&list).unwrap(), "abc");
+        let peer = WasmHashWeb::decode(&web.encode()).unwrap();
+        assert_eq!(peer.text(&list).unwrap(), "abc");
+
         // Deletion reads as absent; the key drops from the live key list.
         web.del(&ws, "page:abc").unwrap();
         let read: serde_json::Value =
@@ -759,6 +770,32 @@ impl WasmHashWeb {
             .and_then(|id| seq.payload_of(&id))
             .as_ref()
             .map(id_to_hex))
+    }
+
+    /// Move the element at visible `from` to sit at visible slot
+    /// `to_slot` (0..=len, interpreted on the current rendering): a Move
+    /// op superseding the placement heads this replica sees.
+    #[wasm_bindgen(js_name = seqMove)]
+    pub fn seq_move(&mut self, obj_hex: &str, from: usize, to_slot: usize) -> Result<(), JsValue> {
+        let seq = self
+            .inner
+            .seq_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        let len = seq.len();
+        if from >= len || to_slot > len {
+            return Err(app_err("move out of bounds"));
+        }
+        let target = seq.id_at(from).expect("from < len");
+        let to = if to_slot == len {
+            Anchor::After(seq.id_at(len - 1).expect("len > 0"))
+        } else {
+            Anchor::Before(seq.id_at(to_slot).expect("to_slot < len"))
+        };
+        if *to.id() == target {
+            return Ok(()); // dropping onto itself
+        }
+        seq.move_element(target, to);
+        Ok(())
     }
 
     // --- marks (formatting as ops, not markup) ---

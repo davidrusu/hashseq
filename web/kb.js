@@ -182,7 +182,7 @@ const treeEl = document.getElementById('tree');
 const crumbsEl = document.getElementById('crumbs');
 const titleEl = document.getElementById('title');
 const conflictEl = document.getElementById('conflict-bar');
-const bodyEl = document.getElementById('body');
+const blocksEl = document.getElementById('blocks');
 const previewEl = document.getElementById('preview');
 const tabEditEl = document.getElementById('tab-edit');
 const tabViewEl = document.getElementById('tab-view');
@@ -193,9 +193,11 @@ const statBytes = document.getElementById('stat-bytes');
 const statParked = document.getElementById('stat-parked');
 
 let current = null; // pageObj hex
-let currentBody = null; // body seq obj hex
-let prevBodyText = ''; // shadow of the textarea for diffing
+let currentBody = null; // body seq obj hex (a seq of block refs)
 let viewMode = 'edit'; // 'edit' | 'view'
+let renderTargetObj = null; // the seq renderBody is currently rendering
+let focusedBlockObj = null; // last-focused block (toolbar target)
+let dragFrom = null; // block index a drag started from
 
 // ---- rendering: marks + light markup ----------------------------------------
 //
@@ -327,7 +329,7 @@ function applyDiff(obj, prev, next) {
 /// An embedded object at body position `idx` — by app convention a table:
 /// a seq of row refs, each row a seq of cell refs, each cell a text seq.
 function renderEmbed(idx) {
-  const origin = web.payloadAt(currentBody, idx);
+  const origin = web.payloadAt(renderTargetObj, idx);
   if (!origin) return document.createTextNode(ATOM);
   return objTableNode(web.createSeq(origin));
 }
@@ -447,6 +449,7 @@ function renderInlineRegion(el, chars) {
 function renderBody(el, bodyObj) {
   el.innerHTML = '';
   if (!bodyObj) return;
+  renderTargetObj = bodyObj;
   const spans = styledSpans(bodyObj);
   let i = 0;
   let pos = 0; // absolute visible index (payloadAt addresses atoms by it)
@@ -583,12 +586,15 @@ function renderEditor() {
   const has = current !== null;
   titleEl.style.display = has ? '' : 'none';
   document.getElementById('fmt-row').style.display = has ? '' : 'none';
-  bodyEl.style.display = has ? '' : 'none';
+  blocksEl.style.display = has ? '' : 'none';
   previewEl.style.display = 'none';
   toolsEl.style.display = has ? '' : 'none';
   crumbsEl.style.display = has ? '' : 'none';
   noPageEl.style.display = has ? 'none' : '';
-  if (!has) return;
+  if (!has) {
+    renderComments();
+    return;
+  }
 
   const meta = pageMeta.get(current);
 
@@ -601,16 +607,16 @@ function renderEditor() {
     const sep = document.createElement('span');
     sep.textContent = '/';
     crumbsEl.appendChild(sep);
-    const s = document.createElement('span');
-    s.textContent = pageMeta.get(p).title;
+    const el = document.createElement('span');
+    el.textContent = pageMeta.get(p).title;
     if (p !== current) {
-      s.className = 'link';
-      s.onclick = () => {
+      el.className = 'link';
+      el.onclick = () => {
         current = p;
         render();
       };
     }
-    crumbsEl.appendChild(s);
+    crumbsEl.appendChild(el);
   }
 
   // Title (don't clobber while the user is typing in it)
@@ -640,50 +646,241 @@ function renderEditor() {
     conflictEl.style.display = 'none';
   }
 
-  // Body
+  // Body: a seq of block refs. Each block is its own text seq.
   currentBody = bodyOf(current);
-  const text = currentBody ? web.text(currentBody) : '';
+  if (currentBody) migrateLegacyBody(currentBody);
   const editing = viewMode === 'edit';
-  bodyEl.style.display = editing ? '' : 'none';
+  blocksEl.style.display = editing ? '' : 'none';
   previewEl.style.display = editing ? 'none' : '';
-  if (editing) {
-    if (bodyEl.value !== text) {
-      const focused = document.activeElement === bodyEl;
-      const selStart = bodyEl.selectionStart;
-      const selEnd = bodyEl.selectionEnd;
-      bodyEl.value = text;
-      if (focused) {
-        // Best-effort caret preservation under remote edits.
-        bodyEl.selectionStart = Math.min(selStart, text.length);
-        bodyEl.selectionEnd = Math.min(selEnd, text.length);
+  if (editing) renderBlocks();
+  else renderPreview();
+  renderComments();
+}
+
+// ---- blocks ------------------------------------------------------------------
+
+function blocksOf(bodyObj) {
+  const out = [];
+  const n = web.textLen(bodyObj);
+  for (let i = 0; i < n; i++) {
+    const origin = web.payloadAt(bodyObj, i);
+    if (origin) out.push({ idx: i, obj: web.createSeq(origin) });
+  }
+  return out;
+}
+
+/// v1 bodies were one text seq (possibly with inline embeds). Wrap plain
+/// runs into text blocks and embeds into their own blocks, once. NOTE:
+/// concurrent migration from two replicas duplicates blocks — schema
+/// evolution inside a CRDT is itself a convergence problem (APP_NOTES).
+function migrateLegacyBody(bodyObj) {
+  const n = web.textLen(bodyObj);
+  if (n === 0) return;
+  const payloads = [];
+  let hasPlain = false;
+  for (let i = 0; i < n; i++) {
+    payloads.push(web.payloadAt(bodyObj, i));
+    if (!payloads[i]) hasPlain = true;
+  }
+  if (!hasPlain) return;
+  const chars = [...web.text(bodyObj)];
+  const segments = [];
+  let buf = '';
+  chars.forEach((c, i) => {
+    if (payloads[i]) {
+      if (buf) {
+        segments.push({ type: 'text', text: buf });
+        buf = '';
+      }
+      segments.push({ type: 'ref', id: payloads[i] });
+    } else buf += c;
+  });
+  if (buf) segments.push({ type: 'text', text: buf });
+  web.textRemove(bodyObj, 0, n);
+  segments.forEach((seg, k) => {
+    const origin = randOrigin();
+    const blockObj = web.createSeq(origin);
+    if (seg.type === 'text') web.textInsert(blockObj, 0, seg.text);
+    else web.seqInsertRef(blockObj, 0, seg.id);
+    web.seqInsertRef(bodyObj, k, origin);
+  });
+  persistSoon();
+}
+
+function autosize(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = `${ta.scrollHeight}px`;
+}
+
+function clearDropMarks() {
+  for (const r of blocksEl.querySelectorAll('.block-row')) {
+    r.classList.remove('drop-above', 'drop-below');
+  }
+}
+
+function renderBlocks() {
+  const blocks = blocksOf(currentBody);
+  const active = document.activeElement;
+  const keepObj = active?.dataset?.blockObj ?? null;
+  const keepSel = keepObj ? [active.selectionStart, active.selectionEnd] : null;
+  blocksEl.innerHTML = '';
+
+  blocks.forEach((b, i) => {
+    const row = document.createElement('div');
+    row.className = 'block-row';
+
+    const handle = document.createElement('span');
+    handle.className = 'handle';
+    handle.textContent = '⠿';
+    handle.title = 'drag to reorder (a Move op)';
+    handle.draggable = true;
+    handle.ondragstart = (e) => {
+      dragFrom = i;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(i));
+    };
+    handle.ondragend = () => {
+      row.classList.remove('dragging');
+      clearDropMarks();
+    };
+
+    row.ondragover = (e) => {
+      e.preventDefault();
+      const rect = row.getBoundingClientRect();
+      const above = e.clientY < rect.top + rect.height / 2;
+      clearDropMarks();
+      row.classList.add(above ? 'drop-above' : 'drop-below');
+    };
+    row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
+    row.ondrop = (e) => {
+      e.preventDefault();
+      clearDropMarks();
+      if (dragFrom === null) return;
+      const rect = row.getBoundingClientRect();
+      const above = e.clientY < rect.top + rect.height / 2;
+      const slot = above ? i : i + 1;
+      const from = dragFrom;
+      dragFrom = null;
+      if (slot === from || slot === from + 1) return; // no movement
+      web.seqMove(currentBody, from, slot); // drag-reorder IS a Move op
+      persistSoon();
+      render();
+    };
+
+    const ta = document.createElement('textarea');
+    ta.spellcheck = false;
+    ta.rows = 1;
+    ta.placeholder = i === 0 && blocks.length === 1 ? 'Type here…' : '';
+    ta.value = web.text(b.obj);
+    ta.dataset.prev = ta.value;
+    ta.dataset.blockObj = b.obj;
+    ta.oninput = () => {
+      applyDiff(b.obj, ta.dataset.prev, ta.value);
+      ta.dataset.prev = ta.value;
+      autosize(ta);
+      persistSoon();
+    };
+    ta.onfocus = () => {
+      focusedBlockObj = b.obj;
+    };
+
+    const del = document.createElement('span');
+    del.className = 'b-del';
+    del.textContent = '✕';
+    del.title = 'remove block (tombstones the ref; the block object remains)';
+    del.onclick = () => {
+      web.textRemove(currentBody, i, 1);
+      persistSoon();
+      render();
+    };
+
+    row.append(handle, ta, del);
+    blocksEl.appendChild(row);
+  });
+
+  const add = document.createElement('button');
+  add.className = 'add-block';
+  add.textContent = '+ BLOCK';
+  add.onclick = () => addBlockAtEnd();
+  blocksEl.appendChild(add);
+
+  blocksEl.ondragover = (e) => e.preventDefault();
+  blocksEl.ondrop = (e) => {
+    if (dragFrom === null) return;
+    // Dropping on the container (below the rows) moves to the end.
+    if (e.target === blocksEl || e.target === add) {
+      const from = dragFrom;
+      dragFrom = null;
+      web.seqMove(currentBody, from, blocksOf(currentBody).length);
+      persistSoon();
+      render();
+    }
+  };
+
+  for (const ta of blocksEl.querySelectorAll('textarea')) {
+    autosize(ta);
+    if (keepObj && ta.dataset.blockObj === keepObj) {
+      ta.focus();
+      if (keepSel) {
+        ta.setSelectionRange(
+          Math.min(keepSel[0], ta.value.length),
+          Math.min(keepSel[1], ta.value.length),
+        );
       }
     }
-  } else {
-    renderBody(previewEl, currentBody);
   }
-  renderComments();
-  prevBodyText = text;
 }
+
+function addBlockAtEnd(focus = true) {
+  const body = ensureBody();
+  const origin = randOrigin();
+  web.createSeq(origin);
+  web.seqInsertRef(body, web.textLen(body), origin);
+  persistSoon();
+  render();
+  if (focus) {
+    const tas = blocksEl.querySelectorAll('textarea');
+    tas[tas.length - 1]?.focus();
+  }
+}
+
+function renderPreview() {
+  previewEl.innerHTML = '';
+  if (!currentBody) return;
+  for (const b of blocksOf(currentBody)) {
+    const div = document.createElement('div');
+    div.className = 'block-view';
+    renderBody(div, b.obj);
+    previewEl.appendChild(div);
+  }
+}
+
+// ---- comments ----------------------------------------------------------------
 
 function collectComments() {
   if (!currentBody) return [];
-  const byKind = new Map();
-  let pos = 0;
-  for (const s of styledSpans(currentBody)) {
-    for (const c of s.text) {
-      for (const cm of s.comments) {
-        let e = byKind.get(cm.kind);
-        if (!e) {
-          e = { kind: cm.kind, text: cm.text, quote: '', start: pos, end: pos + 1 };
-          byKind.set(cm.kind, e);
+  const out = [];
+  for (const b of blocksOf(currentBody)) {
+    const byKind = new Map();
+    let pos = 0;
+    for (const s of styledSpans(b.obj)) {
+      for (const c of s.text) {
+        for (const cm of s.comments) {
+          let e = byKind.get(cm.kind);
+          if (!e) {
+            e = { obj: b.obj, kind: cm.kind, text: cm.text, quote: '', start: pos, end: pos + 1 };
+            byKind.set(cm.kind, e);
+          }
+          e.quote += c;
+          e.end = pos + 1;
         }
-        e.quote += c;
-        e.end = pos + 1;
+        pos++;
       }
-      pos++;
     }
+    out.push(...byKind.values());
   }
-  return [...byKind.values()];
+  return out;
 }
 
 function renderComments() {
@@ -713,7 +910,7 @@ function renderComments() {
     del.textContent = '✕';
     del.title = 'resolve (tombstone the comment mark)';
     del.onclick = () => {
-      web.unmarkRange(currentBody, cm.start, cm.end, cm.kind);
+      web.unmarkRange(cm.obj, cm.start, cm.end, cm.kind);
       persistSoon();
       render();
     };
@@ -722,7 +919,7 @@ function renderComments() {
   }
 }
 
-// ---- editing ----------------------------------------------------------------
+// ---- editing -----------------------------------------------------------------
 
 function ensureBody() {
   if (currentBody) return currentBody;
@@ -732,26 +929,19 @@ function ensureBody() {
   return currentBody;
 }
 
-bodyEl.addEventListener('input', () => {
-  if (!current) return;
-  const body = ensureBody();
-  const next = bodyEl.value;
-  const prev = prevBodyText;
-  // Single-span diff: common prefix + common suffix bound the change.
-  let start = 0;
-  const maxStart = Math.min(prev.length, next.length);
-  while (start < maxStart && prev[start] === next[start]) start++;
-  let endPrev = prev.length;
-  let endNext = next.length;
-  while (endPrev > start && endNext > start && prev[endPrev - 1] === next[endNext - 1]) {
-    endPrev--;
-    endNext--;
+/// The toolbar's target: the focused block textarea, or the last-focused
+/// one (clicking a toolbar button blurs the textarea; its selection
+/// survives on the element).
+function focusedTA() {
+  const el = document.activeElement;
+  if (el?.dataset?.blockObj) return el;
+  if (focusedBlockObj) {
+    for (const ta of blocksEl.querySelectorAll('textarea')) {
+      if (ta.dataset.blockObj === focusedBlockObj) return ta;
+    }
   }
-  if (endPrev > start) web.textRemove(body, start, endPrev - start);
-  if (endNext > start) web.textInsert(body, start, next.slice(start, endNext));
-  prevBodyText = next;
-  persistSoon();
-});
+  return null;
+}
 
 let titleTimer = null;
 titleEl.addEventListener('input', () => {
@@ -771,7 +961,10 @@ function createPage(parentObj) {
   web.putString(page, 'title', 'Untitled');
   const bodyOrigin = randOrigin();
   web.putRef(page, 'body', bodyOrigin);
-  web.createSeq(bodyOrigin);
+  const body = web.createSeq(bodyOrigin);
+  const blockOrigin = randOrigin();
+  web.createSeq(blockOrigin);
+  web.seqInsertRef(body, 0, blockOrigin);
   current = page;
   persistSoon();
   render();
@@ -791,13 +984,7 @@ document.getElementById('delete-page').onclick = () => {
   render();
 };
 
-// ---- go ----------------------------------------------------------------------
-
-render();
-persistNow(false);
-console.log('[kb] workspace object:', WS);
-
-// ---- format toolbar (marks over the textarea selection) ----------------------
+// ---- format toolbar (marks over the focused block's selection) ---------------
 
 function selectionLines(text, selStart, selEnd) {
   const start = text.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1;
@@ -807,10 +994,12 @@ function selectionLines(text, selStart, selEnd) {
 
 document.getElementById('insert-table').onclick = () => {
   if (!current || viewMode !== 'edit') return;
-  const body = ensureBody();
-  const at = Math.min(bodyEl.selectionStart ?? bodyEl.value.length, bodyEl.value.length);
+  const ta = focusedTA();
+  if (!ta) return;
+  const blockObj = ta.dataset.blockObj;
+  const at = Math.min(ta.selectionStart ?? ta.value.length, ta.value.length);
   // A table is a seq of row refs; a row is a seq of cell refs; a cell is a
-  // text seq — a hashseq of hashseqs, embedded in the body as a link atom.
+  // text seq — a hashseq of hashseqs, embedded as a link atom.
   const tableOrigin = randOrigin();
   const tableObj = web.createSeq(tableOrigin);
   for (let r = 0; r < 2; r++) {
@@ -823,7 +1012,7 @@ document.getElementById('insert-table').onclick = () => {
     }
     web.seqInsertRef(tableObj, r, rowOrigin);
   }
-  web.seqInsertRef(body, at, tableOrigin);
+  web.seqInsertRef(blockObj, at, tableOrigin);
   persistSoon();
   setViewMode('view'); // tables live in the rendered face
 };
@@ -832,11 +1021,13 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
   if (!btn.dataset.mark) continue;
   btn.onclick = () => {
     if (!current || viewMode !== 'edit') return;
-    const body = ensureBody();
-    let [a, b] = [bodyEl.selectionStart, bodyEl.selectionEnd];
+    const ta = focusedTA();
+    if (!ta) return;
+    const blockObj = ta.dataset.blockObj;
+    let [a, b] = [ta.selectionStart, ta.selectionEnd];
     const kind = btn.dataset.mark;
     if (kind === 'codeblock' || kind === 'eqblock') {
-      [a, b] = selectionLines(bodyEl.value, a, b);
+      [a, b] = selectionLines(ta.value, a, b);
     }
     if (a >= b) return; // formatting needs a selection
     if (kind === 'comment') {
@@ -844,17 +1035,23 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
       if (!text) return;
       // One kind per comment: overlapping comments coexist (the same-kind
       // overwrite hygiene is a formatting policy, not an annotation one).
-      web.markRange(body, a, b, `comment:${randTag()}`, text);
+      web.markRange(blockObj, a, b, `comment:${randTag()}`, text);
     } else if (kind === 'clear') {
-      for (const k of MARK_KINDS) web.unmarkRange(body, a, b, k);
+      for (const k of MARK_KINDS) web.unmarkRange(blockObj, a, b, k);
     } else if (kind === 'codeblock') {
       const lang = prompt('language label (optional):', '') ?? '';
-      web.markRange(body, a, b, 'codeblock', lang);
+      web.markRange(blockObj, a, b, 'codeblock', lang);
     } else {
-      web.markRange(body, a, b, kind, 'on');
+      web.markRange(blockObj, a, b, kind, 'on');
     }
     persistSoon();
-    bodyEl.focus();
-    bodyEl.setSelectionRange(a, b);
+    ta.focus();
+    ta.setSelectionRange(a, b);
   };
 }
+
+// ---- go ----------------------------------------------------------------------
+
+render();
+persistNow(false);
+console.log('[kb] workspace object:', WS);

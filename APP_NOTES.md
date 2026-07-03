@@ -221,3 +221,38 @@ Worth a line in MARKS.md naming the two idioms: formatting = shared kind
 (overwrite hygiene), annotation = minted kind (coexistence). Slight wrinkle:
 kind-per-comment means "all comments" is a prefix scan over kind strings —
 fine for an app, invisible to generic tooling.
+
+## 12. Blocks + drag-reorder: the Move op earns its keep (2026-07-03)
+
+Pages moved to a block model: the body seq now holds only block refs
+(atoms); each block is its own text seq carrying its own marks, comments,
+and embeds. Dragging a block emits exactly one op — `seqMove` →
+`move_element`, a placement-register Move superseding the heads this
+replica sees. Observations:
+
+- **Reorder-vs-edit concurrency is the whole point**: one replica drags a
+  block while another types inside it — the text ops target the block
+  object, the move targets the body atom; they cannot conflict, and the
+  moved block arrives intact. This decomposition (identity-carrying atom +
+  content object) is what the Move op's same-container rule was designed
+  around, and it composes with zero app-side merge logic.
+- **Block granularity is a schema decision with system consequences**:
+  per-block seqs mean marks and comments are block-scoped (a comment
+  cannot span two blocks), per-block frontiers stay lean, and body-level
+  ops are tiny. The costs surface honestly (cross-block selection needs
+  app-level composition later).
+- **Schema evolution is itself a convergence problem.** v1 bodies were one
+  text seq; the app migrates on open (wrap plain runs into blocks). Two
+  replicas migrating the same legacy page concurrently would double the
+  blocks — deterministic per replica, divergent jointly. Real apps need
+  either migration ops with identity (same origin derivation on every
+  replica — derive block origins from the content ids instead of random!)
+  or version-gated conventions. This deserves ledger status: "how do
+  app conventions version?" is the app-layer twin of the system's
+  cross-version parking story.
+
+**Feedback**: Move via drag needed one wasm method and ~40 lines of DOM.
+The deterministic-migration idea (derive new origins from existing op ids,
+so concurrent migrations converge) falls out of the identity design for
+free and should be the blessed idiom — worth an APP-conventions section
+somewhere once there are two apps.
