@@ -2867,6 +2867,39 @@ document.getElementById('panel-backdrop').onclick = () => {
   document.body.classList.remove('show-nav', 'show-comments');
 };
 
+// ---- visual themes ------------------------------------------------------------
+
+// Themes are pure CSS-variable sets on body[data-theme]; 'field' is the
+// bare :root default. Cycle with the header button, remembered per-browser.
+const THEMES = ['field', 'gallery', 'terminal', 'nord'];
+const THEME_KEY = 'hashweb-kb-theme';
+const themeToggleEl = document.getElementById('theme-toggle');
+
+function applyTheme(name) {
+  if (name === 'field') delete document.body.dataset.theme;
+  else document.body.dataset.theme = name;
+  themeToggleEl.textContent = '◧ ' + name.toUpperCase();
+}
+
+try {
+  const saved = localStorage.getItem(THEME_KEY);
+  applyTheme(THEMES.includes(saved) ? saved : 'field');
+} catch (_) {
+  applyTheme('field');
+}
+
+themeToggleEl.onclick = () => {
+  const cur = document.body.dataset.theme ?? 'field';
+  const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+  applyTheme(next);
+  try {
+    localStorage.setItem(THEME_KEY, next);
+  } catch (_) {
+    /* cache off */
+  }
+  toast('THEME: ' + next.toUpperCase());
+};
+
 // ---- go ----------------------------------------------------------------------
 
 render();
