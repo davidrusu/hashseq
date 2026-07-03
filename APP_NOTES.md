@@ -134,3 +134,44 @@ last flush, enveloped") does not exist yet.
 an authored-ops outbox on HashWeb (or per object), yielding enveloped bytes
 in apply order. This also re-raises APP layering: the outbox is exactly the
 "delta" concept ENCODING_SPEC scopes out of snapshots.
+
+## 9. Formatting wanted to be marks, not markup (2026-07-03)
+
+First cut implemented code blocks, inline code, math, equation blocks, and
+tables as in-band markup (fences, backticks, `$…$`). Redirected: formatting
+belongs to the **marks projection**. The rewrite (mark kinds `code`, `math`,
+`codeblock` — value carries the language — and `eqblock`; wasm surface
+`markRange`/`unmarkRange`/`markedSpans`) confirmed why:
+
+- **Fences shatter; marks cannot.** A concurrent edit that crosses a fence
+  boundary silently reflows the whole document's rendering. Mark regions are
+  anchored to elements: verified through the wasm layer that a concurrent
+  insert *inside* a code-block region merges into the block
+  (`let x = 5;` + fork inserting `yz` → `let xyz = 5;`, still marked, still
+  `rust`).
+- **Regional semantics did the right thing unprompted**: typing inside a
+  marked region inherits the mark; expanding-end anchors (`Before(next)`)
+  make edge-typing grow code blocks naturally; unmark is a tombstone-valued
+  mark and partial unmark just works.
+- **Mark values carry structure**: the code block's language is the mark
+  value — no syntax, MVR-surfaced on conflict like everything else.
+
+What stayed markup: **tables and headings** — structure, not formatting;
+marks have nothing to say about rows and cells. (The structural answer would
+be table-as-object — a seq of row objects — which is the blocks-as-objects
+iteration, not this one.)
+
+Friction found:
+- A `<textarea>` cannot *display* marks, so editing is blind to formatting
+  until the VIEW toggle. A real editor needs decorations driven by
+  `markedSpans` — the data is there; the widget isn't.
+- `marked_spans` coalesces on raw live sets, so a tombstone-suppressed
+  region still splits spans (renders identically; cosmetic).
+- Block-shaped marks (codeblock/eqblock) want line granularity; the app
+  expands selections to line boundaries before marking. The system is
+  character-ranged and agnostic — right call, the granularity policy is
+  the app's.
+
+**Feedback**: marks carried all four formatting features with zero system
+changes — the projection earned its complexity budget. The missing piece is
+editor-side: a decorations-capable text widget over `markedSpans`.

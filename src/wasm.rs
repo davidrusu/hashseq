@@ -20,7 +20,7 @@ use crate::encoding::{
 use crate::hashseq::{Cursor, Loc};
 use crate::hashweb::HashWeb;
 use crate::value::{KIND_KV, KIND_SEQ, TOMBSTONE, Value, object_id};
-use crate::{EncodableOp, HashSeq, Id, Run};
+use crate::{Anchor, EncodableOp, HashSeq, Id, Run};
 
 fn id_to_hex(id: &Id) -> String {
     hex::encode(id.0)
@@ -384,6 +384,21 @@ impl WasmHashSeq {
     }
 }
 
+/// Anchors for a visible range `[start, end)`: expanding ends
+/// (`Before(next)`), with the document tail falling back to `After(last)`.
+fn anchor_range(seq: &HashSeq, start: usize, end: usize) -> Result<(Anchor, Anchor), JsValue> {
+    if start >= end || end > seq.len() {
+        return Err(app_err("mark range out of bounds"));
+    }
+    let s = Anchor::Before(seq.id_at(start).expect("start < len"));
+    let e = if end < seq.len() {
+        Anchor::Before(seq.id_at(end).expect("end < len"))
+    } else {
+        Anchor::After(seq.id_at(end - 1).expect("end-1 < len"))
+    };
+    Ok((s, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +460,31 @@ mod tests {
             serde_json::from_str(&web.read_key(&page, "title").unwrap()).unwrap();
         assert_eq!(title["kind"], "conflict");
         assert_eq!(title["values"].as_array().unwrap().len(), 2);
+
+        // Formatting is marks, not markup: code-mark "ello", then check
+        // the span read; typing inside the region inherits the mark
+        // (regional semantics), and unmark suppresses.
+        web.mark_range(&body, 0, 4, "code", "on").unwrap();
+        let spans: serde_json::Value =
+            serde_json::from_str(&web.marked_spans(&body).unwrap()).unwrap();
+        assert_eq!(spans[0]["text"], "ello");
+        assert_eq!(spans[0]["marks"][0]["kind"], "code");
+        assert_eq!(spans[1]["text"], ", world");
+        assert_eq!(spans[1]["marks"].as_array().unwrap().len(), 0);
+        web.text_insert(&body, 2, "XX").unwrap(); // inside the marked region
+        let spans: serde_json::Value =
+            serde_json::from_str(&web.marked_spans(&body).unwrap()).unwrap();
+        assert_eq!(spans[0]["text"], "elXXlo", "insert inherits the region's mark");
+        web.unmark_range(&body, 0, 6, "code").unwrap();
+        let spans: serde_json::Value =
+            serde_json::from_str(&web.marked_spans(&body).unwrap()).unwrap();
+        for span in spans.as_array().unwrap() {
+            assert_eq!(
+                span["marks"].as_array().unwrap().len(),
+                0,
+                "tombstone suppresses the code mark everywhere"
+            );
+        }
 
         // Deletion reads as absent; the key drops from the live key list.
         web.del(&ws, "page:abc").unwrap();
@@ -668,6 +708,97 @@ impl WasmHashWeb {
             .ok_or_else(|| app_err("no such seq object"))?;
         seq.remove_batch(idx, len);
         Ok(())
+    }
+
+    // --- marks (formatting as ops, not markup) ---
+
+    /// Mark visible range `[start, end)` with `kind`/`value` (both strings;
+    /// the artifacts register store-wide). Expanding-end anchors: typing at
+    /// the edges grows the region (MARKS.md anchor table). Returns the mark
+    /// op id.
+    #[wasm_bindgen(js_name = markRange)]
+    pub fn mark_range(
+        &mut self,
+        obj_hex: &str,
+        start: usize,
+        end: usize,
+        kind: &str,
+        value: &str,
+    ) -> Result<String, JsValue> {
+        let k = Value::String(kind.to_owned());
+        let v = Value::String(value.to_owned());
+        let kind_id = self.inner.provide_value(&k);
+        let value_id = self.inner.provide_value(&v);
+        let seq = self
+            .inner
+            .seq_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        let (s, e) = anchor_range(seq, start, end)?;
+        Ok(id_to_hex(&seq.mark_range(s, e, kind_id, value_id).id()))
+    }
+
+    /// Remove `kind` formatting over `[start, end)` — a tombstone-valued
+    /// mark (partial unmark works: the overwritten mark keeps applying
+    /// outside the range).
+    #[wasm_bindgen(js_name = unmarkRange)]
+    pub fn unmark_range(
+        &mut self,
+        obj_hex: &str,
+        start: usize,
+        end: usize,
+        kind: &str,
+    ) -> Result<String, JsValue> {
+        let k = Value::String(kind.to_owned());
+        let kind_id = self.inner.provide_value(&k);
+        let seq = self
+            .inner
+            .seq_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        let (s, e) = anchor_range(seq, start, end)?;
+        Ok(id_to_hex(&seq.unmark_range(s, e, kind_id).id()))
+    }
+
+    /// The rendered document as coalesced marked spans. JSON:
+    /// `[{"text": s, "marks": [{"kind": s, "values": [s...]}]}]` — marks
+    /// whose live values are all unmark tombstones are omitted; multiple
+    /// values on one kind = an MVR conflict, surfaced whole.
+    #[wasm_bindgen(js_name = markedSpans)]
+    pub fn marked_spans(&self, obj_hex: &str) -> Result<String, JsValue> {
+        let obj = hex_to_id(obj_hex)?;
+        let seq = self
+            .inner
+            .seq(&obj)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        let resolve_str = |id: &Id| match self.inner.resolve(id) {
+            Some(Value::String(s)) => s,
+            Some(other) => format!("{other:?}"),
+            None => id_to_hex(id),
+        };
+        let spans: Vec<serde_json::Value> = seq
+            .marked_spans()
+            .iter()
+            .map(|(text, set)| {
+                let marks: Vec<serde_json::Value> = set
+                    .iter()
+                    .filter_map(|(kind, lives)| {
+                        let values: Vec<String> = lives
+                            .iter()
+                            .filter(|(_, v)| *v != *TOMBSTONE)
+                            .map(|(_, v)| resolve_str(v))
+                            .collect();
+                        if values.is_empty() {
+                            return None; // fully unmarked
+                        }
+                        Some(serde_json::json!({
+                            "kind": resolve_str(kind),
+                            "values": values,
+                        }))
+                    })
+                    .collect();
+                serde_json::json!({ "text": text, "marks": marks })
+            })
+            .collect();
+        Ok(serde_json::to_string(&spans).expect("plain data serializes"))
     }
 
     // --- kv objects (string keys; string or raw-id values) ---

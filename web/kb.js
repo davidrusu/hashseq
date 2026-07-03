@@ -183,6 +183,9 @@ const crumbsEl = document.getElementById('crumbs');
 const titleEl = document.getElementById('title');
 const conflictEl = document.getElementById('conflict-bar');
 const bodyEl = document.getElementById('body');
+const previewEl = document.getElementById('preview');
+const tabEditEl = document.getElementById('tab-edit');
+const tabViewEl = document.getElementById('tab-view');
 const toolsEl = document.getElementById('page-tools');
 const noPageEl = document.getElementById('no-page');
 const statObjects = document.getElementById('stat-objects');
@@ -192,6 +195,237 @@ const statParked = document.getElementById('stat-parked');
 let current = null; // pageObj hex
 let currentBody = null; // body seq obj hex
 let prevBodyText = ''; // shadow of the textarea for diffing
+let viewMode = 'edit'; // 'edit' | 'view'
+
+// ---- rendering: marks + light markup ----------------------------------------
+//
+// Formatting (inline code, inline math, code blocks, equation blocks) is
+// MARKS — ops anchored to elements, surviving concurrent edits and moving
+// with the text (MARKS.md regional semantics). Structure (tables, headings)
+// stays line-level markup over the same text seq. KaTeX loads lazily from a
+// CDN; without it, math renders as its source.
+
+const MARK_KINDS = ['code', 'math', 'codeblock', 'eqblock'];
+
+let katex = null;
+import('https://esm.sh/katex@0.16.11')
+  .then((m) => {
+    katex = m.default;
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://esm.sh/katex@0.16.11/dist/katex.min.css';
+    document.head.appendChild(link);
+    if (viewMode === 'view') renderEditor();
+  })
+  .catch((e) => console.warn('[kb] KaTeX unavailable — math renders as source:', e));
+
+function mathNode(tex, display) {
+  const el = document.createElement(display ? 'div' : 'span');
+  if (katex) {
+    try {
+      katex.render(tex, el, { displayMode: display, throwOnError: true });
+      return el;
+    } catch (_) {
+      /* fall through to source */
+    }
+  }
+  el.className = 'math-src';
+  el.textContent = display ? `$$${tex}$$` : `$${tex}$`;
+  return el;
+}
+
+/// markedSpans → per-span flags the renderer understands.
+function styledSpans(bodyObj) {
+  return JSON.parse(web.markedSpans(bodyObj)).map((s) => {
+    const f = { text: s.text, code: false, math: false, codeblock: null, eqblock: false };
+    for (const m of s.marks) {
+      if (m.kind === 'code') f.code = true;
+      else if (m.kind === 'math') f.math = true;
+      else if (m.kind === 'codeblock') f.codeblock = m.values[0] ?? '';
+      else if (m.kind === 'eqblock') f.eqblock = true;
+    }
+    return f;
+  });
+}
+
+/// Chunk a char-array by (code, math) and emit text / <code> / KaTeX nodes.
+function chunkNodes(chars) {
+  const out = [];
+  let k = 0;
+  while (k < chars.length) {
+    const { code, math } = chars[k];
+    let text = '';
+    while (k < chars.length && chars[k].code === code && chars[k].math === math) {
+      text += chars[k].c;
+      k++;
+    }
+    if (math) out.push(mathNode(text, false));
+    else if (code) {
+      const c = document.createElement('code');
+      c.textContent = text;
+      out.push(c);
+    } else if (text) out.push(document.createTextNode(text));
+  }
+  return out;
+}
+
+function trimCells(ln) {
+  let a = 0;
+  let b = ln.length;
+  while (a < b && ln[a].c === ' ') a++;
+  while (b > a && ln[b - 1].c === ' ') b--;
+  return ln.slice(a, b);
+}
+
+function tableCells(ln) {
+  let t = trimCells(ln);
+  if (t.length && t[0].c === '|') t = t.slice(1);
+  if (t.length && t[t.length - 1].c === '|') t = t.slice(0, -1);
+  const cells = [[]];
+  for (const ch of t) {
+    if (ch.c === '|') cells.push([]);
+    else cells[cells.length - 1].push(ch);
+  }
+  return cells.map(trimCells);
+}
+
+function lineText(ln) {
+  return ln.map((x) => x.c).join('');
+}
+
+function tableNode(lineArrs) {
+  const isSep = (ln) =>
+    tableCells(ln).every((c) => /^:?-+:?$/.test(lineText(c)));
+  const table = document.createElement('table');
+  let body = lineArrs;
+  if (lineArrs.length >= 2 && isSep(lineArrs[1])) {
+    const tr = table.createTHead().insertRow();
+    for (const c of tableCells(lineArrs[0])) {
+      const th = document.createElement('th');
+      th.append(...chunkNodes(c));
+      tr.appendChild(th);
+    }
+    body = lineArrs.slice(2);
+  }
+  const tb = table.createTBody();
+  for (const ln of body) {
+    if (isSep(ln)) continue;
+    const tr = tb.insertRow();
+    for (const c of tableCells(ln)) tr.insertCell().append(...chunkNodes(c));
+  }
+  return table;
+}
+
+/// Inline region (no block marks): headings, tables, paragraphs over
+/// char-arrays that carry their inline mark flags.
+function renderInlineRegion(el, chars) {
+  const lines = [[]];
+  for (const ch of chars) {
+    if (ch.c === '\n') lines.push([]);
+    else lines[lines.length - 1].push(ch);
+  }
+  let para = [];
+  const flushPara = () => {
+    if (para.length === 0) return;
+    const p = document.createElement('p');
+    para.forEach((ln, k) => {
+      if (k > 0) p.appendChild(document.createElement('br'));
+      p.append(...chunkNodes(ln));
+    });
+    el.appendChild(p);
+    para = [];
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const ln = lines[i];
+    const text = lineText(ln);
+    const h = text.match(/^(#{1,3})\s+/);
+    if (h) {
+      flushPara();
+      const hd = document.createElement(`h${h[1].length + 1}`);
+      hd.append(...chunkNodes(ln.slice(h[0].length)));
+      el.appendChild(hd);
+      i++;
+      continue;
+    }
+    const isTableLine = (t) =>
+      t.trimStart().startsWith('|') && t.indexOf('|', t.indexOf('|') + 1) !== -1;
+    if (isTableLine(text)) {
+      flushPara();
+      const rows = [];
+      while (i < lines.length && isTableLine(lineText(lines[i]))) rows.push(lines[i++]);
+      el.appendChild(tableNode(rows));
+      continue;
+    }
+    if (text.trim() === '') {
+      flushPara();
+      i++;
+      continue;
+    }
+    para.push(ln);
+    i++;
+  }
+  flushPara();
+}
+
+function renderBody(el, bodyObj) {
+  el.innerHTML = '';
+  if (!bodyObj) return;
+  const spans = styledSpans(bodyObj);
+  let i = 0;
+  while (i < spans.length) {
+    if (spans[i].codeblock !== null) {
+      let lang = '';
+      let text = '';
+      while (i < spans.length && spans[i].codeblock !== null) {
+        lang = lang || spans[i].codeblock;
+        text += spans[i].text;
+        i++;
+      }
+      const wrap = document.createElement('div');
+      wrap.className = 'code-block';
+      if (lang) {
+        const l = document.createElement('div');
+        l.className = 'code-lang';
+        l.textContent = lang.toUpperCase();
+        wrap.appendChild(l);
+      }
+      const pre = document.createElement('pre');
+      pre.textContent = text.replace(/^\n/, '').replace(/\n$/, '');
+      wrap.appendChild(pre);
+      el.appendChild(wrap);
+    } else if (spans[i].eqblock) {
+      let tex = '';
+      while (i < spans.length && spans[i].eqblock) {
+        tex += spans[i].text;
+        i++;
+      }
+      const d = document.createElement('div');
+      d.className = 'eq-block';
+      d.appendChild(mathNode(tex.trim(), true));
+      el.appendChild(d);
+    } else {
+      const chars = [];
+      while (i < spans.length && spans[i].codeblock === null && !spans[i].eqblock) {
+        for (const c of spans[i].text) {
+          chars.push({ c, code: spans[i].code, math: spans[i].math });
+        }
+        i++;
+      }
+      renderInlineRegion(el, chars);
+    }
+  }
+}
+
+function setViewMode(mode) {
+  viewMode = mode;
+  tabEditEl.classList.toggle('active', mode === 'edit');
+  tabViewEl.classList.toggle('active', mode === 'view');
+  renderEditor();
+}
+
+tabEditEl.onclick = () => setViewMode('edit');
+tabViewEl.onclick = () => setViewMode('view');
 
 // ---- rendering ---------------------------------------------------------------
 
@@ -262,7 +496,9 @@ function crumbPath(pageObj) {
 function renderEditor() {
   const has = current !== null;
   titleEl.style.display = has ? '' : 'none';
+  document.getElementById('fmt-row').style.display = has ? '' : 'none';
   bodyEl.style.display = has ? '' : 'none';
+  previewEl.style.display = 'none';
   toolsEl.style.display = has ? '' : 'none';
   crumbsEl.style.display = has ? '' : 'none';
   noPageEl.style.display = has ? 'none' : '';
@@ -321,16 +557,23 @@ function renderEditor() {
   // Body
   currentBody = bodyOf(current);
   const text = currentBody ? web.text(currentBody) : '';
-  if (bodyEl.value !== text) {
-    const focused = document.activeElement === bodyEl;
-    const selStart = bodyEl.selectionStart;
-    const selEnd = bodyEl.selectionEnd;
-    bodyEl.value = text;
-    if (focused) {
-      // Best-effort caret preservation under remote edits.
-      bodyEl.selectionStart = Math.min(selStart, text.length);
-      bodyEl.selectionEnd = Math.min(selEnd, text.length);
+  const editing = viewMode === 'edit';
+  bodyEl.style.display = editing ? '' : 'none';
+  previewEl.style.display = editing ? 'none' : '';
+  if (editing) {
+    if (bodyEl.value !== text) {
+      const focused = document.activeElement === bodyEl;
+      const selStart = bodyEl.selectionStart;
+      const selEnd = bodyEl.selectionEnd;
+      bodyEl.value = text;
+      if (focused) {
+        // Best-effort caret preservation under remote edits.
+        bodyEl.selectionStart = Math.min(selStart, text.length);
+        bodyEl.selectionEnd = Math.min(selEnd, text.length);
+      }
     }
+  } else {
+    renderBody(previewEl, currentBody);
   }
   prevBodyText = text;
 }
@@ -409,3 +652,35 @@ document.getElementById('delete-page').onclick = () => {
 render();
 persistNow(false);
 console.log('[kb] workspace object:', WS);
+
+// ---- format toolbar (marks over the textarea selection) ----------------------
+
+function selectionLines(text, selStart, selEnd) {
+  const start = text.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1;
+  const nl = text.indexOf('\n', selEnd);
+  return [start, nl === -1 ? text.length : nl];
+}
+
+for (const btn of document.querySelectorAll('#fmt-tools button')) {
+  btn.onclick = () => {
+    if (!current || viewMode !== 'edit') return;
+    const body = ensureBody();
+    let [a, b] = [bodyEl.selectionStart, bodyEl.selectionEnd];
+    const kind = btn.dataset.mark;
+    if (kind === 'codeblock' || kind === 'eqblock') {
+      [a, b] = selectionLines(bodyEl.value, a, b);
+    }
+    if (a >= b) return; // formatting needs a selection
+    if (kind === 'clear') {
+      for (const k of MARK_KINDS) web.unmarkRange(body, a, b, k);
+    } else if (kind === 'codeblock') {
+      const lang = prompt('language label (optional):', '') ?? '';
+      web.markRange(body, a, b, 'codeblock', lang);
+    } else {
+      web.markRange(body, a, b, kind, 'on');
+    }
+    persistSoon();
+    bodyEl.focus();
+    bodyEl.setSelectionRange(a, b);
+  };
+}
