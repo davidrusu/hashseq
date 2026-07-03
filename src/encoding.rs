@@ -1895,8 +1895,10 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
         .collect();
     objects.sort_by_key(|(id, _)| **id);
     encode_varint(objects.len(), &mut buf);
-    for (origin, obj) in objects {
-        encode_id(origin, &mut buf);
+    // No object id on the wire: the store key is derived,
+    // object_id(kind ‖ inner origin) — encoding it would be redundant and
+    // let a non-derived key survive strict decode.
+    for (_, obj) in objects {
         let inner = match obj {
             ObjRef::Map(m) => {
                 buf.push(OBJ_KV);
@@ -1945,25 +1947,32 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
 
     let no = c.step(decode_varint)?;
     for _ in 0..no {
-        let origin = c.step(decode_id)?;
         let kind = c.byte()?;
         let len = c.step(decode_varint)?;
         let inner = bytes
             .get(c.pos..c.pos + len)
             .ok_or(DecodeError::UnexpectedEof)?;
         c.pos += len;
-        match kind {
+        // The store key is derived from the object's kind and inner
+        // origin — never read from the wire.
+        let obj = match kind {
             OBJ_KV => {
-                web.kvs.insert(origin, decode_hashkv(inner)?);
+                let m = decode_hashkv(inner)?;
+                let obj = crate::value::object_id(crate::value::VK_NEW_KV, &m.origin());
+                web.kvs.insert(obj, m);
+                obj
             }
             OBJ_SEQ => {
-                web.seqs.insert(origin, decode_hashseq(inner)?);
+                let s = decode_hashseq(inner)?;
+                let obj = crate::value::object_id(crate::value::VK_NEW_SEQ, &s.origin());
+                web.seqs.insert(obj, s);
+                obj
             }
             other => return Err(DecodeError::InvalidOpTag(other)),
-        }
+        };
         // Creation ops parked inside the object must re-enter the pending
         // birth list (apply-time knowledge, not on the wire).
-        web.pend_held_creations(origin);
+        web.pend_held_creations(obj);
     }
 
     let parked = c.step(decode_varint)?;
@@ -2573,8 +2582,7 @@ mod family_wire {
     #[test]
     fn web_roundtrip_block_document() {
         let mut doc = HashWeb::new();
-        let root = Id([9; 32]);
-        doc.create_kv(root);
+        let root = doc.create_kv(Id([9; 32]));
         let block = doc.new_kv(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
         doc.put(&block, s("color"), s("blue"));
@@ -2606,8 +2614,7 @@ mod family_wire {
         // child's object id; the snapshot carries the envelopes and decode
         // re-parks.
         let mut a = HashWeb::new();
-        let root = Id([9; 32]);
-        a.create_kv(root);
+        let root = a.create_kv(Id([9; 32]));
         let child = a.new_seq(&root, s("t")).unwrap();
         a.text_insert(&child, 0, "x");
         let child_nodes = a.seq(&child).unwrap().all_nodes();
@@ -2623,7 +2630,7 @@ mod family_wire {
         // Adopting the root and delivering its ops wakes the parked op
         // transitively.
         let mut decoded = decoded;
-        decoded.create_kv(root);
+        decoded.create_kv(Id([9; 32]));
         for (id, node) in a.kv(&root).unwrap().all_nodes() {
             decoded.apply_to_with_id(root, id, node);
         }
@@ -2634,8 +2641,7 @@ mod family_wire {
     #[test]
     fn web_bytes_canonical_across_merge_orders() {
         let mut base = HashWeb::new();
-        let root = Id([9; 32]);
-        base.create_kv(root);
+        let root = base.create_kv(Id([9; 32]));
         let text = base.new_seq(&root, s("text")).unwrap();
         let meta = base.new_kv(&root, s("meta")).unwrap();
 

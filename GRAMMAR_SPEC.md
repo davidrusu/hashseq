@@ -37,21 +37,23 @@ OBJECT_CONTEXT = "hashweb v1 object id"
 
 id(u)              = BLAKE3::derive_key(NODE_CONTEXT,   node_bytes(u))
 value_id(a)        = BLAKE3::derive_key(VALUE_CONTEXT,  artifact_bytes(a))
-object_id(k, seed) = BLAKE3::derive_key(OBJECT_CONTEXT, k ‖ seed)
-                     -- k: the creation kind tag (VK_NEW_SEQ / VK_NEW_KV,
-                     --    one byte); seed: the creating op's id, or an
-                     --    out-of-band 32-byte seed for a root object
+object_id(k, origin) = BLAKE3::derive_key(OBJECT_CONTEXT, k ‖ origin)
+                       -- k: the creation kind tag (VK_NEW_SEQ / VK_NEW_KV,
+                       --    one byte); origin: the creating op's id, or an
+                       --    out-of-band 32-byte value for a root object
 ```
 
 One node context for every op kind; one value context for every value kind;
-one object context deriving every object's id. **Origins and object ids
-are distinct**: the seed (a creation op id, or an arbitrary root seed) is
-where an object *comes from*; the object id is derived from **kind ‖
-seed**, so the kind is inside the identity — the same seed opened as a Seq
-and as a Kv is two different objects, and kind mis-agreement is
-unrepresentable rather than gated. Kinds are tags inside the encodings.
-Bump a context string ⟺ identity hard fork; there is no other versioning
-at this layer.
+one object context deriving every object's store address. **Origins and
+object ids are distinct, and they live at different layers**: the origin
+(a creation op id, or an arbitrary root value) is the op-level anchor —
+what an object's ops ref and bottom out at; the object id, derived from
+**kind ‖ origin**, is the store-level address (routing envelope + index)
+and **never appears in any preimage**. The kind is inside the address, so
+the same origin opened as a Seq and as a Kv is two different objects, and
+kind mis-agreement is unrepresentable rather than gated. Kinds are tags
+inside the encodings. Bump a context string ⟺ identity hard fork; there
+is no other versioning at this layer.
 
 ### The node grammar: envelope ‖ body
 
@@ -77,12 +79,12 @@ to the envelope and body exactly as transmitted, and the streaming hasher
 is pinned by test to this layout.
 
 `ref_count ≥ 1`: every op pins at least its frontier, and a frontier is
-never empty (every object has an object id from birth). A zero-ref node is
-malformed. Refs may be op ids or object ids — one namespace; a child
-object's id is recognized by derivation once its creation op is known,
-while a **root object's** seed is the recursion's base: an arbitrary
-32-byte value chosen out-of-band. The kind needs no side agreement — it is
-inside the derivation, so naming a root's object id *is* naming its kind.
+never empty (every object has an origin from birth). A zero-ref node is
+malformed. A child object's ops anchor at its creation op's id; a **root
+object's** origin is the recursion's base: an arbitrary 32-byte value
+chosen out-of-band. Object ids never appear among refs — they are
+store-level addresses, not op-level anchors; naming an object id in an
+envelope *is* naming its kind, since the kind is inside the derivation.
 There is
 no store-level anchor above root objects; each object's closure is its own
 commitment domain. An object's first op is `refs = {origin}` — causally
@@ -120,18 +122,19 @@ rationale and accepted residuals: HASHSEQ_SPEC.md, Resolution.
 
 There is **no route field in the preimage** — delivery rides a **routing
 envelope**, `obj_id ‖ node`, that is pure transport metadata (never
-hashed, never part of identity). Objects are identified by their derived
-**object ids** (`object_id(k, seed)` above; a standalone document's
-`doc_id` is the same class): the object id is a virtual node, never an op,
-so a creation op has no dual role — refs to `X` always mean the parent
-element, refs to `object_id(k, X)` always mean the child object. The
-envelope needs no trust and no verdict: an op enveloped to the wrong
-object simply never applies there (its refs never arrive inside that
-object), the same fate as any garbage ref — bounded and attributable.
-Buffering is two-level: envelopes naming unknown object ids park
-store-wide until birth or adoption; ops inside a live object park on their
-first missing ref in that object's own buffer. Applying a creation op
-derives its child's object id and wakes the store-level waiters.
+hashed, never part of identity). The envelope address is the derived
+object id (`object_id(k, origin)` above; a standalone document's `doc_id`
+is the same class); it disambiguates every ref for free — a creation op's
+id `X` names the parent element in the parent's envelope and the child's
+origin anchor in the child's, with no dual-role ambiguity because the two
+streams never mix. The envelope needs no trust and no verdict: an op
+enveloped to the wrong object simply never applies there (its refs never
+arrive inside that object), the same fate as any garbage ref — bounded
+and attributable. Buffering is two-level: envelopes naming unknown object
+ids park store-wide until birth or adoption; ops inside a live object
+park on their first missing ref in that object's own buffer. Applying a
+creation op derives its child's object id and wakes the store-level
+waiters.
 
 ### Value fields: always by id in the preimage
 

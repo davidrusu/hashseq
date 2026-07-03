@@ -2,20 +2,22 @@
 //!
 //! The store has **no identity and no semantics of its own** — it is not a
 //! datastructure. All composition lives in the ops: a `Put`/`Insert` whose
-//! value is a creation artifact births a child object (`object_id` of the
-//! creating op); a link is an id carried as a value. What the store does
-//! is mechanics: instantiate objects, route each incoming op to its object
-//! (derived from the op's refs — never a field), buffer store-wide on
-//! missing refs, and quarantine ops whose refs determine no single object.
+//! value is a creation artifact births a child object; a link is an id
+//! carried as a value. What the store does is mechanics: instantiate
+//! objects, deliver enveloped ops (`obj_id ‖ node` — transport metadata,
+//! never hashed), park envelopes for unknown objects, and birth children
+//! when creation ops apply.
 //!
 //! Objects are **holonic**: each is a complete replica rooted at its own
-//! origin. A root object's `(origin, kind)` is chosen out-of-band —
-//! agreeing on the kind is the same class of agreement as the 32 origin
-//! bytes themselves, since no creation op exists to commit it; child
-//! objects' origins and kinds are hash-committed by their creation ops.
-//! Every op commits transitively to its object-closure's root origin, so
-//! one object's ops can never merge into another — the commitment domain
-//! is per object, and store merge is unconditional: a union of knowledge.
+//! origin — a creation op's id, or an arbitrary 32-byte value chosen
+//! out-of-band for a root. Ops anchor at the origin; the store indexes by
+//! the derived **object id**, `object_id(kind ‖ origin)`, which never
+//! appears in a preimage — it is the envelope's address, with the kind
+//! inside it, so the same origin opened as a Seq and as a Kv is two
+//! objects and kind mis-agreement is unrepresentable. Every op commits
+//! transitively to its object's origin, so one object's ops can never
+//! merge into another — the commitment domain is per object, and store
+//! merge is unconditional: a union of knowledge.
 
 use rustc_hash::FxHashMap;
 
@@ -26,8 +28,9 @@ use crate::{HashNode, HashSeq, Id, Op, Payload};
 
 #[derive(Debug, Clone, Default)]
 pub struct HashWeb {
-    /// Every seq object this replica knows, by origin id: roots opened
-    /// out-of-band and children born by creation ops alike.
+    /// Every seq object this replica knows, keyed by derived object id
+    /// (`object_id(kind ‖ origin)`): roots opened out-of-band and children
+    /// born by creation ops alike.
     pub(crate) seqs: FxHashMap<Id, HashSeq>,
     /// Every map object, likewise.
     pub(crate) kvs: FxHashMap<Id, HashKv>,
@@ -56,38 +59,43 @@ impl HashWeb {
         Self::default()
     }
 
-    /// Open a root seq at `origin` — an id chosen out-of-band ("each
-    /// object is free to set its own root"; the kind is part of the same
-    /// out-of-band agreement). Returns false if the origin is occupied.
-    pub fn create_seq(&mut self, origin: Id) -> bool {
-        if self.is_origin(&origin) {
-            return false;
+    /// Open a root seq from `origin` — a 32-byte value chosen out-of-band
+    /// ("each object is free to set its own root"). The maps are keyed by
+    /// the derived object id, `object_id(VK_NEW_SEQ ‖ origin)`, which is
+    /// returned as the handle: the kind is inside the store-level identity,
+    /// so the same origin opened as a Kv is a different object, not a
+    /// clash. The *ops* keep anchoring at the origin itself — the derived
+    /// id is a store address (envelope + index) and never appears in a
+    /// preimage. Idempotent.
+    pub fn create_seq(&mut self, origin: Id) -> Id {
+        let obj = object_id(VK_NEW_SEQ, &origin);
+        if !self.is_object(&obj) {
+            self.seqs.insert(obj, HashSeq::new(origin));
+            self.pump(obj);
         }
-        self.seqs.insert(origin, HashSeq::new(origin));
-        self.pump(origin);
-        true
+        obj
     }
 
-    /// Open a root map at `origin` — see [`Self::create_seq`].
-    pub fn create_kv(&mut self, origin: Id) -> bool {
-        if self.is_origin(&origin) {
-            return false;
+    /// Open a root map from `origin` — see [`Self::create_seq`].
+    pub fn create_kv(&mut self, origin: Id) -> Id {
+        let obj = object_id(VK_NEW_KV, &origin);
+        if !self.is_object(&obj) {
+            self.kvs.insert(obj, HashKv::new(origin));
+            self.pump(obj);
         }
-        self.kvs.insert(origin, HashKv::new(origin));
-        self.pump(origin);
-        true
+        obj
     }
 
-    pub fn seq(&self, origin: &Id) -> Option<&HashSeq> {
-        self.seqs.get(origin)
+    pub fn seq(&self, obj: &Id) -> Option<&HashSeq> {
+        self.seqs.get(obj)
     }
 
-    pub fn kv(&self, origin: &Id) -> Option<&HashKv> {
-        self.kvs.get(origin)
+    pub fn kv(&self, obj: &Id) -> Option<&HashKv> {
+        self.kvs.get(obj)
     }
 
-    /// Every known origin id (seqs and kvs).
-    pub fn origins(&self) -> impl Iterator<Item = &Id> {
+    /// Every known object id (seqs and kvs).
+    pub fn objects(&self) -> impl Iterator<Item = &Id> {
         self.seqs.keys().chain(self.kvs.keys())
     }
 
@@ -95,9 +103,9 @@ impl HashWeb {
         self.seqs.len() + self.kvs.len()
     }
 
-    /// Is this id a live object origin (roots adopted out-of-band and
-    /// creation-derived children alike)?
-    fn is_origin(&self, id: &Id) -> bool {
+    /// Is this id a live object (roots opened from out-of-band seeds and
+    /// creation-derived children alike — both keyed by derived object id)?
+    fn is_object(&self, id: &Id) -> bool {
         self.seqs.contains_key(id) || self.kvs.contains_key(id)
     }
 
@@ -129,8 +137,8 @@ impl HashWeb {
     }
 
     /// Create a child object under `parent[key]`; returns the child's
-    /// origin id. The creating op *is* the object: its identity is
-    /// `object_id(creation op id)` — a virtual origin, never an op.
+    /// object id. The creating op *is* the object: its id is the child's
+    /// origin anchor, and `object_id(kind ‖ it)` is the store address.
     pub fn create_child(&mut self, parent: &Id, key: Value, kind: Value) -> Option<Id> {
         debug_assert!(matches!(kind, Value::NewSeq | Value::NewKv));
         let tag = match kind {
@@ -140,7 +148,7 @@ impl HashWeb {
         let node = self.put(parent, key, kind)?;
         // put() delivered the node; creation additionally births the child.
         let child = object_id(tag, &node.id());
-        debug_assert!(self.is_origin(&child), "creation birthed");
+        debug_assert!(self.is_object(&child), "creation birthed");
         Some(child)
     }
 
@@ -182,7 +190,7 @@ impl HashWeb {
         };
         let node = self.seq_insert_value(parent, idx, &kind)?;
         let child = object_id(tag, &node.id());
-        debug_assert!(self.is_origin(&child), "creation birthed");
+        debug_assert!(self.is_object(&child), "creation birthed");
         Some(child)
     }
 
@@ -274,7 +282,7 @@ impl HashWeb {
         let mut work = vec![start];
         while let Some(o) = work.pop() {
             // Envelopes parked on o deliver now that it exists.
-            if self.is_origin(&o)
+            if self.is_object(&o)
                 && let Some(envelopes) = self.parked.remove(&o)
             {
                 for (id, node) in envelopes {
@@ -302,11 +310,13 @@ impl HashWeb {
                 }
                 let tag = if is_seq { VK_NEW_SEQ } else { VK_NEW_KV };
                 let child = object_id(tag, &id);
-                if !self.is_origin(&child) {
+                if !self.is_object(&child) {
+                    // The creation op id is the child's origin anchor; the
+                    // derived id is only the store's address for it.
                     if is_seq {
-                        self.seqs.insert(child, HashSeq::new(child));
+                        self.seqs.insert(child, HashSeq::new(id));
                     } else {
-                        self.kvs.insert(child, HashKv::new(child));
+                        self.kvs.insert(child, HashKv::new(id));
                     }
                 }
                 work.push(child);
@@ -326,20 +336,20 @@ impl HashWeb {
         for (vid, bytes) in other.values {
             self.values.entry(vid).or_insert(bytes);
         }
-        let adopt: Vec<(Id, bool)> = other
+        let adopt: Vec<(Id, Id, bool)> = other
             .seqs
-            .keys()
-            .map(|o| (*o, true))
-            .chain(other.kvs.keys().map(|o| (*o, false)))
-            .filter(|(o, _)| !self.is_origin(o))
+            .iter()
+            .map(|(o, x)| (*o, x.origin(), true))
+            .chain(other.kvs.iter().map(|(o, x)| (*o, x.origin(), false)))
+            .filter(|(o, _, _)| !self.is_object(o))
             .collect();
-        for (origin, is_seq) in adopt {
+        for (obj, origin, is_seq) in adopt {
             if is_seq {
-                self.seqs.insert(origin, HashSeq::new(origin));
+                self.seqs.insert(obj, HashSeq::new(origin));
             } else {
-                self.kvs.insert(origin, HashKv::new(origin));
+                self.kvs.insert(obj, HashKv::new(origin));
             }
-            self.pump(origin);
+            self.pump(obj);
         }
         for (origin, seq) in &other.seqs {
             for (id, node) in seq.all_nodes() {
@@ -418,36 +428,40 @@ mod tests {
         // Two stores with unrelated roots merge unconditionally.
         let mut a = HashWeb::new();
         let mut b = HashWeb::new();
-        assert!(a.create_seq(oid(1)));
-        assert!(!a.create_seq(oid(1)), "already occupied");
-        b.create_kv(oid(2));
-        a.text_insert(&oid(1), 0, "hi");
-        b.put(&oid(2), s("k"), s("v"));
+        let s1 = a.create_seq(oid(1));
+        assert_eq!(a.create_seq(oid(1)), s1, "idempotent: same seed, same object");
+        assert_ne!(s1, oid(1), "the handle is the derived object id, not the seed");
+        let k2 = b.create_kv(oid(2));
+        a.text_insert(&s1, 0, "hi");
+        b.put(&k2, s("k"), s("v"));
 
         a.merge(b.clone());
         assert_eq!(a.object_count(), 2);
-        assert_eq!(a.text(&oid(1)).unwrap(), "hi");
-        assert_eq!(a.get(&oid(2), &s("k")), Some(s("v")));
+        assert_eq!(a.text(&s1).unwrap(), "hi");
+        assert_eq!(a.get(&k2, &s("k")), Some(s("v")));
 
         // Ops arriving before their root is known park; adopting the root
         // wakes them.
-        let nodes = a.seq(&oid(1)).unwrap().all_nodes();
+        let nodes = a.seq(&s1).unwrap().all_nodes();
         let mut fresh = HashWeb::new();
         for (id, node) in nodes {
-            fresh.apply_to_with_id(oid(1), id, node);
+            fresh.apply_to_with_id(s1, id, node);
         }
         assert_eq!(fresh.orphans().count(), 2, "both envelopes park on the unknown object id");
         fresh.create_seq(oid(1));
         assert_eq!(fresh.orphans().count(), 0, "adoption wakes transitively");
-        assert_eq!(fresh.text(&oid(1)).unwrap(), "hi");
+        assert_eq!(fresh.text(&s1).unwrap(), "hi");
 
-        // Kind mis-agreement: the same out-of-band origin opened as a Map
-        // elsewhere — the seq ops quarantine in the local map's gate.
+        // Kind "mis-agreement" is unrepresentable: the same seed opened as
+        // a Kv derives a different object id — the two coexist, nothing
+        // quarantines.
         let mut confused = HashWeb::new();
-        confused.create_kv(oid(1));
+        let k1 = confused.create_kv(oid(1));
+        assert_ne!(k1, s1);
         confused.merge(a.clone());
-        assert!(confused.kv(&oid(1)).is_some());
-        assert!(!confused.kv(&oid(1)).unwrap().delivery.gated.is_empty());
+        assert_eq!(confused.object_count(), 3);
+        assert_eq!(confused.text(&s1).unwrap(), "hi");
+        assert!(confused.kv(&k1).unwrap().delivery.gated.is_empty());
 
         // Roundtrip of a multi-root store.
         let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(
@@ -461,8 +475,7 @@ mod tests {
     fn block_document_shape() {
         // A Notion-style block: a map with "content" -> Text child.
         let mut doc = HashWeb::new();
-        let root = oid(9);
-        doc.create_kv(root);
+        let root = doc.create_kv(oid(9));
 
         let block = doc.new_kv(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
@@ -481,8 +494,7 @@ mod tests {
     fn per_object_frontiers_stay_lean() {
         // Editing one object never enters another's tips (per-object tips).
         let mut doc = HashWeb::new();
-        let root = oid(9);
-        doc.create_kv(root);
+        let root = doc.create_kv(oid(9));
         let a = doc.new_seq(&root, s("a")).unwrap();
         let b = doc.new_seq(&root, s("b")).unwrap();
 
@@ -497,8 +509,7 @@ mod tests {
     #[test]
     fn concurrent_edits_in_different_objects_merge_cleanly() {
         let mut base = HashWeb::new();
-        let root = oid(9);
-        base.create_kv(root);
+        let root = base.create_kv(oid(9));
         let text = base.new_seq(&root, s("text")).unwrap();
         let meta = base.new_kv(&root, s("meta")).unwrap();
 
@@ -523,8 +534,7 @@ mod tests {
         // Deliver a child's ops before the creation op: they park on the
         // origin id; applying the creation op derives it and wakes them.
         let mut a = HashWeb::new();
-        let root = oid(9);
-        a.create_kv(root);
+        let root = a.create_kv(oid(9));
         let child = a.new_seq(&root, s("t")).unwrap();
         a.text_insert(&child, 0, "x");
 
@@ -534,7 +544,7 @@ mod tests {
         let creation_chain: Vec<(Id, HashNode)> = a.kv(&root).unwrap().all_nodes();
 
         let mut fresh = HashWeb::new();
-        fresh.create_kv(root);
+        assert_eq!(fresh.create_kv(oid(9)), root, "same seed, same object id");
         // Child op first: its envelope names an unknown object — parks.
         for (id, node) in &child_nodes {
             fresh.apply_to_with_id(child, *id, node.clone());
@@ -552,8 +562,7 @@ mod tests {
     #[test]
     fn refs_spanning_objects_park_in_their_object() {
         let mut doc = HashWeb::new();
-        let root = oid(9);
-        doc.create_kv(root);
+        let root = doc.create_kv(oid(9));
         let a = doc.new_seq(&root, s("a")).unwrap();
         let b = doc.new_seq(&root, s("b")).unwrap();
         doc.text_insert(&a, 0, "a");
@@ -581,8 +590,7 @@ mod tests {
     #[test]
     fn child_object_born_inline_in_a_seq() {
         let mut doc = HashWeb::new();
-        let text = oid(7);
-        doc.create_seq(text);
+        let text = doc.create_seq(oid(7));
         doc.text_insert(&text, 0, "see [] here");
 
         let inner = doc.new_seq_at(&text, 5).expect("inline creation");
@@ -613,9 +621,8 @@ mod tests {
     #[test]
     fn link_atoms_reference_other_objects()  {
         let mut doc = HashWeb::new();
-        let (a, b) = (oid(3), oid(4));
-        doc.create_seq(a);
-        doc.create_seq(b);
+        let a = doc.create_seq(oid(3));
+        let b = doc.create_seq(oid(4));
         doc.text_insert(&a, 0, "link: ");
         doc.text_insert(&b, 0, "the target");
 
@@ -638,8 +645,7 @@ mod tests {
         // register conflicts (MVR), but BOTH child objects exist — creation
         // is never lost, the app resolves the register.
         let mut base = HashWeb::new();
-        let root = oid(9);
-        base.create_kv(root);
+        let root = base.create_kv(oid(9));
         let mut r1 = base.clone();
         let mut r2 = base.clone();
         let c1 = r1.new_seq(&root, s("content")).unwrap();

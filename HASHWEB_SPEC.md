@@ -46,16 +46,16 @@ No new op shape.
   (`NewSeq`/`NewKv` — ordinary derived value ids, computed constants)
   creates a child object: `Insert { at, payload: New* }` from a sequence
   slot, `Put { key, value: New* }` from a map slot, identically. The
-  child's identity is `object_id(kind ‖ id(X))` for creating op `X`
-  (GRAMMAR_SPEC.md) — a virtual node, never an op. A root object's seed is
-  the recursion's out-of-band base; its kind rides inside the derived id,
-  so there is nothing else to agree on. Child ops anchor at and ref the
-  object id; the closure of an object id is defined as `{X} ∪ closure(X)`,
-  so the creation bridge welds each root's tree into one connected DAG,
-  and store-level buffering resolves object ids by derivation when
-  creation ops apply. Because `X` (the parent element) and the derived
-  object id are distinct, refs are never ambiguous between parent and
-  child.
+  child's ops anchor at `id(X)` — the creating op's id is the child's
+  origin — and its store address is `object_id(kind ‖ id(X))`
+  (GRAMMAR_SPEC.md), a derived name that never appears in a preimage. A
+  root object's origin is the recursion's out-of-band base; its kind
+  rides inside the derived address, so there is nothing else to agree on.
+  The child's refs bottom at `X` itself, so the creation bridge welds
+  each root's tree into one connected DAG literally; store-level
+  buffering derives child addresses when creation ops apply. `X` in the
+  parent's envelope means the parent element, `X` in the child's means
+  the origin anchor — the envelope split leaves no dual-role ambiguity.
 - **Edit**: the seq (insert/remove/move), map, or mark op of the target
   object, delivered in the **routing envelope** `obj_id ‖ node` — pure
   transport metadata, never hashed (there is no route field in the
@@ -90,7 +90,7 @@ Each object keeps **its own tips**. The run/write-run fast path needs
 `tips = {previous op of this object}`; a document-global tips set would
 thread every concurrent edit anywhere in the document through this object's
 deps — the frontier-granularity trade is LAYERING.md's subject. First op of
-a child refs its object id. Buffering is **two-level**: envelopes naming
+a child refs its origin (its creation op's id). Buffering is **two-level**: envelopes naming
 an object id the store does not know park store-wide (birth or adoption
 wakes them — the store's only delivery state); ops inside a live object
 park on their first missing ref in that object's own buffer.
@@ -112,11 +112,11 @@ verdicts that are total, convergent, and stable:
 
 | op . role | admits | otherwise |
 |---|---|---|
-| `Insert . at` | insert, move op (its splice point), or the object's own id — in one `Seq` | gate |
+| `Insert . at` | insert, move op (its splice point), or the object's origin — in one `Seq` | gate |
 | `Remove . target` | insert, in the op's own `Seq` | inert (non-insert); a ref living in another object never arrives here — parks forever, no verdict |
 | `Move . target` | insert, in the object `to` resolves in (same-container rule) | gate |
-| `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the object's own id — in `target`'s object; not `target` itself (self-move) | gate |
-| `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the object's own id, in one `Seq`; inverted spans gate (MARKS.md) | gate |
+| `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the object's origin — in `target`'s object; not `target` itself (self-move) | gate |
+| `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the object's origin, in one `Seq`; inverted spans gate (MARKS.md) | gate |
 | `Mark . overwrites` | — | never gated: entries that are not covering same-kind marks are ignored by the definitional suppression filter (same class as `Put . overwrites` — kind- and coverage-scoping live in the read, not the gate) |
 | `Put . overwrites` | — | never gated: entries that are not puts on the same key are ignored by the definitional head-set filter |
 | op kind vs object kind | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv` | gate (reachable only by enveloping ops at a wrong-kind or colliding out-of-band seed — the kind is inside the derived object id, so honest kind mis-agreement is unrepresentable) |
