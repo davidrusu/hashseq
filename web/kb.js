@@ -509,15 +509,47 @@ function applyDiff(obj, prev, next) {
   if (endNext > start) web.textInsert(obj, start, next.slice(start, endNext));
 }
 
+function sniffImage(b) {
+  if (b.length < 12) return null;
+  if (b[0] === 0x89 && b[1] === 0x50) return 'image/png';
+  if (b[0] === 0xff && b[1] === 0xd8) return 'image/jpeg';
+  if (b[0] === 0x47 && b[1] === 0x49) return 'image/gif';
+  if (b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+  return null;
+}
+
+// Content-addressing makes this cache sound forever: an artifact's bytes
+// can never change under its id.
+const imageUrlCache = new Map();
+
+function imageUrlFor(payload) {
+  if (imageUrlCache.has(payload)) return imageUrlCache.get(payload);
+  const bytes = web.resolveBytes(payload);
+  if (!bytes) return null;
+  const mime = sniffImage(bytes);
+  if (!mime) return null;
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  imageUrlCache.set(payload, url);
+  return url;
+}
+
 /// An embedded object at position `idx`. The payload is a raw id — the
 /// app's conventions decide its face: a known page's OBJECT id is a link
-/// (pure name, navigates); a table's ORIGIN renders the table inline; an
-/// id we can't classify renders as an inert chip (never auto-opened —
-/// opening is a write).
+/// (pure name, navigates); an image artifact renders inline; a table's
+/// ORIGIN renders the table; an id we can't classify renders as an inert
+/// chip (never auto-opened — opening is a write).
 function renderEmbed(idx) {
   const payload = web.payloadAt(renderTargetObj, idx);
   if (!payload) return document.createTextNode(ATOM);
   if (pageMeta.has(payload) || web.isKv(payload)) return pageLinkNode(payload);
+  const imgUrl = imageUrlFor(payload);
+  if (imgUrl) {
+    const img = document.createElement('img');
+    img.className = 'kb-img';
+    img.src = imgUrl;
+    img.draggable = false;
+    return img;
+  }
   const tableObj = WasmHashWeb.seqId(payload);
   if (web.isSeq(tableObj)) return objTableNode(tableObj);
   const chip = document.createElement('span');
@@ -1258,7 +1290,8 @@ function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
     if (first.c === ATOM) {
       const inner = renderEmbed(first.idx);
       const isLink = inner.classList?.contains('page-link');
-      const w = makeWidget(inner, ATOM, isLink ? 'w-link' : 'w-embed');
+      const isImg = inner.classList?.contains('kb-img');
+      const w = makeWidget(inner, ATOM, isLink ? 'w-link' : isImg ? 'w-img' : 'w-embed');
       ed.appendChild(w);
       k++;
       continue;
@@ -1484,6 +1517,17 @@ function renderBlocks() {
     });
     ta.addEventListener('paste', (e) => {
       e.preventDefault();
+      const imgItem = [...(e.clipboardData.items ?? [])].find((it) =>
+        it.type.startsWith('image/'),
+      );
+      if (imgItem) {
+        const file = imgItem.getAsFile();
+        if (file) {
+          const at = caretOffsetIn(ta) ?? extractText(ta).length;
+          insertImageFile(file, ta, at);
+          return;
+        }
+      }
       const clean = e.clipboardData.getData('text/plain').replaceAll(FILLER, '');
       document.execCommand('insertText', false, clean);
     });
@@ -2030,6 +2074,48 @@ document.getElementById('insert-table').onclick = () => {
   if (viewMode === 'split') renderPreview();
 };
 
+/// Downscale + recompress before storing: snapshots carry every artifact,
+/// so keep images modest (WebP keeps alpha).
+async function processImageFile(file) {
+  const bmp = await createImageBitmap(file);
+  const MAX = 1400;
+  const scale = Math.min(1, MAX / Math.max(bmp.width, bmp.height));
+  if (scale === 1 && file.size < 400_000) {
+    return new Uint8Array(await file.arrayBuffer());
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bmp.width * scale));
+  canvas.height = Math.max(1, Math.round(bmp.height * scale));
+  canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise((res) => canvas.toBlob(res, 'image/webp', 0.85));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function insertImageFile(file, ta, at) {
+  const bytes = await processImageFile(file);
+  const imgId = web.provideBytes(bytes);
+  const blockObj = ta.dataset.blockObj;
+  web.seqInsertRef(blockObj, at, imgId);
+  persistSoon();
+  rerenderBlock(ta, blockObj, at + 1);
+  if (viewMode === 'split') renderPreview();
+}
+
+const imageFileEl = document.getElementById('image-file');
+document.getElementById('insert-image').onclick = () => {
+  if (!current || viewMode === 'view') return;
+  if (!focusedTA()) return;
+  imageFileEl.click();
+};
+imageFileEl.onchange = async () => {
+  const file = imageFileEl.files?.[0];
+  imageFileEl.value = '';
+  const ta = focusedTA();
+  if (!file || !ta) return;
+  const at = caretOffsetIn(ta) ?? extractText(ta).length;
+  await insertImageFile(file, ta, at);
+};
+
 document.getElementById('insert-link').onclick = (e) => {
   if (!current || viewMode === 'view') return;
   const ta = focusedTA();
@@ -2142,4 +2228,6 @@ window.__kb = {
   spans: (obj) => JSON.parse(web.markedSpans(obj)),
   text: (obj) => web.text(obj),
   blocks: () => blocksOf(currentBody).map((b) => b.obj),
+  persist: () => persistNow(true),
+  render,
 };

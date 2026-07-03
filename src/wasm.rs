@@ -502,6 +502,19 @@ mod tests {
         assert_eq!(web.payload_at(&body, 1).unwrap(), None, "plain char");
         assert!(web.text(&body).unwrap().starts_with('\u{FFFC}'));
 
+        // Images: content-addressed byte artifacts embedded as atoms.
+        let png = vec![0x89u8, 0x50, 0x4e, 0x47, 1, 2, 3, 4];
+        let img_id = web.provide_bytes(&png);
+        assert_eq!(web.provide_bytes(&png), img_id, "identical bytes dedupe");
+        web.seq_insert_ref(&body, 0, &img_id).unwrap();
+        assert_eq!(web.payload_at(&body, 0).unwrap().unwrap(), img_id);
+        let restored = WasmHashWeb::decode(&web.encode()).unwrap();
+        assert_eq!(
+            restored.resolve_bytes(&img_id).unwrap().unwrap(),
+            png,
+            "artifact bytes ride the snapshot"
+        );
+
         // Drag-reorder is a Move op: block-shaped atoms reorder without
         // losing identity, and the move survives a merge round-trip.
         let list = web.create_seq(&"99".repeat(32)).unwrap();
@@ -735,6 +748,25 @@ impl WasmHashWeb {
             .ok_or_else(|| app_err("no such seq object"))?;
         seq.remove_batch(idx, len);
         Ok(())
+    }
+
+    // --- byte artifacts (images and other blobs) ---
+
+    /// Register raw bytes as a content-addressed value artifact; returns
+    /// its value id (hex). Identical bytes dedupe to the same id.
+    #[wasm_bindgen(js_name = provideBytes)]
+    pub fn provide_bytes(&mut self, bytes: &[u8]) -> String {
+        id_to_hex(&self.inner.provide_value(&Value::Bytes(bytes.to_vec())))
+    }
+
+    /// The bytes of a `Bytes` artifact, or undefined (unknown id, or a
+    /// different value kind).
+    #[wasm_bindgen(js_name = resolveBytes)]
+    pub fn resolve_bytes(&self, id_hex: &str) -> Result<Option<Vec<u8>>, JsValue> {
+        Ok(match self.inner.resolve(&hex_to_id(id_hex)?) {
+            Some(Value::Bytes(b)) => Some(b),
+            _ => None,
+        })
     }
 
     // --- atoms (embedded object refs in a seq) ---
