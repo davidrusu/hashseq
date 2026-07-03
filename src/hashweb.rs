@@ -58,29 +58,35 @@ impl HashWeb {
         Self::default()
     }
 
-    /// Open a root object at `origin` with the given kind — both chosen
-    /// out-of-band ("each object is free to set its own root"). Returns
-    /// false if an object already lives at that origin.
-    pub fn create_root(&mut self, origin: Id, kind: Value) -> bool {
-        debug_assert!(matches!(kind, Value::NewSeq | Value::NewMap));
+    /// Open a root seq at `origin` — an id chosen out-of-band ("each
+    /// object is free to set its own root"; the kind is part of the same
+    /// out-of-band agreement). Returns false if the origin is occupied.
+    pub fn create_seq(&mut self, origin: Id) -> bool {
         if self.is_origin(&origin) {
             return false;
         }
-        match kind {
-            Value::NewSeq => {
-                self.seqs.insert(origin, HashSeq::new(origin));
-            }
-            _ => {
-                self.maps.insert(origin, HashKv::new(origin));
-            }
+        self.seqs.insert(origin, HashSeq::new(origin));
+        self.wake_origin(origin);
+        true
+    }
+
+    /// Open a root map at `origin` — see [`Self::create_seq`].
+    pub fn create_kv(&mut self, origin: Id) -> bool {
+        if self.is_origin(&origin) {
+            return false;
         }
-        // Adopting an origin may wake ops that parked on it.
+        self.maps.insert(origin, HashKv::new(origin));
+        self.wake_origin(origin);
+        true
+    }
+
+    /// Adopting an origin may wake ops that parked on it.
+    fn wake_origin(&mut self, origin: Id) {
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
         self.delivery.wake(&origin, &mut queue);
         while let Some((id, node)) = queue.pop() {
             self.park_or_dispatch(id, node, &mut queue);
         }
-        true
     }
 
     pub fn seq(&self, origin: &Id) -> Option<&HashSeq> {
@@ -419,9 +425,9 @@ mod tests {
         // Two stores with unrelated roots merge unconditionally.
         let mut a = HashWeb::new();
         let mut b = HashWeb::new();
-        assert!(a.create_root(oid(1), Value::NewSeq));
-        assert!(!a.create_root(oid(1), Value::NewSeq), "already occupied");
-        b.create_root(oid(2), Value::NewMap);
+        assert!(a.create_seq(oid(1)));
+        assert!(!a.create_seq(oid(1)), "already occupied");
+        b.create_kv(oid(2));
         a.text_insert(&oid(1), 0, "hi");
         b.put(&oid(2), s("k"), s("v"));
 
@@ -438,14 +444,14 @@ mod tests {
             fresh.apply_with_id(id, node);
         }
         assert_eq!(fresh.orphans().count(), 2, "'h' on the origin, 'i' on 'h'");
-        fresh.create_root(oid(1), Value::NewSeq);
+        fresh.create_seq(oid(1));
         assert_eq!(fresh.orphans().count(), 0, "adoption wakes transitively");
         assert_eq!(fresh.text(&oid(1)).unwrap(), "hi");
 
         // Kind mis-agreement: the same out-of-band origin opened as a Map
         // elsewhere — the seq ops quarantine in the local map's gate.
         let mut confused = HashWeb::new();
-        confused.create_root(oid(1), Value::NewMap);
+        confused.create_kv(oid(1));
         confused.merge(a.clone());
         assert!(confused.map(&oid(1)).is_some());
         assert!(!confused.map(&oid(1)).unwrap().delivery.gated.is_empty());
@@ -463,7 +469,7 @@ mod tests {
         // A Notion-style block: a map with "content" -> Text child.
         let mut doc = HashWeb::new();
         let root = oid(9);
-        doc.create_root(root, Value::NewMap);
+        doc.create_kv(root);
 
         let block = doc.new_map(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
@@ -483,7 +489,7 @@ mod tests {
         // Editing one object never enters another's tips (per-object tips).
         let mut doc = HashWeb::new();
         let root = oid(9);
-        doc.create_root(root, Value::NewMap);
+        doc.create_kv(root);
         let a = doc.new_seq(&root, s("a")).unwrap();
         let b = doc.new_seq(&root, s("b")).unwrap();
 
@@ -499,7 +505,7 @@ mod tests {
     fn concurrent_edits_in_different_objects_merge_cleanly() {
         let mut base = HashWeb::new();
         let root = oid(9);
-        base.create_root(root, Value::NewMap);
+        base.create_kv(root);
         let text = base.new_seq(&root, s("text")).unwrap();
         let meta = base.new_map(&root, s("meta")).unwrap();
 
@@ -525,7 +531,7 @@ mod tests {
         // origin id; applying the creation op derives it and wakes them.
         let mut a = HashWeb::new();
         let root = oid(9);
-        a.create_root(root, Value::NewMap);
+        a.create_kv(root);
         let child = a.new_seq(&root, s("t")).unwrap();
         a.text_insert(&child, 0, "x");
 
@@ -535,7 +541,7 @@ mod tests {
         let creation_chain: Vec<(Id, HashNode)> = a.map(&root).unwrap().all_nodes();
 
         let mut fresh = HashWeb::new();
-        fresh.create_root(root, Value::NewMap);
+        fresh.create_kv(root);
         // Child op first: parks (its ref — the origin id — is unknown).
         for (id, node) in &child_nodes {
             fresh.apply_with_id(*id, node.clone());
@@ -554,7 +560,7 @@ mod tests {
     fn refs_spanning_objects_gate() {
         let mut doc = HashWeb::new();
         let root = oid(9);
-        doc.create_root(root, Value::NewMap);
+        doc.create_kv(root);
         let a = doc.new_seq(&root, s("a")).unwrap();
         let b = doc.new_seq(&root, s("b")).unwrap();
         doc.text_insert(&a, 0, "a");
@@ -581,7 +587,7 @@ mod tests {
     fn child_object_born_inline_in_a_seq() {
         let mut doc = HashWeb::new();
         let text = oid(7);
-        doc.create_root(text, Value::NewSeq);
+        doc.create_seq(text);
         doc.text_insert(&text, 0, "see [] here");
 
         let inner = doc
@@ -612,8 +618,8 @@ mod tests {
     fn link_atoms_reference_other_objects()  {
         let mut doc = HashWeb::new();
         let (a, b) = (oid(3), oid(4));
-        doc.create_root(a, Value::NewSeq);
-        doc.create_root(b, Value::NewSeq);
+        doc.create_seq(a);
+        doc.create_seq(b);
         doc.text_insert(&a, 0, "link: ");
         doc.text_insert(&b, 0, "the target");
 
@@ -637,7 +643,7 @@ mod tests {
         // is never lost, the app resolves the register.
         let mut base = HashWeb::new();
         let root = oid(9);
-        base.create_root(root, Value::NewMap);
+        base.create_kv(root);
         let mut r1 = base.clone();
         let mut r2 = base.clone();
         let c1 = r1.new_seq(&root, s("content")).unwrap();

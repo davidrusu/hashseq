@@ -2577,7 +2577,7 @@ mod family_wire {
     fn web_roundtrip_block_document() {
         let mut doc = HashWeb::new();
         let root = Id([9; 32]);
-        doc.create_root(root, Value::NewMap);
+        doc.create_kv(root);
         let block = doc.new_map(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
         doc.put(&block, s("color"), s("blue"));
@@ -2609,7 +2609,7 @@ mod family_wire {
         // snapshot carries them and decode re-parks.
         let mut a = HashWeb::new();
         let root = Id([9; 32]);
-        a.create_root(root, Value::NewMap);
+        a.create_kv(root);
         let child = a.new_seq(&root, s("t")).unwrap();
         a.text_insert(&child, 0, "x");
         let child_nodes = a.seq(&child).unwrap().all_nodes();
@@ -2625,7 +2625,7 @@ mod family_wire {
         // Adopting the root and delivering its ops wakes the parked op
         // transitively.
         let mut decoded = decoded;
-        decoded.create_root(root, Value::NewMap);
+        decoded.create_kv(root);
         for (id, node) in a.map(&root).unwrap().all_nodes() {
             decoded.apply_with_id(id, node);
         }
@@ -2637,7 +2637,7 @@ mod family_wire {
     fn web_bytes_canonical_across_merge_orders() {
         let mut base = HashWeb::new();
         let root = Id([9; 32]);
-        base.create_root(root, Value::NewMap);
+        base.create_kv(root);
         let text = base.new_seq(&root, s("text")).unwrap();
         let meta = base.new_map(&root, s("meta")).unwrap();
 
