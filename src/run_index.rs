@@ -258,6 +258,14 @@ pub(crate) type ElemRef = (NodeIdx, u32);
 /// Before-point, 1 = the element itself, 2 = an After-point.
 pub(crate) type SweepPos = (u32, u32, u8);
 
+/// What a sweep-coverage fragment is (see `sweep_coverage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SweepFrag {
+    Base,
+    MovedIn,
+    Splice,
+}
+
 /// A fragment as seen by document-order iteration: a contiguous element
 /// range of one run plus its visibility bits.
 #[derive(Clone, Copy)]
@@ -437,12 +445,6 @@ impl RunIndex {
         }
     }
 
-    /// Base-order comparison of two elements: the immutable order that
-    /// anchors and gate verdicts depend on (ghost-resolved).
-    pub(crate) fn cmp_base(&self, a: ElemRef, b: ElemRef) -> std::cmp::Ordering {
-        self.cmp_sweep(self.base_pos(a, 1), self.base_pos(b, 1))
-    }
-
     /// Root-to-`n` path of treap slots.
     fn root_path(&self, n: u32) -> Vec<u32> {
         let mut path = vec![n];
@@ -455,20 +457,30 @@ impl RunIndex {
         path
     }
 
-    /// Every fragment in treap (= rendered) order: `(run, start, len,
-    /// moved-in)`. Base fragments include invisible elements — the ghost
-    /// slots where mark anchor events fire; `moved-in` flags destination
-    /// fragments, where relocated elements render (and where the sweep
-    /// samples their formatting). Zero-width splice fragments yield no
-    /// elements. This is the mark sweep's walk.
-    pub(crate) fn sweep_coverage(&self) -> Vec<(NodeIdx, u32, u32, bool)> {
+    /// Every fragment in treap (= rendered) order: `(head, start, len,
+    /// kind)`. Base fragments include invisible elements — the ghost slots
+    /// where element-anchored mark events fire. `MovedIn` flags destination
+    /// fragments, where relocated elements render (and where op-anchored
+    /// mark events bracket them). `Splice` fragments are zero-width op
+    /// ghosts (`head` is the move op handle) — they yield no elements but
+    /// op-anchored mark events fire at their crossing. This is the mark
+    /// sweep's walk.
+    pub(crate) fn sweep_coverage(&self) -> Vec<(NodeIdx, u32, u32, SweepFrag)> {
         let moved_slots: FxHashSet<u32> = self.moved.values().copied().collect();
+        let splice_slots: FxHashSet<u32> = self.splice.values().copied().collect();
         let mut out = Vec::new();
         let mut cur = self.leftmost(self.root);
         while cur != NIL {
             let f = &self.frags[cur as usize];
-            if f.len > 0 {
-                out.push((f.head, f.start, f.len, moved_slots.contains(&cur)));
+            if splice_slots.contains(&cur) {
+                out.push((f.head, 0, 0, SweepFrag::Splice));
+            } else if f.len > 0 {
+                let kind = if moved_slots.contains(&cur) {
+                    SweepFrag::MovedIn
+                } else {
+                    SweepFrag::Base
+                };
+                out.push((f.head, f.start, f.len, kind));
             }
             cur = self.successor(cur);
         }
@@ -600,6 +612,23 @@ impl RunIndex {
 
     pub(crate) fn has_splice(&self, op: NodeIdx) -> bool {
         !self.splice.is_empty() && self.splice.contains_key(&op)
+    }
+
+    /// The treap slot of `op`'s zero-width splice ghost, if one exists.
+    pub(crate) fn splice_slot(&self, op: NodeIdx) -> Option<u32> {
+        if self.splice.is_empty() {
+            return None;
+        }
+        self.splice.get(&op).copied()
+    }
+
+    /// The sweep position of `op`'s fragment when it currently renders its
+    /// target: the destination fragment's slot.
+    pub(crate) fn moved_slot(&self, elem: ElemRef) -> Option<u32> {
+        if self.moved.is_empty() {
+            return None;
+        }
+        self.moved.get(&elem).copied()
     }
 
     /// Convert `elem`'s destination fragment into `op`'s zero-width splice

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
-use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepPos};
+use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepFrag, SweepPos};
 use crate::delivery::Delivery;
 use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
@@ -512,6 +512,10 @@ pub struct HashSeq {
     pub elem_payloads: FxHashMap<NodeIdx, Id>,
     /// Applied mark ops, by their own handle (MARKS.md).
     pub mark_nodes: FxHashMap<NodeIdx, StoredMark>,
+    /// Move ops some mark anchors at (splice-point span endpoints): their
+    /// op fragments are retained like ops with splice children — a mark
+    /// point's position must never be lost. Monotone.
+    mark_anchored_ops: FxHashSet<NodeIdx>,
     /// Anchor events for the mark sweep: anchor element (or origin) ->
     /// events crossing at its glue points. Empty in mark-free documents.
     mark_events: FxHashMap<NodeIdx, Vec<MarkEvent>>,
@@ -579,6 +583,7 @@ impl HashSeq {
             afters: FxHashMap::default(),
             elem_payloads: FxHashMap::default(),
             mark_nodes: FxHashMap::default(),
+            mark_anchored_ops: FxHashSet::default(),
             mark_events: FxHashMap::default(),
             tips: BTreeSet::new(),
             mark_tips: BTreeSet::new(),
@@ -1321,10 +1326,14 @@ impl HashSeq {
         }
     }
 
-    /// Does anything anchor at `op`'s splice point? (Sibling-set entries are
-    /// dropped when emptied, so presence means non-empty.)
+    /// Does anything anchor at `op`'s splice point — causal children or
+    /// mark span endpoints? (Sibling-set entries are dropped when emptied,
+    /// so presence means non-empty; mark anchorage is monotone.) Anchored
+    /// ops keep a physical fragment at their rank for life.
     fn op_has_children(&self, op: NodeIdx) -> bool {
-        self.afters.contains_key(&op) || self.befores_by_anchor.contains_key(&op)
+        self.afters.contains_key(&op)
+            || self.befores_by_anchor.contains_key(&op)
+            || (!self.mark_anchored_ops.is_empty() && self.mark_anchored_ops.contains(&op))
     }
 
     /// Register `op` in its destination's sibling set (keyed by its own id,
@@ -1335,6 +1344,12 @@ impl HashSeq {
         let op_id = self.id_of(op);
         let mv = &self.move_nodes[&op];
         let (anchor, to_before, target) = (mv.to_anchor, mv.to_before, mv.target);
+        // A destination on another op's splice point: that op needs a
+        // physical rank first (terminates — anchors are causal refs, so
+        // the recursion strictly descends the DAG).
+        if let Loc::MoveOp = self.loc_of(anchor) {
+            self.ensure_op_fragment(anchor);
+        }
         let (el, before) = if to_before {
             (self.before_sibling_target(anchor, &op_id), true)
         } else {
@@ -1428,14 +1443,51 @@ impl HashSeq {
         node
     }
 
-    /// Resolve a mark anchor to a base glue point `(node, after-side)`;
-    /// `None` if it names anything but an element or the origin.
+    /// Resolve a mark anchor to a glue point `(node, after-side)`: an
+    /// element, the origin, or a move op (its splice point — the bracket
+    /// around wherever its target renders). `None` for anything else.
     fn glue_point(&self, a: &Anchor) -> Option<(NodeIdx, bool)> {
         let i = self.idx_of(a.id())?;
         match self.loc_of(i) {
-            Loc::Run { .. } | Loc::Origin => Some((i, matches!(a, Anchor::After(_)))),
+            Loc::Run { .. } | Loc::Origin | Loc::MoveOp => {
+                Some((i, matches!(a, Anchor::After(_))))
+            }
             _ => None,
         }
+    }
+
+    /// Mark admissibility (the Mark gate rows): both anchors resolve to
+    /// glue points, and the span is not inverted. Op-anchored points need a
+    /// physical fragment to compare — materialized here even when the
+    /// verdict is "gate": a zero-width splice slot for an already-applied
+    /// move op is derived, convergence-neutral index state, not a trace of
+    /// the gated mark.
+    fn mark_admissible(&mut self, start: &Anchor, end: &Anchor) -> bool {
+        let (Some(s), Some(e)) = (self.glue_point(start), self.glue_point(end)) else {
+            return false;
+        };
+        for (n, _) in [s, e] {
+            if let Loc::MoveOp = self.loc_of(n) {
+                self.ensure_op_fragment(n);
+            }
+        }
+        self.cmp_points(s, e) != std::cmp::Ordering::Greater
+    }
+
+    /// Sweep position of a move op's fragment point (fragment must exist —
+    /// deciders own their destination fragment, anchored ops their splice
+    /// slot).
+    fn op_point_pos(&self, op: NodeIdx, tie: u8) -> SweepPos {
+        let target = self.move_nodes[&op].target;
+        if self.decider_of(target) == Some(op) && !self.is_removed(target) {
+            let slot = self
+                .index
+                .moved_slot(self.elem_ref(target))
+                .expect("deciders render their target");
+            return (slot, 0, tie);
+        }
+        let slot = self.index.splice_slot(op).expect("anchored ops keep a slot");
+        (slot, 0, tie)
     }
 
     /// Base-order comparison of two glue points. Same element: `Before`
@@ -1454,7 +1506,9 @@ impl HashSeq {
         if b.0 == ORIGIN_IDX {
             return Ordering::Greater;
         }
-        self.index.cmp_base(self.elem_ref(a.0), self.elem_ref(b.0))
+        let pa = self.point_pos(a.0, a.1).expect("non-origin point");
+        let pb = self.point_pos(b.0, b.1).expect("non-origin point");
+        self.index.cmp_sweep(pa, pb)
     }
 
     /// Apply a mark: O(1) bookkeeping (MARKS.md "Apply") — intern, attach
@@ -1474,6 +1528,13 @@ impl HashSeq {
         let idx = self.intern(id, Loc::MarkOp);
         let (start_anchor, start_after) = self.glue_point(&start).expect("gated above");
         let (end_anchor, end_after) = self.glue_point(&end).expect("gated above");
+
+        // Op-anchored span endpoints pin their op's fragment for life.
+        for n in [start_anchor, end_anchor] {
+            if let Loc::MoveOp = self.loc_of(n) {
+                self.mark_anchored_ops.insert(n);
+            }
+        }
 
         for r in overwrites.iter().chain(pins.iter()) {
             self.mark_tips.remove(r);
@@ -1531,10 +1592,11 @@ impl HashSeq {
         if anchor == ORIGIN_IDX {
             return None;
         }
-        Some(
-            self.index
-                .base_pos(self.elem_ref(anchor), if after { 2 } else { 0 }),
-        )
+        let tie = if after { 2 } else { 0 };
+        if let Loc::MoveOp = self.loc_of(anchor) {
+            return Some(self.op_point_pos(anchor, tie));
+        }
+        Some(self.index.base_pos(self.elem_ref(anchor), tie))
     }
 
     /// Does mark `mk` cover element `x`? Regional semantics: the points are
@@ -1652,15 +1714,35 @@ impl HashSeq {
         let mut current = 0usize; // index into `sets` for the current format
         let mut dirty = false;
         let mut out: Vec<(String, usize)> = Vec::new();
-        for (run, start, len, moved_in) in self.index.sweep_coverage() {
+        for (head, start, len, kind) in self.index.sweep_coverage() {
+            if kind == SweepFrag::Splice {
+                // A zero-width op ghost: op-anchored events cross here.
+                if let Some(events) = self.mark_events.get(&head) {
+                    dirty |= fire(events, false, &mut active, &mut ended);
+                    dirty |= fire(events, true, &mut active, &mut ended);
+                }
+                continue;
+            }
             for off in start..start + len {
-                let e = self.runs[&run].elements[off as usize];
-                // Events fire at base slots only — a moved-in crossing is
-                // where the element renders, not where its points live.
-                if !moved_in && let Some(events) = self.mark_events.get(&e) {
+                let e = self.runs[&head].elements[off as usize];
+                // Element-anchored events fire at base slots (regional
+                // points never move); op-anchored events bracket the
+                // element at its rendered (destination) crossing.
+                let op_events = if kind == SweepFrag::MovedIn && !self.mark_events.is_empty() {
+                    self.decider_of(e)
+                        .and_then(|op| self.mark_events.get(&op))
+                } else {
+                    None
+                };
+                if let Some(events) = op_events {
                     dirty |= fire(events, false, &mut active, &mut ended);
                 }
-                let renders_here = if moved_in {
+                if kind == SweepFrag::Base
+                    && let Some(events) = self.mark_events.get(&e)
+                {
+                    dirty |= fire(events, false, &mut active, &mut ended);
+                }
+                let renders_here = if kind == SweepFrag::MovedIn {
                     true // destination fragments hold live elements only
                 } else {
                     !self.is_removed(e) && !self.rendered_elsewhere(e)
@@ -1672,12 +1754,16 @@ impl HashSeq {
                     } else if dirty || current == 0 {
                         let members: Vec<NodeIdx> = active.iter().copied().collect();
                         let set = self.live_set(&members);
-                        current = if set.is_empty() {
-                            0
-                        } else {
-                            sets.push(set);
-                            sets.len() - 1
-                        };
+                        // Suppression can leave the live set unchanged across
+                        // an event boundary — keep the index so spans coalesce.
+                        if set != sets[current] {
+                            current = if set.is_empty() {
+                                0
+                            } else {
+                                sets.push(set);
+                                sets.len() - 1
+                            };
+                        }
                         dirty = false;
                     }
                     match out.last_mut() {
@@ -1685,7 +1771,12 @@ impl HashSeq {
                         _ => out.push((self.char_at(e).to_string(), current)),
                     }
                 }
-                if !moved_in && let Some(events) = self.mark_events.get(&e) {
+                if kind == SweepFrag::Base
+                    && let Some(events) = self.mark_events.get(&e)
+                {
+                    dirty |= fire(events, true, &mut active, &mut ended);
+                }
+                if let Some(events) = op_events {
                     dirty |= fire(events, true, &mut active, &mut ended);
                 }
             }
@@ -1715,6 +1806,11 @@ impl HashSeq {
             self.glue_point(&start).expect("anchor must be applied"),
             self.glue_point(&end).expect("anchor must be applied"),
         );
+        for (n, _) in [s, e] {
+            if let Loc::MoveOp = self.loc_of(n) {
+                self.ensure_op_fragment(n);
+            }
+        }
         let overwrites: BTreeSet<Id> = self
             .mark_nodes
             .iter()
@@ -1939,25 +2035,30 @@ impl HashSeq {
             // move op's splice point is not yet admitted — insert anchors on
             // splice points ARE live); self-moves gate.
             Op::Move { target, to, .. } => {
-                let target_ok = self
-                    .idx_of(target)
-                    .is_some_and(|t| matches!(self.loc_of(t), Loc::Run { .. }));
+                let t = self.idx_of(target);
+                let target_ok =
+                    t.is_some_and(|t| matches!(self.loc_of(t), Loc::Run { .. }));
+                // Destination: an element, the origin, or another move op's
+                // splice point. Self-splice gates: placing an element
+                // adjacent to its own placement is degenerate (the op
+                // fragment being placed relative to is the one being torn
+                // down), and the facts are hash-committed — stable verdict.
                 let anchor_ok = self.idx_of(to.id()).is_some_and(|a| {
-                    matches!(self.loc_of(a), Loc::Run { .. } | Loc::Origin)
+                    match self.loc_of(a) {
+                        Loc::Run { .. } | Loc::Origin => true,
+                        Loc::MoveOp => Some(self.move_nodes[&a].target) != t,
+                        _ => false,
+                    }
                 });
                 target_ok && anchor_ok && to.id() != target
             }
             // The Mark rows (MARKS.md "Validation", all stable): anchors
-            // must be elements or the origin (splice-point anchors for marks
-            // are a future loosening), and the span must not be inverted —
-            // one cmp over the immutable base order, so no later Move can
-            // flip the verdict.
-            Op::Mark { start, end, .. } => {
-                match (self.glue_point(start), self.glue_point(end)) {
-                    (Some(s), Some(e)) => self.cmp_points(s, e) != std::cmp::Ordering::Greater,
-                    _ => false,
-                }
-            }
+            // must resolve to glue points — elements, the origin, or move
+            // ops (splice-point span endpoints) — and the span must not be
+            // inverted: one comparison over permanent positions (base slots
+            // and op ranks), so no later op can flip the verdict. Checked in
+            // the Mark dispatch below (fragment materialization needs &mut).
+            Op::Mark { .. } => true,
             _ => false,
         };
         if !admitted {
@@ -1974,6 +2075,18 @@ impl HashSeq {
             overwrites,
         } = node.op
         {
+            if !self.mark_admissible(&start, &end) {
+                return Err(HashNode {
+                    pins: node.pins,
+                    op: Op::Mark {
+                        start,
+                        end,
+                        kind_v,
+                        value,
+                        overwrites,
+                    },
+                });
+            }
             self.apply_mark(id, node.pins, start, end, kind_v, value, overwrites);
             return Ok(());
         }
@@ -3995,11 +4108,18 @@ mod test {
                         continue;
                     }
                     let target = seq.id_at(x as usize % seq.len()).unwrap();
-                    let anchor = if y as usize % (seq.len() + 1) == seq.len() {
+                    let mut anchor = if y as usize % (seq.len() + 1) == seq.len() {
                         seq.origin()
                     } else {
                         seq.id_at(y as usize % seq.len()).unwrap()
                     };
+                    // Sometimes aim at a splice point instead (self-splice
+                    // combinations gate harmlessly).
+                    if y & 4 != 0
+                        && let Some(m) = seq.move_heads(&anchor).first().copied()
+                    {
+                        anchor = m;
+                    }
                     let to = if y & 1 == 0 {
                         Anchor::After(anchor)
                     } else {
@@ -4042,8 +4162,19 @@ mod test {
                     if seq.is_empty() {
                         continue;
                     }
-                    let p1 = seq.id_at(x as usize % seq.len()).unwrap();
-                    let p2 = seq.id_at(y as usize % seq.len()).unwrap();
+                    let mut p1 = seq.id_at(x as usize % seq.len()).unwrap();
+                    let mut p2 = seq.id_at(y as usize % seq.len()).unwrap();
+                    // Sometimes anchor a span endpoint at a splice point.
+                    if x & 4 != 0
+                        && let Some(m) = seq.move_heads(&p1).first().copied()
+                    {
+                        p1 = m;
+                    }
+                    if y & 8 != 0
+                        && let Some(m) = seq.move_heads(&p2).first().copied()
+                    {
+                        p2 = m;
+                    }
                     let start = if x & 1 == 0 {
                         Anchor::Before(p1)
                     } else {
@@ -4550,6 +4681,145 @@ mod test {
             vec![("ohello ".into(), false), ("bb".into(), true)]
         );
         assert!(kinds_at(&seq, 0).is_empty());
+    }
+
+    /// A span endpoint at a move op's splice point covers the moved-in
+    /// element at its rendered position — the thing element-anchored
+    /// (base-slot) points cannot express.
+    #[test]
+    fn splice_point_span_covers_moved_in_content() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ma".chars());
+        let m = seq.id_at(0).unwrap();
+        let a = seq.id_at(1).unwrap();
+        let op = seq.move_element(m, Anchor::After(a));
+        assert_eq!(seq.iter().collect::<String>(), "am");
+
+        // Element end point: the moved-in m renders beyond After(a) — not
+        // covered (regional membership).
+        let el = seq.mark_range(Anchor::Before(a), Anchor::After(a), bold(), yes());
+        assert_eq!(
+            span_texts(&seq),
+            vec![("a".into(), true), ("m".into(), false)]
+        );
+        seq.unmark_range(Anchor::Before(a), Anchor::After(a), bold());
+        let _ = el;
+
+        // Op end point: brackets wherever the target renders — covered.
+        seq.mark_range(Anchor::Before(a), Anchor::After(op.id()), bold(), yes());
+        assert_eq!(span_texts(&seq), vec![("am".into(), true)]);
+        let m_pos = seq.position_of(&m).unwrap();
+        assert_eq!(kinds_at(&seq, m_pos), vec![bold()]);
+        check_index_matches_iter(&seq);
+    }
+
+    /// A superseded op keeps its rank for mark endpoints: the span's shape
+    /// is stable while the element moves away.
+    #[test]
+    fn splice_point_marks_survive_supersession() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "mab".chars());
+        let m = seq.id_at(0).unwrap();
+        let a = seq.id_at(1).unwrap();
+        let b = seq.id_at(2).unwrap();
+        let op = seq.move_element(m, Anchor::After(b)); // b is the run tail
+        assert_eq!(seq.iter().collect::<String>(), "abm");
+        seq.mark_range(Anchor::Before(b), Anchor::After(op.id()), bold(), yes());
+        assert_eq!(
+            span_texts(&seq),
+            vec![("a".into(), false), ("bm".into(), true)]
+        );
+
+        // Re-move m to the front: it leaves the span (whose end point stays
+        // at the superseded op's rank); b remains covered.
+        seq.move_element(m, Anchor::Before(a));
+        assert_eq!(seq.iter().collect::<String>(), "mab");
+        assert_eq!(
+            span_texts(&seq),
+            vec![("ma".into(), false), ("b".into(), true)]
+        );
+        check_index_matches_iter(&seq);
+
+        // Roundtrip carries op-anchored marks (they park until the op
+        // applies, then re-anchor identically).
+        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
+            &seq,
+        ))
+        .expect("strict");
+        assert_eq!(decoded, seq);
+        assert_eq!(decoded.marked_spans(), seq.marked_spans());
+    }
+
+    /// Inverted spans gate for op points too (permanent: op ranks never
+    /// move).
+    #[test]
+    fn inverted_splice_point_span_gates() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ma".chars());
+        let m = seq.id_at(0).unwrap();
+        let a = seq.id_at(1).unwrap();
+        let op = seq.move_element(m, Anchor::After(a)); // renders after a
+
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Mark {
+                start: Anchor::After(op.id()),
+                end: Anchor::Before(a),
+                kind_v: bold(),
+                value: yes(),
+                overwrites: BTreeSet::new(),
+            },
+        });
+        assert_eq!(seq.delivery.gated.len(), 1);
+        assert!(seq.mark_tips().is_empty());
+    }
+
+    /// Move destinations on splice points: y lands adjacent to wherever the
+    /// moved x renders — the drag-next-to-moved-content gesture.
+    #[test]
+    fn move_to_splice_point_renders_adjacent() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "xya".chars());
+        let x = seq.id_at(0).unwrap();
+        let y = seq.id_at(1).unwrap();
+        let a = seq.id_at(2).unwrap();
+
+        let op1 = seq.move_element(x, Anchor::After(a));
+        assert_eq!(seq.iter().collect::<String>(), "yax");
+
+        seq.move_element(y, Anchor::After(op1.id()));
+        assert_eq!(seq.iter().collect::<String>(), "axy");
+        assert_eq!(seq.placement_of(&y), Some(Anchor::After(op1.id())));
+        check_index_matches_iter(&seq);
+
+        // Roundtrip + merge-order determinism.
+        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
+            &seq,
+        ))
+        .expect("strict");
+        assert_eq!(decoded, seq);
+        assert_eq!(decoded.iter().collect::<String>(), "axy");
+    }
+
+    /// Self-splice gates: an element moved adjacent to its own placement.
+    #[test]
+    fn self_splice_move_gates() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "xa".chars());
+        let x = seq.id_at(0).unwrap();
+        let a = seq.id_at(1).unwrap();
+        let op = seq.move_element(x, Anchor::After(a));
+
+        seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Move {
+                target: x,
+                to: Anchor::After(op.id()),
+                overwrites: BTreeSet::new(),
+            },
+        });
+        assert_eq!(seq.delivery.gated.len(), 1, "self-splice quarantines");
+        assert_eq!(seq.iter().collect::<String>(), "ax", "rendering untouched");
     }
 
     /// A mark delivered before its text parks and applies on arrival.

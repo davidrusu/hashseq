@@ -165,10 +165,13 @@ painter" session chain can run-compress later if profiles say so.
   never-started mark is inert rather than perturbing the active set — so a
   future relaxation of the gate cannot reintroduce the
   formatting-leaks-to-end-of-document failure.
-- **Anchor kind**: anchors must name elements or the origin, in one `Seq` —
-  a row of the edge table (HASHWEB_SPEC.md). Move-op splice points are
-  gated for now; admitting them later is a loosening-class upgrade
-  (HASHWEB_SPEC.md "Tighten never, loosen carefully").
+- **Anchor kind**: anchors must name elements, the origin, or a move op's
+  splice point, in one `Seq` — a row of the edge table (HASHWEB_SPEC.md).
+  An op-anchored endpoint brackets *wherever the op's target renders* (the
+  regional exception that expresses "cover that moved-in word"); its
+  position is the op's id-rank in its anchor's fork order — permanent, so
+  the inverted-span verdict stays stable — and ops that marks anchor at
+  retain their fragment for life.
 - `kind` and `value` are ids (BLAKE3 outputs), so in-memory keying by kind
   id is fast-hash-safe — no SipHash needed (the HASHKV_SPEC.md key rule;
   adversarial kind bytes cost their author indirection, never a table).
