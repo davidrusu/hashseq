@@ -212,27 +212,35 @@
     cursor:help;
   }
   #comments {
-    display:none; margin:0 22px 10px; border:1px solid var(--grid);
-    background:rgba(246,241,229,0.75); max-height:160px; overflow-y:auto;
-    font-size:12px;
+    width:280px; min-width:280px; border-left:1.25px solid var(--line);
+    background:rgba(246,241,229,0.92); overflow-y:auto; font-size:12px;
+    display:flex; flex-direction:column;
   }
   #comments .c-head {
-    padding:5px 10px; font-size:10px; letter-spacing:2px; color:var(--muted);
-    font-weight:600; border-bottom:1px solid var(--grid);
+    padding:10px 12px; font-size:11px; letter-spacing:2px; color:var(--muted);
+    font-weight:600; border-bottom:1px solid var(--line);
   }
-  #comments .c-row {
-    display:flex; gap:10px; align-items:baseline; padding:5px 10px;
-    border-bottom:1px solid var(--grid);
+  .cc-card { border-bottom:1px solid var(--grid); padding:9px 12px; cursor:pointer; }
+  .cc-card:hover, .cc-card.active { background:#ece5d3; }
+  .cc-card.active { border-left:3px solid var(--amber); padding-left:9px; }
+  .cc-quote {
+    color:var(--muted); font-size:11px; overflow:hidden; white-space:nowrap;
+    text-overflow:ellipsis; border-left:2px solid var(--amber); padding-left:6px;
+    margin-bottom:5px;
   }
-  #comments .c-row:last-child { border-bottom:none; }
-  #comments .c-quote {
-    color:var(--muted); max-width:220px; overflow:hidden; white-space:nowrap;
-    text-overflow:ellipsis; flex:none;
+  .cc-msg { padding:2px 0; line-height:1.45; }
+  .cc-msg + .cc-msg { border-top:1px dotted var(--grid); margin-top:3px; padding-top:5px; }
+  .cc-reply {
+    width:100%; margin-top:6px; font-family:inherit; font-size:11px;
+    border:1px solid var(--grid); background:var(--paper2); padding:4px 6px;
+    outline:none; color:var(--ink);
   }
-  #comments .c-quote::before, #comments .c-quote::after { content:'\201C'; }
-  #comments .c-quote::after { content:'\201D'; }
-  #comments .c-text { flex:1; }
-  #comments .c-del { color:var(--red); cursor:pointer; flex:none; }
+  .cc-reply:focus { border-color:var(--ink); }
+  .cc-tools { display:flex; justify-content:flex-end; margin-top:4px; }
+  .cc-resolve { color:var(--red); cursor:pointer; font-size:10px; letter-spacing:1px; }
+  .comment-hl.hl-active, .block-ed .comment-hl.hl-active {
+    background:rgba(200,120,45,0.5); border-bottom-color:var(--red);
+  }
   #page-tools { display:flex; gap:8px; padding:0 22px 12px; }
   #page-tools .danger { color:var(--red); border-color:var(--red); }
   #no-page {
@@ -284,13 +292,13 @@
         <div id="blocks"></div>
         <div id="preview" style="display:none"></div>
       </div>
-      <div id="comments"></div>
       <div id="page-tools">
         <button id="new-subpage">+ SUBPAGE</button>
         <button id="delete-page" class="danger">DELETE PAGE</button>
       </div>
       <div id="no-page" style="display:none">no page selected — create one</div>
     </section>
+    <aside id="comments" style="display:none"></aside>
   </main>
   <footer>
     <span>OBJECTS <b id="stat-objects">0</b></span>

@@ -355,3 +355,30 @@ bumped) — the migration story from #12 remains unexercised beyond design.
 The app's shape is now uniform: **seqs for everything ordered** (blocks,
 table rows/cells, the tree), **kv for named registers** (title, body),
 **derived origins for implicit structure**, Move for reorder everywhere.
+
+## 16. Composite comments: identity = a derived thread (2026-07-03)
+
+Cross-block comments landed as pure app composition, and the identity
+trick collapsed three problems into one 32-byte value: a comment's tag is
+(a) the suffix of its mark kind (`comment:<tag>` on every fragment), (b)
+the ORIGIN of its discussion thread (the seq opened at the tag — replies
+are appends; concurrent replies from two replicas merged cleanly in the
+smoke test), and (c) the grouping key that reassembles fragments across
+blocks for display, hover-highlighting, and resolve. No pointer, no
+registry, no new system surface.
+
+- Fragments ride their blocks' regional semantics independently — a
+  dragged block carries its fragment along; resolve tombstones each
+  fragment while the thread object survives as history (reachability, not
+  erasure — consistent with the deletion story).
+- Threads as newline-delimited text seqs are honest mini-CRDTs: whole-
+  message appends anchor at the tail, and run non-interleaving keeps
+  concurrent replies intact as units.
+- The mark VALUE became vestigial ('on') — identity moved into the kind
+  and content into the thread. Marks-as-annotations really only need the
+  region + a name; the value slot mattered for formatting (language
+  labels), not for anchored discussions.
+
+**Feedback**: the derived-origin idiom (#15) plus minted-kind idiom (#11)
+compose. An app-conventions document should present them as one pattern:
+"mint a 32-byte identity; hang marks, objects, and grouping off it."

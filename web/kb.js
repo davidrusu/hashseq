@@ -27,7 +27,7 @@ const WS_ORIGIN = (() => {
   return hex(bytes);
 })();
 
-const STORAGE_KEY = 'hashweb-kb-snapshot-v2'; // v2: tree = nested children seqs
+const STORAGE_KEY = 'hashweb-kb-snapshot-v3'; // v3: threaded composite comments
 
 function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -35,12 +35,6 @@ function hex(bytes) {
 
 function randOrigin() {
   const b = new Uint8Array(32);
-  crypto.getRandomValues(b);
-  return hex(b);
-}
-
-function randTag() {
-  const b = new Uint8Array(4);
   crypto.getRandomValues(b);
   return hex(b);
 }
@@ -270,7 +264,7 @@ function styledSpans(bodyObj) {
       else if (m.kind === 'codeblock') f.codeblock = m.values[0] ?? '';
       else if (m.kind === 'eqblock') f.eqblock = true;
       else if (m.kind.startsWith('comment:')) {
-        f.comments.push({ kind: m.kind, text: m.values[0] ?? '' });
+        f.comments.push({ kind: m.kind });
       }
     }
     return f;
@@ -316,7 +310,8 @@ function chunkNodes(chars) {
     if (first.comments.length > 0) {
       const hl = document.createElement('span');
       hl.className = 'comment-hl';
-      hl.title = first.comments.map((x) => x.text).join('\n');
+      hl.dataset.tags = ckey;
+      hl.title = 'commented — see the panel';
       hl.appendChild(node);
       node = hl;
     }
@@ -1021,7 +1016,8 @@ function emitEditableChunks(ed, chars, blockObj) {
     if (first.comments.length > 0) {
       const hl = document.createElement('span');
       hl.className = 'comment-hl';
-      hl.title = first.comments.map((x) => x.text).join('\n');
+      hl.dataset.tags = ckey;
+      hl.title = 'commented — see the panel';
       hl.appendChild(node);
       node = hl;
     }
@@ -1215,65 +1211,132 @@ function renderPreview() {
 
 // ---- comments ----------------------------------------------------------------
 
+/// One comment = one identity (its tag — a 32-byte origin) realized as N
+/// per-block mark fragments plus a discussion thread: the seq opened AT
+/// the tag. Grouping across blocks by kind reassembles the composite.
 function collectComments() {
   if (!currentBody) return [];
-  const out = [];
+  const byKind = new Map();
   for (const b of blocksOf(currentBody)) {
-    const byKind = new Map();
     let pos = 0;
     for (const s of styledSpans(b.obj)) {
       for (const c of s.text) {
         for (const cm of s.comments) {
           let e = byKind.get(cm.kind);
           if (!e) {
-            e = { obj: b.obj, kind: cm.kind, text: cm.text, quote: '', start: pos, end: pos + 1 };
+            e = { kind: cm.kind, tag: cm.kind.slice('comment:'.length), fragments: [] };
             byKind.set(cm.kind, e);
           }
-          e.quote += c;
-          e.end = pos + 1;
+          const last = e.fragments[e.fragments.length - 1];
+          if (last && last.obj === b.obj && last.end === pos) {
+            last.quote += c;
+            last.end = pos + 1;
+          } else {
+            e.fragments.push({ obj: b.obj, start: pos, end: pos + 1, quote: c });
+          }
         }
         pos++;
       }
     }
-    out.push(...byKind.values());
+  }
+  const out = [];
+  for (const e of byKind.values()) {
+    if (!/^[0-9a-f]{64}$/.test(e.tag)) continue; // not a thread-tagged comment
+    const thread = web.createSeq(e.tag); // the tag IS the thread's origin
+    e.thread = thread;
+    e.messages = web.text(thread).split('\n').filter(Boolean);
+    out.push(e);
   }
   return out;
 }
 
+let activeCommentTag = null;
+
+function setCommentHighlight(kind, on) {
+  for (const el of document.querySelectorAll('.comment-hl')) {
+    const tags = (el.dataset.tags ?? '').split(',');
+    if (tags.includes(kind)) el.classList.toggle('hl-active', on);
+  }
+}
+
 function renderComments() {
   const panel = document.getElementById('comments');
-  const comments = viewMode !== 'edit' && current ? collectComments() : [];
+  const comments = current ? collectComments() : [];
   if (comments.length === 0) {
     panel.style.display = 'none';
+    activeCommentTag = null;
     return;
   }
-  panel.style.display = 'block';
+  panel.style.display = 'flex';
   panel.innerHTML = '';
   const head = document.createElement('div');
   head.className = 'c-head';
   head.textContent = `COMMENTS (${comments.length})`;
   panel.appendChild(head);
+
   for (const cm of comments) {
-    const row = document.createElement('div');
-    row.className = 'c-row';
-    const quote = document.createElement('span');
-    quote.className = 'c-quote';
-    quote.textContent = cm.quote;
-    const text = document.createElement('span');
-    text.className = 'c-text';
-    text.textContent = cm.text;
-    const del = document.createElement('span');
-    del.className = 'c-del';
-    del.textContent = '✕';
-    del.title = 'resolve (tombstone the comment mark)';
-    del.onclick = () => {
-      web.unmarkRange(cm.obj, cm.start, cm.end, cm.kind);
+    const card = document.createElement('div');
+    card.className = 'cc-card' + (cm.kind === activeCommentTag ? ' active' : '');
+
+    const quote = document.createElement('div');
+    quote.className = 'cc-quote';
+    quote.textContent = cm.fragments.map((f) => f.quote).join(' … ');
+    quote.title = cm.fragments.length > 1 ? `${cm.fragments.length} fragments` : '';
+    card.appendChild(quote);
+
+    for (const msg of cm.messages) {
+      const m = document.createElement('div');
+      m.className = 'cc-msg';
+      m.textContent = msg;
+      card.appendChild(m);
+    }
+
+    const reply = document.createElement('input');
+    reply.className = 'cc-reply';
+    reply.placeholder = 'reply…';
+    reply.onclick = (e) => e.stopPropagation();
+    reply.onkeydown = (e) => {
+      if (e.key !== 'Enter' || !reply.value.trim()) return;
+      web.textInsert(cm.thread, web.textLen(cm.thread), `${reply.value.trim()}\n`);
+      persistSoon();
+      renderComments();
+    };
+    card.appendChild(reply);
+
+    const tools = document.createElement('div');
+    tools.className = 'cc-tools';
+    const resolve = document.createElement('span');
+    resolve.className = 'cc-resolve';
+    resolve.textContent = 'RESOLVE ✕';
+    resolve.title = 'tombstone every fragment of this comment';
+    resolve.onclick = (e) => {
+      e.stopPropagation();
+      for (const f of cm.fragments) {
+        web.unmarkRange(f.obj, f.start, f.end, cm.kind);
+      }
+      if (activeCommentTag === cm.kind) activeCommentTag = null;
       persistSoon();
       render();
     };
-    row.append(quote, text, del);
-    panel.appendChild(row);
+    tools.appendChild(resolve);
+    card.appendChild(tools);
+
+    // Hover or activate the card → light up every fragment it references.
+    card.onmouseenter = () => setCommentHighlight(cm.kind, true);
+    card.onmouseleave = () => {
+      if (activeCommentTag !== cm.kind) setCommentHighlight(cm.kind, false);
+    };
+    card.onclick = () => {
+      const was = activeCommentTag;
+      activeCommentTag = was === cm.kind ? null : cm.kind;
+      if (was) setCommentHighlight(was, false);
+      if (activeCommentTag) setCommentHighlight(activeCommentTag, true);
+      for (const c of panel.querySelectorAll('.cc-card')) c.classList.remove('active');
+      if (activeCommentTag) card.classList.add('active');
+    };
+    panel.appendChild(card);
   }
+  if (activeCommentTag) setCommentHighlight(activeCommentTag, true);
 }
 
 // ---- editing -----------------------------------------------------------------
@@ -1284,6 +1347,31 @@ function ensureBody() {
   web.putRef(current, 'body', origin);
   currentBody = web.createSeq(origin);
   return currentBody;
+}
+
+/// Every block the current selection touches, with per-block offsets —
+/// the input for composite (cross-block) comment marks.
+function selectionFragments() {
+  const sel = window.getSelection();
+  if (!sel.rangeCount || sel.isCollapsed) return [];
+  const range = sel.getRangeAt(0);
+  const frags = [];
+  for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+    if (!range.intersectsNode(ed)) continue;
+    const r = range.cloneRange();
+    const edRange = document.createRange();
+    edRange.selectNodeContents(ed);
+    if (r.compareBoundaryPoints(Range.START_TO_START, edRange) < 0) {
+      r.setStart(edRange.startContainer, edRange.startOffset);
+    }
+    if (r.compareBoundaryPoints(Range.END_TO_END, edRange) > 0) {
+      r.setEnd(edRange.endContainer, edRange.endOffset);
+    }
+    const a = offsetOfPoint(ed, r.startContainer, r.startOffset);
+    const b = offsetOfPoint(ed, r.endContainer, r.endOffset);
+    if (a < b) frags.push({ obj: ed.dataset.blockObj, a, b });
+  }
+  return frags;
 }
 
 /// The toolbar's target block editor. Toolbar buttons preventDefault on
@@ -1433,6 +1521,25 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
   if (!btn.dataset.mark) continue;
   btn.onclick = () => {
     if (!current || viewMode === 'view') return;
+    if (btn.dataset.mark === 'comment') {
+      // Composite: the selection may span blocks. One identity (a fresh
+      // 32-byte tag), one mark fragment per touched block, and the
+      // discussion thread is the seq opened AT the tag — no pointer.
+      const frags = selectionFragments();
+      if (frags.length === 0) return;
+      const text = prompt('Comment:');
+      if (!text) return;
+      const tag = randOrigin();
+      const thread = web.createSeq(tag);
+      web.textInsert(thread, 0, `${text.trim()}\n`);
+      for (const f of frags) {
+        web.markRange(f.obj, f.a, f.b, `comment:${tag}`, 'on');
+      }
+      activeCommentTag = `comment:${tag}`;
+      persistSoon();
+      render();
+      return;
+    }
     const ta = focusedTA();
     if (!ta) return;
     const blockObj = ta.dataset.blockObj;
@@ -1444,13 +1551,7 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
       [a, b] = selectionLines(extractText(ta), a, b);
     }
     if (a >= b) return; // formatting needs a selection
-    if (kind === 'comment') {
-      const text = prompt('Comment:');
-      if (!text) return;
-      // One kind per comment: overlapping comments coexist (the same-kind
-      // overwrite hygiene is a formatting policy, not an annotation one).
-      web.markRange(blockObj, a, b, `comment:${randTag()}`, text);
-    } else if (kind === 'clear') {
+    if (kind === 'clear') {
       for (const k of MARK_KINDS) web.unmarkRange(blockObj, a, b, k);
     } else if (kind === 'codeblock') {
       const lang = prompt('language label (optional):', '') ?? '';
