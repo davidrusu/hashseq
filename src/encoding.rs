@@ -1848,21 +1848,23 @@ pub fn decode_hashkv_strict(bytes: &[u8]) -> Result<HashKv, DecodeError> {
 
 // --- HashWeb snapshot encoding/decoding ---
 //
-// Format: [root][artifacts][objects][trailing]. Each object nests its own
-// canonical stream (`encode_hashseq` / `encode_hashkv`), objects sorted by
-// origin id; the composition-level trailing section (document-wide orphans
-// + the routing gate's quarantine) carries full ids. Nesting keeps every
-// object self-contained (holonic — any object is a replica root); the
-// spec's fully interleaved cross-object stream is a future refinement of
-// this same canonical form (ENCODING_SPEC.md "Interaction with the
-// family").
+// Format: [genesis][artifacts][genesis creations][objects][trailing]. The
+// genesis is a typeless out-of-band id (no object lives at it); the
+// creation section carries the genesis-anchored creation ops (id-sorted,
+// full ids). Each object nests its own canonical stream (`encode_hashseq`
+// / `encode_hashkv`), objects sorted by origin id; the web-level trailing
+// section (web-wide orphans + the routing gate's quarantine) carries full
+// ids. Nesting keeps every object self-contained (holonic — any object is
+// a replica root); the spec's fully interleaved cross-object stream is a
+// future refinement of this same canonical form (ENCODING_SPEC.md
+// "Interaction with the family").
 
 const OBJ_MAP: u8 = 0;
 const OBJ_SEQ: u8 = 1;
 
 pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
     let mut buf = Vec::new();
-    encode_id(&web.root_id(), &mut buf);
+    encode_id(&web.genesis(), &mut buf);
 
     // One document-wide artifact section: the web store unioned with every
     // inner map's local store (inner stores are excluded from the nested
@@ -1882,6 +1884,13 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
     for bytes in artifacts.values() {
         encode_varint(bytes.len(), &mut buf);
         buf.extend_from_slice(bytes);
+    }
+
+    let mut creations: Vec<(&Id, &HashNode)> = web.genesis_nodes.iter().collect();
+    creations.sort_by_key(|(id, _)| **id);
+    encode_varint(creations.len(), &mut buf);
+    for (_, node) in &creations {
+        encode_hash_node(node, &mut buf);
     }
 
     let mut objects: Vec<(&Id, &Object)> = web.objects.iter().collect();
@@ -1918,8 +1927,8 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
 
 pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
     let mut c = Cursor { bytes, pos: 0 };
-    let root = c.step(decode_id)?;
-    let mut web = HashWeb::new(root);
+    let genesis = c.step(decode_id)?;
+    let mut web = HashWeb::new(genesis);
 
     let na = c.step(decode_varint)?;
     for _ in 0..na {
@@ -1931,6 +1940,18 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
         c.pos += len;
         let vid = crate::value::value_id_of_bytes(&b);
         web.values.entry(vid).or_insert(b);
+    }
+
+    // Genesis creations apply first: they birth (empty) objects, which the
+    // object sections below then overwrite with full decoded state.
+    let nc = c.step(decode_varint)?;
+    for _ in 0..nc {
+        let (op, used) = decode_op(&bytes[c.pos..])?;
+        c.pos += used;
+        match op {
+            EncodableOp::Node(node) => web.apply(node),
+            EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
+        }
     }
 
     let no = c.step(decode_varint)?;
@@ -2570,7 +2591,7 @@ mod family_wire {
     #[test]
     fn web_roundtrip_block_document() {
         let mut doc = HashWeb::default();
-        let root = doc.root_id();
+        let root = doc.create(Value::NewMap);
         let block = doc.new_map(&root, s("block-1")).unwrap();
         let content = doc.new_seq(&block, s("content")).unwrap();
         doc.put(&block, s("color"), s("blue"));
@@ -2601,12 +2622,12 @@ mod family_wire {
         // A child's ops without their creation op park document-wide; the
         // snapshot carries them and decode re-parks.
         let mut a = HashWeb::default();
-        let root = a.root_id();
+        let root = a.create(Value::NewMap);
         let child = a.new_seq(&root, s("t")).unwrap();
         a.text_insert(&child, 0, "x");
         let child_nodes = a.seq(&child).unwrap().all_nodes();
 
-        let mut fresh = HashWeb::new(root);
+        let mut fresh = HashWeb::new(a.genesis());
         for (id, node) in child_nodes {
             fresh.apply_with_id(id, node);
         }
@@ -2614,9 +2635,18 @@ mod family_wire {
 
         let decoded = decode_hashweb_strict(&encode_hashweb(&fresh)).expect("strict");
         assert_eq!(decoded.orphans().count(), 1);
-        // Delivering the root ops to the decoded copy wakes the parked op.
+        // Delivering the creation chain to the decoded copy wakes the
+        // parked op transitively.
         let mut decoded = decoded;
-        for (id, node) in a.root().all_nodes() {
+        let genesis_nodes: Vec<(Id, HashNode)> = a
+            .genesis_nodes
+            .iter()
+            .map(|(i, n)| (*i, n.clone()))
+            .collect();
+        for (id, node) in genesis_nodes {
+            decoded.apply_with_id(id, node);
+        }
+        for (id, node) in a.map(&root).unwrap().all_nodes() {
             decoded.apply_with_id(id, node);
         }
         assert_eq!(decoded.orphans().count(), 0);
@@ -2626,7 +2656,7 @@ mod family_wire {
     #[test]
     fn web_bytes_canonical_across_merge_orders() {
         let mut base = HashWeb::default();
-        let root = base.root_id();
+        let root = base.create(Value::NewMap);
         let text = base.new_seq(&root, s("text")).unwrap();
         let meta = base.new_map(&root, s("meta")).unwrap();
 

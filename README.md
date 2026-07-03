@@ -42,8 +42,9 @@ references:
   arranges the grinder's *own* content — the locality invariant);
 - **zero per-collaborator state** — no vector clocks, no actor registry;
   anyone can join anonymously;
-- **self-certifying documents** — every op hash transitively commits to the
-  document id; different documents can never merge;
+- **self-certifying webs** — every op hash transitively commits to the
+  web's genesis id (an arbitrary out-of-band anchor, not an object);
+  different webs can never merge;
 - **honest conflicts** — contested registers surface every head (MVR) and
   freeze at the last agreed value rather than silently picking a winner.
 

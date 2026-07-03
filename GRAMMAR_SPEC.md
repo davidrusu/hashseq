@@ -70,15 +70,17 @@ is pinned by test to this layout.
 
 `ref_count ≥ 1`: every op pins at least its frontier, and a frontier is
 never empty (every object has an origin id from birth). A zero-ref node is
-malformed. Refs may be op ids or origin ids — one namespace; a child
-object's origin id is recognized by derivation once its creation op is
-known, while the **root** object's origin id is the document identity
-itself (`doc_id`): chosen out-of-band at document creation, no creation op,
-present axiomatically on any replica that opened the document. A document's
-first op is therefore `refs = {doc_id}` — causally empty, but never
-object-free. That is the rule's real content: no op floats outside every
-object, which is what roots routing and confines ops to their document (an
-op bottoming at document A's origin orphans forever in document B).
+malformed. Refs may be op ids or origin ids — one namespace; an object's
+origin id is recognized by derivation once its creation op is known, while
+the recursion's base is the **genesis**: an arbitrary, typeless,
+meaningless id chosen out-of-band when a web is opened — not an object, no
+creation op, present axiomatically on every replica of the web. The only
+ops that anchor at the genesis are creations (each births its own object;
+anything else fails the edge table — there is no projection there). A
+web's first op is therefore `refs = {genesis}` — causally empty, but never
+anchor-free. That is the rule's real content: no op floats outside the
+commitment chain, which is what roots routing and confines ops to their
+web (an op bottoming at web A's genesis orphans forever in web B).
 
 ### Op kinds
 
@@ -187,10 +189,10 @@ without touching identity.
 ### Header
 
 ```
-stream  := magic "hwb1" ‖ stream_version:varint ‖ doc_id:id ‖ block*
+stream  := magic "hwb1" ‖ stream_version:varint ‖ genesis:id ‖ block*
 ```
 
-`doc_id` is implicit dict entry 0 of the stream-level reference space.
+`genesis` is implicit dict entry 0 of the stream-level reference space.
 
 ### Blocks
 
