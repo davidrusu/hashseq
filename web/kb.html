@@ -118,18 +118,16 @@
   :root { --measure: 46rem; }
   #title {
     font-family:inherit; font-size:24px; font-weight:600; color:var(--ink);
-    background:transparent; border:none; outline:none; padding:18px 0 6px;
-    letter-spacing:0.5px; width:100%; max-width:var(--measure); margin:0 auto;
-    display:block; padding-left:32px; padding-right:32px;
+    background:transparent; border:none; outline:none; padding:6px 0 2px;
+    letter-spacing:0.5px; width:100%; display:block;
   }
   #title::placeholder { color:var(--muted); }
   #conflict-bar {
-    display:none; margin:0 22px; padding:6px 10px; font-size:11px; letter-spacing:0.5px;
+    display:none; margin:6px 0; padding:6px 10px; font-size:11px; letter-spacing:0.5px;
     border:1px solid var(--red); color:var(--red); background:rgba(178,58,46,0.06);
   }
   #conflict-bar b { letter-spacing:2px; }
-  #fmt-row { display:flex; align-items:center; gap:16px; margin:2px auto 8px; max-width:var(--measure); width:100%; padding:0 32px; }
-  .fmt-hint { color:var(--muted); font-size:11px; letter-spacing:0.5px; }
+  .fmt-hint { color:var(--muted); font-size:11px; letter-spacing:0.5px; margin:0 0 10px; }
   .fmt-hint b { color:var(--ink); border:1px solid var(--grid); padding:0 4px; }
   #view-tabs { display:flex; width:fit-content; border:1px solid var(--ink); }
   /* floating selection toolbar */
@@ -161,12 +159,15 @@
   #view-tabs button { border:none; border-right:1px solid var(--ink); }
   #view-tabs button:last-child { border-right:none; }
   #view-tabs button.active { background:var(--ink); color:var(--paper); }
-  #work { flex:1; display:flex; margin:0 22px 14px; min-height:0; overflow-y:auto; padding-top:2px; }
-  #blocks {
-    flex:1; min-width:0; max-width:var(--measure); margin:0 auto; height:fit-content;
-    padding:22px 32px 40px;
+  #work { flex:1; display:block; margin:0 22px 14px; min-height:0; overflow-y:auto; }
+  #page {
+    max-width:var(--measure); margin:8px auto; height:fit-content;
+    padding:20px 32px 44px;
     background:rgba(246,241,229,0.85); border:1px solid var(--ink);
     box-shadow:2px 3px 0 rgba(27,24,22,0.10);
+    color:var(--ink);
+  }
+  #blocks {
     font-family:inherit; font-size:14px; line-height:1.65; color:var(--ink);
   }
   .block-row { display:flex; align-items:flex-start; gap:4px; padding:2px 0; position:relative; }
@@ -370,12 +371,7 @@
     </nav>
     <section id="editor-pane">
       <div id="crumbs"></div>
-      <input id="title" placeholder="Untitled" spellcheck="false" autocomplete="off">
-      <div id="conflict-bar"></div>
-      <div id="fmt-row">
-        <div class="fmt-hint">Select text to format · type <b>/</b> for blocks</div>
-        <input id="image-file" type="file" accept="image/*" style="display:none">
-      </div>
+      <input id="image-file" type="file" accept="image/*" style="display:none">
       <div id="sel-toolbar">
         <button data-act="code" title="inline code (⌘E)"><span class="ic">&lt;/&gt;</span></button>
         <button data-act="math" title="inline math">∑</button>
@@ -384,7 +380,12 @@
       </div>
       <div id="slash-menu"></div>
       <div id="work">
-        <div id="blocks"></div>
+        <div id="page">
+          <input id="title" placeholder="Untitled" spellcheck="false" autocomplete="off">
+          <div id="conflict-bar"></div>
+          <div class="fmt-hint">Select text to format · type <b>/</b> for blocks</div>
+          <div id="blocks"></div>
+        </div>
       </div>
       <div id="page-tools">
         <button id="new-subpage">+ SUBPAGE</button>

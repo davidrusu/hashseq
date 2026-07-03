@@ -943,9 +943,7 @@ function crumbPath(pageObj) {
 
 function renderEditor() {
   const has = current !== null;
-  titleEl.style.display = has ? '' : 'none';
-  document.getElementById('fmt-row').style.display = has ? '' : 'none';
-  blocksEl.style.display = has ? '' : 'none';
+  document.getElementById('page').style.display = has ? '' : 'none';
   toolsEl.style.display = has ? '' : 'none';
   crumbsEl.style.display = has ? '' : 'none';
   noPageEl.style.display = has ? 'none' : '';
