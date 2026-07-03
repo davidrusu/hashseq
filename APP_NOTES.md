@@ -602,3 +602,38 @@ whole product's structural grammar now — text, blocks, rows, columns,
 tables, trees are one recursive shape. The app never needed a new
 primitive; it needed to nest the one it has. Strongest validation yet of
 the flat-store + seq-projection design.
+
+## 24. Arbitrary subdivision: a recursive layout tree by depth-alternation (2026-07-03)
+
+Nested split blocks (a column that itself splits into stacked rows, to any
+depth). The body became a recursive tree of layout nodes: a node is a LEAF
+(text block) or a CONTAINER (a marker atom + child-node refs). **Orientation
+alternates by depth** — body vertical, its containers horizontal, theirs
+vertical again — so there is no orientation to store or converge, and
+subdividing perpendicular to a parent falls out for free: dropping a block
+on the perpendicular edge of a target wraps the target in a new container
+one level deeper, which (being one depth down) arranges the other way. One
+rule yields the whole BSP.
+
+- **Same store, same three primitives.** Nodes are seqs of refs like
+  everything else; drag ops are seqMove (reorder), remove+insert (move),
+  and "wrap target in a new container" (subdivide). A whole-tree normalize
+  pass after each edit removes empty containers and unwraps single-child
+  ones, keeping the tree minimal. Verified live: the user's exact
+  figure — A | (B stacked over C) — built by two drags, and it survived a
+  reload.
+- **The origin-vs-object-id distinction bit hard.** Tree node ids are the
+  *origins* stored in parent atoms; every store call needs the *object id*
+  (`createSeq(origin)`). Mixing them ("no such seq object" at init, empty
+  renders) cost the most debugging time. The wasm boundary would be safer
+  if it accepted origins directly, or if the two were newtype-distinct in
+  JS — a real ergonomics wart the app keeps re-hitting (#1, here).
+- Migration chained cleanly: flat → rows → tree, each gated by the page's
+  bodySchema flag, single-column rows collapsing to bare leaves.
+
+**Feedback**: this is the fourth structural feature (tables, tree,
+columns, now arbitrary nesting) built purely by nesting the seq-of-refs
+shape, and the first that's genuinely *recursive*. The flat-store +
+seq-projection substrate has turned out to be a general layout/structure
+engine; the app has never needed a new store primitive, only new ways to
+arrange the one it has.

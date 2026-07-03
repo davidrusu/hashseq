@@ -57,6 +57,114 @@ function loadStore() {
 const web = loadStore();
 const WS = web.createKv(WS_ORIGIN); // idempotent: open ≠ create
 
+// A layout node is a seq. A LEAF is a text block. A CONTAINER's first
+// element is this marker atom; its remaining elements are child-node refs.
+// Orientation alternates by depth (body=vertical, then horizontal, …), so
+// subdividing perpendicular to a parent is automatic — no orientation
+// metadata to store or converge.
+const CONTAINER_MARK = web.provideBytes(new Uint8Array([0x1a, 0x63, 0x74, 0x72]));
+function nodeIsContainer(origin) {
+  const obj = web.createSeq(origin);
+  return web.textLen(obj) > 0 && web.payloadAt(obj, 0) === CONTAINER_MARK;
+}
+function childOffset(nodeOrigin) {
+  return nodeOrigin === currentBody0() || !nodeIsContainer(nodeOrigin) ? 0 : 1;
+}
+function currentBody0() {
+  return typeof currentBodyOrigin !== 'undefined' ? currentBodyOrigin : null;
+}
+/// Child node refs of a container (or of the body). Dedup by origin.
+function childNodes2(nodeOrigin) {
+  const obj = web.createSeq(nodeOrigin);
+  const off = childOffset(nodeOrigin);
+  const out = [];
+  const seen = new Set();
+  const n = web.textLen(obj);
+  for (let i = off; i < n; i++) {
+    const o = web.payloadAt(obj, i);
+    if (!o || seen.has(o)) continue;
+    seen.add(o);
+    out.push({ idx: i, origin: o });
+  }
+  return out;
+}
+function childIndexOf(parentOrigin, origin) {
+  return childNodes2(parentOrigin).findIndex((c) => c.origin === origin);
+}
+function makeLeafNode() {
+  const o = randOrigin();
+  web.createSeq(o);
+  return o;
+}
+function makeContainerNode(childOrigins) {
+  const o = randOrigin();
+  const c = web.createSeq(o);
+  web.seqInsertRef(c, 0, CONTAINER_MARK);
+  childOrigins.forEach((co, i) => web.seqInsertRef(c, 1 + i, co));
+  return o;
+}
+function removeNodeFromParent(parentOrigin, nodeOrigin) {
+  const p = web.createSeq(parentOrigin);
+  for (let i = 0; i < web.textLen(p); i++) {
+    if (web.payloadAt(p, i) === nodeOrigin) {
+      web.textRemove(p, i, 1);
+      return;
+    }
+  }
+}
+function insertChildAt(parentOrigin, nodeOrigin, childIdx) {
+  const p = web.createSeq(parentOrigin);
+  const off = childOffset(parentOrigin);
+  web.seqInsertRef(p, Math.min(off + childIdx, web.textLen(p)), nodeOrigin);
+}
+function replaceChild(parentOrigin, oldOrigin, newOrigin) {
+  const p = web.createSeq(parentOrigin);
+  const off = childOffset(parentOrigin);
+  const ci = childIndexOf(parentOrigin, oldOrigin);
+  if (ci < 0) return;
+  web.textRemove(p, off + ci, 1);
+  web.seqInsertRef(p, off + ci, newOrigin);
+}
+/// Depth after edits can leave empty containers or pointless single-child
+/// wrappers; a full walk from the body removes the former and unwraps the
+/// latter (trees are tiny, so a whole-tree normalize is cheap and simpler
+/// than incremental parent tracking).
+function normalizeTree(parentOrigin) {
+  const p = web.createSeq(parentOrigin);
+  const off = childOffset(parentOrigin);
+  let i = off;
+  while (i < web.textLen(p)) {
+    const childOrigin = web.payloadAt(p, i);
+    if (!childOrigin) {
+      i++;
+      continue;
+    }
+    if (nodeIsContainer(childOrigin)) {
+      normalizeTree(childOrigin);
+      const kids = childNodes2(childOrigin);
+      if (kids.length === 0) {
+        web.textRemove(p, i, 1);
+        continue;
+      }
+      if (kids.length === 1) {
+        web.textRemove(p, i, 1);
+        web.seqInsertRef(p, i, kids[0].origin);
+        continue;
+      }
+    }
+    i++;
+  }
+}
+/// Every leaf block object across the whole tree (for comments etc).
+function allLeaves(parentOrigin) {
+  const out = [];
+  for (const c of childNodes2(parentOrigin)) {
+    if (nodeIsContainer(c.origin)) out.push(...allLeaves(c.origin));
+    else out.push({ origin: c.origin, obj: web.createSeq(c.origin) });
+  }
+  return out;
+}
+
 // ---- kv read helpers -------------------------------------------------------
 
 function readKey(obj, key) {
@@ -292,7 +400,8 @@ const statBytes = document.getElementById('stat-bytes');
 const statParked = document.getElementById('stat-parked');
 
 let current = null; // pageObj hex
-let currentBody = null; // body seq obj hex (a seq of block refs)
+let currentBody = null; // body seq obj id
+let currentBodyOrigin = null; // body origin (root node id for the tree)
 const viewMode = 'edit'; // WYSIWYG is the only mode now
 let renderTargetObj = null; // the seq renderBody is currently rendering
 let focusedBlockObj = null; // last-focused block (toolbar target)
@@ -1002,8 +1111,9 @@ function renderEditor() {
   }
 
   // Body: a seq of ROW refs; each row a seq of column blocks.
+  currentBodyOrigin = refsOf(current, 'body').sort()[0] ?? null;
   currentBody = bodyOf(current);
-  if (currentBody) ensureRowSchema(current, currentBody);
+  if (currentBody) ensureTreeSchema(current, currentBody);
   renderBlocks();
   renderComments();
 }
@@ -1413,119 +1523,102 @@ function rerenderBlock(ed, blockObj, caretOff, preferAfter = false) {
 let normalizeTimer = null;
 
 function clearDropMarks() {
-  for (const el of blocksEl.querySelectorAll('.doc-row, .block-col')) {
+  for (const el of blocksEl.querySelectorAll('.block-col')) {
     el.classList.remove('drop-above', 'drop-below', 'drop-left', 'drop-right');
   }
 }
 
-// ---- rows and columns --------------------------------------------------------
+// ---- layout tree: leaves and containers --------------------------------------
 //
-// The body is a seq of ROW refs; each row is a seq of COLUMN refs; each
-// column is a text-seq block. Most rows hold one column (a full-width
-// block); dragging a block onto the left/right edge of another splits its
-// row into side-by-side columns. All three levels are the same seq-of-refs
-// shape used by the tree and tables.
+// The body is the root container (vertical). A child is a LEAF (text block)
+// or a CONTAINER (marker + child refs). Orientation alternates by depth, so
+// dropping a block perpendicular to its target's parent auto-creates a
+// container the other way — arbitrary subdivision from one rule.
 
-function rowsOf(body) {
-  return blocksOf(body); // atoms of the body are rows
-}
-function columnsOf(rowObj) {
-  return blocksOf(rowObj); // atoms of a row are column blocks
-}
-function allColumns(body) {
-  const out = [];
-  for (const r of rowsOf(body)) {
-    for (const c of columnsOf(r.obj)) {
-      out.push({ ...c, rowOrigin: r.origin, rowObj: r.obj, rowIdx: r.idx });
-    }
-  }
-  return out;
-}
-
-/// One-time migration: legacy bodies are a flat seq of block refs. Wrap
-/// each block in a derived row (origin = seqId(block) → convergent across
-/// concurrent migrations). Idempotent per page via the bodySchema flag.
-function ensureRowSchema(page, body) {
-  if (stringsOf(page, 'bodySchema').includes('rows')) return;
+/// One-time migration into the tree model. Handles both the flat-block
+/// legacy and the intermediate rows model via the page's bodySchema flag.
+function ensureTreeSchema(page, body) {
+  const schema = stringsOf(page, 'bodySchema');
+  if (schema.includes('tree')) return;
+  const isRows = schema.includes('rows');
+  const atoms = [];
   const n = web.textLen(body);
-  const origins = [];
   for (let i = 0; i < n; i++) {
     const o = web.payloadAt(body, i);
-    if (o) origins.push(o);
+    if (o) atoms.push(o);
   }
-  if (n > 0) web.textRemove(body, 0, n);
-  for (const bo of origins) {
-    const rowOrigin = WasmHashWeb.seqId(bo); // deterministic
-    const row = web.createSeq(rowOrigin);
-    if (web.textLen(row) === 0) web.seqInsertRef(row, 0, bo);
-    web.seqInsertRef(body, web.textLen(body), rowOrigin);
+  web.textRemove(body, 0, web.textLen(body));
+  for (const ao of atoms) {
+    if (!isRows) {
+      web.seqInsertRef(body, web.textLen(body), ao); // legacy: ao is a leaf
+      continue;
+    }
+    // rows model: ao is a row seq of column blocks.
+    const row = web.createSeq(ao);
+    const cols = [];
+    for (let i = 0; i < web.textLen(row); i++) {
+      const c = web.payloadAt(row, i);
+      if (c) cols.push(c);
+    }
+    if (cols.length <= 1) {
+      web.seqInsertRef(body, web.textLen(body), cols[0] ?? ao);
+    } else {
+      web.seqInsertRef(row, 0, CONTAINER_MARK); // reuse the row seq as a container
+      web.seqInsertRef(body, web.textLen(body), ao);
+    }
   }
-  web.putString(page, 'bodySchema', 'rows');
+  web.putString(page, 'bodySchema', 'tree');
   persistSoon();
 }
 
-let dragCol = null; // { blockOrigin, rowOrigin, colIdx }
+let dragCol = null; // { origin, parentOrigin }
 
-function rowRecord(rowOrigin) {
-  return rowsOf(currentBody).find((r) => r.origin === rowOrigin);
-}
-
-/// Remove a row from the body if it has no columns left. Returns the body
-/// index it occupied, or -1.
-function cleanupEmptyRow(rowOrigin) {
-  const row = web.createSeq(rowOrigin);
-  if (web.textLen(row) > 0) return -1;
-  const r = rowRecord(rowOrigin);
-  if (r) {
-    web.textRemove(currentBody, r.idx, 1);
-    return r.idx;
-  }
-  return -1;
-}
-
-/// Move the dragged block to be a column of `targetRowOrigin` at column
-/// slot `targetColIdx` (a Move within a row, or remove+insert across).
-function moveColumnInto(targetRowOrigin, targetColIdx) {
+/// Drop the dragged leaf beside `col` on side `dir`. Parallel to the
+/// target's parent axis → sibling insert; perpendicular → wrap target in a
+/// new container (which, being one level deeper, arranges the other way).
+function dropOnLeaf(col, dir) {
   const src = dragCol;
   dragCol = null;
   if (!src) return;
-  if (src.rowOrigin === targetRowOrigin) {
-    const row = web.createSeq(targetRowOrigin);
-    let to = targetColIdx;
-    if (to > src.colIdx) to -= 1;
-    if (to === src.colIdx) return; // no movement
-    web.seqMove(row, src.colIdx, to); // reorder columns: one Move op
+  const tOrigin = col.dataset.origin;
+  if (src.origin === tOrigin) return;
+  const tParent = col.dataset.parentOrigin;
+  const tDepth = Number(col.dataset.depth);
+  removeNodeFromParent(src.parentOrigin, src.origin);
+  const parentAxis = (tDepth - 1) % 2 === 0 ? 'V' : 'H';
+  const dirAxis = dir === 'left' || dir === 'right' ? 'H' : 'V';
+  const before = dir === 'left' || dir === 'top';
+  const ti = childIndexOf(tParent, tOrigin);
+  if (ti < 0) {
+    normalizeTree(currentBodyOrigin);
+    persistSoon();
+    render();
+    return;
+  }
+  if (parentAxis === dirAxis) {
+    insertChildAt(tParent, src.origin, ti + (before ? 0 : 1));
   } else {
-    const srcRow = web.createSeq(src.rowOrigin);
-    web.textRemove(srcRow, src.colIdx, 1);
-    const tRow = web.createSeq(targetRowOrigin);
-    web.seqInsertRef(tRow, Math.min(targetColIdx, web.textLen(tRow)), src.blockOrigin);
-    cleanupEmptyRow(src.rowOrigin);
+    const kids = before ? [src.origin, tOrigin] : [tOrigin, src.origin];
+    replaceChild(tParent, tOrigin, makeContainerNode(kids));
   }
+  normalizeTree(currentBodyOrigin);
   persistSoon();
   render();
 }
 
-/// Move the dragged block to a brand-new single-column row at body index.
-function moveColumnToNewRow(bodyIdx) {
+function newLeafToNewRow(bodyIdx) {
   const src = dragCol;
   dragCol = null;
   if (!src) return;
-  const srcRow = web.createSeq(src.rowOrigin);
-  web.textRemove(srcRow, src.colIdx, 1);
-  const removedAt = cleanupEmptyRow(src.rowOrigin);
-  let at = bodyIdx;
-  if (removedAt !== -1 && removedAt < bodyIdx) at -= 1;
-  const rowOrigin = randOrigin();
-  const row = web.createSeq(rowOrigin);
-  web.seqInsertRef(row, 0, src.blockOrigin);
-  web.seqInsertRef(currentBody, Math.min(at, web.textLen(currentBody)), rowOrigin);
+  removeNodeFromParent(src.parentOrigin, src.origin);
+  insertChildAt(currentBodyOrigin, src.origin, bodyIdx);
+  normalizeTree(currentBodyOrigin);
   persistSoon();
   render();
 }
 
-/// Build a column (block editor) ONCE; renderBlocks keeps its row context
-/// (rowOrigin/colIdx/rowIdx) updated via dataset. Columns persist across
+/// Build a leaf block editor ONCE; renderBlocks keeps its tree context
+/// (origin/parentOrigin/depth) updated via dataset. Leaves persist across
 /// renders so an untouched block keeps its DOM caret and selection.
 function makeColumn(obj, origin) {
   const col = document.createElement('div');
@@ -1536,14 +1629,10 @@ function makeColumn(obj, origin) {
   const handle = document.createElement('span');
   handle.className = 'handle';
   handle.textContent = '⠿';
-  handle.title = 'drag to reorder or drop beside another block';
+  handle.title = 'drag to move, or drop beside/under another block to split';
   handle.draggable = true;
   handle.ondragstart = (e) => {
-    dragCol = {
-      blockOrigin: col.dataset.origin,
-      rowOrigin: col.dataset.rowOrigin,
-      colIdx: Number(col.dataset.colIdx),
-    };
+    dragCol = { origin: col.dataset.origin, parentOrigin: col.dataset.parentOrigin };
     col.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', 'block');
@@ -1554,7 +1643,6 @@ function makeColumn(obj, origin) {
     dragCol = null;
   };
 
-  // Drop zones on a column: left/right → column beside; top/bottom → new row.
   col.ondragover = (e) => {
     if (!dragCol) return;
     e.preventDefault();
@@ -1563,12 +1651,13 @@ function makeColumn(obj, origin) {
     const fx = (e.clientX - rect.left) / rect.width;
     const fy = (e.clientY - rect.top) / rect.height;
     clearDropMarks();
-    if (fx < 0.25) col.classList.add('drop-left');
-    else if (fx > 0.75) col.classList.add('drop-right');
-    else col.classList.add(fy < 0.5 ? 'drop-above' : 'drop-below');
+    if (Math.min(fx, 1 - fx) < Math.min(fy, 1 - fy)) {
+      col.classList.add(fx < 0.5 ? 'drop-left' : 'drop-right');
+    } else {
+      col.classList.add(fy < 0.5 ? 'drop-above' : 'drop-below');
+    }
   };
-  col.ondragleave = () =>
-    col.classList.remove('drop-above', 'drop-below', 'drop-left', 'drop-right');
+  col.ondragleave = () => clearDropMarks();
   col.ondrop = (e) => {
     if (!dragCol) return;
     e.preventDefault();
@@ -1577,12 +1666,10 @@ function makeColumn(obj, origin) {
     const rect = col.getBoundingClientRect();
     const fx = (e.clientX - rect.left) / rect.width;
     const fy = (e.clientY - rect.top) / rect.height;
-    const rowOrigin = col.dataset.rowOrigin;
-    const colIdx = Number(col.dataset.colIdx);
-    const rowIdx = Number(col.dataset.rowIdx);
-    if (fx < 0.25) moveColumnInto(rowOrigin, colIdx);
-    else if (fx > 0.75) moveColumnInto(rowOrigin, colIdx + 1);
-    else moveColumnToNewRow(rowIdx + (fy < 0.5 ? 0 : 1));
+    let dir;
+    if (Math.min(fx, 1 - fx) < Math.min(fy, 1 - fy)) dir = fx < 0.5 ? 'left' : 'right';
+    else dir = fy < 0.5 ? 'top' : 'bottom';
+    dropOnLeaf(col, dir);
   };
 
   const ta = document.createElement('div');
@@ -1654,8 +1741,7 @@ function makeColumn(obj, origin) {
       insertNewlineAtCaret();
       return;
     }
-    // Enter: a new single-column row after this column's row. A plain tail
-    // after the caret moves into the new block.
+    // Enter: a new leaf after this one in its parent. A plain tail moves in.
     const caret = caretOffsetIn(ta) ?? extractText(ta).length;
     const text = extractText(ta);
     const tail = text.slice(caret);
@@ -1670,22 +1756,20 @@ function makeColumn(obj, origin) {
         }
         return true;
       })();
-    const blockOrigin = randOrigin();
-    const nb = web.createSeq(blockOrigin);
+    const nb = makeLeafNode();
+    const nbObj = web.createSeq(nb);
     if (tail && tailPlain) {
       web.textRemove(obj, caret, text.length - caret);
-      web.textInsert(nb, 0, tail);
+      web.textInsert(nbObj, 0, tail);
       refreshSig();
     }
-    const rowOrigin = randOrigin();
-    const nr = web.createSeq(rowOrigin);
-    web.seqInsertRef(nr, 0, blockOrigin);
-    const rr = rowRecord(col.dataset.rowOrigin);
-    web.seqInsertRef(currentBody, (rr ? rr.idx : web.textLen(currentBody) - 1) + 1, rowOrigin);
+    const parent = col.dataset.parentOrigin;
+    const ci = childIndexOf(parent, col.dataset.origin);
+    insertChildAt(parent, nb, ci + 1);
     persistSoon();
     render();
     for (const ed of blocksEl.querySelectorAll('.block-ed')) {
-      if (ed.dataset.blockObj === nb) {
+      if (ed.dataset.blockObj === nbObj) {
         ed.focus();
         setSelectionRangeIn(ed, 0);
         break;
@@ -1761,9 +1845,8 @@ function makeColumn(obj, origin) {
   del.textContent = '✕';
   del.title = 'remove block';
   del.onclick = () => {
-    const row = web.createSeq(col.dataset.rowOrigin);
-    web.textRemove(row, Number(col.dataset.colIdx), 1);
-    cleanupEmptyRow(col.dataset.rowOrigin);
+    removeNodeFromParent(col.dataset.parentOrigin, col.dataset.origin);
+    normalizeTree(currentBodyOrigin);
     persistSoon();
     render();
   };
@@ -1772,73 +1855,58 @@ function makeColumn(obj, origin) {
   return col;
 }
 
-/// Incremental: columns persist keyed by block object across renders (so a
-/// remote merge never touches a caret it didn't change); rows are rebuilt
-/// as lightweight flex containers holding the persistent columns.
-function renderBlocks() {
-  for (const d of blocksEl.querySelectorAll('.dragging')) d.classList.remove('dragging');
-  const rows = rowsOf(currentBody);
-  const cols = allColumns(currentBody);
-  const single = cols.length === 1;
-
-  const prev = new Map();
-  for (const c of blocksEl.querySelectorAll('.block-col')) prev.set(c.dataset.obj, c);
-
-  const rowEls = [];
-  for (const r of rows) {
-    const rowEl = document.createElement('div');
-    rowEl.className = 'doc-row';
-    rowEl.dataset.rowOrigin = r.origin;
-    for (const c of columnsOf(r.obj)) {
-      let col = prev.get(c.obj);
-      if (!col) col = makeColumn(c.obj, c.origin);
-      else prev.delete(c.obj);
-      col.dataset.rowOrigin = r.origin;
-      col.dataset.colIdx = c.idx;
-      col.dataset.rowIdx = r.idx;
-      const ed = col.querySelector('.block-ed');
-      if (single) ed.dataset.placeholder = 'Type here…';
-      else delete ed.dataset.placeholder;
-      const sig = web.markedSpans(c.obj);
-      if (col.dataset.sig !== sig) {
-        const focused = ed === document.activeElement || ed.contains(document.activeElement);
-        const seqText = JSON.parse(sig)
-          .map((sp) => sp.text)
-          .join('');
-        if (focused && extractText(ed) === seqText) {
-          col.dataset.sig = sig;
-          clearTimeout(normalizeTimer);
-          normalizeTimer = setTimeout(() => {
-            rerenderBlock(
-              ed,
-              c.obj,
-              ed === document.activeElement || ed.contains(document.activeElement)
-                ? caretOffsetIn(ed)
-                : null,
-            );
-          }, 400);
-        } else {
-          renderEditableInto(ed, c.obj);
-          ed.dataset.prev = extractText(ed);
-          col.dataset.sig = sig;
-        }
-      }
-      rowEl.appendChild(col);
-    }
-    rowEls.push(rowEl);
+function updateLeafContent(col, obj, ed) {
+  const sig = web.markedSpans(obj);
+  if (col.dataset.sig === sig) return;
+  const focused = ed === document.activeElement || ed.contains(document.activeElement);
+  const seqText = JSON.parse(sig)
+    .map((sp) => sp.text)
+    .join('');
+  if (focused && extractText(ed) === seqText) {
+    col.dataset.sig = sig;
+    clearTimeout(normalizeTimer);
+    normalizeTimer = setTimeout(() => {
+      rerenderBlock(
+        ed,
+        obj,
+        ed === document.activeElement || ed.contains(document.activeElement)
+          ? caretOffsetIn(ed)
+          : null,
+      );
+    }, 400);
+  } else {
+    renderEditableInto(ed, obj);
+    ed.dataset.prev = extractText(ed);
+    col.dataset.sig = sig;
   }
+}
 
-  for (const stale of prev.values()) stale.remove();
+function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, single) {
+  if (nodeIsContainer(origin)) {
+    const cont = document.createElement('div');
+    cont.className = 'node-container';
+    cont.style.flexDirection = depth % 2 === 0 ? 'column' : 'row';
+    for (const k of childNodes2(origin)) {
+      renderNodeInto(cont, k.origin, depth + 1, origin, prevLeaves, false);
+    }
+    parentEl.appendChild(cont);
+    return;
+  }
+  const obj = web.createSeq(origin);
+  let col = prevLeaves.get(origin);
+  if (col) prevLeaves.delete(origin);
+  else col = makeColumn(obj, origin);
+  col.dataset.parentOrigin = parentOrigin;
+  col.dataset.depth = depth;
+  const ed = col.querySelector('.block-ed');
+  if (single) ed.dataset.placeholder = 'Type here…';
+  else delete ed.dataset.placeholder;
+  updateLeafContent(col, obj, ed);
+  parentEl.appendChild(col);
+}
 
-  // Rows are cheap containers — rebuild the list wholesale, but reuse the
-  // persistent column nodes (moved into fresh row wrappers keeps their DOM
-  // and any selection inside them).
-  const addBtn = blocksEl.querySelector('.add-block');
-  blocksEl.querySelectorAll('.doc-row').forEach((r) => r.remove());
-  const anchor = addBtn ?? null;
-  for (const rowEl of rowEls) blocksEl.insertBefore(rowEl, anchor);
-
-  let add = addBtn;
+function ensureAddButton() {
+  let add = blocksEl.querySelector('.add-block');
   if (!add) {
     add = document.createElement('button');
     add.className = 'add-block';
@@ -1846,15 +1914,35 @@ function renderBlocks() {
     add.onclick = () => addBlockAtEnd();
     blocksEl.appendChild(add);
   }
+  return add;
+}
+
+/// Recursive render. Leaves persist keyed by origin (caret survives); the
+/// container DOM is rebuilt each render and reused leaves are re-parented.
+function renderBlocks() {
+  for (const d of blocksEl.querySelectorAll('.dragging')) d.classList.remove('dragging');
+  const prevLeaves = new Map();
+  for (const c of blocksEl.querySelectorAll('.block-col')) prevLeaves.set(c.dataset.origin, c);
+
+  const frag = document.createDocumentFragment();
+  const topKids = childNodes2(currentBodyOrigin);
+  const single = topKids.length === 1 && !nodeIsContainer(topKids[0].origin);
+  for (const k of topKids) renderNodeInto(frag, k.origin, 1, currentBodyOrigin, prevLeaves, single);
+
+  for (const c of prevLeaves.values()) c.remove();
+  blocksEl
+    .querySelectorAll(':scope > .node-container, :scope > .block-col')
+    .forEach((e) => e.remove());
+  const add = ensureAddButton();
+  for (const child of [...frag.childNodes]) blocksEl.insertBefore(child, add);
   if (blocksEl.lastChild !== add) blocksEl.appendChild(add);
 
-  // Dropping below all rows (on the container) makes a new row at the end.
   blocksEl.ondragover = (e) => {
     if (dragCol) e.preventDefault();
   };
   blocksEl.ondrop = (e) => {
     if (dragCol && (e.target === blocksEl || e.target === add)) {
-      moveColumnToNewRow(rowsOf(currentBody).length);
+      newLeafToNewRow(childNodes2(currentBodyOrigin).length);
     }
   };
 }
@@ -1901,12 +1989,8 @@ function restoreEditState(st) {
 
 function addBlockAtEnd(focus = true) {
   const body = ensureBody();
-  const blockOrigin = randOrigin();
-  web.createSeq(blockOrigin);
-  const rowOrigin = randOrigin();
-  const row = web.createSeq(rowOrigin);
-  web.seqInsertRef(row, 0, blockOrigin);
-  web.seqInsertRef(body, web.textLen(body), rowOrigin);
+  const leaf = makeLeafNode();
+  web.seqInsertRef(body, web.textLen(body), leaf);
   persistSoon();
   render();
   if (focus) {
@@ -1925,7 +2009,7 @@ function addBlockAtEnd(focus = true) {
 function collectComments() {
   if (!currentBody) return [];
   const byKind = new Map();
-  for (const b of allColumns(currentBody)) {
+  for (const b of allLeaves(currentBodyOrigin)) {
     let pos = 0;
     for (const s of styledSpans(b.obj)) {
       for (const c of s.text) {
@@ -2311,13 +2395,8 @@ function createPage(parentObj) {
   const bodyOrigin = randOrigin();
   web.putRef(page, 'body', bodyOrigin);
   const body = web.createSeq(bodyOrigin);
-  const blockOrigin = randOrigin();
-  web.createSeq(blockOrigin);
-  const rowOrigin = randOrigin();
-  const row = web.createSeq(rowOrigin);
-  web.seqInsertRef(row, 0, blockOrigin);
-  web.seqInsertRef(body, 0, rowOrigin);
-  web.putString(page, 'bodySchema', 'rows');
+  web.seqInsertRef(body, 0, makeLeafNode());
+  web.putString(page, 'bodySchema', 'tree');
   current = page;
   persistSoon();
   render();
@@ -2800,7 +2879,7 @@ window.__kb = {
   WS,
   spans: (obj) => JSON.parse(web.markedSpans(obj)),
   text: (obj) => web.text(obj),
-  blocks: () => allColumns(currentBody).map((b) => b.obj),
+  blocks: () => allLeaves(currentBodyOrigin).map((b) => b.obj),
   persist: () => persistNow(true),
   render,
 };

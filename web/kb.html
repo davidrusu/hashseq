@@ -170,7 +170,8 @@
   #blocks {
     font-family:inherit; font-size:14px; line-height:1.65; color:var(--ink);
   }
-  .doc-row { display:flex; align-items:flex-start; gap:14px; }
+  .node-container { display:flex; gap:14px; align-items:stretch; flex:1 1 0; min-width:0; }
+  .node-container[style*="row"] > * { flex:1 1 0; min-width:0; }
   .block-col {
     display:flex; align-items:flex-start; gap:4px; padding:2px 0;
     position:relative; flex:1 1 0; min-width:0;
