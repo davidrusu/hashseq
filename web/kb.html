@@ -110,9 +110,41 @@
     padding:10px 14px; overflow-x:auto; text-align:center;
   }
   #preview .math-src { color:var(--red); font-style:italic; }
-  #preview table { border-collapse:collapse; margin:0 0 12px; font-size:13px; }
-  #preview th, #preview td { border:1px solid var(--ink); padding:4px 10px; text-align:left; }
-  #preview th { background:#E6DEC9; letter-spacing:0.5px; }
+  #preview .obj-table { margin:4px 0 12px; }
+  #preview table { border-collapse:collapse; font-size:13px; }
+  #preview td {
+    border:1px solid var(--ink); padding:4px 10px; text-align:left;
+    min-width:90px; outline:none;
+  }
+  #preview td:focus { background:#ece5d3; }
+  #preview .table-tools { display:flex; gap:6px; margin-top:4px; }
+  #preview .table-tools button { font-size:10px; letter-spacing:1px; }
+  #preview .comment-hl {
+    background:rgba(200,120,45,0.22); border-bottom:1.5px solid var(--amber);
+    cursor:help;
+  }
+  #comments {
+    display:none; margin:0 22px 10px; border:1px solid var(--grid);
+    background:rgba(246,241,229,0.75); max-height:160px; overflow-y:auto;
+    font-size:12px;
+  }
+  #comments .c-head {
+    padding:5px 10px; font-size:10px; letter-spacing:2px; color:var(--muted);
+    font-weight:600; border-bottom:1px solid var(--grid);
+  }
+  #comments .c-row {
+    display:flex; gap:10px; align-items:baseline; padding:5px 10px;
+    border-bottom:1px solid var(--grid);
+  }
+  #comments .c-row:last-child { border-bottom:none; }
+  #comments .c-quote {
+    color:var(--muted); max-width:220px; overflow:hidden; white-space:nowrap;
+    text-overflow:ellipsis; flex:none;
+  }
+  #comments .c-quote::before, #comments .c-quote::after { content:'\201C'; }
+  #comments .c-quote::after { content:'\201D'; }
+  #comments .c-text { flex:1; }
+  #comments .c-del { color:var(--red); cursor:pointer; flex:none; }
   #page-tools { display:flex; gap:8px; padding:0 22px 12px; }
   #page-tools .danger { color:var(--red); border-color:var(--red); }
   #no-page {
@@ -154,6 +186,8 @@
           <button data-mark="codeblock" title="code block (mark, whole lines)">CODE BLOCK</button>
           <button data-mark="eqblock" title="equation block (mark, whole lines)">EQUATION</button>
           <button data-mark="clear" title="remove formatting marks">CLEAR</button>
+          <button data-mark="comment" title="comment on the selection (mark)">COMMENT</button>
+          <button id="insert-table" title="insert a table object at the caret">TABLE</button>
         </div>
       </div>
       <textarea id="body" spellcheck="false"
@@ -161,6 +195,7 @@
 Formatting is marks: select text, then `CODE` / $MATH$ / CODE BLOCK / EQUATION — it travels with the text through concurrent edits.
 Structure is markup: | pipe | tables | and # headings."></textarea>
       <div id="preview" style="display:none"></div>
+      <div id="comments"></div>
       <div id="page-tools">
         <button id="new-subpage">+ SUBPAGE</button>
         <button id="delete-page" class="danger">DELETE PAGE</button>

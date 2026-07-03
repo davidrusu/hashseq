@@ -486,6 +486,22 @@ mod tests {
             );
         }
 
+        // Table shape: body embeds a table seq (link atom); the table's
+        // elements are atoms referencing row seqs; rows reference cell
+        // seqs (a hashseq of hashseqs).
+        let table = web.create_seq(&"55".repeat(32)).unwrap();
+        let row = web.create_seq(&"66".repeat(32)).unwrap();
+        let cell = web.create_seq(&"77".repeat(32)).unwrap();
+        web.text_insert(&cell, 0, "cell text").unwrap();
+        web.seq_insert_ref(&row, 0, &"77".repeat(32)).unwrap();
+        web.seq_insert_ref(&table, 0, &"66".repeat(32)).unwrap();
+        web.seq_insert_ref(&body, 0, &"55".repeat(32)).unwrap();
+        assert_eq!(web.payload_at(&body, 0).unwrap().unwrap(), "55".repeat(32));
+        assert_eq!(web.payload_at(&table, 0).unwrap().unwrap(), "66".repeat(32));
+        assert_eq!(web.payload_at(&row, 0).unwrap().unwrap(), "77".repeat(32));
+        assert_eq!(web.payload_at(&body, 1).unwrap(), None, "plain char");
+        assert!(web.text(&body).unwrap().starts_with('\u{FFFC}'));
+
         // Deletion reads as absent; the key drops from the live key list.
         web.del(&ws, "page:abc").unwrap();
         let read: serde_json::Value =
@@ -708,6 +724,41 @@ impl WasmHashWeb {
             .ok_or_else(|| app_err("no such seq object"))?;
         seq.remove_batch(idx, len);
         Ok(())
+    }
+
+    // --- atoms (embedded object refs in a seq) ---
+
+    /// Insert an atom at visible position `idx` whose payload is a raw id
+    /// (an embed: another object's origin, by app convention). Renders as
+    /// U+FFFC in `text()`; read back with `payloadAt`.
+    #[wasm_bindgen(js_name = seqInsertRef)]
+    pub fn seq_insert_ref(
+        &mut self,
+        obj_hex: &str,
+        idx: usize,
+        ref_hex: &str,
+    ) -> Result<String, JsValue> {
+        let payload = hex_to_id(ref_hex)?;
+        let seq = self
+            .inner
+            .seq_mut(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        Ok(id_to_hex(&seq.insert_value(idx, payload).id()))
+    }
+
+    /// The payload id (hex) of the atom at visible position `idx`, or
+    /// undefined for plain characters / out of range.
+    #[wasm_bindgen(js_name = payloadAt)]
+    pub fn payload_at(&self, obj_hex: &str, idx: usize) -> Result<Option<String>, JsValue> {
+        let seq = self
+            .inner
+            .seq(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        Ok(seq
+            .id_at(idx)
+            .and_then(|id| seq.payload_of(&id))
+            .as_ref()
+            .map(id_to_hex))
     }
 
     // --- marks (formatting as ops, not markup) ---

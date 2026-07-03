@@ -175,3 +175,49 @@ Friction found:
 **Feedback**: marks carried all four formatting features with zero system
 changes — the projection earned its complexity budget. The missing piece is
 editor-side: a decorations-capable text widget over `markedSpans`.
+
+## 10. Tables as a hashseq of hashseqs (2026-07-03)
+
+Pipe-markup tables replaced by structure: a table is a seq of row refs,
+each row a seq of cell refs, each cell a text seq — embedded in the body as
+a link atom (payload = table origin, rendered from U+FFFC via `payloadAt`).
+Rows insert/order like any seq elements; cells edit like any text; all of
+it merges per the existing seq semantics with zero new system surface.
+
+Two real findings:
+
+- **Column identity does not exist.** A "column" is only an index into each
+  independent row seq, so two replicas concurrently adding columns can
+  interleave differently per row after merge — a structurally misaligned
+  table, each row individually correct. The honest fix is a column-list
+  object plus cells keyed by (row id, column id) — i.e. the database model,
+  where a kv per row keyed by column origin replaces positional cells. This
+  is the app-schema layer of the same lesson as marks-vs-markup: *alignment
+  is a constraint, and constraints need identity to attach to*.
+- **Embeds need the atom's visible index.** Rendering resolves U+FFFC
+  placeholders via `payloadAt(body, idx)`, which means the renderer must
+  thread absolute positions through span chunking. Worked fine; an
+  `atomsOf(obj) -> [(idx, payload)]` read would be marginally nicer.
+
+**Feedback**: no system change needed for doc-tables; the column-identity
+problem is worth a paragraph in HETEROGENEITY.md as the canonical example
+of when positional composition must graduate to keyed composition.
+
+## 11. Comments are marks with per-comment kinds (2026-07-03)
+
+"Highlight a span and comment on it" is exactly a mark — value = the
+comment text, region = the highlight, regional semantics keep it attached
+under concurrent edits, tombstone = resolve. One catch: `mark_range`'s
+overwrites hygiene names every intersecting same-kind mark, which is the
+right policy for formatting (bold over bold replaces) and the wrong one for
+annotations (a new comment must not suppress an overlapping older one). The
+app mints a **fresh kind per comment** (`comment:<tag>`), giving each its
+own register: overlapping comments coexist, the overlap region carries
+both, resolving one leaves the other (verified through the wasm layer).
+
+**Feedback**: the *model* already supports coexisting same-kind marks (MVR
+per (element, kind)); only the authoring helper bakes in replace-on-overlap.
+Worth a line in MARKS.md naming the two idioms: formatting = shared kind
+(overwrite hygiene), annotation = minted kind (coexistence). Slight wrinkle:
+kind-per-comment means "all comments" is a prefix scan over kind strings —
+fine for an app, invisible to generic tooling.

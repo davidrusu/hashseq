@@ -206,6 +206,7 @@ let viewMode = 'edit'; // 'edit' | 'view'
 // CDN; without it, math renders as its source.
 
 const MARK_KINDS = ['code', 'math', 'codeblock', 'eqblock'];
+const ATOM = '￼'; // an embedded object ref renders as U+FFFC in text()
 
 let katex = null;
 import('https://esm.sh/katex@0.16.11')
@@ -234,86 +235,170 @@ function mathNode(tex, display) {
   return el;
 }
 
-/// markedSpans → per-span flags the renderer understands.
+/// markedSpans → per-span flags the renderer understands. Comment marks
+/// are per-comment kinds (`comment:<tag>`) so overlapping comments coexist
+/// instead of overwriting each other.
 function styledSpans(bodyObj) {
   return JSON.parse(web.markedSpans(bodyObj)).map((s) => {
-    const f = { text: s.text, code: false, math: false, codeblock: null, eqblock: false };
+    const f = {
+      text: s.text,
+      code: false,
+      math: false,
+      codeblock: null,
+      eqblock: false,
+      comments: [],
+    };
     for (const m of s.marks) {
       if (m.kind === 'code') f.code = true;
       else if (m.kind === 'math') f.math = true;
       else if (m.kind === 'codeblock') f.codeblock = m.values[0] ?? '';
       else if (m.kind === 'eqblock') f.eqblock = true;
+      else if (m.kind.startsWith('comment:')) {
+        f.comments.push({ kind: m.kind, text: m.values[0] ?? '' });
+      }
     }
     return f;
   });
 }
 
-/// Chunk a char-array by (code, math) and emit text / <code> / KaTeX nodes.
+function commentKey(comments) {
+  return comments.map((x) => x.kind).join(',');
+}
+
+/// Chunk a char-array by (code, math, comments) and emit text / <code> /
+/// KaTeX / embed nodes; commented chunks get a highlight wrapper.
 function chunkNodes(chars) {
   const out = [];
   let k = 0;
   while (k < chars.length) {
-    const { code, math } = chars[k];
+    const first = chars[k];
+    if (first.c === ATOM) {
+      out.push(renderEmbed(first.idx));
+      k++;
+      continue;
+    }
+    const { code, math } = first;
+    const ckey = commentKey(first.comments);
     let text = '';
-    while (k < chars.length && chars[k].code === code && chars[k].math === math) {
+    while (
+      k < chars.length &&
+      chars[k].c !== ATOM &&
+      chars[k].code === code &&
+      chars[k].math === math &&
+      commentKey(chars[k].comments) === ckey
+    ) {
       text += chars[k].c;
       k++;
     }
-    if (math) out.push(mathNode(text, false));
+    if (!text) continue;
+    let node;
+    if (math) node = mathNode(text, false);
     else if (code) {
-      const c = document.createElement('code');
-      c.textContent = text;
-      out.push(c);
-    } else if (text) out.push(document.createTextNode(text));
+      node = document.createElement('code');
+      node.textContent = text;
+    } else node = document.createTextNode(text);
+    if (first.comments.length > 0) {
+      const hl = document.createElement('span');
+      hl.className = 'comment-hl';
+      hl.title = first.comments.map((x) => x.text).join('\n');
+      hl.appendChild(node);
+      node = hl;
+    }
+    out.push(node);
   }
   return out;
 }
 
-function trimCells(ln) {
-  let a = 0;
-  let b = ln.length;
-  while (a < b && ln[a].c === ' ') a++;
-  while (b > a && ln[b - 1].c === ' ') b--;
-  return ln.slice(a, b);
+/// A single-span text diff applied as seq ops.
+function applyDiff(obj, prev, next) {
+  let start = 0;
+  const maxStart = Math.min(prev.length, next.length);
+  while (start < maxStart && prev[start] === next[start]) start++;
+  let endPrev = prev.length;
+  let endNext = next.length;
+  while (endPrev > start && endNext > start && prev[endPrev - 1] === next[endNext - 1]) {
+    endPrev--;
+    endNext--;
+  }
+  if (endPrev > start) web.textRemove(obj, start, endPrev - start);
+  if (endNext > start) web.textInsert(obj, start, next.slice(start, endNext));
 }
 
-function tableCells(ln) {
-  let t = trimCells(ln);
-  if (t.length && t[0].c === '|') t = t.slice(1);
-  if (t.length && t[t.length - 1].c === '|') t = t.slice(0, -1);
-  const cells = [[]];
-  for (const ch of t) {
-    if (ch.c === '|') cells.push([]);
-    else cells[cells.length - 1].push(ch);
+/// An embedded object at body position `idx` — by app convention a table:
+/// a seq of row refs, each row a seq of cell refs, each cell a text seq.
+function renderEmbed(idx) {
+  const origin = web.payloadAt(currentBody, idx);
+  if (!origin) return document.createTextNode(ATOM);
+  return objTableNode(web.createSeq(origin));
+}
+
+function objTableNode(tableObj) {
+  const wrap = document.createElement('div');
+  wrap.className = 'obj-table';
+  const table = document.createElement('table');
+  const tb = table.createTBody();
+  const rowCount = web.textLen(tableObj);
+  for (let r = 0; r < rowCount; r++) {
+    const rowOrigin = web.payloadAt(tableObj, r);
+    if (!rowOrigin) continue;
+    const rowObj = web.createSeq(rowOrigin);
+    const tr = tb.insertRow();
+    const cellCount = web.textLen(rowObj);
+    for (let c = 0; c < cellCount; c++) {
+      const cellOrigin = web.payloadAt(rowObj, c);
+      if (!cellOrigin) continue;
+      const cellObj = web.createSeq(cellOrigin);
+      const td = tr.insertCell();
+      td.contentEditable = 'plaintext-only';
+      td.textContent = web.text(cellObj);
+      td.dataset.prev = td.textContent;
+      td.addEventListener('input', () => {
+        applyDiff(cellObj, td.dataset.prev, td.textContent);
+        td.dataset.prev = td.textContent;
+        persistSoon();
+      });
+    }
   }
-  return cells.map(trimCells);
+  wrap.appendChild(table);
+  const tools = document.createElement('div');
+  tools.className = 'table-tools';
+  const addRow = document.createElement('button');
+  addRow.textContent = '+ ROW';
+  addRow.onclick = () => {
+    const cols =
+      rowCount > 0 ? Math.max(1, web.textLen(web.createSeq(web.payloadAt(tableObj, 0)))) : 1;
+    const rowOrigin = randOrigin();
+    web.createSeq(rowOrigin);
+    for (let c = 0; c < cols; c++) {
+      const cellOrigin = randOrigin();
+      web.createSeq(cellOrigin);
+      web.seqInsertRef(web.createSeq(rowOrigin), c, cellOrigin);
+    }
+    web.seqInsertRef(tableObj, rowCount, rowOrigin);
+    persistSoon();
+    render();
+  };
+  const addCol = document.createElement('button');
+  addCol.textContent = '+ COL';
+  addCol.onclick = () => {
+    for (let r = 0; r < rowCount; r++) {
+      const rowOrigin = web.payloadAt(tableObj, r);
+      if (!rowOrigin) continue;
+      const rowObj = web.createSeq(rowOrigin);
+      const cellOrigin = randOrigin();
+      web.createSeq(cellOrigin);
+      web.seqInsertRef(rowObj, web.textLen(rowObj), cellOrigin);
+    }
+    persistSoon();
+    render();
+  };
+  tools.append(addRow, addCol);
+  wrap.appendChild(tools);
+  return wrap;
 }
 
 function lineText(ln) {
   return ln.map((x) => x.c).join('');
-}
-
-function tableNode(lineArrs) {
-  const isSep = (ln) =>
-    tableCells(ln).every((c) => /^:?-+:?$/.test(lineText(c)));
-  const table = document.createElement('table');
-  let body = lineArrs;
-  if (lineArrs.length >= 2 && isSep(lineArrs[1])) {
-    const tr = table.createTHead().insertRow();
-    for (const c of tableCells(lineArrs[0])) {
-      const th = document.createElement('th');
-      th.append(...chunkNodes(c));
-      tr.appendChild(th);
-    }
-    body = lineArrs.slice(2);
-  }
-  const tb = table.createTBody();
-  for (const ln of body) {
-    if (isSep(ln)) continue;
-    const tr = tb.insertRow();
-    for (const c of tableCells(ln)) tr.insertCell().append(...chunkNodes(c));
-  }
-  return table;
 }
 
 /// Inline region (no block marks): headings, tables, paragraphs over
@@ -348,15 +433,6 @@ function renderInlineRegion(el, chars) {
       i++;
       continue;
     }
-    const isTableLine = (t) =>
-      t.trimStart().startsWith('|') && t.indexOf('|', t.indexOf('|') + 1) !== -1;
-    if (isTableLine(text)) {
-      flushPara();
-      const rows = [];
-      while (i < lines.length && isTableLine(lineText(lines[i]))) rows.push(lines[i++]);
-      el.appendChild(tableNode(rows));
-      continue;
-    }
     if (text.trim() === '') {
       flushPara();
       i++;
@@ -373,6 +449,7 @@ function renderBody(el, bodyObj) {
   if (!bodyObj) return;
   const spans = styledSpans(bodyObj);
   let i = 0;
+  let pos = 0; // absolute visible index (payloadAt addresses atoms by it)
   while (i < spans.length) {
     if (spans[i].codeblock !== null) {
       let lang = '';
@@ -380,6 +457,7 @@ function renderBody(el, bodyObj) {
       while (i < spans.length && spans[i].codeblock !== null) {
         lang = lang || spans[i].codeblock;
         text += spans[i].text;
+        pos += [...spans[i].text].length;
         i++;
       }
       const wrap = document.createElement('div');
@@ -398,6 +476,7 @@ function renderBody(el, bodyObj) {
       let tex = '';
       while (i < spans.length && spans[i].eqblock) {
         tex += spans[i].text;
+        pos += [...spans[i].text].length;
         i++;
       }
       const d = document.createElement('div');
@@ -408,7 +487,14 @@ function renderBody(el, bodyObj) {
       const chars = [];
       while (i < spans.length && spans[i].codeblock === null && !spans[i].eqblock) {
         for (const c of spans[i].text) {
-          chars.push({ c, code: spans[i].code, math: spans[i].math });
+          chars.push({
+            c,
+            code: spans[i].code,
+            math: spans[i].math,
+            comments: spans[i].comments,
+            idx: pos,
+          });
+          pos++;
         }
         i++;
       }
@@ -575,7 +661,65 @@ function renderEditor() {
   } else {
     renderBody(previewEl, currentBody);
   }
+  renderComments();
   prevBodyText = text;
+}
+
+function collectComments() {
+  if (!currentBody) return [];
+  const byKind = new Map();
+  let pos = 0;
+  for (const s of styledSpans(currentBody)) {
+    for (const c of s.text) {
+      for (const cm of s.comments) {
+        let e = byKind.get(cm.kind);
+        if (!e) {
+          e = { kind: cm.kind, text: cm.text, quote: '', start: pos, end: pos + 1 };
+          byKind.set(cm.kind, e);
+        }
+        e.quote += c;
+        e.end = pos + 1;
+      }
+      pos++;
+    }
+  }
+  return [...byKind.values()];
+}
+
+function renderComments() {
+  const panel = document.getElementById('comments');
+  const comments = viewMode === 'view' && current ? collectComments() : [];
+  if (comments.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = 'block';
+  panel.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'c-head';
+  head.textContent = `COMMENTS (${comments.length})`;
+  panel.appendChild(head);
+  for (const cm of comments) {
+    const row = document.createElement('div');
+    row.className = 'c-row';
+    const quote = document.createElement('span');
+    quote.className = 'c-quote';
+    quote.textContent = cm.quote;
+    const text = document.createElement('span');
+    text.className = 'c-text';
+    text.textContent = cm.text;
+    const del = document.createElement('span');
+    del.className = 'c-del';
+    del.textContent = '✕';
+    del.title = 'resolve (tombstone the comment mark)';
+    del.onclick = () => {
+      web.unmarkRange(currentBody, cm.start, cm.end, cm.kind);
+      persistSoon();
+      render();
+    };
+    row.append(quote, text, del);
+    panel.appendChild(row);
+  }
 }
 
 // ---- editing ----------------------------------------------------------------
@@ -661,7 +805,31 @@ function selectionLines(text, selStart, selEnd) {
   return [start, nl === -1 ? text.length : nl];
 }
 
+document.getElementById('insert-table').onclick = () => {
+  if (!current || viewMode !== 'edit') return;
+  const body = ensureBody();
+  const at = Math.min(bodyEl.selectionStart ?? bodyEl.value.length, bodyEl.value.length);
+  // A table is a seq of row refs; a row is a seq of cell refs; a cell is a
+  // text seq — a hashseq of hashseqs, embedded in the body as a link atom.
+  const tableOrigin = randOrigin();
+  const tableObj = web.createSeq(tableOrigin);
+  for (let r = 0; r < 2; r++) {
+    const rowOrigin = randOrigin();
+    const rowObj = web.createSeq(rowOrigin);
+    for (let c = 0; c < 2; c++) {
+      const cellOrigin = randOrigin();
+      web.createSeq(cellOrigin);
+      web.seqInsertRef(rowObj, c, cellOrigin);
+    }
+    web.seqInsertRef(tableObj, r, rowOrigin);
+  }
+  web.seqInsertRef(body, at, tableOrigin);
+  persistSoon();
+  setViewMode('view'); // tables live in the rendered face
+};
+
 for (const btn of document.querySelectorAll('#fmt-tools button')) {
+  if (!btn.dataset.mark) continue;
   btn.onclick = () => {
     if (!current || viewMode !== 'edit') return;
     const body = ensureBody();
@@ -671,7 +839,13 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
       [a, b] = selectionLines(bodyEl.value, a, b);
     }
     if (a >= b) return; // formatting needs a selection
-    if (kind === 'clear') {
+    if (kind === 'comment') {
+      const text = prompt('Comment:');
+      if (!text) return;
+      // One kind per comment: overlapping comments coexist (the same-kind
+      // overwrite hygiene is a formatting policy, not an annotation one).
+      web.markRange(body, a, b, `comment:${randTag()}`, text);
+    } else if (kind === 'clear') {
       for (const k of MARK_KINDS) web.unmarkRange(body, a, b, k);
     } else if (kind === 'codeblock') {
       const lang = prompt('language label (optional):', '') ?? '';
