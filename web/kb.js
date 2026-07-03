@@ -587,8 +587,18 @@ function renderTree() {
   }
   const clearTreeMarks = () => {
     for (const r of treeEl.querySelectorAll('.page-row')) {
-      r.classList.remove('drop-above', 'drop-below');
+      r.classList.remove('drop-above', 'drop-below', 'drop-into');
     }
+  };
+  // Three drop zones per row: top third = before, bottom third = after,
+  // middle = INTO (become a subpage — the target's children list already
+  // exists by derivation, even if it has never been touched).
+  const dropZone = (row, e) => {
+    const rect = row.getBoundingClientRect();
+    const y = e.clientY - rect.top;
+    if (y < rect.height * 0.3) return 'above';
+    if (y > rect.height * 0.7) return 'below';
+    return 'into';
   };
   const emit = (pages, depth) => {
     for (const p of pages) {
@@ -631,13 +641,13 @@ function renderTree() {
       row.ondragover = (e) => {
         if (!treeDrag) return;
         e.preventDefault();
-        const rect = row.getBoundingClientRect();
         clearTreeMarks();
+        const zone = dropZone(row, e);
         row.classList.add(
-          e.clientY < rect.top + rect.height / 2 ? 'drop-above' : 'drop-below',
+          zone === 'above' ? 'drop-above' : zone === 'below' ? 'drop-below' : 'drop-into',
         );
       };
-      row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
+      row.ondragleave = () => row.classList.remove('drop-above', 'drop-below', 'drop-into');
       row.ondrop = (e) => {
         if (!treeDrag) return;
         e.preventDefault();
@@ -649,18 +659,30 @@ function renderTree() {
         for (let anc = p; anc && pageMeta.has(anc); anc = pageMeta.get(anc).parentObj) {
           if (anc === src.pageObj) return;
         }
-        const rect = row.getBoundingClientRect();
-        const above = e.clientY < rect.top + rect.height / 2;
-        const slot = meta.idx + (above ? 0 : 1);
-        if (src.listObj === meta.listObj) {
-          if (slot === src.idx || slot === src.idx + 1) return;
-          web.seqMove(src.listObj, src.idx, slot); // same list: ONE Move op
-        } else {
-          // Reparent: a Move cannot cross containers (same-container rule),
-          // so this is remove + insert — a new atom, new identity.
+        const zone = dropZone(row, e);
+        if (zone === 'into') {
+          // Become a subpage: append to the drop target's children list
+          // (derived origin — it exists the moment we name it).
+          const target = childrenListOf(p);
           const origin = web.payloadAt(src.listObj, src.idx);
-          web.textRemove(src.listObj, src.idx, 1);
-          web.seqInsertRef(meta.listObj, slot, origin);
+          if (src.listObj === target) {
+            web.seqMove(src.listObj, src.idx, web.textLen(target)); // already a child: move to end
+          } else {
+            web.textRemove(src.listObj, src.idx, 1);
+            web.seqInsertRef(target, web.textLen(target), origin);
+          }
+        } else {
+          const slot = meta.idx + (zone === 'above' ? 0 : 1);
+          if (src.listObj === meta.listObj) {
+            if (slot === src.idx || slot === src.idx + 1) return;
+            web.seqMove(src.listObj, src.idx, slot); // same list: ONE Move op
+          } else {
+            // Reparent: a Move cannot cross containers (same-container
+            // rule), so this is remove + insert — a new atom, new identity.
+            const origin = web.payloadAt(src.listObj, src.idx);
+            web.textRemove(src.listObj, src.idx, 1);
+            web.seqInsertRef(meta.listObj, slot, origin);
+          }
         }
         persistSoon();
         render();
