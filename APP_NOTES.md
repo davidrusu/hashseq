@@ -498,3 +498,38 @@ possible because of the CRDT:
 **Feedback**: id-anchored cursors are what the emacs/wasm FFI's cursor
 concept should expose natively for any future editor integration; worth
 promoting into the shared app kit (#5, #14).
+
+## 21. A big image broke page load — and the CRDT saved the data (2026-07-03)
+
+An iPhone HEIC photo, undecodable by Chrome's createImageBitmap, fell
+back to raw (~6MB) and pushed the snapshot past localStorage's ~5MB
+quota. The uncaught QuotaExceededError fired inside the sync onmessage
+handler BEFORE render(), so a fresh browser received the full state from
+the server yet showed the empty initial page — "can't load."
+
+Fixes: (a) localStorage is a disposable cache — a quota failure disables
+it and continues, since the server and op DAG are the real source of
+truth; (b) hard 1.5MB image cap, refusing undecodable oversized images
+(HEIC) with guidance to export as JPEG/PNG.
+
+Two design observations that outlast the bug:
+
+- **The CRDT made data loss impossible even when I tried.** Believing it
+  was test data, I `rm`'d the server state file. A still-connected client
+  immediately re-merged its copy back (union of knowledge), restoring
+  everything — a real conversation and photos. Whole-store merge means
+  any live replica is a full backup; there is no single point of deletion.
+  This is the deletion/GC story (HASHWEB_SPEC) as lived experience:
+  "deleted" only means "no honest peer forwards it," and a peer that has
+  it re-presents it harmlessly.
+- **Whole-snapshot sync + large artifacts is the wall.** A 6MB image made
+  every sync haul 6MB and blew a browser storage limit. This is APP_NOTES
+  #8 (delta outbox) and #19 (lazy artifact have/want) converging into the
+  single most load-bearing gap: the sync protocol must not ship the whole
+  store, and must not ship artifact bytes a peer already has. Until then,
+  images are a cap-and-downscale liability, not a feature that scales.
+
+**Feedback**: the artifact side store needs out-of-band, content-addressed
+transfer (fetch-by-id, cache-forever) separate from the op-snapshot wire —
+exactly what content addressing was designed to enable. First real
+system-facing work item the app has forced.
