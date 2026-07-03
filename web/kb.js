@@ -1251,6 +1251,31 @@ function collectComments() {
 }
 
 let activeCommentTag = null;
+let pendingComposeTag = null; // focus this comment's composer after render
+
+/// Replace (or delete, when `next` is empty) message `idx` in a thread —
+/// messages are the non-empty newline-delimited lines.
+function replaceThreadMessage(thread, idx, next) {
+  const text = web.text(thread);
+  let off = 0;
+  let mi = 0;
+  for (const line of text.split('\n')) {
+    if (line !== '') {
+      if (mi === idx) {
+        if (next === line) return;
+        if (next) {
+          if (line.length) web.textRemove(thread, off, line.length);
+          web.textInsert(thread, off, next);
+        } else {
+          web.textRemove(thread, off, line.length + 1); // line + newline
+        }
+        return;
+      }
+      mi++;
+    }
+    off += line.length + 1;
+  }
+}
 
 function setCommentHighlight(kind, on) {
   for (const el of document.querySelectorAll('.comment-hl')) {
@@ -1284,16 +1309,46 @@ function renderComments() {
     quote.title = cm.fragments.length > 1 ? `${cm.fragments.length} fragments` : '';
     card.appendChild(quote);
 
-    for (const msg of cm.messages) {
+    cm.messages.forEach((msg, idx) => {
       const m = document.createElement('div');
       m.className = 'cc-msg';
       m.textContent = msg;
+      m.title = 'click to edit';
+      m.onclick = (e) => {
+        e.stopPropagation();
+        if (m.isContentEditable) return;
+        m.contentEditable = 'plaintext-only';
+        m.classList.add('editing');
+        m.focus();
+        const r = document.createRange();
+        r.selectNodeContents(m);
+        r.collapse(false);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+        const commit = () => {
+          m.onblur = null;
+          replaceThreadMessage(cm.thread, idx, m.textContent.trim());
+          persistSoon();
+          renderComments();
+        };
+        m.onblur = commit;
+        m.onkeydown = (ev) => {
+          if (ev.key === 'Enter' && !ev.shiftKey) {
+            ev.preventDefault();
+            commit();
+          } else if (ev.key === 'Escape') {
+            m.onblur = null;
+            renderComments();
+          }
+        };
+      };
       card.appendChild(m);
-    }
+    });
 
     const reply = document.createElement('input');
     reply.className = 'cc-reply';
-    reply.placeholder = 'reply…';
+    reply.placeholder = cm.messages.length === 0 ? 'write a comment…' : 'reply…';
     reply.onclick = (e) => e.stopPropagation();
     reply.onkeydown = (e) => {
       if (e.key !== 'Enter' || !reply.value.trim()) return;
@@ -1335,6 +1390,10 @@ function renderComments() {
       if (activeCommentTag) card.classList.add('active');
     };
     panel.appendChild(card);
+    if (pendingComposeTag === cm.kind) {
+      pendingComposeTag = null;
+      setTimeout(() => reply.focus(), 0);
+    }
   }
   if (activeCommentTag) setCommentHighlight(activeCommentTag, true);
 }
@@ -1527,15 +1586,13 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
       // discussion thread is the seq opened AT the tag — no pointer.
       const frags = selectionFragments();
       if (frags.length === 0) return;
-      const text = prompt('Comment:');
-      if (!text) return;
       const tag = randOrigin();
-      const thread = web.createSeq(tag);
-      web.textInsert(thread, 0, `${text.trim()}\n`);
+      web.createSeq(tag); // the thread starts empty — composed in the panel
       for (const f of frags) {
         web.markRange(f.obj, f.a, f.b, `comment:${tag}`, 'on');
       }
       activeCommentTag = `comment:${tag}`;
+      pendingComposeTag = `comment:${tag}`;
       persistSoon();
       render();
       return;

@@ -228,7 +228,11 @@
     text-overflow:ellipsis; border-left:2px solid var(--amber); padding-left:6px;
     margin-bottom:5px;
   }
-  .cc-msg { padding:2px 0; line-height:1.45; }
+  .cc-msg { padding:2px 0; line-height:1.45; cursor:text; }
+  .cc-msg.editing {
+    border:1px solid var(--ink); background:var(--paper2); padding:3px 6px;
+    outline:none;
+  }
   .cc-msg + .cc-msg { border-top:1px dotted var(--grid); margin-top:3px; padding-top:5px; }
   .cc-reply {
     width:100%; margin-top:6px; font-family:inherit; font-size:11px;
