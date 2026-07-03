@@ -2869,27 +2869,27 @@ document.getElementById('panel-backdrop').onclick = () => {
 
 // ---- visual themes ------------------------------------------------------------
 
-// Themes are pure CSS-variable sets on body[data-theme]; 'field' is the
-// bare :root default. Cycle with the header button, remembered per-browser.
-const THEMES = ['field', 'gallery', 'terminal', 'nord'];
+// Themes are CSS-variable sets plus structural overrides on body[data-theme],
+// cycled with the header button and remembered per-browser. Device state, not
+// document state — deliberately never synced.
+const THEMES = ['gallery', 'editorial', 'poster', 'zen', 'terminal', 'nord'];
 const THEME_KEY = 'hashweb-kb-theme';
 const themeToggleEl = document.getElementById('theme-toggle');
 
 function applyTheme(name) {
-  if (name === 'field') delete document.body.dataset.theme;
-  else document.body.dataset.theme = name;
+  document.body.dataset.theme = name;
   themeToggleEl.textContent = '◧ ' + name.toUpperCase();
 }
 
 try {
   const saved = localStorage.getItem(THEME_KEY);
-  applyTheme(THEMES.includes(saved) ? saved : 'field');
+  applyTheme(THEMES.includes(saved) ? saved : 'gallery');
 } catch (_) {
-  applyTheme('field');
+  applyTheme('gallery');
 }
 
 themeToggleEl.onclick = () => {
-  const cur = document.body.dataset.theme ?? 'field';
+  const cur = document.body.dataset.theme ?? 'gallery';
   const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
   applyTheme(next);
   try {

@@ -86,6 +86,65 @@
     --shadow-panel-r:4px 0 16px rgba(0,0,0,0.45);
     --radius:4px;
   }
+  /* EDITORIAL — serif magazine, no card, big display title */
+  body[data-theme="editorial"] {
+    --paper:#F7F5EF; --paper2:#FFFFFF; --ink:#1C1B18; --muted:#8D8779;
+    --red:#C42B1E; --green:#2F6B4F; --amber:#B8860B; --grid:#E4E0D4; --line:#C9C4B6;
+    --blue:#1F4FA0;
+    --hover:#EDEAE0; --code-bg:#EDEAE0;
+    --card:transparent; --panel:transparent; --chrome:rgba(247,245,239,0.95);
+    --focus-bg:#FFFFFF; --backdrop:rgba(28,27,24,0.25); --dot:transparent;
+    --tb-bg:#1C1B18; --tb-fg:#F7F5EF; --tb-hover:#45423a;
+    --c-underline:rgba(184,134,11,0.6); --c-active:rgba(184,134,11,0.25);
+    --math-live:rgba(31,79,160,0.08); --danger-soft:rgba(196,43,30,0.05);
+    --shadow-card:none;
+    --shadow-menu:0 3px 14px rgba(28,27,24,0.15);
+    --shadow-pop:0 3px 10px rgba(28,27,24,0.2);
+    --shadow-img:0 2px 10px rgba(28,27,24,0.15);
+    --shadow-panel:-4px 0 16px rgba(28,27,24,0.12);
+    --shadow-panel-r:4px 0 16px rgba(28,27,24,0.12);
+    --font:'Charter','Iowan Old Style',Georgia,'Times New Roman',serif;
+    --radius:0px;
+  }
+  /* POSTER — neo-brutalist: blocks as cards, thick borders, hard shadows */
+  body[data-theme="poster"] {
+    --paper:#F7F1E3; --paper2:#FFFFFF; --ink:#141414; --muted:#6E6759;
+    --red:#E8442E; --green:#0F8A5F; --amber:#FFD43B; --grid:#E6DECB; --line:#141414;
+    --blue:#2B6EF2;
+    --hover:#FFE9A8; --code-bg:#FFF3C4;
+    --card:#FFFFFF; --panel:#F7F1E3; --chrome:#F7F1E3;
+    --focus-bg:#FFFDF5; --backdrop:rgba(20,20,20,0.3); --dot:#E6DECB;
+    --tb-bg:#141414; --tb-fg:#FFD43B; --tb-hover:#3a3a3a;
+    --c-underline:rgba(232,68,46,0.6); --c-active:rgba(255,212,59,0.5);
+    --math-live:rgba(43,110,242,0.1); --danger-soft:rgba(232,68,46,0.07);
+    --shadow-card:6px 6px 0 #141414;
+    --shadow-menu:5px 5px 0 #141414;
+    --shadow-pop:4px 4px 0 #141414;
+    --shadow-img:5px 5px 0 #141414;
+    --shadow-panel:-6px 0 0 #141414;
+    --shadow-panel-r:6px 0 0 #141414;
+    --font:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    --radius:8px;
+  }
+  /* ZEN — chrome disappears, narrow centered measure, tall leading */
+  body[data-theme="zen"] {
+    --paper:#F5F5F2; --paper2:#EDEDE9; --ink:#43423D; --muted:#B3B2AA;
+    --red:#B0674F; --green:#6E8B74; --amber:#C2A36B; --grid:#E6E6E1; --line:#DDDDD7;
+    --blue:#7C9AA6;
+    --hover:#ECECE7; --code-bg:#ECECE7;
+    --card:transparent; --panel:transparent; --chrome:transparent;
+    --focus-bg:rgba(255,255,255,0.6); --backdrop:rgba(67,66,61,0.2); --dot:transparent;
+    --tb-bg:#43423D; --tb-fg:#F5F5F2; --tb-hover:#5c5b54;
+    --c-underline:rgba(194,163,107,0.5); --c-active:rgba(194,163,107,0.22);
+    --math-live:rgba(124,154,166,0.12); --danger-soft:rgba(176,103,79,0.06);
+    --shadow-card:none;
+    --shadow-menu:0 4px 16px rgba(67,66,61,0.12);
+    --shadow-pop:0 3px 10px rgba(67,66,61,0.15);
+    --shadow-img:0 1px 8px rgba(67,66,61,0.12);
+    --shadow-panel:-4px 0 14px rgba(67,66,61,0.1);
+    --shadow-panel-r:4px 0 14px rgba(67,66,61,0.1);
+    --radius:2px;
+  }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
   body {
@@ -443,9 +502,66 @@
   body[data-theme="gallery"] .block-ed { font-size:15px; }
   body[data-theme="gallery"] #title { font-size:27px; letter-spacing:0; }
   body[data-theme="gallery"] #page { border-color:transparent; }
+  /* ---- theme structure: EDITORIAL ---- */
+  body[data-theme="editorial"] #page { border:none; box-shadow:none; max-width:52rem; padding-top:36px; }
+  body[data-theme="editorial"] #title {
+    font-size:42px; font-weight:700; letter-spacing:-0.5px;
+    border-bottom:3px solid var(--ink); padding-bottom:12px; margin-bottom:8px;
+  }
+  body[data-theme="editorial"] .block-ed { font-size:17px; line-height:1.8; }
+  body[data-theme="editorial"] .block-ed.bl-h1 { font-size:28px; }
+  body[data-theme="editorial"] .block-ed.bl-h2 { font-size:22px; }
+  body[data-theme="editorial"] header { border-bottom:1px solid var(--ink); }
+  body[data-theme="editorial"] .fmt-hint { display:none; }
+
+  /* ---- theme structure: POSTER ---- */
+  body[data-theme="poster"] header { border-bottom:3px solid var(--ink); }
+  body[data-theme="poster"] header .brand {
+    background:var(--amber); border:2px solid var(--ink); padding:3px 10px; letter-spacing:4px;
+  }
+  body[data-theme="poster"] footer { border-top:3px solid var(--ink); }
+  body[data-theme="poster"] #sidebar { border-right:3px solid var(--ink); }
+  body[data-theme="poster"] #comments { border-left:3px solid var(--ink); }
+  body[data-theme="poster"] button { border:2px solid var(--ink); box-shadow:3px 3px 0 var(--ink); font-weight:700; }
+  body[data-theme="poster"] button:hover { transform:translate(2px,2px); box-shadow:1px 1px 0 var(--ink); }
+  body[data-theme="poster"] #sel-toolbar button { border:none; box-shadow:none; }
+  body[data-theme="poster"] #sel-toolbar button:hover { transform:none; }
+  body[data-theme="poster"] #page { border:3px solid var(--ink); }
+  body[data-theme="poster"] #title { font-size:38px; font-weight:800; text-transform:uppercase; letter-spacing:1.5px; }
+  body[data-theme="poster"] #blocks > .block-col, body[data-theme="poster"] #blocks > .node-container .block-col {
+    background:var(--paper2); border:2px solid var(--ink); box-shadow:4px 4px 0 var(--ink);
+    border-radius:var(--radius); padding:4px 10px;
+  }
+  body[data-theme="poster"] #blocks > .block-col { margin:12px 0; }
+  body[data-theme="poster"] .page-row.active { background:var(--amber); }
+
+  /* ---- theme structure: ZEN ---- */
+  body[data-theme="zen"] header, body[data-theme="zen"] footer {
+    border-color:transparent; opacity:0.3; transition:opacity 0.25s ease-out;
+  }
+  body[data-theme="zen"] header:hover, body[data-theme="zen"] footer:hover { opacity:1; }
+  body[data-theme="zen"] #sidebar {
+    border-color:transparent; opacity:0.35; transition:opacity 0.25s ease-out;
+    width:230px; min-width:230px;
+  }
+  body[data-theme="zen"] #sidebar:hover { opacity:1; }
+  body[data-theme="zen"] #comments { border-color:transparent; opacity:0.5; transition:opacity 0.25s ease-out; }
+  body[data-theme="zen"] #comments:hover { opacity:1; }
+  body[data-theme="zen"] #page { border:none; box-shadow:none; max-width:40rem; padding-top:48px; }
+  body[data-theme="zen"] #title { font-size:19px; font-weight:600; text-align:center; letter-spacing:2px; }
+  body[data-theme="zen"] #crumbs { opacity:0.45; }
+  body[data-theme="zen"] .fmt-hint { display:none; }
+  body[data-theme="zen"] .block-ed { line-height:1.95; }
 </style>
 </head>
 <body>
+  <script>
+    try {
+      var t = localStorage.getItem('hashweb-kb-theme');
+      var ok = ['gallery','editorial','poster','zen','terminal','nord'];
+      document.body.dataset.theme = ok.indexOf(t) >= 0 ? t : 'gallery';
+    } catch (e) { document.body.dataset.theme = 'gallery'; }
+  </script>
   <header>
     <div class="h-left">
       <button id="nav-toggle" title="pages">☰</button>
@@ -453,7 +569,7 @@
     </div>
     <div class="h-right">
       <div class="fig">FIG. 03 — KNOWLEDGE BASE ON A FLAT STORE OF OBJECTS</div>
-      <button id="theme-toggle" title="cycle visual theme">◧ FIELD</button>
+      <button id="theme-toggle" title="cycle visual theme">◧ GALLERY</button>
       <button id="comments-toggle" title="comments">💬 <span id="ct-count">0</span></button>
     </div>
   </header>
