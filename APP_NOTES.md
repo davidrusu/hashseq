@@ -690,3 +690,23 @@ POSTER possible — "each block is a card" was one CSS rule because blocks
 are already discrete nodes. A textarea-per-page design could never have
 done this. View/model separation keeps paying: six themes, zero data
 migrations.
+
+---
+
+## 27 — FABLE, a personal theme
+
+The user asked for a theme in my own style. FABLE is a twilight
+manuscript: the premise is that a document has two voices — the human's
+prose and the machine's structure — and they should wear different
+clothes. Prose is warm serif (Charter, 16px, 1.85 leading) in candlelight
+cream; everything structural (headings, chrome, buttons, labels) is small
+letterspaced mono caps in gold, like a librarian's annotations. The app
+itself is an indigo night — faint moonlight gradient, star-dot grid — and
+the page floats in it with a soft gold ring. Math is periwinkle. Every
+page ends with an asterism (⁂), the old typographic mark for "a break,
+but not an ending."
+
+Headings are deliberately SMALLER than body text — hierarchy by contrast
+of register (mono caps vs serif) rather than by size. On a flat store
+where structure is emergent from marks and refs, it felt right that
+structure whispers instead of shouts.
