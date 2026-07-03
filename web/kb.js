@@ -385,7 +385,8 @@ function objTableNode(tableObj) {
       td.contentEditable = 'plaintext-only';
       td.textContent = web.text(cellObj);
       td.dataset.prev = td.textContent;
-      td.addEventListener('input', () => {
+      td.addEventListener('input', (e) => {
+        e.stopPropagation(); // the cell's ops are its own, not the block's
         applyDiff(cellObj, td.dataset.prev, td.textContent);
         td.dataset.prev = td.textContent;
         persistSoon();
@@ -741,10 +742,250 @@ function migrateLegacyBody(bodyObj) {
   persistSoon();
 }
 
-function autosize(ta) {
-  ta.style.height = 'auto';
-  ta.style.height = `${ta.scrollHeight}px`;
+// ---- WYSIWYG machinery --------------------------------------------------
+//
+// Each block is a contenteditable div rendered from markedSpans: marks show
+// while editing; math/equations/embeds are atomic widgets carrying their
+// underlying text in data-text. Edits are extracted from the DOM (widgets
+// contribute data-text) and diffed into seq ops — the DOM is a *view* of
+// the seq, and the seq stays the source of truth.
+
+function extractText(node) {
+  let out = '';
+  for (const child of node.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE) out += child.data;
+    else if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    else if (child.dataset && child.dataset.text != null) out += child.dataset.text;
+    else if (child.tagName === 'BR') out += '\n';
+    else out += extractText(child);
+  }
+  return out;
 }
+
+function offsetOfPoint(blockEl, container, offset) {
+  const r = document.createRange();
+  r.selectNodeContents(blockEl);
+  r.setEnd(container, offset);
+  const div = document.createElement('div');
+  div.appendChild(r.cloneContents());
+  return extractText(div).length;
+}
+
+function caretOffsetIn(blockEl) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return null;
+  const range = sel.getRangeAt(0);
+  if (!blockEl.contains(range.startContainer)) return null;
+  return offsetOfPoint(blockEl, range.startContainer, range.startOffset);
+}
+
+function selectionOffsetsIn(blockEl) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return null;
+  const range = sel.getRangeAt(0);
+  if (!blockEl.contains(range.startContainer) || !blockEl.contains(range.endContainer)) {
+    return null;
+  }
+  return [
+    offsetOfPoint(blockEl, range.startContainer, range.startOffset),
+    offsetOfPoint(blockEl, range.endContainer, range.endOffset),
+  ];
+}
+
+/// Locate text offset `target` as a (node, offset) DOM point.
+function locateOffset(blockEl, target) {
+  let remaining = target;
+  const visit = (node) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        if (remaining <= child.data.length) return { node: child, offset: remaining };
+        remaining -= child.data.length;
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        if (child.dataset && child.dataset.text != null) {
+          const len = child.dataset.text.length;
+          if (remaining < len) return { node: child.parentNode, after: child };
+          remaining -= len;
+        } else if (child.tagName === 'BR') {
+          if (remaining <= 0) return { node: child.parentNode, before: child };
+          remaining -= 1;
+        } else {
+          const hit = visit(child);
+          if (hit) return hit;
+        }
+      }
+    }
+    return null;
+  };
+  return visit(blockEl);
+}
+
+function setSelectionRangeIn(blockEl, a, b) {
+  const r = document.createRange();
+  const place = (target, setter) => {
+    const hit = locateOffset(blockEl, target);
+    if (!hit) {
+      r[setter === 'start' ? 'setStart' : 'setEnd'](blockEl, blockEl.childNodes.length);
+    } else if (hit.after) {
+      r[setter === 'start' ? 'setStartAfter' : 'setEndAfter'](hit.after);
+    } else if (hit.before) {
+      r[setter === 'start' ? 'setStartBefore' : 'setEndBefore'](hit.before);
+    } else {
+      r[setter === 'start' ? 'setStart' : 'setEnd'](hit.node, hit.offset);
+    }
+  };
+  place(a, 'start');
+  place(b ?? a, 'end');
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
+function makeWidget(inner, text, cls) {
+  const w = document.createElement('span');
+  w.className = `inline-widget ${cls}`;
+  w.contentEditable = 'false';
+  w.dataset.text = text;
+  w.appendChild(inner);
+  return w;
+}
+
+/// Double-click a math/equation widget to edit its source: replace the
+/// region's chars in place — the mark's regional points survive, so the
+/// new source stays inside the math region.
+function widgetSourceEditor(w, blockObj, ed, label) {
+  w.ondblclick = () => {
+    const src = prompt(`${label}:`, w.dataset.text);
+    if (src == null || src === w.dataset.text) return;
+    const off = offsetOfPoint(ed, ...rangePointBefore(w));
+    web.textRemove(blockObj, off, [...w.dataset.text].length);
+    if (src.length > 0) web.textInsert(blockObj, off, src);
+    persistSoon();
+    rerenderBlock(ed, blockObj, off + [...src].length);
+    if (viewMode === 'split') renderPreview();
+  };
+}
+
+function rangePointBefore(node) {
+  return [node.parentNode, [...node.parentNode.childNodes].indexOf(node)];
+}
+
+/// Render a block's content as editable, formatted DOM.
+function renderEditableInto(ed, blockObj) {
+  ed.innerHTML = '';
+  renderTargetObj = blockObj;
+  const spans = styledSpans(blockObj);
+  let i = 0;
+  let pos = 0;
+  while (i < spans.length) {
+    if (spans[i].codeblock !== null) {
+      let text = '';
+      while (i < spans.length && spans[i].codeblock !== null) {
+        text += spans[i].text;
+        pos += [...spans[i].text].length;
+        i++;
+      }
+      // Editable in place: an inline shaded region (spans whole lines, so
+      // it reads as a block) whose chars are the region's chars exactly.
+      const region = document.createElement('span');
+      region.className = 'cb-region';
+      region.appendChild(document.createTextNode(text));
+      ed.appendChild(region);
+    } else if (spans[i].eqblock) {
+      let tex = '';
+      while (i < spans.length && spans[i].eqblock) {
+        tex += spans[i].text;
+        pos += [...spans[i].text].length;
+        i++;
+      }
+      const w = makeWidget(mathNode(tex.trim(), true), tex, 'w-eq');
+      w.title = 'double-click to edit the equation source';
+      widgetSourceEditor(w, blockObj, ed, 'Equation (TeX)');
+      ed.appendChild(w);
+    } else {
+      const chars = [];
+      while (i < spans.length && spans[i].codeblock === null && !spans[i].eqblock) {
+        for (const c of spans[i].text) {
+          chars.push({
+            c,
+            code: spans[i].code,
+            math: spans[i].math,
+            comments: spans[i].comments,
+            idx: pos,
+          });
+          pos++;
+        }
+        i++;
+      }
+      emitEditableChunks(ed, chars, blockObj);
+    }
+  }
+}
+
+function emitEditableChunks(ed, chars, blockObj) {
+  let k = 0;
+  while (k < chars.length) {
+    const first = chars[k];
+    if (first.c === ATOM) {
+      const inner = renderEmbed(first.idx);
+      const isLink = inner.classList?.contains('page-link');
+      const w = makeWidget(inner, ATOM, isLink ? 'w-link' : 'w-embed');
+      ed.appendChild(w);
+      k++;
+      continue;
+    }
+    if (first.math) {
+      let src = '';
+      while (k < chars.length && chars[k].math && chars[k].c !== ATOM) {
+        src += chars[k].c;
+        k++;
+      }
+      const w = makeWidget(mathNode(src, false), src, 'w-math');
+      w.title = 'double-click to edit the math source';
+      widgetSourceEditor(w, blockObj, ed, 'Math (TeX)');
+      ed.appendChild(w);
+      continue;
+    }
+    const { code } = first;
+    const ckey = commentKey(first.comments);
+    let text = '';
+    while (
+      k < chars.length &&
+      chars[k].c !== ATOM &&
+      !chars[k].math &&
+      chars[k].code === code &&
+      commentKey(chars[k].comments) === ckey
+    ) {
+      text += chars[k].c;
+      k++;
+    }
+    if (!text) continue;
+    let node = document.createTextNode(text);
+    if (code) {
+      const c = document.createElement('code');
+      c.appendChild(node);
+      node = c;
+    }
+    if (first.comments.length > 0) {
+      const hl = document.createElement('span');
+      hl.className = 'comment-hl';
+      hl.title = first.comments.map((x) => x.text).join('\n');
+      hl.appendChild(node);
+      node = hl;
+    }
+    ed.appendChild(node);
+  }
+}
+
+function rerenderBlock(ed, blockObj, caretOff) {
+  renderEditableInto(ed, blockObj);
+  ed.dataset.prev = extractText(ed);
+  if (caretOff != null) {
+    ed.focus();
+    setSelectionRangeIn(ed, Math.min(caretOff, ed.dataset.prev.length));
+  }
+}
+
+let normalizeTimer = null;
 
 function clearDropMarks() {
   for (const r of blocksEl.querySelectorAll('.block-row')) {
@@ -754,9 +995,9 @@ function clearDropMarks() {
 
 function renderBlocks() {
   const blocks = blocksOf(currentBody);
-  const active = document.activeElement;
-  const keepObj = active?.dataset?.blockObj ?? null;
-  const keepSel = keepObj ? [active.selectionStart, active.selectionEnd] : null;
+  const activeEd = document.activeElement?.closest?.('.block-ed') ?? null;
+  const keepObj = activeEd?.dataset?.blockObj ?? null;
+  const keepCaret = activeEd ? caretOffsetIn(activeEd) : null;
   blocksEl.innerHTML = '';
 
   blocks.forEach((b, i) => {
@@ -802,23 +1043,50 @@ function renderBlocks() {
       render();
     };
 
-    const ta = document.createElement('textarea');
+    const ta = document.createElement('div');
+    ta.className = 'block-ed';
+    ta.contentEditable = 'true';
     ta.spellcheck = false;
-    ta.rows = 1;
-    ta.placeholder = i === 0 && blocks.length === 1 ? 'Type here…' : '';
-    ta.value = web.text(b.obj);
-    ta.dataset.prev = ta.value;
+    if (i === 0 && blocks.length === 1) ta.dataset.placeholder = 'Type here…';
+    renderEditableInto(ta, b.obj);
+    ta.dataset.prev = extractText(ta);
     ta.dataset.blockObj = b.obj;
-    ta.oninput = () => {
-      applyDiff(b.obj, ta.dataset.prev, ta.value);
-      ta.dataset.prev = ta.value;
-      autosize(ta);
+    ta.addEventListener('beforeinput', (e) => {
+      if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
+        // Keep the DOM plain: newlines are text, never <div>/<br> soup.
+        e.preventDefault();
+        document.execCommand('insertText', false, '\n');
+      }
+    });
+    ta.addEventListener('paste', (e) => {
+      e.preventDefault();
+      document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
+    });
+    ta.addEventListener('input', (e) => {
+      if (e.isComposing) return;
+      // Table cells inside embed widgets stopPropagation; anything else
+      // reaching here edits the block's own text.
+      const next = extractText(ta);
+      applyDiff(b.obj, ta.dataset.prev, next);
+      ta.dataset.prev = next;
       if (viewMode === 'split') {
         renderPreview();
         renderComments();
       }
       persistSoon();
-    };
+      // Reconcile styling drift (typing at mark edges) once typing pauses.
+      clearTimeout(normalizeTimer);
+      normalizeTimer = setTimeout(() => {
+        if (document.activeElement === ta || ta.contains(document.activeElement)) {
+          rerenderBlock(ta, b.obj, caretOffsetIn(ta));
+        }
+      }, 900);
+    });
+    ta.addEventListener('drop', (e) => {
+      // Text drops would splice DOM we don't control; block reorders are
+      // handled by the row.
+      if (dragFrom === null) e.preventDefault();
+    });
     ta.onfocus = () => {
       focusedBlockObj = b.obj;
     };
@@ -856,15 +1124,13 @@ function renderBlocks() {
     }
   };
 
-  for (const ta of blocksEl.querySelectorAll('textarea')) {
-    autosize(ta);
-    if (keepObj && ta.dataset.blockObj === keepObj) {
-      ta.focus();
-      if (keepSel) {
-        ta.setSelectionRange(
-          Math.min(keepSel[0], ta.value.length),
-          Math.min(keepSel[1], ta.value.length),
-        );
+  if (keepObj) {
+    for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+      if (ed.dataset.blockObj === keepObj) {
+        ed.focus();
+        if (keepCaret != null) {
+          setSelectionRangeIn(ed, Math.min(keepCaret, extractText(ed).length));
+        }
       }
     }
   }
@@ -878,8 +1144,8 @@ function addBlockAtEnd(focus = true) {
   persistSoon();
   render();
   if (focus) {
-    const tas = blocksEl.querySelectorAll('textarea');
-    tas[tas.length - 1]?.focus();
+    const eds = blocksEl.querySelectorAll('.block-ed');
+    eds[eds.length - 1]?.focus();
   }
 }
 
@@ -967,19 +1233,23 @@ function ensureBody() {
   return currentBody;
 }
 
-/// The toolbar's target: the focused block textarea, or the last-focused
-/// one (clicking a toolbar button blurs the textarea; its selection
-/// survives on the element).
+/// The toolbar's target block editor. Toolbar buttons preventDefault on
+/// mousedown, so focus and selection stay in the block while clicking.
 function focusedTA() {
-  const el = document.activeElement;
-  if (el?.dataset?.blockObj) return el;
+  const el = document.activeElement?.closest?.('.block-ed');
+  if (el) return el;
   if (focusedBlockObj) {
-    for (const ta of blocksEl.querySelectorAll('textarea')) {
-      if (ta.dataset.blockObj === focusedBlockObj) return ta;
+    for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+      if (ed.dataset.blockObj === focusedBlockObj) return ed;
     }
   }
   return null;
 }
+
+// Keep editor focus/selection through toolbar clicks.
+document.getElementById('fmt-tools').addEventListener('mousedown', (e) => {
+  if (e.target.tagName === 'BUTTON') e.preventDefault();
+});
 
 let titleTimer = null;
 titleEl.addEventListener('input', () => {
@@ -1035,7 +1305,7 @@ document.getElementById('insert-table').onclick = () => {
   const ta = focusedTA();
   if (!ta) return;
   const blockObj = ta.dataset.blockObj;
-  const at = Math.min(ta.selectionStart ?? ta.value.length, ta.value.length);
+  const at = caretOffsetIn(ta) ?? extractText(ta).length;
   // A table is a seq of row refs; a row is a seq of cell refs; a cell is a
   // text seq — a hashseq of hashseqs, embedded as a link atom.
   const tableOrigin = randOrigin();
@@ -1052,7 +1322,8 @@ document.getElementById('insert-table').onclick = () => {
   }
   web.seqInsertRef(blockObj, at, tableOrigin);
   persistSoon();
-  setViewMode(viewMode === 'edit' ? 'split' : viewMode); // show the table, keep editing
+  rerenderBlock(ta, blockObj, at + 1); // the table appears in place
+  if (viewMode === 'split') renderPreview();
 };
 
 document.getElementById('insert-link').onclick = (e) => {
@@ -1060,7 +1331,7 @@ document.getElementById('insert-link').onclick = (e) => {
   const ta = focusedTA();
   if (!ta) return;
   const blockObj = ta.dataset.blockObj;
-  const at = Math.min(ta.selectionStart ?? ta.value.length, ta.value.length);
+  const at = caretOffsetIn(ta) ?? extractText(ta).length;
   document.getElementById('link-menu')?.remove();
 
   const menu = document.createElement('div');
@@ -1081,9 +1352,8 @@ document.getElementById('insert-link').onclick = (e) => {
         // The link atom's payload is the page's OBJECT id — a pure name.
         web.seqInsertRef(blockObj, at, p);
         persistSoon();
+        rerenderBlock(ta, blockObj, at + 1); // the link appears in place
         if (viewMode === 'split') renderPreview();
-        ta.focus();
-        ta.setSelectionRange(at + 1, at + 1);
       };
       menu.appendChild(item);
       emit(meta.subpages, depth + 1);
@@ -1112,10 +1382,12 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
     const ta = focusedTA();
     if (!ta) return;
     const blockObj = ta.dataset.blockObj;
-    let [a, b] = [ta.selectionStart, ta.selectionEnd];
+    const sel = selectionOffsetsIn(ta);
+    if (!sel) return;
+    let [a, b] = sel;
     const kind = btn.dataset.mark;
     if (kind === 'codeblock' || kind === 'eqblock') {
-      [a, b] = selectionLines(ta.value, a, b);
+      [a, b] = selectionLines(extractText(ta), a, b);
     }
     if (a >= b) return; // formatting needs a selection
     if (kind === 'comment') {
@@ -1133,12 +1405,13 @@ for (const btn of document.querySelectorAll('#fmt-tools button')) {
       web.markRange(blockObj, a, b, kind, 'on');
     }
     persistSoon();
+    rerenderBlock(ta, blockObj, null); // formatting appears in place
+    setSelectionRangeIn(ta, a, b);
+    ta.focus();
     if (viewMode === 'split') {
       renderPreview();
       renderComments();
     }
-    ta.focus();
-    ta.setSelectionRange(a, b);
   };
 }
 

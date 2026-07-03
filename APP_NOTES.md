@@ -279,3 +279,40 @@ capabilities. Note #1's asymmetry became a live UI distinction:
 
 **Feedback**: reinforces #1 and #6. If a second app appears, the tagged
 value vocabulary should be shared, not re-invented.
+
+## 14. WYSIWYG: the DOM as a view of the seq (2026-07-03)
+
+The textarea editor is gone; blocks are contenteditable divs rendered from
+`markedSpans` — formatting visible while typing, closing note #9's gap.
+The architecture that made it tractable:
+
+- **The seq stays the source of truth; the DOM is a view.** Every input
+  event extracts plain text from the DOM (atomic widgets contribute their
+  `data-text`; math widgets carry their TeX source, embeds/links carry
+  U+FFFC) and diffs it into seq ops. The browser's own edit is left in
+  place during typing; a debounced normalize re-renders from spans and
+  restores the caret by text offset, reconciling any styling drift at mark
+  edges.
+- **Atomic widgets solve the render-vs-source problem.** KaTeX output is
+  not text — so math renders as a `contenteditable=false` island whose
+  extraction value is the source. Double-click replaces the region's chars
+  in place, and the mark's regional points survive the replacement (the
+  ghosts hold the region), so re-entered source stays math. Regional mark
+  semantics did the heavy lifting again.
+- **Newlines as text, never markup**: Enter is intercepted to insert a
+  literal `\n` (pre-wrap rendering), so extraction never has to interpret
+  `<br>`/`<div>` soup and offsets stay exact.
+- Small tricks that mattered: toolbar `mousedown` preventDefault keeps the
+  editor's selection alive through button clicks; table cells
+  stopPropagation so embed edits never double-apply as block edits; text
+  drops into the editor are blocked (they'd splice DOM the extractor
+  doesn't own).
+
+Honest gaps: IME composition is best-effort; a comment can still not span
+blocks; typing at a code-span edge shows correct CRDT behavior only after
+the normalize pass catches up (~1s).
+
+**Feedback**: no system changes needed — `markedSpans` + `payloadAt` were
+sufficient to drive a real WYSIWYG. The offset-mapping layer (DOM point ↔
+visible index) is app code any editor will need; it belongs in the shared
+app-layer kit alongside note #5's wrappers.
