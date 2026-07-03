@@ -27,7 +27,7 @@ const WS_ORIGIN = (() => {
   return hex(bytes);
 })();
 
-const STORAGE_KEY = 'hashweb-kb-snapshot';
+const STORAGE_KEY = 'hashweb-kb-snapshot-v2'; // v2: tree = nested children seqs
 
 function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -82,10 +82,23 @@ function stringsOf(obj, key) {
   return r.values.filter((v) => v.type === 'string').map((v) => v.value);
 }
 
-function pageKeysOf(obj) {
-  return JSON.parse(web.keys(obj))
-    .filter((k) => k.startsWith('page:'))
-    .sort();
+/// Every object implicitly owns an ordered children list: a seq whose
+/// origin derives deterministically from the object's id (the app-layer
+/// twin of object_id derivation — no pointer key, nothing to race on;
+/// replicas converge on the same list by construction).
+function childrenListOf(parentObj) {
+  return web.createSeq(WasmHashWeb.seqId(parentObj));
+}
+
+function childrenOf(parentObj) {
+  const listObj = childrenListOf(parentObj);
+  const out = [];
+  const n = web.textLen(listObj);
+  for (let i = 0; i < n; i++) {
+    const origin = web.payloadAt(listObj, i);
+    if (origin) out.push({ idx: i, origin, listObj });
+  }
+  return out;
 }
 
 // ---- page graph (rebuilt every render; the store is the only state) --------
@@ -96,21 +109,20 @@ let rootPages = [];
 
 function openPagesUnder(parentObj, visited) {
   const out = [];
-  for (const key of pageKeysOf(parentObj)) {
-    for (const origin of refsOf(parentObj, key)) {
-      const pageObj = web.createKv(origin); // open-on-discovery: app-level birth
-      if (visited.has(pageObj)) continue; // transclusion/cycle guard
-      visited.add(pageObj);
-      const titles = stringsOf(pageObj, 'title');
-      pageMeta.set(pageObj, {
-        parentObj,
-        key,
-        title: titles[0] ?? 'Untitled',
-        conflict: titles.length > 1 ? titles : null,
-        subpages: openPagesUnder(pageObj, visited),
-      });
-      out.push(pageObj);
-    }
+  for (const c of childrenOf(parentObj)) {
+    const pageObj = web.createKv(c.origin); // open-on-discovery: app-level birth
+    if (visited.has(pageObj)) continue; // duplicate-atom / cycle guard
+    visited.add(pageObj);
+    const titles = stringsOf(pageObj, 'title');
+    pageMeta.set(pageObj, {
+      parentObj,
+      listObj: c.listObj,
+      idx: c.idx,
+      title: titles[0] ?? 'Untitled',
+      conflict: titles.length > 1 ? titles : null,
+      subpages: openPagesUnder(pageObj, visited),
+    });
+    out.push(pageObj);
   }
   return out;
 }
@@ -199,6 +211,7 @@ let viewMode = 'edit'; // 'edit' | 'split' | 'view'
 let renderTargetObj = null; // the seq renderBody is currently rendering
 let focusedBlockObj = null; // last-focused block (toolbar target)
 let dragFrom = null; // block index a drag started from
+let treeDrag = null; // { pageObj, listObj, idx } — a sidebar drag in flight
 
 // ---- rendering: marks + light markup ----------------------------------------
 //
@@ -572,6 +585,11 @@ function renderTree() {
     treeEl.appendChild(d);
     return;
   }
+  const clearTreeMarks = () => {
+    for (const r of treeEl.querySelectorAll('.page-row')) {
+      r.classList.remove('drop-above', 'drop-below');
+    }
+  };
   const emit = (pages, depth) => {
     for (const p of pages) {
       const meta = pageMeta.get(p);
@@ -581,6 +599,7 @@ function renderTree() {
       const twirl = document.createElement('span');
       twirl.className = 'twirl';
       twirl.textContent = meta.subpages.length > 0 ? '▸' : '·';
+      twirl.title = 'drag to reorder';
       const name = document.createElement('span');
       name.className = 'name';
       name.textContent = meta.title;
@@ -596,6 +615,57 @@ function renderTree() {
         current = p;
         render();
       };
+
+      row.draggable = true;
+      row.ondragstart = (e) => {
+        treeDrag = { pageObj: p, listObj: meta.listObj, idx: meta.idx };
+        row.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', meta.title);
+      };
+      row.ondragend = () => {
+        row.classList.remove('dragging');
+        clearTreeMarks();
+        treeDrag = null;
+      };
+      row.ondragover = (e) => {
+        if (!treeDrag) return;
+        e.preventDefault();
+        const rect = row.getBoundingClientRect();
+        clearTreeMarks();
+        row.classList.add(
+          e.clientY < rect.top + rect.height / 2 ? 'drop-above' : 'drop-below',
+        );
+      };
+      row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
+      row.ondrop = (e) => {
+        if (!treeDrag) return;
+        e.preventDefault();
+        clearTreeMarks();
+        const src = treeDrag;
+        treeDrag = null;
+        if (src.pageObj === p) return;
+        // Dropping into your own subtree would orphan the subtree.
+        for (let anc = p; anc && pageMeta.has(anc); anc = pageMeta.get(anc).parentObj) {
+          if (anc === src.pageObj) return;
+        }
+        const rect = row.getBoundingClientRect();
+        const above = e.clientY < rect.top + rect.height / 2;
+        const slot = meta.idx + (above ? 0 : 1);
+        if (src.listObj === meta.listObj) {
+          if (slot === src.idx || slot === src.idx + 1) return;
+          web.seqMove(src.listObj, src.idx, slot); // same list: ONE Move op
+        } else {
+          // Reparent: a Move cannot cross containers (same-container rule),
+          // so this is remove + insert — a new atom, new identity.
+          const origin = web.payloadAt(src.listObj, src.idx);
+          web.textRemove(src.listObj, src.idx, 1);
+          web.seqInsertRef(meta.listObj, slot, origin);
+        }
+        persistSoon();
+        render();
+      };
+
       treeEl.appendChild(row);
       emit(meta.subpages, depth + 1);
     }
@@ -682,7 +752,6 @@ function renderEditor() {
 
   // Body: a seq of block refs. Each block is its own text seq.
   currentBody = bodyOf(current);
-  if (currentBody) migrateLegacyBody(currentBody);
   const editing = viewMode !== 'view';
   const showPreview = viewMode !== 'edit';
   blocksEl.style.display = editing ? '' : 'none';
@@ -702,44 +771,6 @@ function blocksOf(bodyObj) {
     if (origin) out.push({ idx: i, obj: web.createSeq(origin) });
   }
   return out;
-}
-
-/// v1 bodies were one text seq (possibly with inline embeds). Wrap plain
-/// runs into text blocks and embeds into their own blocks, once. NOTE:
-/// concurrent migration from two replicas duplicates blocks — schema
-/// evolution inside a CRDT is itself a convergence problem (APP_NOTES).
-function migrateLegacyBody(bodyObj) {
-  const n = web.textLen(bodyObj);
-  if (n === 0) return;
-  const payloads = [];
-  let hasPlain = false;
-  for (let i = 0; i < n; i++) {
-    payloads.push(web.payloadAt(bodyObj, i));
-    if (!payloads[i]) hasPlain = true;
-  }
-  if (!hasPlain) return;
-  const chars = [...web.text(bodyObj)];
-  const segments = [];
-  let buf = '';
-  chars.forEach((c, i) => {
-    if (payloads[i]) {
-      if (buf) {
-        segments.push({ type: 'text', text: buf });
-        buf = '';
-      }
-      segments.push({ type: 'ref', id: payloads[i] });
-    } else buf += c;
-  });
-  if (buf) segments.push({ type: 'text', text: buf });
-  web.textRemove(bodyObj, 0, n);
-  segments.forEach((seg, k) => {
-    const origin = randOrigin();
-    const blockObj = web.createSeq(origin);
-    if (seg.type === 'text') web.textInsert(blockObj, 0, seg.text);
-    else web.seqInsertRef(blockObj, 0, seg.id);
-    web.seqInsertRef(bodyObj, k, origin);
-  });
-  persistSoon();
 }
 
 // ---- WYSIWYG machinery --------------------------------------------------
@@ -1264,7 +1295,8 @@ titleEl.addEventListener('input', () => {
 
 function createPage(parentObj) {
   const origin = randOrigin();
-  web.putRef(parentObj, `page:${randTag()}`, origin);
+  const list = childrenListOf(parentObj);
+  web.seqInsertRef(list, web.textLen(list), origin);
   const page = web.createKv(origin);
   web.putString(page, 'title', 'Untitled');
   const bodyOrigin = randOrigin();
@@ -1285,8 +1317,8 @@ document.getElementById('new-subpage').onclick = () => current && createPage(cur
 document.getElementById('delete-page').onclick = () => {
   if (!current) return;
   const meta = pageMeta.get(current);
-  if (!confirm(`Delete "${meta.title}"? (Tombstones the slot; ops remain in the DAG.)`)) return;
-  web.del(meta.parentObj, meta.key);
+  if (!confirm(`Delete "${meta.title}"? (Tombstones its tree entry; ops remain in the DAG.)`)) return;
+  web.textRemove(meta.listObj, meta.idx, 1);
   current = null;
   persistSoon();
   render();

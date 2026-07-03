@@ -56,6 +56,17 @@
   .page-row .twirl { color:var(--muted); width:12px; text-align:center; flex:none; }
   .page-row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .page-row .sub { color:var(--muted); font-size:10px; }
+  .page-row.drop-above::before {
+    content:''; position:absolute; top:0; left:12px; right:0; height:0;
+    border-top:2px solid var(--red);
+  }
+  .page-row.drop-below::after {
+    content:''; position:absolute; bottom:0; left:12px; right:0; height:0;
+    border-top:2px solid var(--red);
+  }
+  .page-row { position:relative; }
+  .page-row .twirl { cursor:grab; }
+  .page-row.dragging { opacity:0.4; }
   .empty-note { color:var(--muted); font-size:12px; padding:14px; letter-spacing:0.5px; }
 
   /* ---- editor ---- */

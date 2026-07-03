@@ -316,3 +316,42 @@ the normalize pass catches up (~1s).
 sufficient to drive a real WYSIWYG. The offset-mapping layer (DOM point ↔
 visible index) is app code any editor will need; it belongs in the shared
 app-layer kit alongside note #5's wrappers.
+
+## 15. The page tree as nested seqs; derived children origins (2026-07-03)
+
+The sidebar graduated from kv keys (`page:<rand>` → ref) to the block
+model: every object implicitly owns an ordered **children seq** whose
+origin derives deterministically from the object's id
+(`seqId(parentObj)` reused as a plain hash). Consequences:
+
+- **No pointer, nothing to race.** Two replicas "creating" a page's child
+  list converge on the same object by construction — verified: independent
+  stores derived identical list objects and a merge unioned their entries
+  with no pointer op ever existing. This is note #12's deterministic-
+  origin idiom, now load-bearing; it should be the default convention for
+  any per-object auxiliary structure (children, comments-threads,
+  backlinks…).
+- **Sidebar drag is one Move op** within a parent — same machinery, same
+  guarantees as block reorder. **Reparenting is not a Move**: the
+  same-container rule means cross-parent drag is remove + insert — a new
+  atom with a new identity. For bare refs that costs nothing (no marks or
+  ops hang off the atom), but it is a visible asymmetry: "move within" and
+  "move across" are different operations with different concurrency
+  stories (a concurrent edit races an eviction+recreation, not a move).
+  If cross-container moves ever matter semantically, that is a system
+  question, and the same-container rule was chosen deliberately — the app
+  must own the composite.
+- **The same-key create conflict class vanished** (it was an artifact of
+  random key slots); concurrent creates now simply both appear, ordered by
+  the seq's arbitration. Tree conflicts shift to the placement-register
+  class (freeze, surfaced).
+- Ancestor-cycle guard moved into the app's drop handler (dropping a page
+  into its own subtree would orphan it) — reachability constraints are
+  render/app concerns, consistent with the store never validating shape.
+
+State was discarded rather than migrated (active development; storage key
+bumped) — the migration story from #12 remains unexercised beyond design.
+
+The app's shape is now uniform: **seqs for everything ordered** (blocks,
+table rows/cells, the tree), **kv for named registers** (title, body),
+**derived origins for implicit structure**, Move for reorder everywhere.
