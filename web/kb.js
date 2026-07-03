@@ -244,6 +244,16 @@ function connectSync() {
 
 if (location.protocol.startsWith('http')) connectSync();
 
+let toastTimer = null;
+function toast(msg, isErr = false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.toggle('err', isErr);
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), isErr ? 3500 : 1800);
+}
+
 function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -2220,44 +2230,89 @@ document.getElementById('insert-table').onclick = () => {
   if (viewMode === 'split') renderPreview();
 };
 
-/// Downscale + recompress before storing: snapshots carry every artifact,
-/// so keep images modest (WebP keeps alpha).
+function toBlobAsync(canvas, type, quality) {
+  return new Promise((res) => canvas.toBlob(res, type, quality));
+}
+
+/// Downscale + recompress before storing (snapshots carry every artifact),
+/// but NEVER drop the image: every failure mode falls back to the raw
+/// bytes so at worst it stores un-optimized instead of vanishing.
 async function processImageFile(file) {
-  const bmp = await createImageBitmap(file);
+  const raw = new Uint8Array(await file.arrayBuffer());
+  let bmp;
+  try {
+    bmp = await createImageBitmap(file); // throws on HEIC etc.
+  } catch (_) {
+    return raw; // undecodable here — store as-is, the <img> may still show it
+  }
   const MAX = 1400;
   const scale = Math.min(1, MAX / Math.max(bmp.width, bmp.height));
-  if (scale === 1 && file.size < 400_000) {
-    return new Uint8Array(await file.arrayBuffer());
-  }
+  if (scale === 1 && raw.length < 400_000) return raw;
+
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(bmp.width * scale));
   canvas.height = Math.max(1, Math.round(bmp.height * scale));
   canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise((res) => canvas.toBlob(res, 'image/webp', 0.85));
-  return new Uint8Array(await blob.arrayBuffer());
+  // WebP first (smallest, keeps alpha), then JPEG, then raw — toBlob
+  // returns null for unsupported types (older Safari), so guard each.
+  for (const [type, q] of [['image/webp', 0.85], ['image/jpeg', 0.85]]) {
+    const blob = await toBlobAsync(canvas, type, q);
+    if (blob && blob.type === type) {
+      const out = new Uint8Array(await blob.arrayBuffer());
+      if (out.length < raw.length) return out;
+    }
+  }
+  return raw;
 }
 
 async function insertImageFile(file, ta, at) {
-  const bytes = await processImageFile(file);
-  const imgId = web.provideBytes(bytes);
-  const blockObj = ta.dataset.blockObj;
-  web.seqInsertRef(blockObj, at, imgId);
-  persistSoon();
-  rerenderBlock(ta, blockObj, at + 1);
-  if (viewMode === 'split') renderPreview();
+  try {
+    if (!file.type.startsWith('image/')) {
+      toast('Not an image file', true);
+      return;
+    }
+    const bytes = await processImageFile(file);
+    if (bytes.length > 6_000_000) {
+      toast(`Image too large (${fmtBytes(bytes.length)}) — snapshots carry every artifact`, true);
+      return;
+    }
+    const imgId = web.provideBytes(bytes);
+    const blockObj = ta.dataset.blockObj;
+    web.seqInsertRef(blockObj, at, imgId);
+    persistSoon();
+    rerenderBlock(ta, blockObj, at + 1);
+    if (viewMode === 'split') renderPreview();
+    toast(`Image added (${fmtBytes(bytes.length)})`);
+  } catch (e) {
+    console.error('[kb] image insert failed:', e);
+    toast('Could not read that image', true);
+  }
 }
 
 const imageFileEl = document.getElementById('image-file');
 document.getElementById('insert-image').onclick = () => {
   if (!current || viewMode === 'view') return;
-  if (!focusedTA()) return;
-  imageFileEl.click();
+  imageFileEl.click(); // target block is resolved at change time
 };
 imageFileEl.onchange = async () => {
   const file = imageFileEl.files?.[0];
   imageFileEl.value = '';
-  const ta = focusedTA();
-  if (!file || !ta) return;
+  if (!file) return;
+  // The file dialog steals focus; fall back to the last-focused block, or
+  // the last block, or a fresh one — the button must never no-op silently.
+  let ta = focusedTA();
+  if (!ta) {
+    const eds = blocksEl.querySelectorAll('.block-ed');
+    ta = eds[eds.length - 1] ?? null;
+  }
+  if (!ta) {
+    addBlockAtEnd(false);
+    ta = blocksEl.querySelector('.block-ed');
+  }
+  if (!ta) {
+    toast('Open a page first', true);
+    return;
+  }
   const at = caretOffsetIn(ta) ?? extractText(ta).length;
   await insertImageFile(file, ta, at);
 };

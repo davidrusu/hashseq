@@ -307,6 +307,14 @@
   }
   footer b { color:var(--ink); font-weight:500; }
   #sync-dot { color:var(--green); }
+  #toast {
+    position:fixed; left:50%; bottom:52px; transform:translateX(-50%);
+    background:var(--ink); color:var(--paper); font-size:12px; letter-spacing:0.5px;
+    padding:8px 16px; border:1px solid var(--ink); z-index:40; max-width:80vw;
+    opacity:0; pointer-events:none; transition:opacity 0.2s ease-out;
+  }
+  #toast.show { opacity:1; }
+  #toast.err { background:var(--red); border-color:var(--red); }
 </style>
 </head>
 <body>
@@ -321,6 +329,7 @@
     </div>
   </header>
   <div id="panel-backdrop"></div>
+  <div id="toast"></div>
   <main>
     <nav id="sidebar">
       <div class="side-head"><span>PAGES</span><button id="new-page">+ NEW</button></div>
