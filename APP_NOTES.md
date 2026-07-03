@@ -637,3 +637,33 @@ shape, and the first that's genuinely *recursive*. The flat-store +
 seq-projection substrate has turned out to be a general layout/structure
 engine; the app has never needed a new store primitive, only new ways to
 arrange the one it has.
+
+---
+
+## 25 — Theming as a pure view concern (+ a re-render focus bug)
+
+The user wanted several visual styles to choose from (not sold on the sepia
+berkeley look). Implemented four themes — FIELD (sepia baseline), GALLERY
+(white/sans/rounded), TERMINAL (dark phosphor), NORD (arctic blue-grey) — as
+CSS-variable sets on `body[data-theme]`, cycled by a header button and
+persisted per-browser in localStorage.
+
+- **Zero store involvement, and that's the point.** Theme choice is device
+  state, not document state — it must NOT converge across replicas (my dark
+  mode shouldn't flip your editor). The kv would have made syncing it
+  trivial, which is exactly why it stays out. First feature where the right
+  call was to *avoid* the substrate.
+- The prerequisite work was flushing every hardcoded color into variables
+  (hover, code-bg, panels, shadow shapes, comment-highlight tints, toolbar
+  fg/bg, dot grid, font stacks, corner radius). Shadow *shape* — hard
+  offsets vs soft blur — turned out to matter more for theme identity than
+  the palette itself.
+- KaTeX and all marks render in `currentColor`, so math/code/comments
+  survived every palette untouched. Marks-as-semantic-ranges pays off
+  again: the view owns all appearance.
+
+**Bug found while seeding the test doc**: after the ``` input rule converts
+a block into a code region, the conversion re-render replaces the DOM node
+the caret was in — the next keystrokes go to a detached node and are
+silently lost (same family as the just-converted-region focus quirk fixed
+for math). Needs a caret re-anchor after input-rule block conversion.
