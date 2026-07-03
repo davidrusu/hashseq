@@ -40,8 +40,8 @@ pub enum Read {
 
 #[derive(Debug, Clone)]
 pub struct HashKv {
-    /// The object identity: for a standalone map, the document id; for a
-    /// child object, its origin id (`object_id` of the creation op).
+    /// The origin anchor: the arbitrary 32-byte value this object's
+    /// creator chose (often another op's id — the composition convention).
     origin: Id,
     /// Applied puts by node id (the register history — retention: keep all;
     /// the supersession spine is what the read rules walk).

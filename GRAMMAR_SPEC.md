@@ -38,16 +38,18 @@ OBJECT_CONTEXT = "hashweb v1 object id"
 id(u)              = BLAKE3::derive_key(NODE_CONTEXT,   node_bytes(u))
 value_id(a)        = BLAKE3::derive_key(VALUE_CONTEXT,  artifact_bytes(a))
 object_id(k, origin) = BLAKE3::derive_key(OBJECT_CONTEXT, k ‖ origin)
-                       -- k: the creation kind tag (VK_NEW_SEQ / VK_NEW_KV,
-                       --    one byte); origin: the creating op's id, or an
-                       --    out-of-band 32-byte value for a root object
+                       -- k: the object kind tag (KIND_KV = 0x00 /
+                       --    KIND_SEQ = 0x01, one byte); origin: an
+                       --    arbitrary 32-byte value the object's creator
+                       --    chose
 ```
 
 One node context for every op kind; one value context for every value kind;
 one object context deriving every object's store address. **Origins and
 object ids are distinct, and they live at different layers**: the origin
-(a creation op id, or an arbitrary root value) is the op-level anchor —
-what an object's ops ref and bottom out at; the object id, derived from
+(an arbitrary 32-byte value — often another op's id, by app convention)
+is the op-level anchor — what an object's ops ref and bottom out at; the
+object id, derived from
 **kind ‖ origin**, is the store-level address (routing envelope + index)
 and **never appears in any preimage**. The kind is inside the address, so
 the same origin opened as a Seq and as a Kv is two different objects, and
@@ -80,12 +82,14 @@ is pinned by test to this layout.
 
 `ref_count ≥ 1`: every op pins at least its frontier, and a frontier is
 never empty (every object has an origin from birth). A zero-ref node is
-malformed. A child object's ops anchor at its creation op's id; a **root
-object's** origin is the recursion's base: an arbitrary 32-byte value
-chosen out-of-band. Object ids never appear among refs — they are
-store-level addresses, not op-level anchors; naming an object id in an
-envelope *is* naming its kind, since the kind is inside the derivation.
-There is
+malformed. An object's origin is the recursion's base: an arbitrary
+32-byte value its creator chose. Choosing another op's id is the standard
+*composition convention* — it welds the new object into that op's causal
+closure (ownership-style nesting), but the store attaches no semantics to
+the choice: creation is not an op-layer concept. Object ids never appear
+among refs — they are store-level addresses, not op-level anchors; naming
+an object id in an envelope *is* naming its kind, since the kind is
+inside the derivation. There is
 no store-level anchor above root objects; each object's closure is its own
 commitment domain. An object's first op is `refs = {origin}` — causally
 empty, but never anchor-free. That is the rule's real content: no op
@@ -124,17 +128,16 @@ There is **no route field in the preimage** — delivery rides a **routing
 envelope**, `obj_id ‖ node`, that is pure transport metadata (never
 hashed, never part of identity). The envelope address is the derived
 object id (`object_id(k, origin)` above; a standalone document's `doc_id`
-is the same class); it disambiguates every ref for free — a creation op's
-id `X` names the parent element in the parent's envelope and the child's
-origin anchor in the child's, with no dual-role ambiguity because the two
-streams never mix. The envelope needs no trust and no verdict: an op
-enveloped to the wrong object simply never applies there (its refs never
-arrive inside that object), the same fate as any garbage ref — bounded
-and attributable. Buffering is two-level: envelopes naming unknown object
-ids park store-wide until birth or adoption; ops inside a live object
-park on their first missing ref in that object's own buffer. Applying a
-creation op derives its child's object id and wakes the store-level
-waiters.
+is the same class); it disambiguates every ref for free — an op id `X`
+used as another object's origin names the element in its own object's
+envelope and the origin anchor in the other's, with no dual-role
+ambiguity because the two streams never mix. The envelope needs no trust
+and no verdict: an op enveloped to the wrong object simply never applies
+there (its refs never arrive inside that object), the same fate as any
+garbage ref — bounded and attributable. Buffering is two-level: envelopes
+naming unknown object ids park store-wide until the object is opened or
+adopted; ops inside a live object park on their first missing ref in that
+object's own buffer.
 
 ### Value fields: always by id in the preimage
 
@@ -167,8 +170,6 @@ artifact := kind:varint ‖ payload
 | 4   | `String`    | UTF-8 bytes                        |                                                                               |
 | 5   | `Bytes`     | raw bytes                          |                                                                               |
 | 6   | `F64`       | 8 bytes, IEEE 754 LE, bit-verbatim | every bit pattern is a distinct value; NaN normalization is the app's concern |
-| 7   | `NewSeq`    | empty                              | creation artifact — derived constant                                          |
-| 8   | `NewKv`    | empty                              | creation artifact — derived constant                                          |
 
 Artifact bytes are the `value_id` preimage; there is **no length prefix
 inside an artifact** — an artifact is a leaf, hashed whole, and every
@@ -182,8 +183,8 @@ this reason), and nowhere else — so a future artifact kind with more than
 one variable-length field must self-delimit all but its final field.
 Unknown artifact tags are carried opaquely — the id verifies, renderers
 show placeholders.
-`TOMBSTONE`, `NewSeq`, `NewKv` are ordinary derived ids: computed
-constants, published as test vectors, never magic bytes in id space.
+`TOMBSTONE` is an ordinary derived id: a computed constant, published as
+a test vector, never magic bytes in id space.
 
 ### Grammar-level validation (all stable)
 
@@ -252,11 +253,9 @@ reconstructs each member's full envelope deterministically.
 
    ```
    TOMBSTONE            = 37e7b9a9496baa6bc45fc76168e02a70e2b640a7ae2ca826fb5990f48f772f8a
-   NEW_SEQ              = 8fff7f38a876c8f8dc821a2acd0027539f496194f366d1c7401f2e1d765d0ef7
-   NEW_KV              = 76796526efce6c555148595918fd9cf934753cd7e06f8f22e26b7f2501c60e26
    value_id(Char 'a')   = 555c4ad3f1f89bacc6d46a3d7c6cf897f83e8c0500da8f2dc9a46fc85a740638
-   object_id(seq, 0x11 × 32) = 175531dbcc017f332d4b2f3e2903100ec7990a25d61c65446e1899cda75d2932
-   object_id(kv,  0x11 × 32) = 638a668baf72db186b5874f128314deddf1c7148ea644ca10dc87bb28ad885c8
+   object_id(seq, 0x11 × 32) = dec2ca1db8abc0150e54eac174fdbf56a0ffeb833d83ba0d53eb91e4b063b58b
+   object_id(kv,  0x11 × 32) = d17caee6e539818d5cf8c5f5087d3e6ad43797cf2674b3196b3b4c0dc601f757
 
    with origin = 0x00 × 32:
    Insert{After(origin), 'a'} (no pins)      = 796e3d6b9739303167ce099a5e801545aee245227e1d0c483592fc839a3e66d2

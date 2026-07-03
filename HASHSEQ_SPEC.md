@@ -73,7 +73,7 @@ an atom is a single-element run holding the U+FFFC placeholder with its
 commitment id in `elem_payloads` — atoms never chain (their text is not
 identity input), ride the wire as individual trailing nodes in the payload
 elision form, and are ordinary elements to every projection (movable,
-markable, removable; creation values birth HashWeb children inline).
+markable, removable).
 Splice-point anchors are fully live: insert anchors, mark span endpoints
 (op points bracket wherever the target renders; anchored ops retain their
 rank fragment for life), and Move destinations (drag-next-to-moved-content
@@ -98,11 +98,10 @@ promotes back if the register re-agrees on it). Still gated: a Move whose
 The payload is an **id, not a raw value**: the id of a content-addressed
 value artifact (a kind-tagged canonical value encoding — char, int, bytes,
 …; `value_id = BLAKE3::derive_key(VALUE_CONTEXT, encoding)`, one context for
-all value kinds; well-known artifacts like `TOMBSTONE` and the creation
-artifacts are ordinary derived value ids — computed constants, never magic
-ids — creation artifacts included), of an object's origin id (a link;
-transclusion when the object lives elsewhere — HASHWEB_SPEC.md), or of an
-op node.
+all value kinds; well-known artifacts like `TOMBSTONE` are ordinary
+derived value ids — computed constants, never magic ids), of an object id
+(a link; transclusion when the object lives elsewhere — HASHWEB_SPEC.md),
+or of an op node.
 Element identity is unchanged: the *element* is the insert node id (what
 anchors, marks, removes, and moves name); the payload id is the element's
 **content commitment**.

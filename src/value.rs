@@ -28,8 +28,12 @@ pub const VK_CHAR: u8 = 3;
 pub const VK_STRING: u8 = 4;
 pub const VK_BYTES: u8 = 5;
 pub const VK_F64: u8 = 6;
-pub const VK_NEW_SEQ: u8 = 7;
-pub const VK_NEW_KV: u8 = 8;
+
+/// Object kind tags — the byte inside `object_id`'s derivation and the
+/// family wire's object framing. A separate namespace from value kinds:
+/// objects are not values.
+pub const KIND_KV: u8 = 0;
+pub const KIND_SEQ: u8 = 1;
 
 // Pre-hashed derive-key context keys: `Hasher::new_from_context_key` yields
 // output identical to `Hasher::new_derive_key(ctx)` (same derive_key
@@ -49,17 +53,16 @@ pub fn value_id_of_bytes(artifact: &[u8]) -> Id {
     Id(*hasher.finalize().as_bytes())
 }
 
-/// An object's identity:
-/// `object_id(kind, seed) = derive_key(OBJECT_CONTEXT, kind_tag ‖ seed)`.
+/// An object's store address:
+/// `object_id(kind, origin) = derive_key(OBJECT_CONTEXT, kind_tag ‖ origin)`.
 ///
-/// `seed` distinguishes origins from object ids: it is a creation op's id
-/// for children, or an arbitrary out-of-band id for roots — naming input,
-/// never itself an addressable identity. The kind tag (`VK_NEW_SEQ` /
-/// `VK_NEW_KV`) is inside the derivation, so the same seed opened as a Seq
-/// and as a Kv are two *different* objects — kind mis-agreement is
-/// unrepresentable. The object id is a virtual node — never an op — so a
-/// creation op has no dual role: refs to `X` mean the parent element, refs
-/// to `object_id(kind, X)` mean the child object.
+/// The origin is the op-level anchor (an arbitrary 32-byte value the
+/// object's creator chose — often another op's id, which welds the new
+/// object into that op's causal closure); the object id is the
+/// store-level address (routing envelope + index) and never appears in a
+/// preimage. The kind tag (`KIND_SEQ` / `KIND_KV`) is inside the
+/// derivation, so the same origin opened as a Seq and as a Kv are two
+/// *different* objects — kind mis-agreement is unrepresentable.
 pub fn object_id(kind_tag: u8, seed: &Id) -> Id {
     use blake3::hazmat::HasherExt;
     let mut hasher = blake3::Hasher::new_from_context_key(&OBJECT_KEY);
@@ -81,8 +84,6 @@ pub enum Value {
     Bytes(Vec<u8>),
     /// IEEE 754 bits, verbatim — every bit pattern is a distinct value.
     F64(u64),
-    NewSeq,
-    NewKv,
 }
 
 impl Value {
@@ -115,8 +116,6 @@ impl Value {
                 buf.push(VK_F64);
                 buf.extend_from_slice(&bits.to_le_bytes());
             }
-            Value::NewSeq => buf.push(VK_NEW_SEQ),
-            Value::NewKv => buf.push(VK_NEW_KV),
         }
     }
 
@@ -153,8 +152,6 @@ impl Value {
                 let bits: [u8; 8] = rest.try_into().ok()?;
                 Value::F64(u64::from_le_bytes(bits))
             }
-            VK_NEW_SEQ if rest.is_empty() => Value::NewSeq,
-            VK_NEW_KV if rest.is_empty() => Value::NewKv,
             _ => return None,
         })
     }
@@ -214,11 +211,6 @@ fn decode_zigzag(bytes: &[u8]) -> Option<(i64, usize)> {
 
 /// `TOMBSTONE = value_id([VK_TOMBSTONE])`.
 pub static TOMBSTONE: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_TOMBSTONE]));
-/// `NEW_SEQ = value_id([VK_NEW_SEQ])` — the seq-creation artifact.
-pub static NEW_SEQ: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_NEW_SEQ]));
-/// `NEW_KV = value_id([VK_NEW_KV])` — the kv-creation artifact (tag byte
-/// unchanged from its former NewMap name; the name is Rust-level only).
-pub static NEW_KV: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_NEW_KV]));
 
 // ---- char value-id cache ----
 //
@@ -281,8 +273,6 @@ mod tests {
             Value::Bytes(Vec::new()),
             Value::F64(1.5f64.to_bits()),
             Value::F64(f64::NAN.to_bits()),
-            Value::NewSeq,
-            Value::NewKv,
         ];
         for v in values {
             let bytes = v.encoded();
@@ -299,8 +289,6 @@ mod tests {
             Value::String("a".into()).value_id(),
             Value::Bytes(vec![b'a']).value_id(),
             Value::Tombstone.value_id(),
-            Value::NewSeq.value_id(),
-            Value::NewKv.value_id(),
         ];
         for (i, a) in ids.iter().enumerate() {
             for b in &ids[i + 1..] {
@@ -321,22 +309,17 @@ mod tests {
     #[test]
     fn well_known_constants_are_derived() {
         assert_eq!(*TOMBSTONE, Value::Tombstone.value_id());
-        assert_eq!(*NEW_SEQ, Value::NewSeq.value_id());
-        assert_eq!(*NEW_KV, Value::NewKv.value_id());
-        // and all distinct
-        assert_ne!(*TOMBSTONE, *NEW_SEQ);
-        assert_ne!(*NEW_SEQ, *NEW_KV);
     }
 
     #[test]
-    fn object_ids_are_distinct_from_their_creation_ops() {
+    fn object_ids_are_distinct_from_their_origins() {
         let x = Id([7; 32]);
-        let oid = object_id(VK_NEW_SEQ, &x);
+        let oid = object_id(KIND_SEQ, &x);
         assert_ne!(oid, x);
         // deterministic
-        assert_eq!(oid, object_id(VK_NEW_SEQ, &x));
-        // the kind is inside the derivation: same seed, different object
-        assert_ne!(oid, object_id(VK_NEW_KV, &x));
+        assert_eq!(oid, object_id(KIND_SEQ, &x));
+        // the kind is inside the derivation: same origin, different object
+        assert_ne!(oid, object_id(KIND_KV, &x));
     }
 
     #[test]

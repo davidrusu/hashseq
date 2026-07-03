@@ -5,14 +5,13 @@ resource → conflict → resolution). Design rationale: HETEROGENEITY.md
 (composition by reference, one namespace) and LAYERING.md (frontiers).
 
 HashWeb is a **flat store of objects**: it holds every object this replica
-knows about — roots opened out-of-band and children born by creation ops
-alike — and adds *no new conflict type*. Every op is delivered in a routing
-envelope to a per-object projection that resolves per its own spec
+knows about, and adds *no new conflict type*. Every op is delivered in a
+routing envelope to a per-object projection that resolves per its own spec
 (HASHSEQ_SPEC.md, HASHKV_SPEC.md, MARKS.md). The store itself has no
-identity, no root, and no state beyond its objects: merge is an
-unconditional union of knowledge. What this spec defines is objects and
-creation, the routing envelope, per-object tips, the schema gate, the value
-side store, and deletion.
+identity, no root, no creation semantics, and no state beyond its objects:
+merge is an unconditional union of knowledge. What this spec defines is
+objects and how they are opened, the routing envelope, per-object tips,
+the schema gate, the value side store, and deletion.
 
 ## Objects
 
@@ -29,8 +28,8 @@ is derived, never negotiated.
 There is no `Value` enum anywhere in the op layer: payloads, keys, and map
 values are **ids** of content-addressed artifacts (HASHSEQ_SPEC.md
 "Payload"; HASHKV_SPEC.md "Keys and values are ids") — scalar value
-artifacts, blobs, creation artifacts, op nodes, or object ids (object
-links; naming a *foreign* object's id is transclusion).
+artifacts, blobs, op nodes, or object ids (object links; naming a
+*foreign* object's id is transclusion).
 
 **Text and List are unified**: one seq kind, any payload in any slot.
 "Textness" is a rendering and export convention — a seq whose payloads are
@@ -38,24 +37,27 @@ char values renders as a string; a mixed seq renders chars, embeds, and
 placeholders per HETEROGENEITY.md — never a committed type, never a
 convergence concern. JSON fidelity is an exporter's projection choice.
 
-## Op: creation and routing
+## Op: opening and delivery
 
-No new op shape.
+No new op shape — and **no creation op**. An object is *opened*, not
+created: `open(kind, origin)` instantiates the object addressed by
+`object_id(kind ‖ origin)` (GRAMMAR_SPEC.md), where the origin is an
+arbitrary 32-byte value the creator chose. Opening is replica-local,
+idempotent, and carries no authority — the object's identity is the
+derivation, not the act.
 
-- **Create**: an op whose payload/value is a creation artifact
-  (`NewSeq`/`NewKv` — ordinary derived value ids, computed constants)
-  creates a child object: `Insert { at, payload: New* }` from a sequence
-  slot, `Put { key, value: New* }` from a map slot, identically. The
-  child's ops anchor at `id(X)` — the creating op's id is the child's
-  origin — and its store address is `object_id(kind ‖ id(X))`
-  (GRAMMAR_SPEC.md), a derived name that never appears in a preimage. A
-  root object's origin is the recursion's out-of-band base; its kind
-  rides inside the derived address, so there is nothing else to agree on.
-  The child's refs bottom at `X` itself, so the creation bridge welds
-  each root's tree into one connected DAG literally; store-level
-  buffering derives child addresses when creation ops apply. `X` in the
-  parent's envelope means the parent element, `X` in the child's means
-  the origin anchor — the envelope split leaves no dual-role ambiguity.
+- **Composition is the app's convention, not the store's semantics.**
+  The standard pattern: commit an op in the parent (a `Put` or an
+  `Insert` whose value marks the slot however the app likes), then open
+  the child at that op's id. The child's ops bottom at the parent op, so
+  the weld into the parent's causal closure — and with it sync-closure
+  and reachability-based deletion — is recreated exactly; the derived
+  address is recomputable by anyone holding the parent op. What is
+  *not* recreated is automatic birth: a replica opens the child when its
+  app recognizes the convention, not when the store does — the store
+  never interprets values. A link is the other half of the vocabulary:
+  an object id carried as a value, referencing an independent object
+  with its own lifecycle.
 - **Edit**: the seq (insert/remove/move), map, or mark op of the target
   object, delivered in the **routing envelope** `obj_id ‖ node` — pure
   transport metadata, never hashed (there is no route field in the
@@ -81,8 +83,10 @@ Routed, not new:
 | marks | (element, kind) register → multi-head → MVR / freeze (MARKS.md) |
 
 The substrate routes by object; the projection applies and resolves. State
-is a function of the op set per object; cross-object causality holds through
-creation bridges and named refs only (FRAMEWORK "Frontiers are per layer").
+is a function of the op set per object; cross-object causality holds only
+through origins that are other objects' op ids (the composition
+convention) — never through the store (FRAMEWORK "Frontiers are per
+layer").
 
 ## Per-object tips
 
@@ -90,17 +94,16 @@ Each object keeps **its own tips**. The run/write-run fast path needs
 `tips = {previous op of this object}`; a document-global tips set would
 thread every concurrent edit anywhere in the document through this object's
 deps — the frontier-granularity trade is LAYERING.md's subject. First op of
-a child refs its origin (its creation op's id). Buffering is **two-level**: envelopes naming
-an object id the store does not know park store-wide (birth or adoption
+an object refs its origin. Buffering is **two-level**: envelopes naming
+an object id the store does not know park store-wide (opening or adoption
 wakes them — the store's only delivery state); ops inside a live object
 park on their first missing ref in that object's own buffer.
 
 ## The edge table (the apply-time gate)
 
-Two facts are hash-committed and version-independent: an object's **type**
-(the creation artifact is in the creating op's preimage — replicas can
-never disagree, and object links need no type annotation) and every
-referent's **kind**. So reference validation is one shared gate, run when
+Two facts are hash-committed and version-independent: an object's **kind**
+(inside its derived object id — replicas can never disagree, and object
+links need no type annotation) and every referent's **kind**. So reference validation is one shared gate, run when
 an op leaves the orphan buffer (all refs present), issuing per-edge
 verdicts that are total, convergent, and stable:
 

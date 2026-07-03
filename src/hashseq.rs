@@ -178,7 +178,7 @@ impl Cursor {
     }
 
     /// Build the insert node for any payload — a char, or a value
-    /// commitment id (a link, an artifact, a creation value).
+    /// commitment id (a link or an artifact).
     pub fn payload_node(self, payload: Payload) -> HashNode {
         let (pins, at) = match self {
             Cursor::After { anchor, extra_deps } => (extra_deps, Anchor::After(anchor)),
@@ -907,8 +907,7 @@ impl HashSeq {
     }
 
     /// Build (without applying) an insert of a value commitment id at
-    /// visible position `idx` — an atom: a link, an artifact id, or a
-    /// creation value (HashWeb births the child object).
+    /// visible position `idx` — an atom: a link or an artifact id.
     pub fn make_insert_value(&self, idx: usize, payload: Id) -> Option<HashNode> {
         let cursor = self.cursor_at(idx.min(self.len()))?;
         Some(cursor.payload_node(Payload::Id(payload)))

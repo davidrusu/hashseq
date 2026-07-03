@@ -1,47 +1,44 @@
 //! HashWeb: a flat store of every object this replica knows about.
 //!
 //! The store has **no identity and no semantics of its own** — it is not a
-//! datastructure. All composition lives in the ops: a `Put`/`Insert` whose
-//! value is a creation artifact births a child object; a link is an id
-//! carried as a value. What the store does is mechanics: instantiate
-//! objects, deliver enveloped ops (`obj_id ‖ node` — transport metadata,
-//! never hashed), park envelopes for unknown objects, and birth children
-//! when creation ops apply.
+//! datastructure, and it defines no composition. What it does is
+//! mechanics: open objects, deliver enveloped ops (`obj_id ‖ node` —
+//! transport metadata, never hashed), park envelopes for unknown objects,
+//! and merge as a union of knowledge. Composition is the *user's*
+//! convention: a link is an object id carried as a value; ownership-style
+//! nesting is recreated by opening a child at one of your own op ids
+//! (`create_seq(node.id())`) — the derived identity and the causal weld
+//! come for free, with no creation semantics at this layer.
 //!
 //! Objects are **holonic**: each is a complete replica rooted at its own
-//! origin — a creation op's id, or an arbitrary 32-byte value chosen
-//! out-of-band for a root. Ops anchor at the origin; the store indexes by
-//! the derived **object id**, `object_id(kind ‖ origin)`, which never
-//! appears in a preimage — it is the envelope's address, with the kind
-//! inside it, so the same origin opened as a Seq and as a Kv is two
-//! objects and kind mis-agreement is unrepresentable. Every op commits
-//! transitively to its object's origin, so one object's ops can never
-//! merge into another — the commitment domain is per object, and store
-//! merge is unconditional: a union of knowledge.
+//! origin — an arbitrary 32-byte value its creator chose (often another
+//! op's id, per the convention above). Ops anchor at the origin; the
+//! store indexes by the derived **object id**, `object_id(kind ‖ origin)`,
+//! which never appears in a preimage — it is the envelope's address, with
+//! the kind inside it, so the same origin opened as a Seq and as a Kv is
+//! two objects and kind mis-agreement is unrepresentable. Every op
+//! commits transitively to its object's origin, so one object's ops can
+//! never merge into another — the commitment domain is per object.
 
 use rustc_hash::FxHashMap;
 
 use crate::hashkv::HashKv;
 use crate::hashseq::IdMap;
-use crate::value::{NEW_KV, NEW_SEQ, VK_NEW_KV, VK_NEW_SEQ, Value, object_id};
-use crate::{HashNode, HashSeq, Id, Op, Payload};
+use crate::value::{KIND_KV, KIND_SEQ, Value, object_id};
+use crate::{HashNode, HashSeq, Id};
 
 #[derive(Debug, Clone, Default)]
 pub struct HashWeb {
     /// Every seq object this replica knows, keyed by derived object id
-    /// (`object_id(kind ‖ origin)`): roots opened out-of-band and children
-    /// born by creation ops alike.
+    /// (`object_id(kind ‖ origin)`).
     pub(crate) seqs: FxHashMap<Id, HashSeq>,
     /// Every map object, likewise.
     pub(crate) kvs: FxHashMap<Id, HashKv>,
-    /// Envelopes parked on object ids this store does not know yet; birth
-    /// or adoption wakes them. Node-level parking lives inside each
-    /// object's own delivery — the store keeps no per-node state at all.
+    /// Envelopes parked on object ids this store does not know yet;
+    /// opening or adopting the object wakes them. Node-level parking
+    /// lives inside each object's own delivery — the store keeps no
+    /// per-node state at all.
     pub(crate) parked: FxHashMap<Id, Vec<(Id, HashNode)>>,
-    /// Creation-valued ops seen enveloped to an object but not yet
-    /// observed applied there (they may be parked inside it); `pump`
-    /// births their children the moment they apply.
-    pending_creations: FxHashMap<Id, Vec<(Id, bool)>>,
     /// Value-artifact side store shared across objects.
     pub(crate) values: IdMap<Vec<u8>>,
 }
@@ -61,27 +58,27 @@ impl HashWeb {
 
     /// Open a root seq from `origin` — a 32-byte value chosen out-of-band
     /// ("each object is free to set its own root"). The maps are keyed by
-    /// the derived object id, `object_id(VK_NEW_SEQ ‖ origin)`, which is
+    /// the derived object id, `object_id(KIND_SEQ ‖ origin)`, which is
     /// returned as the handle: the kind is inside the store-level identity,
     /// so the same origin opened as a Kv is a different object, not a
     /// clash. The *ops* keep anchoring at the origin itself — the derived
     /// id is a store address (envelope + index) and never appears in a
     /// preimage. Idempotent.
     pub fn create_seq(&mut self, origin: Id) -> Id {
-        let obj = object_id(VK_NEW_SEQ, &origin);
+        let obj = object_id(KIND_SEQ, &origin);
         if !self.is_object(&obj) {
             self.seqs.insert(obj, HashSeq::new(origin));
-            self.pump(obj);
+            self.wake(obj);
         }
         obj
     }
 
     /// Open a root map from `origin` — see [`Self::create_seq`].
     pub fn create_kv(&mut self, origin: Id) -> Id {
-        let obj = object_id(VK_NEW_KV, &origin);
+        let obj = object_id(KIND_KV, &origin);
         if !self.is_object(&obj) {
             self.kvs.insert(obj, HashKv::new(origin));
-            self.pump(obj);
+            self.wake(obj);
         }
         obj
     }
@@ -103,8 +100,7 @@ impl HashWeb {
         self.seqs.len() + self.kvs.len()
     }
 
-    /// Is this id a live object (roots opened from out-of-band seeds and
-    /// creation-derived children alike — both keyed by derived object id)?
+    /// Is this id a live object (keyed by derived object id)?
     fn is_object(&self, id: &Id) -> bool {
         self.seqs.contains_key(id) || self.kvs.contains_key(id)
     }
@@ -121,8 +117,7 @@ impl HashWeb {
 
     // ---- authoring ----
 
-    /// Write `key = value` in the map object `origin`. Routes through the
-    /// composition's apply so creation semantics fire.
+    /// Write `key = value` in the map object `origin`.
     pub fn put(&mut self, origin: &Id, key: Value, value: Value) -> Option<HashNode> {
         let key_id = self.provide_value(&key);
         let value_id = self.provide_value(&value);
@@ -136,62 +131,13 @@ impl HashWeb {
         Some(node)
     }
 
-    /// Create a child object under `parent[key]`; returns the child's
-    /// object id. The creating op *is* the object: its id is the child's
-    /// origin anchor, and `object_id(kind ‖ it)` is the store address.
-    pub fn create_child(&mut self, parent: &Id, key: Value, kind: Value) -> Option<Id> {
-        debug_assert!(matches!(kind, Value::NewSeq | Value::NewKv));
-        let tag = match kind {
-            Value::NewSeq => VK_NEW_SEQ,
-            _ => VK_NEW_KV,
-        };
-        let node = self.put(parent, key, kind)?;
-        // put() delivered the node; creation additionally births the child.
-        let child = object_id(tag, &node.id());
-        debug_assert!(self.is_object(&child), "creation birthed");
-        Some(child)
-    }
-
-    pub fn new_kv(&mut self, parent: &Id, key: Value) -> Option<Id> {
-        self.create_child(parent, key, Value::NewKv)
-    }
-
-    pub fn new_seq(&mut self, parent: &Id, key: Value) -> Option<Id> {
-        self.create_child(parent, key, Value::NewSeq)
-    }
-
-    /// Insert a value commitment into a child seq at `idx` — an artifact,
-    /// a link (another object's origin id), or a creation value
-    /// (`NewSeq`/`NewKv` births a child object inline). Routes through the
-    /// composition's apply so creation semantics fire.
+    /// Insert a value commitment into a seq at `idx` — an artifact or a
+    /// link (another object's id carried as a value).
     pub fn seq_insert_value(&mut self, origin: &Id, idx: usize, value: &Value) -> Option<HashNode> {
         let vid = self.provide_value(value);
         let node = self.seqs.get(origin)?.make_insert_value(idx, vid)?;
         self.apply_to(*origin, node.clone());
         Some(node)
-    }
-
-    /// Create a child seq as an inline element of a seq (creation-in-seq:
-    /// the element IS the creation op; the child's origin id derives from
-    /// it).
-    pub fn new_seq_at(&mut self, parent: &Id, idx: usize) -> Option<Id> {
-        self.create_child_at(parent, idx, Value::NewSeq)
-    }
-
-    /// Create a child kv as an inline element of a seq.
-    pub fn new_kv_at(&mut self, parent: &Id, idx: usize) -> Option<Id> {
-        self.create_child_at(parent, idx, Value::NewKv)
-    }
-
-    fn create_child_at(&mut self, parent: &Id, idx: usize, kind: Value) -> Option<Id> {
-        let tag = match kind {
-            Value::NewSeq => VK_NEW_SEQ,
-            _ => VK_NEW_KV,
-        };
-        let node = self.seq_insert_value(parent, idx, &kind)?;
-        let child = object_id(tag, &node.id());
-        debug_assert!(self.is_object(&child), "creation birthed");
-        Some(child)
     }
 
     /// Edit a child text object.
@@ -235,7 +181,8 @@ impl HashWeb {
     /// enveloped to the wrong object simply never applies there (its refs
     /// never arrive in that object), the same fate as any garbage ref —
     /// bounded, attributable, and correct by construction. Envelopes for
-    /// unknown object ids park store-wide and wake on birth or adoption.
+    /// unknown object ids park store-wide and wake when the object is
+    /// opened or adopted.
     pub fn apply_to(&mut self, obj: Id, node: HashNode) {
         let id = node.id();
         self.apply_to_with_id(obj, id, node);
@@ -243,95 +190,29 @@ impl HashWeb {
 
     pub fn apply_to_with_id(&mut self, obj: Id, id: Id, node: HashNode) {
         debug_assert_eq!(id, node.id(), "apply_to_with_id called with a wrong id");
-        if let Some(kind) = Self::creation_kind(&node) {
-            self.pending_creations.entry(obj).or_default().push((id, kind));
-        }
         if let Some(seq) = self.seqs.get_mut(&obj) {
             seq.apply_with_id(id, node);
         } else if let Some(kv) = self.kvs.get_mut(&obj) {
             kv.apply_with_id(id, node);
         } else {
             self.parked.entry(obj).or_default().push((id, node));
+        }
+    }
+
+    /// Deliver envelopes parked on a newly opened object.
+    fn wake(&mut self, obj: Id) {
+        let Some(envelopes) = self.parked.remove(&obj) else {
             return;
-        }
-        self.pump(obj);
-    }
-
-    /// Is this op a creation (value/payload = a creation artifact)?
-    /// `Some(is_seq)`.
-    fn creation_kind(node: &HashNode) -> Option<bool> {
-        match &node.op {
-            Op::Put { value, .. } if *value == *NEW_SEQ => Some(true),
-            Op::Put { value, .. } if *value == *NEW_KV => Some(false),
-            Op::Insert {
-                payload: Payload::Id(v),
-                ..
-            } if *v == *NEW_SEQ => Some(true),
-            Op::Insert {
-                payload: Payload::Id(v),
-                ..
-            } if *v == *NEW_KV => Some(false),
-            _ => None,
-        }
-    }
-
-    /// Settle an object after delivery: birth the children of creation ops
-    /// observed applied in it (derive-and-wake), deliver envelopes parked
-    /// on the newly-live ids, and repeat for every object this touches.
-    fn pump(&mut self, start: Id) {
-        let mut work = vec![start];
-        while let Some(o) = work.pop() {
-            // Envelopes parked on o deliver now that it exists.
-            if self.is_object(&o)
-                && let Some(envelopes) = self.parked.remove(&o)
-            {
-                for (id, node) in envelopes {
-                    if let Some(kind) = Self::creation_kind(&node) {
-                        self.pending_creations.entry(o).or_default().push((id, kind));
-                    }
-                    if let Some(seq) = self.seqs.get_mut(&o) {
-                        seq.apply_with_id(id, node);
-                    } else if let Some(kv) = self.kvs.get_mut(&o) {
-                        kv.apply_with_id(id, node);
-                    }
-                }
-            }
-            // Birth children of creations that have applied in o.
-            let Some(pending) = self.pending_creations.remove(&o) else {
-                continue;
-            };
-            let mut still = Vec::new();
-            for (id, is_seq) in pending {
-                let applied = self.seqs.get(&o).is_some_and(|x| x.contains_node(&id))
-                    || self.kvs.get(&o).is_some_and(|x| x.contains_node(&id));
-                if !applied {
-                    still.push((id, is_seq));
-                    continue;
-                }
-                let tag = if is_seq { VK_NEW_SEQ } else { VK_NEW_KV };
-                let child = object_id(tag, &id);
-                if !self.is_object(&child) {
-                    // The creation op id is the child's origin anchor; the
-                    // derived id is only the store's address for it.
-                    if is_seq {
-                        self.seqs.insert(child, HashSeq::new(id));
-                    } else {
-                        self.kvs.insert(child, HashKv::new(id));
-                    }
-                }
-                work.push(child);
-            }
-            if !still.is_empty() {
-                self.pending_creations.insert(o, still);
-            }
+        };
+        for (id, node) in envelopes {
+            self.apply_to_with_id(obj, id, node);
         }
     }
 
     /// Merge = union of knowledge. Unconditional: there is no store
-    /// identity to compare. Missing origins are adopted with their kind
-    /// (for roots, the (seed, kind) agreement is baked into the derived
-    /// object id — a kind mis-agreement is a different object, not a
-    /// conflict); every op re-delivers in its own envelope.
+    /// identity to compare. Missing objects are adopted with their kind
+    /// (committed inside their derived object id); every op re-delivers
+    /// in its own envelope.
     pub fn merge(&mut self, other: Self) {
         for (vid, bytes) in other.values {
             self.values.entry(vid).or_insert(bytes);
@@ -349,7 +230,7 @@ impl HashWeb {
             } else {
                 self.kvs.insert(obj, HashKv::new(origin));
             }
-            self.pump(obj);
+            self.wake(obj);
         }
         for (origin, seq) in &other.seqs {
             for (id, node) in seq.all_nodes() {
@@ -382,34 +263,12 @@ impl HashWeb {
         self.parked.values().flatten().map(|(_, node)| node)
     }
 
-    /// Re-register creation-valued ops parked *inside* an object (its own
-    /// orphan/gate buffers) as pending births. Decode needs this: the
-    /// pending list is apply-time knowledge, and a decoded object carries
-    /// its held ops without ever passing through `apply_to`.
-    pub(crate) fn pend_held_creations(&mut self, obj: Id) {
-        let mut found: Vec<(Id, bool)> = Vec::new();
-        let held: Box<dyn Iterator<Item = (&Id, &HashNode)>> =
-            if let Some(seq) = self.seqs.get(&obj) {
-                Box::new(seq.delivery.held())
-            } else if let Some(kv) = self.kvs.get(&obj) {
-                Box::new(kv.delivery.held())
-            } else {
-                return;
-            };
-        for (id, node) in held {
-            if let Some(kind) = Self::creation_kind(node) {
-                found.push((*id, kind));
-            }
-        }
-        if !found.is_empty() {
-            self.pending_creations.entry(obj).or_default().extend(found);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Op;
 
     fn s(v: &str) -> Value {
         Value::String(v.into())
@@ -473,21 +332,26 @@ mod tests {
 
     #[test]
     fn block_document_shape() {
-        // A Notion-style block: a map with "content" -> Text child.
+        // A Notion-style block, composed in user space: creation is not a
+        // store concept — the app commits an op in the parent, then opens
+        // the child at that op's id. Same derived identity, same causal
+        // weld, no magic.
         let mut doc = HashWeb::new();
         let root = doc.create_kv(oid(9));
 
-        let block = doc.new_kv(&root, s("block-1")).unwrap();
-        let content = doc.new_seq(&block, s("content")).unwrap();
+        let p1 = doc.put(&root, s("block-1"), s("kv")).unwrap();
+        let block = doc.create_kv(p1.id());
+        let p2 = doc.put(&block, s("content"), s("seq")).unwrap();
+        let content = doc.create_seq(p2.id());
         doc.put(&block, s("color"), s("blue"));
         doc.text_insert(&content, 0, "hello world");
 
         assert_eq!(doc.text(&content).unwrap(), "hello world");
         assert_eq!(doc.kv(&block).unwrap().get(&s("color")), Some(s("blue")));
-        // The root links to the block by... the creation op is the value; the
-        // child object id is derived from it.
-        assert!(doc.kv(&block).is_some());
         assert_eq!(doc.object_count(), 3); // root + block + content
+        // The convention is reproducible from the ops: anyone holding the
+        // parent's op can re-derive the child's address.
+        assert_eq!(object_id(KIND_KV, &p1.id()), block);
     }
 
     #[test]
@@ -495,8 +359,10 @@ mod tests {
         // Editing one object never enters another's tips (per-object tips).
         let mut doc = HashWeb::new();
         let root = doc.create_kv(oid(9));
-        let a = doc.new_seq(&root, s("a")).unwrap();
-        let b = doc.new_seq(&root, s("b")).unwrap();
+        let pa = doc.put(&root, s("a"), s("seq")).unwrap();
+        let a = doc.create_seq(pa.id());
+        let pb = doc.put(&root, s("b"), s("seq")).unwrap();
+        let b = doc.create_seq(pb.id());
 
         doc.text_insert(&a, 0, "aaa");
         doc.text_insert(&b, 0, "bbb");
@@ -510,8 +376,10 @@ mod tests {
     fn concurrent_edits_in_different_objects_merge_cleanly() {
         let mut base = HashWeb::new();
         let root = base.create_kv(oid(9));
-        let text = base.new_seq(&root, s("text")).unwrap();
-        let meta = base.new_kv(&root, s("meta")).unwrap();
+        let pt = base.put(&root, s("text"), s("seq")).unwrap();
+        let text = base.create_seq(pt.id());
+        let pm = base.put(&root, s("meta"), s("kv")).unwrap();
+        let meta = base.create_kv(pm.id());
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
@@ -530,31 +398,25 @@ mod tests {
     }
 
     #[test]
-    fn child_ops_park_until_creation_arrives() {
-        // Deliver a child's ops before the creation op: they park on the
-        // origin id; applying the creation op derives it and wakes them.
+    fn envelopes_park_until_object_is_opened() {
+        // Deliver an object's ops before this replica knows the object:
+        // the envelopes park store-wide; opening the object wakes them.
         let mut a = HashWeb::new();
         let root = a.create_kv(oid(9));
-        let child = a.new_seq(&root, s("t")).unwrap();
+        let p = a.put(&root, s("t"), s("seq")).unwrap();
+        let child = a.create_seq(p.id());
         a.text_insert(&child, 0, "x");
-
-        // Extract the child's inserts and the creation chain separately
-        // (root adoption -> root map's put -> child).
         let child_nodes = a.seq(&child).unwrap().all_nodes();
-        let creation_chain: Vec<(Id, HashNode)> = a.kv(&root).unwrap().all_nodes();
 
         let mut fresh = HashWeb::new();
-        assert_eq!(fresh.create_kv(oid(9)), root, "same seed, same object id");
-        // Child op first: its envelope names an unknown object — parks.
         for (id, node) in &child_nodes {
             fresh.apply_to_with_id(child, *id, node.clone());
         }
         assert_eq!(fresh.orphans().count(), 1);
         assert!(fresh.seq(&child).is_none());
-        // The creation chain arrives: derive-and-wake, transitively.
-        for (id, node) in creation_chain {
-            fresh.apply_to_with_id(root, id, node);
-        }
+        // The app learns the convention's input (the parent op's id) and
+        // opens the child: parked envelopes deliver.
+        assert_eq!(fresh.create_seq(p.id()), child);
         assert_eq!(fresh.orphans().count(), 0);
         assert_eq!(fresh.text(&child).unwrap(), "x");
     }
@@ -562,9 +424,8 @@ mod tests {
     #[test]
     fn refs_spanning_objects_park_in_their_object() {
         let mut doc = HashWeb::new();
-        let root = doc.create_kv(oid(9));
-        let a = doc.new_seq(&root, s("a")).unwrap();
-        let b = doc.new_seq(&root, s("b")).unwrap();
+        let a = doc.create_seq(oid(1));
+        let b = doc.create_seq(oid(2));
         doc.text_insert(&a, 0, "a");
         doc.text_insert(&b, 0, "b");
         let a0 = doc.seq(&a).unwrap().id_at(0).unwrap();
@@ -583,31 +444,28 @@ mod tests {
         assert_eq!(doc.text(&b).unwrap(), "b");
     }
 
-    /// Creation-in-seq: a child object born as an inline element of a text
-    /// object — the transclusion shape. The element renders as the atom
-    /// placeholder; the payload id is the creation value, and the child's
-    /// origin derives from the creating op.
+    /// Child-in-seq, user-space: an inline element op is the child's
+    /// origin — the app inserts a marker value, then opens the child at
+    /// the element's id. The element renders as the atom placeholder.
     #[test]
-    fn child_object_born_inline_in_a_seq() {
+    fn child_object_opened_at_an_inline_element() {
         let mut doc = HashWeb::new();
         let text = doc.create_seq(oid(7));
         doc.text_insert(&text, 0, "see [] here");
 
-        let inner = doc.new_seq_at(&text, 5).expect("inline creation");
+        let node = doc.seq_insert_value(&text, 5, &s("embed")).unwrap();
+        let inner = doc.create_seq(node.id());
         doc.text_insert(&inner, 0, "the embedded doc");
 
         assert_eq!(doc.text(&inner).unwrap(), "the embedded doc");
         let body = doc.text(&text).unwrap();
         assert_eq!(body, format!("see [{}] here", crate::hashseq::ATOM_CHAR));
-        // The atom's payload is the creation value; the child origin
-        // derives from the creating op's id.
+        // The atom's payload is the app's marker; the child's address
+        // derives from the element op's id.
         let seq = doc.seq(&text).unwrap();
         let atom_id = seq.id_at(5).unwrap();
-        assert_eq!(seq.payload_of(&atom_id), Some(*crate::value::NEW_SEQ));
-        assert_eq!(
-            crate::value::object_id(crate::value::VK_NEW_SEQ, &atom_id),
-            inner
-        );
+        assert_eq!(seq.payload_of(&atom_id), Some(s("embed").value_id()));
+        assert_eq!(object_id(KIND_SEQ, &atom_id), inner);
 
         // Merges carry the whole shape both ways.
         let mut other = HashWeb::new();
@@ -640,16 +498,19 @@ mod tests {
     }
 
     #[test]
-    fn same_key_concurrent_children_are_both_born() {
-        // Two replicas concurrently create a child at the same key: the key
-        // register conflicts (MVR), but BOTH child objects exist — creation
-        // is never lost, the app resolves the register.
+    fn same_key_concurrent_children_both_survive_merge() {
+        // Two replicas concurrently attach a child at the same key: the
+        // key register conflicts (MVR), but BOTH child objects exist after
+        // merge (adoption is unconditional) — the app resolves the
+        // register.
         let mut base = HashWeb::new();
         let root = base.create_kv(oid(9));
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        let c1 = r1.new_seq(&root, s("content")).unwrap();
-        let c2 = r2.new_kv(&root, s("content")).unwrap();
+        let p1 = r1.put(&root, s("content"), s("seq")).unwrap();
+        let c1 = r1.create_seq(p1.id());
+        let p2 = r2.put(&root, s("content"), s("kv")).unwrap();
+        let c2 = r2.create_kv(p2.id());
         r1.text_insert(&c1, 0, "one");
 
         base.merge(r1);

@@ -226,7 +226,7 @@ payloads remain side objects, only their hashes are op-stream bytes, and
 erasability per HASHWEB_SPEC.md is unaffected).
 
 The fully interleaved single-stream form — blocks of all objects and
-layers in one dependency order, creation bridges connecting the DAG,
+layers in one dependency order, cross-object origins connecting the DAG,
 blocks carrying their object route, kv write-run chains as a block kind —
 remains the target refinement of this same canonical form, worth taking
 when cross-object volumes justify shared dictionaries and positional refs

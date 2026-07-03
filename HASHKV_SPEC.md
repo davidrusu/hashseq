@@ -21,8 +21,8 @@ enum MapOp {
 struct MapNode { refs: BTreeSet<Id>, op: MapOp }
 // id = BLAKE3::derive_key(NODE_CONTEXT, canonical_encoding) — the family's
 // single context; op kinds are tags in the encoding (HETEROGENEITY.md).
-// TOMBSTONE and the creation artifacts are ordinary derived value ids —
-// computed constants, never magic ids.
+// TOMBSTONE is an ordinary derived value id — a computed constant, never
+// a magic id.
 ```
 
 ## Refs
@@ -51,8 +51,7 @@ covers everything a tagged union would — and more:
 |---|---|
 | a value artifact (bytes, string, int, bool, …) | a scalar. Encodes inline on the wire at ≤ hash size, id derived at decode — inline vs indirect is transport, never identity |
 | the well-known tombstone artifact | `Del` |
-| a creation artifact (`NewSeq` / `NewKv`) | **this Put creates a child object**, identified by its origin id — `object_id = derive_key(OBJECT_CONTEXT, <this Put's id>)` (GRAMMAR_SPEC.md). Creation works identically from a map slot and a sequence slot |
-| an object's origin id (`object_id`, GRAMMAR_SPEC.md) | a link to that object — `Ref` with no wrapper needed. Linking an object that already lives elsewhere is transclusion (HETEROGENEITY.md open problems) |
+| an object id (`object_id`, GRAMMAR_SPEC.md) | a link to that object — `Ref` with no wrapper needed. Linking an object that already lives elsewhere is transclusion (HETEROGENEITY.md open problems) |
 | an op node | a reference to that op — e.g. the subject of an "about" register (below) |
 
 Keys get the same generality: bytes/strings are the common case, but any
