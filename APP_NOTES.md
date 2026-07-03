@@ -471,3 +471,30 @@ first.
 an obvious UI: an image whose bytes were erased or haven't arrived
 should render as a placeholder chip with its id — worth adding when
 lazy artifact sync exists.
+
+## 20. Concurrent edits must not steal the caret (2026-07-03)
+
+Live collaboration surfaced the classic editor-CRDT integration bug: a
+peer editing the block you're in caused a full re-render — focus lost,
+selection gone mid-comment. Two-layer fix, and the second layer is only
+possible because of the CRDT:
+
+- **Render incrementally.** Block rows persist keyed by object id with a
+  markedSpans signature; a merge that didn't change a block leaves its
+  DOM alone — the browser's own caret and selection survive untouched.
+  Same-text-different-marks defers repaint to the normalize pass rather
+  than stealing the caret.
+- **Anchor selections to element ids, not offsets.** Offsets shift when
+  a peer inserts before your caret; ids never do. Before merging, capture
+  the id of the character left of each selection endpoint; after
+  re-render, re-derive positions via positionOf. The selection re-attaches
+  to the same characters wherever they moved — verified live: selection
+  held across a same-block prepend. This is the id-addressing story
+  (stable identity under concurrency) paying off at the UI layer; a
+  plain-text collaborative editor has to invent OT-style transform for
+  exactly this, and here it is two 10-line functions over seqIdAt /
+  seqPositionOf.
+
+**Feedback**: id-anchored cursors are what the emacs/wasm FFI's cursor
+concept should expose natively for any future editor integration; worth
+promoting into the shared app kit (#5, #14).

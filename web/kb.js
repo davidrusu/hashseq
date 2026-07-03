@@ -169,6 +169,7 @@ function persistSoon() {
 
 channel.onmessage = (e) => {
   const theirs = new Uint8Array(e.data);
+  const savedEdit = captureEditState();
   web.mergeEncoded(theirs);
   const mine = persistNow(false);
   // Canonical bytes: equal op sets ⟺ identical snapshots. Re-broadcast only
@@ -177,6 +178,7 @@ channel.onmessage = (e) => {
     channel.postMessage(mine);
   }
   render();
+  restoreEditState(savedEdit);
 };
 
 // ---- server sync (hashweb-sync relay) ----------------------------------------
@@ -224,10 +226,12 @@ function connectSync() {
   };
   sock.onmessage = (e) => {
     const theirs = new Uint8Array(e.data);
+    const savedEdit = captureEditState();
     web.mergeEncoded(theirs);
     const mine = persistNow(false);
     if (!bytesEqual(mine, theirs)) sock.send(mine);
     render();
+    restoreEditState(savedEdit);
   };
   sock.onclose = () => {
     wsReady = false;
@@ -1356,6 +1360,8 @@ function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
 function rerenderBlock(ed, blockObj, caretOff, preferAfter = false) {
   renderEditableInto(ed, blockObj);
   ed.dataset.prev = extractText(ed);
+  const row = ed.closest?.('.block-row');
+  if (row) row.dataset.sig = web.markedSpans(blockObj);
   if (caretOff != null) {
     ed.focus();
     setSelectionRangeIn(
@@ -1375,233 +1381,290 @@ function clearDropMarks() {
   }
 }
 
-function renderBlocks() {
-  const blocks = blocksOf(currentBody);
-  const activeEd = document.activeElement?.closest?.('.block-ed') ?? null;
-  const keepObj = activeEd?.dataset?.blockObj ?? null;
-  const keepCaret = activeEd ? caretOffsetIn(activeEd) : null;
-  blocksEl.innerHTML = '';
+/// Build a block row ONCE; renders and index assignments happen in
+/// renderBlocks. Rows persist across renders so an untouched block keeps
+/// its DOM — and with it the browser's own caret and selection.
+function makeBlockRow(obj) {
+  const row = document.createElement('div');
+  row.className = 'block-row';
+  row.dataset.obj = obj;
+  const curIdx = () => Number(row.dataset.idx);
 
-  blocks.forEach((b, i) => {
-    const row = document.createElement('div');
-    row.className = 'block-row';
+  const handle = document.createElement('span');
+  handle.className = 'handle';
+  handle.textContent = '⠿';
+  handle.title = 'drag to reorder (a Move op)';
+  handle.draggable = true;
+  handle.ondragstart = (e) => {
+    dragFrom = curIdx();
+    row.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(curIdx()));
+  };
+  handle.ondragend = () => {
+    row.classList.remove('dragging');
+    clearDropMarks();
+  };
 
-    const handle = document.createElement('span');
-    handle.className = 'handle';
-    handle.textContent = '⠿';
-    handle.title = 'drag to reorder (a Move op)';
-    handle.draggable = true;
-    handle.ondragstart = (e) => {
-      dragFrom = i;
-      row.classList.add('dragging');
-      e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', String(i));
-    };
-    handle.ondragend = () => {
-      row.classList.remove('dragging');
-      clearDropMarks();
-    };
+  row.ondragover = (e) => {
+    if (dragFrom === null) return;
+    e.preventDefault();
+    const rect = row.getBoundingClientRect();
+    const above = e.clientY < rect.top + rect.height / 2;
+    clearDropMarks();
+    row.classList.add(above ? 'drop-above' : 'drop-below');
+  };
+  row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
+  row.ondrop = (e) => {
+    e.preventDefault();
+    clearDropMarks();
+    if (dragFrom === null) return;
+    const rect = row.getBoundingClientRect();
+    const above = e.clientY < rect.top + rect.height / 2;
+    const slot = curIdx() + (above ? 0 : 1);
+    const from = dragFrom;
+    dragFrom = null;
+    if (slot === from || slot === from + 1) return; // no movement
+    web.seqMove(currentBody, from, slot); // drag-reorder IS a Move op
+    persistSoon();
+    render();
+  };
 
-    row.ondragover = (e) => {
+  const ta = document.createElement('div');
+  ta.className = 'block-ed';
+  ta.contentEditable = 'true';
+  ta.spellcheck = false;
+  ta.dataset.blockObj = obj;
+
+  const refreshSig = () => {
+    row.dataset.sig = web.markedSpans(obj);
+  };
+
+  // Insert a literal newline text node at the caret (Chrome's own
+  // insertParagraph wraps <div>s the extractor would miscount), then
+  // commit manually — no input event fires for programmatic changes.
+  const insertNewlineAtCaret = () => {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return;
+    const r = sel.getRangeAt(0);
+    if (!ta.contains(r.startContainer)) return;
+    r.deleteContents();
+    const tn = document.createTextNode('\n');
+    r.insertNode(tn);
+    r.setStartAfter(tn);
+    r.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(r);
+    if (extractText(ta).endsWith('\n') && !ta.querySelector('br[data-sentinel]')) {
+      const br = document.createElement('br');
+      br.dataset.sentinel = '1';
+      ta.appendChild(br);
+    }
+    commitBlockEdit();
+  };
+  const commitBlockEdit = () => {
+    const next = extractText(ta);
+    const did = applyDiffAt(obj, ta.dataset.prev, next, caretOffsetIn(ta));
+    ta.dataset.prev = next;
+    if (did?.kind === 'insert') reconcileMarkAffinity(ta, obj, did.p, did.n);
+    refreshSig(); // local edits are already on screen — no rebuild needed
+    if (viewMode === 'split') {
+      renderPreview();
+      renderComments();
+    }
+    persistSoon();
+    return did;
+  };
+
+  ta.addEventListener('beforeinput', (e) => {
+    if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
       e.preventDefault();
-      const rect = row.getBoundingClientRect();
-      const above = e.clientY < rect.top + rect.height / 2;
-      clearDropMarks();
-      row.classList.add(above ? 'drop-above' : 'drop-below');
-    };
-    row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
-    row.ondrop = (e) => {
-      e.preventDefault();
-      clearDropMarks();
-      if (dragFrom === null) return;
-      const rect = row.getBoundingClientRect();
-      const above = e.clientY < rect.top + rect.height / 2;
-      const slot = above ? i : i + 1;
-      const from = dragFrom;
-      dragFrom = null;
-      if (slot === from || slot === from + 1) return; // no movement
-      web.seqMove(currentBody, from, slot); // drag-reorder IS a Move op
-      persistSoon();
-      render();
-    };
-
-    const ta = document.createElement('div');
-    ta.className = 'block-ed';
-    ta.contentEditable = 'true';
-    ta.spellcheck = false;
-    if (i === 0 && blocks.length === 1) ta.dataset.placeholder = 'Type here…';
-    renderEditableInto(ta, b.obj);
-    ta.dataset.prev = extractText(ta);
-    ta.dataset.blockObj = b.obj;
-    // Insert a literal newline text node at the caret (Chrome's own
-    // insertParagraph/insertText('\n') wraps <div>s, which the extractor
-    // would miscount), then commit the edit pipeline manually — no input
-    // event fires for programmatic DOM changes.
-    const insertNewlineAtCaret = () => {
-      const sel = window.getSelection();
-      if (!sel.rangeCount) return;
-      const r = sel.getRangeAt(0);
-      if (!ta.contains(r.startContainer)) return;
-      r.deleteContents();
-      const tn = document.createTextNode('\n');
-      r.insertNode(tn);
-      r.setStartAfter(tn);
-      r.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(r);
-      if (extractText(ta).endsWith('\n') && !ta.querySelector('br[data-sentinel]')) {
-        const br = document.createElement('br');
-        br.dataset.sentinel = '1';
-        ta.appendChild(br);
+      insertNewlineAtCaret();
+    }
+  });
+  ta.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    if (e.metaKey || e.ctrlKey) {
+      insertNewlineAtCaret();
+      return;
+    }
+    // Enter: a new block after this one. A plain tail after the caret
+    // moves into it; tails carrying marks or embeds stay put.
+    const caret = caretOffsetIn(ta) ?? extractText(ta).length;
+    const text = extractText(ta);
+    const tail = text.slice(caret);
+    const tailPlain =
+      !tail.includes(ATOM) &&
+      (() => {
+        for (let q = caret; q < text.length; q++) {
+          const f = flagsAt(obj, q);
+          if (f && (f.code || f.math || f.codeblock !== null || f.eqblock || f.comments.length)) {
+            return false;
+          }
+        }
+        return true;
+      })();
+    const origin = randOrigin();
+    const nb = web.createSeq(origin);
+    if (tail && tailPlain) {
+      web.textRemove(obj, caret, text.length - caret);
+      web.textInsert(nb, 0, tail);
+      refreshSig();
+    }
+    web.seqInsertRef(currentBody, curIdx() + 1, origin);
+    persistSoon();
+    render();
+    for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+      if (ed.dataset.blockObj === nb) {
+        ed.focus();
+        setSelectionRangeIn(ed, 0);
+        break;
       }
-      commitBlockEdit();
-    };
-    const commitBlockEdit = () => {
-      const next = extractText(ta);
-      const did = applyDiffAt(b.obj, ta.dataset.prev, next, caretOffsetIn(ta));
-      ta.dataset.prev = next;
-      if (did?.kind === 'insert') reconcileMarkAffinity(ta, b.obj, did.p, did.n);
-      if (viewMode === 'split') {
-        renderPreview();
-        renderComments();
-      }
-      persistSoon();
-      return did;
-    };
-    ta.addEventListener('beforeinput', (e) => {
-      if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
+    }
+  });
+  ta.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const caret = caretOffsetIn(ta);
+    if (caret == null) return;
+    for (const w of ta.querySelectorAll('.inline-widget.w-math, .inline-widget.w-eq')) {
+      const start = Number(w.dataset.start);
+      const len = w.dataset.text.length;
+      if (e.key === 'ArrowRight' && caret === start) {
         e.preventDefault();
-        insertNewlineAtCaret();
-      }
-    });
-    ta.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter') return;
-      e.preventDefault();
-      if (e.metaKey || e.ctrlKey) {
-        // cmd+Enter: a newline within this block.
-        insertNewlineAtCaret();
+        exposeRegion(ta, obj, w.dataset.kind, Number(w.dataset.ord), start + 1);
         return;
       }
-      // Enter: a new block after this one. A plain tail after the caret
-      // moves into the new block (a true split); tails carrying marks or
-      // embeds stay put — their anchors live in this block's elements.
-      const caret = caretOffsetIn(ta) ?? extractText(ta).length;
-      const text = extractText(ta);
-      const tail = text.slice(caret);
-      const tailPlain =
-        !tail.includes(ATOM) &&
-        (() => {
-          for (let q = caret; q < text.length; q++) {
-            const f = flagsAt(b.obj, q);
-            if (f && (f.code || f.math || f.codeblock !== null || f.eqblock || f.comments.length)) {
-              return false;
-            }
-          }
-          return true;
-        })();
-      const origin = randOrigin();
-      const nb = web.createSeq(origin);
-      if (tail && tailPlain) {
-        web.textRemove(b.obj, caret, text.length - caret);
-        web.textInsert(nb, 0, tail);
+      if (e.key === 'ArrowLeft' && caret === start + len) {
+        e.preventDefault();
+        exposeRegion(ta, obj, w.dataset.kind, Number(w.dataset.ord), start + len);
+        return;
       }
-      web.seqInsertRef(currentBody, i + 1, origin);
-      persistSoon();
-      render();
-      for (const ed of blocksEl.querySelectorAll('.block-ed')) {
-        if (ed.dataset.blockObj === nb) {
-          ed.focus();
-          setSelectionRangeIn(ed, 0);
-          break;
-        }
+    }
+  });
+  ta.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const imgItem = [...(e.clipboardData.items ?? [])].find((it) =>
+      it.type.startsWith('image/'),
+    );
+    if (imgItem) {
+      const file = imgItem.getAsFile();
+      if (file) {
+        const at = caretOffsetIn(ta) ?? extractText(ta).length;
+        insertImageFile(file, ta, at);
+        return;
       }
-    });
-    ta.addEventListener('paste', (e) => {
-      e.preventDefault();
-      const imgItem = [...(e.clipboardData.items ?? [])].find((it) =>
-        it.type.startsWith('image/'),
-      );
-      if (imgItem) {
-        const file = imgItem.getAsFile();
-        if (file) {
-          const at = caretOffsetIn(ta) ?? extractText(ta).length;
-          insertImageFile(file, ta, at);
-          return;
-        }
-      }
-      const clean = e.clipboardData.getData('text/plain').replaceAll(FILLER, '');
-      document.execCommand('insertText', false, clean);
-    });
-    ta.addEventListener('input', (e) => {
-      if (e.isComposing) return;
-      // Table cells inside embed widgets stopPropagation; anything else
-      // reaching here edits the block's own text.
-      commitBlockEdit();
-      const ruled = maybeInputRule(ta, b.obj, e.data);
-      if (ruled != null) {
-        clearTimeout(normalizeTimer);
-        rerenderBlock(ta, b.obj, ruled, true); // caret outside the new span
-      }
+    }
+    const clean = e.clipboardData.getData('text/plain').replaceAll(FILLER, '');
+    document.execCommand('insertText', false, clean);
+  });
+  ta.addEventListener('input', (e) => {
+    if (e.isComposing) return;
+    commitBlockEdit();
+    const ruled = maybeInputRule(ta, obj, e.data);
+    if (ruled != null) {
+      clearTimeout(normalizeTimer);
+      rerenderBlock(ta, obj, ruled, true); // caret outside the new span
+    } else {
       // Reconcile styling drift (typing at mark edges) once typing pauses.
       clearTimeout(normalizeTimer);
       normalizeTimer = setTimeout(() => {
         if (document.activeElement === ta || ta.contains(document.activeElement)) {
-          rerenderBlock(ta, b.obj, caretOffsetIn(ta));
+          rerenderBlock(ta, obj, caretOffsetIn(ta));
         }
       }, 900);
-    });
-    ta.addEventListener('keydown', (e) => {
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-      const caret = caretOffsetIn(ta);
-      if (caret == null) return;
-      for (const w of ta.querySelectorAll('.inline-widget.w-math, .inline-widget.w-eq')) {
-        const start = Number(w.dataset.start);
-        const len = w.dataset.text.length;
-        if (e.key === 'ArrowRight' && caret === start) {
-          e.preventDefault();
-          exposeRegion(ta, b.obj, w.dataset.kind, Number(w.dataset.ord), start + 1);
-          return;
-        }
-        if (e.key === 'ArrowLeft' && caret === start + len) {
-          e.preventDefault();
-          exposeRegion(ta, b.obj, w.dataset.kind, Number(w.dataset.ord), start + len);
-          return;
-        }
+    }
+  });
+  ta.addEventListener('drop', (e) => {
+    if (dragFrom === null) e.preventDefault();
+  });
+  ta.onfocus = () => {
+    focusedBlockObj = obj;
+  };
+
+  const del = document.createElement('span');
+  del.className = 'b-del';
+  del.textContent = '✕';
+  del.title = 'remove block (tombstones the ref; the block object remains)';
+  del.onclick = () => {
+    web.textRemove(currentBody, curIdx(), 1);
+    persistSoon();
+    render();
+  };
+
+  row.append(handle, ta, del);
+  return row;
+}
+
+/// Incremental: rows persist keyed by block object; only blocks whose
+/// spans actually changed re-render, so a remote merge never touches the
+/// DOM (or the caret) of blocks it didn't change.
+function renderBlocks() {
+  const blocks = blocksOf(currentBody);
+  const prevRows = new Map();
+  for (const r of blocksEl.querySelectorAll('.block-row')) prevRows.set(r.dataset.obj, r);
+
+  const rows = [];
+  blocks.forEach((b, i) => {
+    let row = prevRows.get(b.obj);
+    if (!row) row = makeBlockRow(b.obj);
+    else prevRows.delete(b.obj);
+    row.dataset.idx = i;
+    const ed = row.querySelector('.block-ed');
+    if (i === 0 && blocks.length === 1) ed.dataset.placeholder = 'Type here…';
+    else delete ed.dataset.placeholder;
+    const sig = web.markedSpans(b.obj);
+    if (row.dataset.sig !== sig) {
+      const focused = ed === document.activeElement || ed.contains(document.activeElement);
+      const seqText = JSON.parse(sig)
+        .map((sp) => sp.text)
+        .join('');
+      if (focused && extractText(ed) === seqText) {
+        // Same text, different styling (e.g. a remote mark): let the
+        // normalize pass repaint shortly; don't steal the caret now.
+        row.dataset.sig = sig;
+        clearTimeout(normalizeTimer);
+        normalizeTimer = setTimeout(() => {
+          if (ed === document.activeElement || ed.contains(document.activeElement)) {
+            rerenderBlock(ed, b.obj, caretOffsetIn(ed));
+          } else {
+            rerenderBlock(ed, b.obj, null);
+          }
+        }, 400);
+      } else {
+        renderEditableInto(ed, b.obj);
+        ed.dataset.prev = extractText(ed);
+        row.dataset.sig = sig;
       }
-    });
-    ta.addEventListener('drop', (e) => {
-      // Text drops would splice DOM we don't control; block reorders are
-      // handled by the row.
-      if (dragFrom === null) e.preventDefault();
-    });
-    ta.onfocus = () => {
-      focusedBlockObj = b.obj;
-    };
-
-    const del = document.createElement('span');
-    del.className = 'b-del';
-    del.textContent = '✕';
-    del.title = 'remove block (tombstones the ref; the block object remains)';
-    del.onclick = () => {
-      web.textRemove(currentBody, i, 1);
-      persistSoon();
-      render();
-    };
-
-    row.append(handle, ta, del);
-    blocksEl.appendChild(row);
+    }
+    rows.push(row);
   });
 
-  const add = document.createElement('button');
-  add.className = 'add-block';
-  add.textContent = '+ BLOCK';
-  add.onclick = () => addBlockAtEnd();
-  blocksEl.appendChild(add);
+  for (const stale of prevRows.values()) stale.remove();
+
+  // Minimal reordering: only move rows that are out of place (moving a
+  // node would drop any selection inside it).
+  let cursor = blocksEl.firstChild;
+  for (const row of rows) {
+    if (cursor === row) {
+      cursor = cursor.nextSibling;
+      continue;
+    }
+    blocksEl.insertBefore(row, cursor);
+  }
+
+  let add = blocksEl.querySelector('.add-block');
+  if (!add) {
+    add = document.createElement('button');
+    add.className = 'add-block';
+    add.textContent = '+ BLOCK';
+    add.onclick = () => addBlockAtEnd();
+  }
+  if (blocksEl.lastChild !== add) blocksEl.appendChild(add);
 
   blocksEl.ondragover = (e) => e.preventDefault();
   blocksEl.ondrop = (e) => {
     if (dragFrom === null) return;
-    // Dropping on the container (below the rows) moves to the end.
     if (e.target === blocksEl || e.target === add) {
       const from = dragFrom;
       dragFrom = null;
@@ -1610,16 +1673,45 @@ function renderBlocks() {
       render();
     }
   };
+}
 
-  if (keepObj) {
-    for (const ed of blocksEl.querySelectorAll('.block-ed')) {
-      if (ed.dataset.blockObj === keepObj) {
-        ed.focus();
-        if (keepCaret != null) {
-          setSelectionRangeIn(ed, Math.min(keepCaret, extractText(ed).length));
-        }
-      }
-    }
+// ---- caret survival across remote merges -------------------------------------
+//
+// Offsets shift when a peer's insert lands before your caret; element ids
+// do not. Capture the id of the character LEFT of each selection endpoint
+// BEFORE merging, and re-derive positions from those ids afterwards — the
+// selection re-attaches to the same characters wherever they now sit.
+
+function captureEditState() {
+  const ed = document.activeElement?.closest?.('.block-ed');
+  if (!ed) return null;
+  const obj = ed.dataset.blockObj;
+  const sel = selectionOffsetsIn(ed);
+  if (!sel) return null;
+  let anchor = null;
+  let focus = null;
+  try {
+    anchor = sel[0] > 0 ? web.seqIdAt(obj, sel[0] - 1) : null;
+    focus = sel[1] > 0 ? web.seqIdAt(obj, sel[1] - 1) : null;
+  } catch (_) {
+    return null;
+  }
+  return { obj, anchor, focus, aOff: sel[0], bOff: sel[1] };
+}
+
+function restoreEditState(st) {
+  if (!st) return;
+  for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+    if (ed.dataset.blockObj !== st.obj) continue;
+    const len = extractText(ed).length;
+    const back = (id, off) => {
+      if (id == null) return 0;
+      const p = web.seqPositionOf(st.obj, id);
+      return p == null ? Math.min(off, len) : p + 1; // deleted anchor: best effort
+    };
+    ed.focus();
+    setSelectionRangeIn(ed, back(st.anchor, st.aOff), back(st.focus, st.bOff));
+    return;
   }
 }
 

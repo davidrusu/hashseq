@@ -830,6 +830,28 @@ impl WasmHashWeb {
         Ok(())
     }
 
+    /// Element id (hex) at visible position `idx` of a seq object.
+    #[wasm_bindgen(js_name = seqIdAt)]
+    pub fn seq_id_at(&self, obj_hex: &str, idx: usize) -> Result<Option<String>, JsValue> {
+        let seq = self
+            .inner
+            .seq(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        Ok(seq.id_at(idx).as_ref().map(id_to_hex))
+    }
+
+    /// Current visible position of element `id` in a seq object, or
+    /// undefined if absent/removed. Ids are stable under concurrent
+    /// edits — this is the anchor for caret/selection preservation.
+    #[wasm_bindgen(js_name = seqPositionOf)]
+    pub fn seq_position_of(&self, obj_hex: &str, id_hex: &str) -> Result<Option<usize>, JsValue> {
+        let seq = self
+            .inner
+            .seq(&hex_to_id(obj_hex)?)
+            .ok_or_else(|| app_err("no such seq object"))?;
+        Ok(seq.position_of(&hex_to_id(id_hex)?))
+    }
+
     // --- marks (formatting as ops, not markup) ---
 
     /// Mark visible range `[start, end)` with `kind`/`value` (both strings;
