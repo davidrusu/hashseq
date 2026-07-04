@@ -1243,6 +1243,14 @@ impl WasmHashWeb {
         encode_hashweb(&self.inner)
     }
 
+    /// The ops-only wire snapshot (empty artifact section): what clients
+    /// send and receive on hello/resync — artifact bytes ride 0xAF pushes
+    /// or lazy content-addressed fetches instead.
+    #[wasm_bindgen(js_name = encodeOps)]
+    pub fn encode_ops(&self) -> Vec<u8> {
+        crate::encoding::encode_hashweb_ops(&self.inner)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<WasmHashWeb, JsValue> {
         let mut inner =
             decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;

@@ -164,6 +164,12 @@ impl HashWeb {
         out.into_iter().map(|(_, g)| g).collect()
     }
 
+    /// Canonical bytes of one artifact, if this replica holds them
+    /// (the content-addressed GET path).
+    pub fn artifact_bytes(&self, id: &Id) -> Option<&Vec<u8>> {
+        self.values.get(id)
+    }
+
     /// Store raw artifact bytes (content-addressed; the 0xAF wire frame).
     pub fn provide_artifact_bytes(&mut self, bytes: Vec<u8>) -> Id {
         let vid = crate::value::value_id_of_bytes(&bytes);

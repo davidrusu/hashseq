@@ -34,23 +34,28 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use hashseq::encoding::{
-    apply_delta, decode_hashweb, encode_hashweb, ARTIFACT_TAG, DELTA_TAG,
+    apply_delta, decode_hashweb, encode_hashweb, encode_hashweb_ops, ARTIFACT_TAG, DELTA_TAG,
 };
 use hashseq::HashWeb;
 
 struct Shared {
     web: HashWeb,
+    /// The OPS-ONLY wire snapshot (hello / resync / quiesce compare).
+    /// Artifact bytes never ride snapshots on the wire — they are pushed
+    /// once (0xAF) or fetched by GET /artifact/:id, immutable-cached.
     bytes: Vec<u8>,
-    /// Ops applied since `bytes` was last derived (delta path).
+    /// Ops or artifacts landed since `bytes` / the state file were
+    /// derived. Cleared by the debounced persist task (disk gets the
+    /// FULL encoding; the wire never does).
     dirty: bool,
 }
 
 impl Shared {
-    /// Canonical bytes, re-derived if deltas landed since the last encode.
+    /// Fresh ops-wire bytes; leaves `dirty` set so the persist task
+    /// still flushes the full state to disk.
     fn fresh_bytes(&mut self) -> Vec<u8> {
         if self.dirty {
-            self.bytes = encode_hashweb(&self.web);
-            self.dirty = false;
+            self.bytes = encode_hashweb_ops(&self.web);
         }
         self.bytes.clone()
     }
@@ -93,7 +98,7 @@ async fn main() {
             HashWeb::new()
         }
     };
-    let bytes = encode_hashweb(&web);
+    let bytes = encode_hashweb_ops(&web);
     let (tx, _) = broadcast::channel(64);
     let app = Arc::new(App {
         shared: Mutex::new(Shared { web, bytes, dirty: false }),
@@ -109,14 +114,16 @@ async fn main() {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
                 tick.tick().await;
-                let bytes = {
+                let full = {
                     let mut shared = app.shared.lock().await;
                     if !shared.dirty {
                         continue;
                     }
-                    shared.fresh_bytes()
+                    shared.bytes = encode_hashweb_ops(&shared.web);
+                    shared.dirty = false;
+                    encode_hashweb(&shared.web) // disk keeps the artifacts
                 };
-                persist(&app.state_path, &bytes).await;
+                persist(&app.state_path, &full).await;
             }
         });
     }
@@ -124,6 +131,11 @@ async fn main() {
     let kb = web_dir.join("kb.html");
     let router = Router::new()
         .route("/sync", get(ws_handler))
+        // Content-addressed artifact fetch: the id IS the content, so the
+        // response is immutable — the browser HTTP cache becomes the
+        // artifact store (this route sets its own Cache-Control; the
+        // global layer only fills in where absent).
+        .route("/artifact/{id}", get(artifact_handler))
         .route(
             "/",
             get(move || async move {
@@ -136,7 +148,8 @@ async fn main() {
         .fallback_service(ServeDir::new(web_dir))
         // Clients must revalidate on every load: a phone running week-old
         // cached kb.js against a fresher peer is how documents get mangled.
-        .layer(SetResponseHeaderLayer::overriding(
+        // (if_not_present: the artifact route sets immutable itself.)
+        .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-cache"),
         ))
@@ -218,7 +231,10 @@ async fn client_loop(mut socket: WebSocket, app: Arc<App>) {
                     }
                     // Anything else: a snapshot (hello-resync from a
                     // reconnecting client, or an older client's whole-state
-                    // exchange). The original merge/quiesce protocol.
+                    // exchange). Merge/quiesce — but ALL comparisons happen
+                    // in ops-encoding space: a legacy client sends full
+                    // snapshots, and comparing its bytes to our ops bytes
+                    // directly would never quiesce (a 7MB ping-pong).
                     _ => {
                         let theirs = match decode_hashweb(&data) {
                             Ok(web) => web,
@@ -227,24 +243,27 @@ async fn client_loop(mut socket: WebSocket, app: Arc<App>) {
                                 continue;
                             }
                         };
+                        let theirs_ops = encode_hashweb_ops(&theirs);
                         let (changed, reply) = {
                             let mut shared = app.shared.lock().await;
-                            shared.web.merge(theirs);
                             let before = shared.fresh_bytes();
-                            let merged = encode_hashweb(&shared.web);
-                            if merged != before {
-                                shared.bytes = merged.clone();
-                                shared.dirty = false;
-                                (Some(merged), None)
-                            } else if data.as_ref() != before.as_slice() {
-                                // Client is strictly behind: catch it up directly.
-                                (None, Some(before))
+                            shared.web.merge(theirs);
+                            let merged_ops = encode_hashweb_ops(&shared.web);
+                            if merged_ops != before {
+                                // The client taught us something: everyone
+                                // hears the new state; disk flushes via the
+                                // dirty task (artifacts may have arrived too).
+                                shared.bytes = merged_ops.clone();
+                                shared.dirty = true;
+                                (Some(merged_ops), None)
+                            } else if theirs_ops != merged_ops {
+                                // Client is strictly behind: catch it up.
+                                (None, Some(merged_ops))
                             } else {
                                 (None, None) // converged — silence ends the exchange
                             }
                         };
                         if let Some(merged) = changed {
-                            persist(&app.state_path, &merged).await;
                             let _ = app.tx.send(Arc::new(merged));
                         }
                         if let Some(bytes) = reply {
@@ -256,6 +275,36 @@ async fn client_loop(mut socket: WebSocket, app: Arc<App>) {
                 }
             }
         }
+    }
+}
+
+async fn artifact_handler(
+    axum::extract::Path(id_hex): axum::extract::Path<String>,
+    State(app): State<Arc<App>>,
+) -> impl IntoResponse {
+    let Ok(raw) = hex::decode(&id_hex) else {
+        return (axum::http::StatusCode::BAD_REQUEST, "bad id").into_response();
+    };
+    if raw.len() != 32 {
+        return (axum::http::StatusCode::BAD_REQUEST, "bad id").into_response();
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&raw);
+    let bytes = {
+        let shared = app.shared.lock().await;
+        shared.web.artifact_bytes(&hashseq::Id(id)).cloned()
+    };
+    match bytes {
+        Some(b) => (
+            [
+                ("content-type", "application/octet-stream"),
+                // Content-addressed: the id commits to the bytes forever.
+                ("cache-control", "public, max-age=31536000, immutable"),
+            ],
+            b,
+        )
+            .into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "unknown artifact").into_response(),
     }
 }
 

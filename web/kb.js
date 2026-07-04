@@ -384,8 +384,13 @@ function bodyOf(pageObj) {
 const channel = new BroadcastChannel('hashweb-kb');
 let persistTimer = null;
 
+/// The wire/cache snapshot: OPS ONLY (empty artifact section). Artifact
+/// bytes ride 0xAF pushes at upload and lazy content-addressed fetches
+/// (GET /artifact/:id, immutable — the browser HTTP cache is the store).
+/// This is what killed the 7MB hello and the localStorage quota bug in
+/// one move: state scales with ops, images scale with the HTTP cache.
 function snapshotBytes() {
-  return web.encode();
+  return web.encodeOps();
 }
 
 let localCacheOff = false;
@@ -451,7 +456,11 @@ function sendDeltas() {
   }
 }
 
-/// Push one artifact's bytes (image upload) to every peer, once.
+/// Push one artifact's bytes (image upload) to every peer, once. If the
+/// server is unreachable the id is queued and re-pushed on reconnect —
+/// ops travel via the snapshot resync, but artifact bytes have no other
+/// road to the server.
+const pendingArtifactPush = new Set();
 function sendArtifact(idHex) {
   try {
     const frame = web.artifactFrame(idHex);
@@ -460,10 +469,41 @@ function sendArtifact(idHex) {
     } catch (_) {
       /* channel closed */
     }
-    if (wsReady) ws.send(frame);
+    if (wsReady) {
+      ws.send(frame);
+    } else {
+      pendingArtifactPush.add(idHex);
+    }
   } catch (_) {
     /* no local bytes — nothing to push */
   }
+}
+
+/// Lazy artifact fetch: an unresolvable id might be an artifact the
+/// server holds (images arrive as ops long before their bytes now).
+/// Content addressing makes the response verifiable AND immutable —
+/// fetched once per browser, ever. A 404 means it is not an artifact
+/// (a link to an unopened object, or bytes nobody pushed).
+const artifactFetchTried = new Set();
+function requestArtifact(idHex) {
+  if (artifactFetchTried.has(idHex)) return;
+  if (!location.protocol.startsWith('http')) return;
+  artifactFetchTried.add(idHex);
+  fetch('/artifact/' + idHex)
+    .then(async (r) => {
+      if (!r.ok) return;
+      const buf = new Uint8Array(await r.arrayBuffer());
+      const got = web.provideArtifactBytes(buf);
+      if (got !== idHex) {
+        console.warn('[kb] artifact id mismatch — discarded', idHex, got);
+        return;
+      }
+      persistLocalSoon();
+      render();
+    })
+    .catch(() => {
+      artifactFetchTried.delete(idHex); // transient — retry on next render
+    });
 }
 
 function persistNow(broadcast) {
@@ -556,7 +596,11 @@ function connectSync() {
     wsReady = true;
     wsRetry = 1000;
     setSyncStatus(true);
-    sock.send(snapshotBytes()); // offer what we know
+    sock.send(snapshotBytes()); // offer what we know (ops only)
+    for (const id of [...pendingArtifactPush]) {
+      pendingArtifactPush.delete(id);
+      sendArtifact(id); // bytes authored while offline
+    }
   };
   sock.onmessage = (e) => handleSyncMessage(e.data, (mine) => sock.send(mine));
   sock.onclose = () => {
@@ -902,6 +946,17 @@ function renderEmbed(idx) {
   }
   const tableObj = WasmHashWeb.seqId(payload);
   if (web.isSeq(tableObj)) return objTableNode(tableObj);
+  if (!web.resolveBytes(payload)) {
+    // The pending/unavailable value state (HASHWEB_SPEC): possibly an
+    // artifact whose bytes haven't arrived — try the lazy fetch; the
+    // render replaces this chip when bytes land.
+    requestArtifact(payload);
+    const chip = document.createElement('span');
+    chip.className = 'page-link broken';
+    chip.textContent = `⟨…${payload.slice(0, 8)}⟩`;
+    chip.title = 'content pending — fetching';
+    return chip;
+  }
   const chip = document.createElement('span');
   chip.className = 'page-link broken';
   chip.textContent = `⟨${payload.slice(0, 8)}…⟩`;

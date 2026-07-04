@@ -9,3 +9,4 @@ hashseq = { path = ".." }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs"] }
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
+hex = "0.4"

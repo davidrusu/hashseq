@@ -1956,25 +1956,43 @@ use crate::value::{KIND_KV as OBJ_KV, KIND_SEQ as OBJ_SEQ};
 const HASHWEB_MAGIC_V2: &[u8; 4] = b"HWB2";
 
 pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
+    encode_hashweb_with(web, true)
+}
+
+/// The ops-only wire form: the identical stream with an EMPTY artifact
+/// section (the decoder accepts both — zero artifacts is a valid count).
+/// Ops verify without bytes (the pending/unavailable value state);
+/// artifact bytes travel separately — pushed once at upload (0xAF) or
+/// fetched lazily by content-addressed GET, where an immutable id makes
+/// the receiver's HTTP cache the artifact store.
+pub fn encode_hashweb_ops(web: &HashWeb) -> Vec<u8> {
+    encode_hashweb_with(web, false)
+}
+
+fn encode_hashweb_with(web: &HashWeb, include_artifacts: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(HASHWEB_MAGIC_V2);
 
     // One store-wide artifact section: the store's values unioned with
     // every map's local store (inner stores are excluded from the nested
     // streams — they are replica-local views, not canonical state).
-    let mut artifacts: BTreeMap<Id, &Vec<u8>> = BTreeMap::new();
-    for (id, bytes) in web.values.iter() {
-        artifacts.insert(*id, bytes);
-    }
-    for m in web.kvs.values() {
-        for (id, bytes) in m.values.iter() {
-            artifacts.entry(*id).or_insert(bytes);
+    if include_artifacts {
+        let mut artifacts: BTreeMap<Id, &Vec<u8>> = BTreeMap::new();
+        for (id, bytes) in web.values.iter() {
+            artifacts.insert(*id, bytes);
         }
-    }
-    encode_varint(artifacts.len(), &mut buf);
-    for bytes in artifacts.values() {
-        encode_varint(bytes.len(), &mut buf);
-        buf.extend_from_slice(bytes);
+        for m in web.kvs.values() {
+            for (id, bytes) in m.values.iter() {
+                artifacts.entry(*id).or_insert(bytes);
+            }
+        }
+        encode_varint(artifacts.len(), &mut buf);
+        for bytes in artifacts.values() {
+            encode_varint(bytes.len(), &mut buf);
+            buf.extend_from_slice(bytes);
+        }
+    } else {
+        encode_varint(0, &mut buf);
     }
 
     enum ObjRef<'a> {
