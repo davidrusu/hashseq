@@ -536,6 +536,11 @@ pub struct HashSeq {
     /// The mark layer's own frontier: marks are downstream-only (content
     /// never references marks), so mark ops never enter the text tips.
     pub(crate) mark_tips: BTreeSet<Id>,
+    /// Authored-ops outbox (APP_NOTES #8 / delta sync): locally-authored
+    /// nodes since the last drain, in apply order. `None` = disabled (the
+    /// default — servers and tests never author-and-forget). Remote
+    /// application paths never record; only the authoring helpers do.
+    pub(crate) outbox: Option<Vec<HashNode>>,
     /// Parked orphans + the gate (see `delivery::Delivery`). Gated here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
     /// (a map op in a seq), non-char insert payloads (the value column
@@ -612,6 +617,7 @@ impl HashSeq {
             placement: PlacementRegister::default(),
             tips: BTreeSet::new(),
             mark_tips: BTreeSet::new(),
+            outbox: None,
             delivery: Delivery::default(),
             index: RunIndex::default(),
         };
@@ -643,6 +649,16 @@ impl HashSeq {
         self.removed.push(false);
         self.id_to_idx.insert(id, idx, &self.ids);
         idx
+    }
+
+    /// Record a locally-authored node into the outbox (delta sync). Called
+    /// ONLY by authoring helpers — never by apply — so remote and replayed
+    /// ops can never echo back onto the wire.
+    #[inline]
+    pub(crate) fn record_authored(&mut self, node: &HashNode) {
+        if let Some(ob) = &mut self.outbox {
+            ob.push(node.clone());
+        }
     }
 
     pub fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
@@ -917,6 +933,7 @@ impl HashSeq {
         let first_node = cursor.first_node(first_ch);
 
         let mut prev_id = first_node.id();
+        self.record_authored(&first_node);
         self.apply_with_id(prev_id, first_node);
 
         // After the first apply, tips == {prev_id}, so the chained nodes carry no
@@ -927,6 +944,7 @@ impl HashSeq {
                 op: Op::insert_after(prev_id, ch),
             };
             prev_id = node.id();
+            self.record_authored(&node);
             self.apply_with_id(prev_id, node);
         }
     }
@@ -944,6 +962,7 @@ impl HashSeq {
         let node = self
             .make_insert_value(idx, payload)
             .expect("cursor_at is total for clamped idx");
+        self.record_authored(&node);
         self.apply(node.clone());
         node
     }
@@ -959,6 +978,7 @@ impl HashSeq {
     /// `idx` is past the end (no characters were actually removed).
     pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
         let node = self.make_remove_batch(idx, amount)?;
+        self.record_authored(&node);
         self.apply(node.clone());
         Some(node)
     }
@@ -1467,6 +1487,7 @@ impl HashSeq {
                 overwrites,
             },
         };
+        self.record_authored(&node);
         self.apply(node.clone());
         node
     }
@@ -1659,6 +1680,7 @@ impl HashSeq {
                 overwrites,
             },
         };
+        self.record_authored(&node);
         self.apply(node.clone());
         node
     }
@@ -1916,6 +1938,7 @@ impl HashSeq {
                 overwrites,
             },
         };
+        self.record_authored(&node);
         self.apply(node.clone());
         node
     }

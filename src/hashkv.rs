@@ -55,6 +55,8 @@ pub struct HashKv {
     /// this replica has seen bytes for. Reads without bytes are `pending`.
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
+    /// Authored-ops outbox (delta sync) — see `HashSeq::outbox`.
+    pub(crate) outbox: Option<Vec<HashNode>>,
     /// The containment register — where does this object live
     /// (PLACEMENT_SPEC.md). `Place` is valid in any object kind.
     pub(crate) placement: PlacementRegister,
@@ -83,6 +85,7 @@ impl HashKv {
             keys: IdMap::default(),
             values: IdMap::default(),
             tips: BTreeSet::new(),
+            outbox: None,
             placement: PlacementRegister::default(),
             delivery: Delivery::default(),
         };
@@ -147,9 +150,18 @@ impl HashKv {
         }
     }
 
+    /// Record a locally-authored node (delta sync) — authoring paths only.
+    #[inline]
+    pub(crate) fn record_authored(&mut self, node: &HashNode) {
+        if let Some(ob) = &mut self.outbox {
+            ob.push(node.clone());
+        }
+    }
+
     /// `put` by raw ids (links, already-provided artifacts, tombstone).
     pub fn put_ids(&mut self, key: Id, value: Id) -> HashNode {
         let node = self.make_put(key, value);
+        self.record_authored(&node);
         self.apply(node.clone());
         node
     }
@@ -339,6 +351,7 @@ impl HashKv {
                 overwrites,
             },
         };
+        self.record_authored(&node);
         self.apply(node.clone());
         node
     }

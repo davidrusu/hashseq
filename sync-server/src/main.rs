@@ -11,8 +11,14 @@
 //!     still differ. "Equal op sets ⟺ identical snapshots" makes byte
 //!     equality the convergence test, so the exchange provably quiesces.
 //!
-//! Snapshots are whole-state (kb-scale); the delta/outbox refinement is
-//! APP_NOTES #8.
+//! Steady-state sync is DELTAS (0xDE frames of authored ops, relayed
+//! raw to every client) and one-shot ARTIFACT pushes (0xAF ‖ bytes,
+//! content-addressed). Snapshots remain the hello / reconnect-resync
+//! path — and the compatibility path for older clients. Persistence is
+//! debounced: deltas mark the state dirty; a background task re-encodes
+//! and writes at most every few seconds; hello/lagged/catch-up replies
+//! always encode fresh when dirty (a stale hello would strand a joiner
+//! between the snapshot and the deltas it missed).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -27,12 +33,27 @@ use tokio::sync::{broadcast, Mutex};
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use hashseq::encoding::{decode_hashweb, encode_hashweb};
+use hashseq::encoding::{
+    apply_delta, decode_hashweb, encode_hashweb, ARTIFACT_TAG, DELTA_TAG,
+};
 use hashseq::HashWeb;
 
 struct Shared {
     web: HashWeb,
     bytes: Vec<u8>,
+    /// Ops applied since `bytes` was last derived (delta path).
+    dirty: bool,
+}
+
+impl Shared {
+    /// Canonical bytes, re-derived if deltas landed since the last encode.
+    fn fresh_bytes(&mut self) -> Vec<u8> {
+        if self.dirty {
+            self.bytes = encode_hashweb(&self.web);
+            self.dirty = false;
+        }
+        self.bytes.clone()
+    }
 }
 
 struct App {
@@ -75,10 +96,30 @@ async fn main() {
     let bytes = encode_hashweb(&web);
     let (tx, _) = broadcast::channel(64);
     let app = Arc::new(App {
-        shared: Mutex::new(Shared { web, bytes }),
+        shared: Mutex::new(Shared { web, bytes, dirty: false }),
         tx,
         state_path,
     });
+
+    // Debounced persistence: deltas mark dirty; this task folds them into
+    // the canonical state file at most every 3 seconds.
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                tick.tick().await;
+                let bytes = {
+                    let mut shared = app.shared.lock().await;
+                    if !shared.dirty {
+                        continue;
+                    }
+                    shared.fresh_bytes()
+                };
+                persist(&app.state_path, &bytes).await;
+            }
+        });
+    }
 
     let kb = web_dir.join("kb.html");
     let router = Router::new()
@@ -112,10 +153,11 @@ async fn ws_handler(ws: WebSocketUpgrade, State(app): State<Arc<App>>) -> impl I
 }
 
 async fn client_loop(mut socket: WebSocket, app: Arc<App>) {
-    // Late-joiner bootstrap: current canonical state.
+    // Late-joiner bootstrap: current canonical state (fresh — a stale
+    // hello would strand the joiner between snapshot and missed deltas).
     let (hello, mut rx) = {
-        let shared = app.shared.lock().await;
-        (shared.bytes.clone(), app.tx.subscribe())
+        let mut shared = app.shared.lock().await;
+        (shared.fresh_bytes(), app.tx.subscribe())
     };
     if socket.send(Message::Binary(hello.into())).await.is_err() {
         return;
@@ -130,9 +172,9 @@ async fn client_loop(mut socket: WebSocket, app: Arc<App>) {
                             return;
                         }
                     }
-                    // Lagged: skip to the freshest state.
+                    // Lagged past deltas: skip to the freshest full state.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let bytes = app.shared.lock().await.bytes.clone();
+                        let bytes = app.shared.lock().await.fresh_bytes();
                         if socket.send(Message::Binary(bytes.into())).await.is_err() {
                             return;
                         }
@@ -143,32 +185,73 @@ async fn client_loop(mut socket: WebSocket, app: Arc<App>) {
             incoming = socket.recv() => {
                 let Some(Ok(msg)) = incoming else { return };
                 let Message::Binary(data) = msg else { continue };
-                let theirs = match decode_hashweb(&data) {
-                    Ok(web) => web,
-                    Err(e) => {
-                        eprintln!("[sync] rejecting undecodable snapshot ({} bytes): {e:?}", data.len());
-                        continue;
+                match data.first() {
+                    // Steady state: a delta of authored ops. Apply (opens
+                    // unknown objects from kind+origin, idempotent) and
+                    // relay the RAW bytes to every client — no re-encode.
+                    Some(&DELTA_TAG) => {
+                        let ok = {
+                            let mut shared = app.shared.lock().await;
+                            match apply_delta(&mut shared.web, &data) {
+                                Ok(_) => {
+                                    shared.dirty = true;
+                                    true
+                                }
+                                Err(e) => {
+                                    eprintln!("[sync] bad delta ({} bytes): {e:?}", data.len());
+                                    false
+                                }
+                            }
+                        };
+                        if ok {
+                            let _ = app.tx.send(Arc::new(data.to_vec()));
+                        }
                     }
-                };
-                let reply = {
-                    let mut shared = app.shared.lock().await;
-                    shared.web.merge(theirs);
-                    let merged = encode_hashweb(&shared.web);
-                    if merged != shared.bytes {
-                        shared.bytes = merged.clone();
-                        persist(&app.state_path, &merged).await;
-                        let _ = app.tx.send(Arc::new(merged));
-                        None // this client hears the broadcast like everyone
-                    } else if data.as_ref() != shared.bytes.as_slice() {
-                        // Client is strictly behind: catch it up directly.
-                        Some(shared.bytes.clone())
-                    } else {
-                        None // converged — silence ends the exchange
+                    // An artifact travels ONCE, at upload: store + relay.
+                    Some(&ARTIFACT_TAG) => {
+                        {
+                            let mut shared = app.shared.lock().await;
+                            shared.web.provide_artifact_bytes(data[1..].to_vec());
+                            shared.dirty = true;
+                        }
+                        let _ = app.tx.send(Arc::new(data.to_vec()));
                     }
-                };
-                if let Some(bytes) = reply {
-                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                        return;
+                    // Anything else: a snapshot (hello-resync from a
+                    // reconnecting client, or an older client's whole-state
+                    // exchange). The original merge/quiesce protocol.
+                    _ => {
+                        let theirs = match decode_hashweb(&data) {
+                            Ok(web) => web,
+                            Err(e) => {
+                                eprintln!("[sync] rejecting undecodable snapshot ({} bytes): {e:?}", data.len());
+                                continue;
+                            }
+                        };
+                        let (changed, reply) = {
+                            let mut shared = app.shared.lock().await;
+                            shared.web.merge(theirs);
+                            let before = shared.fresh_bytes();
+                            let merged = encode_hashweb(&shared.web);
+                            if merged != before {
+                                shared.bytes = merged.clone();
+                                shared.dirty = false;
+                                (Some(merged), None)
+                            } else if data.as_ref() != before.as_slice() {
+                                // Client is strictly behind: catch it up directly.
+                                (None, Some(before))
+                            } else {
+                                (None, None) // converged — silence ends the exchange
+                            }
+                        };
+                        if let Some(merged) = changed {
+                            persist(&app.state_path, &merged).await;
+                            let _ = app.tx.send(Arc::new(merged));
+                        }
+                        if let Some(bytes) = reply {
+                            if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }

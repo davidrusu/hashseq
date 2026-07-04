@@ -41,6 +41,9 @@ pub struct HashWeb {
     pub(crate) parked: FxHashMap<Id, Vec<(Id, HashNode)>>,
     /// Value-artifact side store shared across objects.
     pub(crate) values: IdMap<Vec<u8>>,
+    /// Authored-ops outboxes enabled on every object (delta sync;
+    /// APP_NOTES #8). Off by default — servers and tests don't flush.
+    pub(crate) outbox_enabled: bool,
 }
 
 impl PartialEq for HashWeb {
@@ -67,7 +70,11 @@ impl HashWeb {
     pub fn create_seq(&mut self, origin: Id) -> Id {
         let obj = object_id(KIND_SEQ, &origin);
         if !self.is_object(&obj) {
-            self.seqs.insert(obj, HashSeq::new(origin));
+            let mut seq = HashSeq::new(origin);
+            if self.outbox_enabled {
+                seq.outbox = Some(Vec::new());
+            }
+            self.seqs.insert(obj, seq);
             self.wake(obj);
         }
         obj
@@ -77,7 +84,11 @@ impl HashWeb {
     pub fn create_kv(&mut self, origin: Id) -> Id {
         let obj = object_id(KIND_KV, &origin);
         if !self.is_object(&obj) {
-            self.kvs.insert(obj, HashKv::new(origin));
+            let mut kv = HashKv::new(origin);
+            if self.outbox_enabled {
+                kv.outbox = Some(Vec::new());
+            }
+            self.kvs.insert(obj, kv);
             self.wake(obj);
         }
         obj
@@ -110,6 +121,54 @@ impl HashWeb {
     /// See [`Self::seq_mut`].
     pub fn kv_mut(&mut self, obj: &Id) -> Option<&mut HashKv> {
         self.kvs.get_mut(obj)
+    }
+
+    /// Turn on authored-ops outboxes for every current and future object
+    /// (delta sync). Idempotent; existing outbox contents are preserved.
+    pub fn enable_outbox(&mut self) {
+        self.outbox_enabled = true;
+        for seq in self.seqs.values_mut() {
+            if seq.outbox.is_none() {
+                seq.outbox = Some(Vec::new());
+            }
+        }
+        for kv in self.kvs.values_mut() {
+            if kv.outbox.is_none() {
+                kv.outbox = Some(Vec::new());
+            }
+        }
+    }
+
+    /// Drain every object's outbox: `(kind, origin, nodes)` groups sorted
+    /// by object id — the openable wire address (an object id cannot be
+    /// opened; the frame must carry kind + origin).
+    pub fn take_deltas(&mut self) -> Vec<(u8, Id, Vec<HashNode>)> {
+        let mut out: Vec<(Id, (u8, Id, Vec<HashNode>))> = Vec::new();
+        for (obj, seq) in self.seqs.iter_mut() {
+            let origin = seq.origin();
+            if let Some(ob) = &mut seq.outbox
+                && !ob.is_empty()
+            {
+                out.push((*obj, (KIND_SEQ, origin, std::mem::take(ob))));
+            }
+        }
+        for (obj, kv) in self.kvs.iter_mut() {
+            let origin = kv.origin();
+            if let Some(ob) = &mut kv.outbox
+                && !ob.is_empty()
+            {
+                out.push((*obj, (KIND_KV, origin, std::mem::take(ob))));
+            }
+        }
+        out.sort_by_key(|(obj, _)| *obj);
+        out.into_iter().map(|(_, g)| g).collect()
+    }
+
+    /// Store raw artifact bytes (content-addressed; the 0xAF wire frame).
+    pub fn provide_artifact_bytes(&mut self, bytes: Vec<u8>) -> Id {
+        let vid = crate::value::value_id_of_bytes(&bytes);
+        self.values.entry(vid).or_insert(bytes);
+        vid
     }
 
     /// Every known object id (seqs and kvs).
@@ -189,9 +248,17 @@ impl HashWeb {
             .collect();
         for (obj, origin, is_seq) in adopt {
             if is_seq {
-                self.seqs.insert(obj, HashSeq::new(origin));
+                let mut seq = HashSeq::new(origin);
+                if self.outbox_enabled {
+                    seq.outbox = Some(Vec::new());
+                }
+                self.seqs.insert(obj, seq);
             } else {
-                self.kvs.insert(obj, HashKv::new(origin));
+                let mut kv = HashKv::new(origin);
+                if self.outbox_enabled {
+                    kv.outbox = Some(Vec::new());
+                }
+                self.kvs.insert(obj, kv);
             }
             self.wake(obj);
         }

@@ -390,7 +390,21 @@ function snapshotBytes() {
 
 let localCacheOff = false;
 
-function persistNow(broadcast) {
+// ---- delta sync (APP_NOTES #8/#19/#21 — the wall, fixed) ---------------------
+//
+// Steady state ships OPS, not snapshots: local edits drain the wasm
+// outbox into a 0xDE delta frame (bytes to KB, not MB) sent to the
+// server and the tab channel; images travel ONCE at upload as 0xAF
+// artifact frames. Full snapshots remain the hello / reconnect-resync
+// path only. The heavy full-state encode (localStorage cache + stats)
+// is debounced separately so neither typing nor remote deltas pay it
+// per keystroke.
+
+const TAG_DELTA = 0xde;
+const TAG_ARTIFACT = 0xaf;
+
+/// Full encode + local cache + stats. Heavy — callers debounce.
+function persistLocal() {
   const bytes = snapshotBytes();
   // localStorage is a *cache*, not the source of truth — the server and
   // the op DAG are. If the snapshot outgrows the ~5MB quota, drop the
@@ -412,34 +426,94 @@ function persistNow(broadcast) {
       console.warn('[kb] local cache disabled (snapshot exceeds quota):', e.name);
     }
   }
-  if (broadcast) {
-    channel.postMessage(bytes);
-    if (wsReady) ws.send(bytes);
-  }
   statObjects.textContent = web.objectCount();
   statBytes.textContent = fmtBytes(bytes.length);
   statParked.textContent = web.orphanCount();
   return bytes;
 }
 
-function persistSoon() {
-  clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => persistNow(true), 200);
+let localSaveTimer = null;
+function persistLocalSoon() {
+  clearTimeout(localSaveTimer);
+  localSaveTimer = setTimeout(persistLocal, 1200);
 }
 
-channel.onmessage = (e) => {
-  const theirs = new Uint8Array(e.data);
-  const savedEdit = captureEditState();
-  web.mergeEncoded(theirs);
-  const mine = persistNow(false);
-  // Canonical bytes: equal op sets ⟺ identical snapshots. Re-broadcast only
-  // while we know something they don't; equality ends the exchange.
-  if (!bytesEqual(mine, theirs)) {
-    channel.postMessage(mine);
+/// Drain authored ops onto the wire — cheap and immediate.
+function sendDeltas() {
+  const delta = web.takeDeltas();
+  if (delta.length > 0) {
+    try {
+      channel.postMessage(delta);
+    } catch (_) {
+      /* channel closed */
+    }
+    if (wsReady) ws.send(delta);
   }
+}
+
+/// Push one artifact's bytes (image upload) to every peer, once.
+function sendArtifact(idHex) {
+  try {
+    const frame = web.artifactFrame(idHex);
+    try {
+      channel.postMessage(frame);
+    } catch (_) {
+      /* channel closed */
+    }
+    if (wsReady) ws.send(frame);
+  } catch (_) {
+    /* no local bytes — nothing to push */
+  }
+}
+
+function persistNow(broadcast) {
+  if (broadcast) sendDeltas();
+  return persistLocal();
+}
+
+function persistSoon() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    sendDeltas(); // wire: fast path
+    persistLocalSoon(); // cache: debounced heavy path
+  }, 200);
+}
+
+/// One dispatch for both transports (tab channel + WebSocket).
+/// `replySnap` sends our snapshot back on the quiesce path.
+function handleSyncMessage(raw, replySnap) {
+  const theirs = new Uint8Array(raw);
+  if (theirs.length === 0) return;
+  const savedEdit = captureEditState();
+  if (theirs[0] === TAG_DELTA) {
+    try {
+      web.applyDelta(theirs);
+    } catch (err) {
+      console.warn('[kb] bad delta:', err);
+    }
+    persistLocalSoon();
+    render();
+    restoreEditState(savedEdit);
+    return;
+  }
+  if (theirs[0] === TAG_ARTIFACT) {
+    web.provideArtifactBytes(theirs.subarray(1));
+    persistLocalSoon();
+    render(); // pending images resolve
+    restoreEditState(savedEdit);
+    return;
+  }
+  // A snapshot: hello, reconnect resync, or a legacy peer.
+  web.mergeEncoded(theirs);
+  const mine = persistLocal();
+  // Canonical bytes: equal op sets ⟺ identical snapshots. Re-send only
+  // while we know something they don't; equality ends the exchange.
+  if (!bytesEqual(mine, theirs)) replySnap(mine);
   render();
   restoreEditState(savedEdit);
-};
+}
+
+channel.onmessage = (e) => handleSyncMessage(e.data, (mine) => channel.postMessage(mine));
 
 // ---- server sync (hashweb-sync relay) ----------------------------------------
 //
@@ -484,15 +558,7 @@ function connectSync() {
     setSyncStatus(true);
     sock.send(snapshotBytes()); // offer what we know
   };
-  sock.onmessage = (e) => {
-    const theirs = new Uint8Array(e.data);
-    const savedEdit = captureEditState();
-    web.mergeEncoded(theirs);
-    const mine = persistNow(false);
-    if (!bytesEqual(mine, theirs)) sock.send(mine);
-    render();
-    restoreEditState(savedEdit);
-  };
+  sock.onmessage = (e) => handleSyncMessage(e.data, (mine) => sock.send(mine));
   sock.onclose = () => {
     wsReady = false;
     setSyncStatus(false);
@@ -1700,13 +1766,22 @@ function ensureTreeSchema(page, body) {
     const o = web.payloadAt(body, i);
     if (o) atoms.push(o);
   }
+  // A flat body IS already a valid tree (a list of leaf refs): flag it
+  // and touch nothing. Rewriting atoms here tombstones registered
+  // children's claimed atoms (remove-wins = deletion) — found the hard
+  // way when a delta-synced fresh page rendered on a peer before its
+  // bodySchema flag arrived and 'migrated' itself invisible. Same guard
+  // for any body that already has registered children: it cannot be
+  // pre-tree data, whatever the flag says.
+  if (!isRows || atoms.some((o) => !placementOfObj(web.createSeq(o)).empty)) {
+    web.putString(page, 'bodySchema', 'tree');
+    persistSoon();
+    return;
+  }
   web.textRemove(body, 0, web.textLen(body));
   for (const ao of atoms) {
-    if (!isRows) {
-      web.seqInsertRef(body, web.textLen(body), ao); // legacy: ao is a leaf
-      continue;
-    }
-    // rows model: ao is a row seq of column blocks.
+    // rows model (pre-register data, presence rule): ao is a row seq of
+    // column blocks.
     const row = web.createSeq(ao);
     const cols = [];
     for (let i = 0; i < web.textLen(row); i++) {
@@ -2949,6 +3024,7 @@ async function insertImageFile(file, ta, at) {
       return;
     }
     const imgId = web.provideBytes(bytes);
+    sendArtifact(imgId); // bytes travel once; ops ride the delta path
     const blockObj = ta.dataset.blockObj;
     web.seqInsertRef(blockObj, at, imgId);
     persistSoon();

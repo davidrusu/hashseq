@@ -2847,3 +2847,131 @@ mod legacy_compat {
         assert_eq!(web2, web, "legacy state upgrades losslessly to v2");
     }
 }
+
+// --- Delta wire frames (APP_NOTES #8: the authored-ops outbox) ---
+//
+// Steady-state sync ships ops, not snapshots. A delta message is
+//
+//   0xDE ‖ [ kind:u8 ‖ origin:32 ‖ n:varint ‖ n × (len:varint ‖ node) ]*
+//
+// where `node` is the standalone tagged form (`encode_hash_node`). Frames
+// are addressed by **(kind, origin)** — the openable address — never by
+// object id: the id derivation is one-way, so a receiver could not open
+// an unknown object addressed by id, and its ops would park forever.
+// Apply is idempotent (dedup at the object layer), so echo and replay
+// are harmless; out-of-order arrival parks on refs per the ordinary
+// orphan machinery. Artifact bytes never ride deltas — they travel once,
+// in 0xAF frames (tag ‖ raw bytes), content-addressed at the receiver.
+
+pub const DELTA_TAG: u8 = 0xDE;
+pub const ARTIFACT_TAG: u8 = 0xAF;
+
+/// Encode drained outbox groups (`HashWeb::take_deltas`) as one message.
+pub fn encode_delta(groups: &[(u8, Id, Vec<HashNode>)]) -> Vec<u8> {
+    let mut buf = vec![DELTA_TAG];
+    let mut nb = Vec::new();
+    for (kind, origin, nodes) in groups {
+        buf.push(*kind);
+        encode_id(origin, &mut buf);
+        encode_varint(nodes.len(), &mut buf);
+        for n in nodes {
+            nb.clear();
+            encode_hash_node(n, &mut nb);
+            encode_varint(nb.len(), &mut buf);
+            buf.extend_from_slice(&nb);
+        }
+    }
+    buf
+}
+
+/// Apply a delta message to a store: open each addressed object
+/// (idempotent) and deliver its nodes through the normal apply path.
+/// Returns the number of nodes delivered.
+pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError> {
+    if bytes.first() != Some(&DELTA_TAG) {
+        return Err(DecodeError::InvalidOpTag(bytes.first().copied().unwrap_or(0)));
+    }
+    let mut c = Cursor { bytes, pos: 1 };
+    let mut delivered = 0usize;
+    while c.pos < bytes.len() {
+        let kind = c.byte()?;
+        let origin = c.step(decode_id)?;
+        let obj = match kind {
+            OBJ_SEQ => web.create_seq(origin),
+            OBJ_KV => web.create_kv(origin),
+            other => return Err(DecodeError::InvalidOpTag(other)),
+        };
+        let n = c.step(decode_varint)?;
+        for _ in 0..n {
+            let len = c.step(decode_varint)?;
+            let slice = bytes
+                .get(c.pos..c.pos + len)
+                .ok_or(DecodeError::UnexpectedEof)?;
+            let (op, used) = decode_op(slice)?;
+            if used != len {
+                return Err(DecodeError::UnexpectedEof);
+            }
+            c.pos += len;
+            match op {
+                EncodableOp::Node(node) => {
+                    web.apply_to(obj, node);
+                    delivered += 1;
+                }
+                EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
+            }
+        }
+    }
+    Ok(delivered)
+}
+
+#[cfg(test)]
+mod delta_tests {
+    use super::*;
+
+    fn oid(n: u8) -> Id {
+        Id([n; 32])
+    }
+
+    /// The delta loop end to end: author on A (outbox enabled), drain,
+    /// apply on B — states converge to identical canonical bytes; replay
+    /// and echo are no-ops; artifact frames ride separately.
+    #[test]
+    fn delta_roundtrip_replay_and_convergence() {
+        let mut a = HashWeb::new();
+        a.enable_outbox();
+        let s = a.create_seq(oid(1));
+        let k = a.create_kv(oid(2));
+        a.seq_mut(&s).unwrap().insert_batch(0, "hello".chars());
+        let key = a.provide_value(&crate::value::Value::String("title".into()));
+        let val = a.provide_value(&crate::value::Value::String("Doc".into()));
+        a.kv_mut(&k).unwrap().put_ids(key, val);
+        let link = a.seq_mut(&s).unwrap().insert_value(5, oid(3));
+        a.seq_mut(&s).unwrap().place(link.id());
+
+        let groups = a.take_deltas();
+        assert!(!groups.is_empty());
+        let msg = encode_delta(&groups);
+        assert_eq!(msg[0], DELTA_TAG);
+        // Drained: a second take is empty.
+        assert!(a.take_deltas().is_empty());
+
+        // B receives the delta cold — objects opened from (kind, origin).
+        let mut b = HashWeb::new();
+        let delivered = apply_delta(&mut b, &msg).expect("applies");
+        assert_eq!(delivered, 5 + 1 + 1 + 1); // chars + put + atom + place
+        // Artifacts travel separately (0xAF): ops verify without bytes.
+        b.provide_artifact_bytes(crate::value::Value::String("title".into()).encoded());
+        b.provide_artifact_bytes(crate::value::Value::String("Doc".into()).encoded());
+        assert_eq!(encode_hashweb(&a), encode_hashweb(&b));
+
+        // Echo/replay: applying the same delta again changes nothing.
+        apply_delta(&mut b, &msg).expect("replay ok");
+        assert_eq!(encode_hashweb(&a), encode_hashweb(&b));
+        // Remote application recorded nothing: B (outbox off) and even an
+        // outbox-enabled receiver never re-broadcast received ops.
+        let mut c2 = HashWeb::new();
+        c2.enable_outbox();
+        apply_delta(&mut c2, &msg).expect("applies");
+        assert!(c2.take_deltas().is_empty(), "remote ops never echo");
+    }
+}

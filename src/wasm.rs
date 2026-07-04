@@ -714,7 +714,9 @@ pub struct WasmHashWeb {
 impl WasmHashWeb {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self::default()
+        let mut w = Self::default();
+        w.inner.enable_outbox(); // wasm consumers are delta-sync clients
+        w
     }
 
     // --- derivation (pure; usable before anything is open) ---
@@ -1242,8 +1244,9 @@ impl WasmHashWeb {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<WasmHashWeb, JsValue> {
-        let inner =
+        let mut inner =
             decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
+        inner.enable_outbox();
         Ok(WasmHashWeb { inner })
     }
 
@@ -1254,5 +1257,47 @@ impl WasmHashWeb {
             decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
         self.inner.merge(other);
         Ok(())
+    }
+
+    /// Drain the authored-ops outbox as one 0xDE delta message; empty if
+    /// nothing was authored since the last take (APP_NOTES #8).
+    #[wasm_bindgen(js_name = takeDeltas)]
+    pub fn take_deltas(&mut self) -> Vec<u8> {
+        let groups = self.inner.take_deltas();
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        crate::encoding::encode_delta(&groups)
+    }
+
+    /// Apply a peer's 0xDE delta message. Idempotent; unknown objects are
+    /// opened from the frame's (kind, origin). Returns nodes delivered.
+    #[wasm_bindgen(js_name = applyDelta)]
+    pub fn apply_delta(&mut self, bytes: &[u8]) -> Result<usize, JsValue> {
+        crate::encoding::apply_delta(&mut self.inner, bytes)
+            .map_err(|e| app_err(&format!("delta decode error: {e}")))
+    }
+
+    /// Store raw artifact bytes (the 0xAF frame payload); returns the
+    /// content-addressed value id.
+    #[wasm_bindgen(js_name = provideArtifactBytes)]
+    pub fn provide_artifact_bytes(&mut self, bytes: &[u8]) -> String {
+        id_to_hex(&self.inner.provide_artifact_bytes(bytes.to_vec()))
+    }
+
+    /// Build a 0xAF artifact frame (tag ‖ canonical artifact bytes) for a
+    /// value id this replica holds bytes for — the once-per-upload push.
+    #[wasm_bindgen(js_name = artifactFrame)]
+    pub fn artifact_frame(&self, id_hex: &str) -> Result<Vec<u8>, JsValue> {
+        let id = hex_to_id(id_hex)?;
+        let bytes = self
+            .inner
+            .values
+            .get(&id)
+            .ok_or_else(|| app_err("no artifact bytes for that id"))?;
+        let mut out = Vec::with_capacity(1 + bytes.len());
+        out.push(crate::encoding::ARTIFACT_TAG);
+        out.extend_from_slice(bytes);
+        Ok(out)
     }
 }
