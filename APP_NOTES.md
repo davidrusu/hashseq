@@ -883,3 +883,44 @@ idempotent apply made relay/echo/replay a non-problem. The remaining
 sync gap from #21 is now only artifact laziness (hello still hauls all
 image bytes once per fresh browser; have/want negotiation or
 GET-by-id would finish the job).
+
+---
+
+## 33 — Artifact lazy loading: the sync story is complete
+
+The last piece of #8/#19/#21. Wire snapshots now carry ops plus only
+SMALL artifacts (≤1KB); blobs travel once at upload (0xAF) and
+otherwise arrive by content-addressed GET /artifact/:id with
+`immutable` caching — the browser HTTP cache IS the artifact store.
+Measured on the family doc: hello went 6.99MB → 35KB (200×), a
+keystroke is 107 bytes, and a photo is fetched once per browser, ever.
+The localStorage-quota failure mode (#21) is structurally gone: the
+cache stores ops, images live in the HTTP cache.
+
+Two regressions caught live, both worth their lesson:
+
+- **Small scalar artifacts are semantic state.** The first cut
+  stripped ALL artifacts from the wire — and every fresh session
+  rendered title-less and mark-blind, because titles, mark kinds, and
+  code-block languages are artifacts too, and nothing lazy-fetches kv
+  values. The ops/blob boundary is a SIZE, not a kind: at ≤1KB an
+  artifact is vocabulary; above it, content.
+- **The KaTeX lesson, third appearance.** Lazily-arrived bytes change
+  no span signature, so the incremental renderer skipped every block
+  whose image had just landed — stale pending chips over resolvable
+  bytes. Any async-arriving render dependency (fonts, math, artifact
+  bytes) needs an explicit repaint hook keyed on what arrived. This is
+  now a named pattern, not a recurring surprise.
+
+Also: quiesce comparisons moved into ops-encoding space with the
+client's offer re-encoded before comparing — a legacy client sending
+full snapshots converges to silence (verified: two 11KB full offers,
+zero replies) instead of a 7MB ping-pong.
+
+**Feedback**: the artifact side store delivered exactly what
+HASHWEB_SPEC promised — ops verify with no payload bytes, the pending
+state surfaced honestly in the UI, and content addressing made the
+transport trivially cacheable AND verifiable (the client hashes what
+it fetched; a lying server buys nothing). The sync protocol the app
+needed is now: deltas + push-once blobs + lazy verified fetch +
+snapshot resync. Nothing on this list required a new store concept.
