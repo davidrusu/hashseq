@@ -73,7 +73,49 @@ function childOffset(nodeOrigin) {
 function currentBody0() {
   return typeof currentBodyOrigin !== 'undefined' ? currentBodyOrigin : null;
 }
-/// Child node refs of a container (or of the body). Dedup by origin.
+// ---- containment registers (PLACEMENT_SPEC.md) --------------------------------
+//
+// Membership is decided by each node's placement register, not by the
+// union of link atoms: a link atom is live iff the node's register names
+// it. Moves insert a new atom and re-claim — the old atom stays as a dead
+// ghost (the freeze fallback may land on it); only DELETION tombstones.
+// Nodes with no register history (pre-Place data) keep the legacy
+// presence rule with the deterministic duplicate heal.
+
+const TOMB_ID = WasmHashWeb.tombstoneId();
+
+// Register reads memoized per render; any local write or remote merge
+// invalidates (placeNodeAt / render() clear).
+const placementMemo = new Map();
+function placementInfo(origin) {
+  let pl = placementMemo.get(origin);
+  if (!pl) {
+    pl = JSON.parse(web.placementOf(web.createSeq(origin)));
+    placementMemo.set(origin, pl);
+  }
+  return pl;
+}
+
+/// Claim: `nodeOrigin`'s placement = link atom `elemId` (or TOMB_ID to
+/// detach), superseding the heads this replica sees.
+function placeNodeAt(nodeOrigin, elemId) {
+  web.placeAt(web.createSeq(nodeOrigin), elemId);
+  placementMemo.delete(nodeOrigin);
+}
+
+/// The winning link atom for a node, per the register: chain[0] is the
+/// single head's claim, or the last-agreed placement under conflict
+/// (freeze — contenders never render). TOMB = deleted. null = legacy.
+function winningAtomOf(origin) {
+  const pl = placementInfo(origin);
+  if (pl.empty) return null;
+  const w = pl.chain[0];
+  return !w || w === TOMB_ID ? undefined : w; // undefined = placed nowhere
+}
+
+/// Child node refs of a container (or of the body), membership-filtered:
+/// registered children render only at their claimed atom; legacy children
+/// by presence (deduped).
 function childNodes2(nodeOrigin) {
   const obj = web.createSeq(nodeOrigin);
   const off = childOffset(nodeOrigin);
@@ -82,9 +124,19 @@ function childNodes2(nodeOrigin) {
   const n = web.textLen(obj);
   for (let i = off; i < n; i++) {
     const o = web.payloadAt(obj, i);
-    if (!o || seen.has(o)) continue;
-    seen.add(o);
-    out.push({ idx: i, origin: o });
+    if (!o || o === CONTAINER_MARK || seen.has(o)) continue;
+    const pl = placementInfo(o);
+    if (pl.empty) {
+      seen.add(o);
+      out.push({ idx: i, origin: o, legacy: true });
+      continue;
+    }
+    const winner = winningAtomOf(o);
+    if (winner && web.seqIdAt(obj, i) === winner) {
+      seen.add(o);
+      out.push({ idx: i, origin: o, conflicted: pl.conflicted });
+    }
+    // else: a dead ghost atom — invisible, retained for the fallback.
   }
   return out;
 }
@@ -100,10 +152,17 @@ function makeContainerNode(childOrigins) {
   const o = randOrigin();
   const c = web.createSeq(o);
   web.seqInsertRef(c, 0, CONTAINER_MARK);
-  childOrigins.forEach((co, i) => web.seqInsertRef(c, 1 + i, co));
+  childOrigins.forEach((co, i) => {
+    const elemId = web.seqInsertRef(c, 1 + i, co);
+    placeNodeAt(co, elemId); // the children now live here
+  });
   return o;
 }
+/// DELETE a node: the register records the detachment (no fallback can
+/// resurrect it), the visible atom is tombstoned as hygiene. Moves never
+/// come through here — a move is insertChildAt (a fresh claim).
 function removeNodeFromParent(parentOrigin, nodeOrigin) {
+  placeNodeAt(nodeOrigin, TOMB_ID);
   const p = web.createSeq(parentOrigin);
   for (let i = 0; i < web.textLen(p); i++) {
     if (web.payloadAt(p, i) === nodeOrigin) {
@@ -112,18 +171,23 @@ function removeNodeFromParent(parentOrigin, nodeOrigin) {
     }
   }
 }
+/// Link `nodeOrigin` into `parentOrigin` at child index and CLAIM the new
+/// atom — the one primitive behind birth, move, and reparent. Old atoms
+/// (if any) go dead by the membership rule; they are never tombstoned.
 function insertChildAt(parentOrigin, nodeOrigin, childIdx) {
   const p = web.createSeq(parentOrigin);
   const off = childOffset(parentOrigin);
-  web.seqInsertRef(p, Math.min(off + childIdx, web.textLen(p)), nodeOrigin);
+  const at = Math.min(off + childIdx, web.textLen(p));
+  const elemId = web.seqInsertRef(p, at, nodeOrigin);
+  placeNodeAt(nodeOrigin, elemId);
+  return elemId;
 }
+/// The new node takes the old one's slot. The old node's own register says
+/// where it went (the caller placed it — typically into `newOrigin`); its
+/// atom here stays as a dead ghost.
 function replaceChild(parentOrigin, oldOrigin, newOrigin) {
-  const p = web.createSeq(parentOrigin);
-  const off = childOffset(parentOrigin);
   const ci = childIndexOf(parentOrigin, oldOrigin);
-  if (ci < 0) return;
-  web.textRemove(p, off + ci, 1);
-  web.seqInsertRef(p, off + ci, newOrigin);
+  insertChildAt(parentOrigin, newOrigin, ci < 0 ? 1e9 : ci);
 }
 /// Depth after edits can leave empty containers or pointless single-child
 /// wrappers; a full walk from the body removes the former and unwraps the
@@ -131,39 +195,41 @@ function replaceChild(parentOrigin, oldOrigin, newOrigin) {
 /// than incremental parent tracking).
 function normalizeTree(parentOrigin, seen = new Set()) {
   const p = web.createSeq(parentOrigin);
-  const off = childOffset(parentOrigin);
-  let i = off;
-  while (i < web.textLen(p)) {
-    const childOrigin = web.payloadAt(p, i);
-    if (!childOrigin) {
+  // Legacy heal only: for nodes WITHOUT a register, duplicate atoms are
+  // visible — first occurrence in document order wins, later raw atoms
+  // are removed. Registered nodes cannot visibly duplicate (membership
+  // picks one atom) and their ghosts must be retained for the fallback.
+  {
+    const legacySeen = new Set();
+    let i = childOffset(parentOrigin);
+    while (i < web.textLen(p)) {
+      const o = web.payloadAt(p, i);
+      if (o && o !== CONTAINER_MARK && placementInfo(o).empty) {
+        if (legacySeen.has(o)) {
+          web.textRemove(p, i, 1);
+          continue;
+        }
+        legacySeen.add(o);
+      }
       i++;
-      continue;
     }
-    // Self-heal duplicate refs: concurrent structural ops (a move is
-    // remove+insert; normalize itself re-inserts on unwrap) can leave the
-    // same node referenced twice. First occurrence in document order wins
-    // — a deterministic rule, so every replica repairs identically and
-    // the repairs converge.
-    if (seen.has(childOrigin)) {
-      web.textRemove(p, i, 1);
-      continue;
+  }
+  for (const c of childNodes2(parentOrigin)) {
+    if (seen.has(c.origin)) continue; // cycle guard
+    seen.add(c.origin);
+    if (!nodeIsContainer(c.origin)) continue;
+    normalizeTree(c.origin, seen);
+    const kids = childNodes2(c.origin);
+    if (kids.length === 0) {
+      removeNodeFromParent(parentOrigin, c.origin);
+    } else if (kids.length === 1) {
+      // Unwrap: hoist the child to the container's slot (a move — a fresh
+      // claim), then delete the container.
+      const ci = childIndexOf(parentOrigin, c.origin);
+      insertChildAt(parentOrigin, kids[0].origin, ci < 0 ? 1e9 : ci);
+      seen.delete(kids[0].origin);
+      removeNodeFromParent(parentOrigin, c.origin);
     }
-    seen.add(childOrigin);
-    if (nodeIsContainer(childOrigin)) {
-      normalizeTree(childOrigin, seen);
-      const kids = childNodes2(childOrigin);
-      if (kids.length === 0) {
-        web.textRemove(p, i, 1);
-        continue;
-      }
-      if (kids.length === 1) {
-        web.textRemove(p, i, 1);
-        web.seqInsertRef(p, i, kids[0].origin);
-        seen.delete(kids[0].origin); // re-check the hoisted child at this slot
-        continue;
-      }
-    }
-    i++;
   }
 }
 /// Every leaf block object across the whole tree (for comments etc).
@@ -922,6 +988,7 @@ function renderBody(el, bodyObj) {
 // ---- rendering ---------------------------------------------------------------
 
 function render() {
+  placementMemo.clear();
   rebuildGraph();
   if (current && !pageMeta.has(current)) current = null;
   if (!current && rootPages.length > 0) current = rootPages[0];
@@ -1600,7 +1667,8 @@ function dropOnLeaf(col, dir) {
   if (src.origin === tOrigin) return;
   const tParent = col.dataset.parentOrigin;
   const tDepth = Number(col.dataset.depth);
-  removeNodeFromParent(src.parentOrigin, src.origin);
+  // A move is never a delete: the new claim supersedes the old placement,
+  // and the old atom stays as a dead ghost.
   const parentAxis = (tDepth - 1) % 2 === 0 ? 'V' : 'H';
   const dirAxis = dir === 'left' || dir === 'right' ? 'H' : 'V';
   const before = dir === 'left' || dir === 'top';
@@ -1614,8 +1682,12 @@ function dropOnLeaf(col, dir) {
   if (parentAxis === dirAxis) {
     insertChildAt(tParent, src.origin, ti + (before ? 0 : 1));
   } else {
+    // Wrap: build the container (which claims both children into it),
+    // then claim the container at the target's old slot. Order matters —
+    // ti was computed before the target's membership moved.
     const kids = before ? [src.origin, tOrigin] : [tOrigin, src.origin];
-    replaceChild(tParent, tOrigin, makeContainerNode(kids));
+    const cont = makeContainerNode(kids);
+    insertChildAt(tParent, cont, ti);
   }
   normalizeTree(currentBodyOrigin);
   persistSoon();
@@ -1626,8 +1698,7 @@ function newLeafToNewRow(bodyIdx) {
   const src = dragCol;
   dragCol = null;
   if (!src) return;
-  removeNodeFromParent(src.parentOrigin, src.origin);
-  insertChildAt(currentBodyOrigin, src.origin, bodyIdx);
+  insertChildAt(currentBodyOrigin, src.origin, bodyIdx); // move = re-claim
   normalizeTree(currentBodyOrigin);
   persistSoon();
   render();
@@ -2132,7 +2203,7 @@ function updateLeafContent(col, obj, ed) {
   }
 }
 
-function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, single, seen) {
+function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, single, seen, conflicted) {
   if (seen.has(origin)) return; // duplicate ref — render first occurrence only
   seen.add(origin);
   if (nodeIsContainer(origin)) {
@@ -2140,7 +2211,7 @@ function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, singl
     cont.className = 'node-container';
     cont.style.flexDirection = depth % 2 === 0 ? 'column' : 'row';
     for (const k of childNodes2(origin)) {
-      renderNodeInto(cont, k.origin, depth + 1, origin, prevLeaves, false, seen);
+      renderNodeInto(cont, k.origin, depth + 1, origin, prevLeaves, false, seen, k.conflicted);
     }
     parentEl.appendChild(cont);
     return;
@@ -2151,6 +2222,10 @@ function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, singl
   else col = makeColumn(obj, origin);
   col.dataset.parentOrigin = parentOrigin;
   col.dataset.depth = depth;
+  // Contested placement (two register heads): frozen at last-agreed,
+  // badged; the next drag names both heads and resolves.
+  col.classList.toggle('pl-conflict', !!conflicted);
+  col.title = conflicted ? 'placement contested by a concurrent move — drag to resolve' : '';
   const ed = col.querySelector('.block-ed');
   if (single) ed.dataset.placeholder = 'Type here…';
   else delete ed.dataset.placeholder;
@@ -2182,7 +2257,7 @@ function renderBlocks() {
   const single = topKids.length === 1 && !nodeIsContainer(topKids[0].origin);
   const seen = new Set();
   for (const k of topKids) {
-    renderNodeInto(frag, k.origin, 1, currentBodyOrigin, prevLeaves, single, seen);
+    renderNodeInto(frag, k.origin, 1, currentBodyOrigin, prevLeaves, single, seen, k.conflicted);
   }
 
   for (const c of prevLeaves.values()) c.remove();
@@ -2246,7 +2321,8 @@ function restoreEditState(st) {
 function addBlockAtEnd(focus = true) {
   const body = ensureBody();
   const leaf = makeLeafNode();
-  web.seqInsertRef(body, web.textLen(body), leaf);
+  const elemId = web.seqInsertRef(body, web.textLen(body), leaf);
+  placeNodeAt(leaf, elemId);
   persistSoon();
   render();
   if (focus) {
@@ -2671,7 +2747,11 @@ function createPage(parentObj) {
   const bodyOrigin = randOrigin();
   web.putRef(page, 'body', bodyOrigin);
   const body = web.createSeq(bodyOrigin);
-  web.seqInsertRef(body, 0, makeLeafNode());
+  {
+    const firstLeaf = makeLeafNode();
+    const elemId = web.seqInsertRef(body, 0, firstLeaf);
+    placeNodeAt(firstLeaf, elemId);
+  }
   web.putString(page, 'bodySchema', 'tree');
   current = page;
   persistSoon();
