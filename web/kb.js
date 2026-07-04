@@ -1874,7 +1874,9 @@ function makeColumn(obj, origin) {
     }
     if (e.key !== 'Enter') return;
     e.preventDefault();
-    if (e.metaKey || e.ctrlKey) {
+    // Shift+Enter (the common idiom) or cmd/ctrl+Enter: newline within
+    // the block. Plain Enter: a new block.
+    if (e.shiftKey || e.metaKey || e.ctrlKey) {
       insertNewlineAtCaret();
       return;
     }
