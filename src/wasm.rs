@@ -403,6 +403,61 @@ fn anchor_range(seq: &HashSeq, start: usize, end: usize) -> Result<(Anchor, Anch
 mod tests {
     use super::*;
 
+    /// PLACEMENT_SPEC.md through the FFI: move a block between two
+    /// containers by insert-link + placeAt; the chain resolves membership;
+    /// the tombstone detaches; registers survive the snapshot.
+    #[test]
+    fn placement_conventions_through_ffi() {
+        let mut web = WasmHashWeb::new();
+        let child_origin = "aa".repeat(32);
+        let p_origin = "bb".repeat(32);
+        let q_origin = "cc".repeat(32);
+        let child = web.create_seq(&child_origin).unwrap();
+        let p = web.create_seq(&p_origin).unwrap();
+        let q = web.create_seq(&q_origin).unwrap();
+        web.text_insert(&child, 0, "hello").unwrap();
+
+        // Birth link in P + agreed placement.
+        let birth = web.seq_insert_ref(&p, 0, &child_origin).unwrap();
+        web.place_at(&child, &birth).unwrap();
+        let pl: serde_json::Value =
+            serde_json::from_str(&web.placement_of(&child).unwrap()).unwrap();
+        assert_eq!(pl["empty"], false);
+        assert_eq!(pl["conflicted"], false);
+        assert_eq!(pl["chain"][0], birth);
+
+        // Move to Q: new link + place superseding.
+        let link_q = web.seq_insert_ref(&q, 0, &child_origin).unwrap();
+        web.place_at(&child, &link_q).unwrap();
+        let pl: serde_json::Value =
+            serde_json::from_str(&web.placement_of(&child).unwrap()).unwrap();
+        assert_eq!(pl["chain"][0], link_q);
+        assert_eq!(pl["chain"][1], birth, "spine retained for fallback");
+
+        // Detach (delete): place the tombstone.
+        web.place_at(&child, &WasmHashWeb::tombstone_id()).unwrap();
+        let pl: serde_json::Value =
+            serde_json::from_str(&web.placement_of(&child).unwrap()).unwrap();
+        assert_eq!(pl["chain"][0], WasmHashWeb::tombstone_id());
+
+        // A kv (page) is placeable the same way.
+        let page_origin = "dd".repeat(32);
+        let page = web.create_kv(&page_origin).unwrap();
+        let link_pg = web.seq_insert_ref(&p, 0, &page_origin).unwrap();
+        web.place_at(&page, &link_pg).unwrap();
+        let pl: serde_json::Value =
+            serde_json::from_str(&web.placement_of(&page).unwrap()).unwrap();
+        assert_eq!(pl["chain"][0], link_pg);
+
+        // Snapshot round-trip preserves registers.
+        let bytes = web.encode();
+        let mut web2 = WasmHashWeb::new();
+        web2.merge_encoded(&bytes).unwrap();
+        let pl2: serde_json::Value =
+            serde_json::from_str(&web2.placement_of(&page).unwrap()).unwrap();
+        assert_eq!(pl2["chain"][0], link_pg);
+    }
+
     /// The knowledge-base app's whole object model, end to end: a
     /// workspace kv opened at a well-known origin; pages as kv objects at
     /// app-chosen origins carried as ref values; bodies as seq children;
@@ -774,6 +829,56 @@ impl WasmHashWeb {
     /// Insert an atom at visible position `idx` whose payload is a raw id
     /// (an embed: another object's origin, by app convention). Renders as
     /// U+FFFC in `text()`; read back with `payloadAt`.
+    /// Author a `Place` op on any object (seq or kv): claim the link atom
+    /// `placed_at_hex` (an element id in some container) as this object's
+    /// containment placement, superseding the placement heads this replica
+    /// sees. Pass the tombstone id (`tombstoneId()`) to detach/delete.
+    /// Returns the place op's id. PLACEMENT_SPEC.md.
+    #[wasm_bindgen(js_name = placeAt)]
+    pub fn place_at(&mut self, obj_hex: &str, placed_at_hex: &str) -> Result<String, JsValue> {
+        let obj = hex_to_id(obj_hex)?;
+        let placed_at = hex_to_id(placed_at_hex)?;
+        if let Some(seq) = self.inner.seq_mut(&obj) {
+            return Ok(id_to_hex(&seq.place(placed_at).id()));
+        }
+        if let Some(kv) = self.inner.kv_mut(&obj) {
+            return Ok(id_to_hex(&kv.place(placed_at).id()));
+        }
+        Err(app_err("no such object"))
+    }
+
+    /// The containment register read (PLACEMENT_SPEC.md): JSON
+    /// `{"empty":bool,"conflicted":bool,"heads":[hex],"chain":[hex]}`.
+    /// `empty` = no Place op ever (the legacy presence rule applies);
+    /// `chain` = placed_at values in descending agreement order — the read
+    /// layer tries entries in order, skipping dead/unresolvable atoms;
+    /// a tombstone entry means detached-by-intent.
+    #[wasm_bindgen(js_name = placementOf)]
+    pub fn placement_of(&self, obj_hex: &str) -> Result<String, JsValue> {
+        let obj = hex_to_id(obj_hex)?;
+        let reg = if let Some(seq) = self.inner.seq(&obj) {
+            seq.placement().clone()
+        } else if let Some(kv) = self.inner.kv(&obj) {
+            kv.placement().clone()
+        } else {
+            return Err(app_err("no such object"));
+        };
+        let json = serde_json::json!({
+            "empty": reg.is_empty(),
+            "conflicted": reg.conflicted(),
+            "heads": reg.heads().iter().map(id_to_hex).collect::<Vec<_>>(),
+            "chain": reg.chain().iter().map(id_to_hex).collect::<Vec<_>>(),
+        });
+        Ok(json.to_string())
+    }
+
+    /// The tombstone value id (a derived constant): the `placed_at` for
+    /// detach, the mark value for unmark.
+    #[wasm_bindgen(js_name = tombstoneId)]
+    pub fn tombstone_id() -> String {
+        id_to_hex(&TOMBSTONE)
+    }
+
     #[wasm_bindgen(js_name = seqInsertRef)]
     pub fn seq_insert_ref(
         &mut self,

@@ -21,6 +21,7 @@ pub const KIND_REMOVE: u8 = 1;
 pub const KIND_MOVE: u8 = 2;
 pub const KIND_PUT: u8 = 3;
 pub const KIND_MARK: u8 = 4;
+pub const KIND_PLACE: u8 = 5;
 
 /// THE glued point — the addressing primitive shared by inserts, moves, and
 /// marks (HASHSEQ_SPEC.md). The side is data, not op kind: a gap *is* an
@@ -107,6 +108,17 @@ pub enum Op {
         value: Id,
         overwrites: BTreeSet<Id>,
     },
+    /// Claim the object's containment register (PLACEMENT_SPEC.md): which
+    /// link atom — anywhere in the store — places this object. `placed_at`
+    /// is a value commitment, never a ref (an Insert op id in some
+    /// container, or `TOMBSTONE` = detach); `overwrites` names the
+    /// placement heads this op saw and replaces, in THIS object's own DAG.
+    /// Valid in any object kind — the register concerns the object's
+    /// placement, not its content projection.
+    Place {
+        placed_at: Id,
+        overwrites: BTreeSet<Id>,
+    },
 }
 
 impl Op {
@@ -134,6 +146,7 @@ impl Op {
             Op::Move { .. } => KIND_MOVE,
             Op::Put { .. } => KIND_PUT,
             Op::Mark { .. } => KIND_MARK,
+            Op::Place { .. } => KIND_PLACE,
         }
     }
 
@@ -144,7 +157,8 @@ impl Op {
             Op::Insert { at, .. } => Some(at.id()),
             Op::Move { target, .. } => Some(target),
             Op::Mark { start, .. } => Some(start.id()),
-            Op::Remove(_) | Op::Put { .. } => None,
+            // Place's placed_at is a value commitment, never a named ref.
+            Op::Remove(_) | Op::Put { .. } | Op::Place { .. } => None,
         }
     }
 
@@ -165,7 +179,8 @@ impl Op {
             Op::Remove(targets) => Some(targets),
             Op::Move { overwrites, .. }
             | Op::Put { overwrites, .. }
-            | Op::Mark { overwrites, .. } => Some(overwrites),
+            | Op::Mark { overwrites, .. }
+            | Op::Place { overwrites, .. } => Some(overwrites),
             Op::Insert { .. } => None,
         }
     }
@@ -369,6 +384,21 @@ impl HashNode {
                     update_varint(&mut hasher, i);
                 }
             }
+            Op::Place {
+                placed_at,
+                overwrites,
+            } => {
+                let idxs = sorted_subset_indices(&refs, overwrites);
+                let body_len = 32
+                    + varint_len(idxs.len())
+                    + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
+                update_varint(&mut hasher, body_len);
+                hasher.update(&placed_at.0);
+                update_varint(&mut hasher, idxs.len());
+                for i in idxs {
+                    update_varint(&mut hasher, i);
+                }
+            }
         }
         Id(*hasher.finalize().as_bytes())
     }
@@ -450,13 +480,20 @@ mod tests {
                 },
             },
             HashNode {
-                pins,
+                pins: pins.clone(),
                 op: Op::Mark {
                     start: Anchor::Before(tid(0x01)),
                     end: Anchor::After(tid(0x02)),
                     kind_v: tid(0x30),
                     value: tid(0x31),
                     overwrites: BTreeSet::from_iter([tid(0x03)]),
+                },
+            },
+            HashNode {
+                pins,
+                op: Op::Place {
+                    placed_at: tid(0x44),
+                    overwrites: BTreeSet::from_iter([tid(0x03), tid(0x0C)]),
                 },
             },
         ];

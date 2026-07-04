@@ -76,6 +76,7 @@ pub(crate) const TAG_REMOVE: u8 = 0x02;
 pub(crate) const TAG_MOVE: u8 = 0x03;
 pub(crate) const TAG_PUT: u8 = 0x04;
 pub(crate) const TAG_MARK: u8 = 0x05;
+pub(crate) const TAG_PLACE: u8 = 0x06;
 
 // --- Varint (LEB128) encoding/decoding ---
 
@@ -319,7 +320,7 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(Payload, usize), DecodeError> {
 /// This is the reference encoder that `HashNode::id`'s streaming hasher is
 /// locked to by test.
 pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
-    use crate::hash_node::{KIND_INSERT, KIND_MARK, KIND_MOVE, KIND_PUT, KIND_REMOVE};
+    use crate::hash_node::{KIND_INSERT, KIND_MARK, KIND_MOVE, KIND_PLACE, KIND_PUT, KIND_REMOVE};
 
     let mut refs: Vec<Id> = node.iter_refs().copied().collect();
     refs.sort_unstable();
@@ -353,6 +354,7 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
         Op::Move { .. } => KIND_MOVE,
         Op::Put { .. } => KIND_PUT,
         Op::Mark { .. } => KIND_MARK,
+        Op::Place { .. } => KIND_PLACE,
     };
     buf.push(kind);
     encode_varint(refs.len(), buf);
@@ -438,6 +440,20 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
                 encode_varint(i, buf);
             }
         }
+        Op::Place {
+            placed_at,
+            overwrites,
+        } => {
+            let idxs = subset_idxs(overwrites);
+            let body_len =
+                32 + varint_len(idxs.len()) + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
+            encode_varint(body_len, buf);
+            encode_id(placed_at, buf);
+            encode_varint(idxs.len(), buf);
+            for i in idxs {
+                encode_varint(i, buf);
+            }
+        }
     }
 }
 
@@ -500,6 +516,17 @@ fn encode_node_with(node: &HashNode, buf: &mut Vec<u8>, ref_: &mut PutRef, ref_s
             encode_id(value, buf);
             ref_set(overwrites, buf);
         }
+        Op::Place {
+            placed_at,
+            overwrites,
+        } => {
+            buf.push(TAG_PLACE);
+            ref_set(&node.pins, buf);
+            // placed_at is a value commitment (a foreign op id) — raw,
+            // never through the ref table.
+            encode_id(placed_at, buf);
+            ref_set(overwrites, buf);
+        }
     }
 }
 
@@ -550,6 +577,10 @@ fn decode_node_with(
             end: anchor(c, ref_)?,
             kind_v: c.step(decode_id)?,
             value: c.step(decode_id)?,
+            overwrites: ref_set(c)?,
+        },
+        TAG_PLACE => Op::Place {
+            placed_at: c.step(decode_id)?,
             overwrites: ref_set(c)?,
         },
         other => return Err(DecodeError::InvalidOpTag(other)),
@@ -763,6 +794,17 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                         bump(h);
                     }
                     for h in mv.pins.iter() {
+                        bump(h);
+                    }
+                }
+                Loc::PlaceOp => {
+                    let sp = &seq.place_nodes[&idx];
+                    // placed_at is a foreign commitment — not in this
+                    // object's id table, so it cannot affect depth.
+                    for h in sp.overwrites.iter() {
+                        bump(h);
+                    }
+                    for h in sp.pins.iter() {
                         bump(h);
                     }
                 }
@@ -1274,6 +1316,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         for (idx, mk) in &seq.mark_nodes {
             nodes.push((seq.id_of(*idx), seq.mark_node(mk)));
         }
+        for (idx, sp) in &seq.place_nodes {
+            nodes.push((seq.id_of(*idx), seq.place_node(sp)));
+        }
         for &e in seq.elem_payloads.keys() {
             nodes.push((seq.id_of(e), seq.atom_node(e)));
         }
@@ -1725,23 +1770,44 @@ fn encode_hashkv_with_store(kv: &HashKv, include_store: bool) -> Vec<u8> {
     encode_varint(n, &mut buf);
     for &i in &order {
         let (_, node) = nodes[i];
-        let Op::Put {
-            key,
-            value,
-            overwrites,
-        } = &node.op
-        else {
-            unreachable!("applied kv nodes are puts");
-        };
-        encode_varint(node.pins.len(), &mut buf);
-        for r in &node.pins {
-            put_ref(r, &mut buf);
-        }
-        encode_id(key, &mut buf);
-        encode_id(value, &mut buf);
-        encode_varint(overwrites.len(), &mut buf);
-        for r in overwrites {
-            put_ref(r, &mut buf);
+        // Per-node kind tag (snapshot v2): 0 = Put, 1 = Place. The kv
+        // section predating Place was tagless (every node a Put); the
+        // legacy decode path still reads that form.
+        match &node.op {
+            Op::Put {
+                key,
+                value,
+                overwrites,
+            } => {
+                encode_varint(0, &mut buf);
+                encode_varint(node.pins.len(), &mut buf);
+                for r in &node.pins {
+                    put_ref(r, &mut buf);
+                }
+                encode_id(key, &mut buf);
+                encode_id(value, &mut buf);
+                encode_varint(overwrites.len(), &mut buf);
+                for r in overwrites {
+                    put_ref(r, &mut buf);
+                }
+            }
+            Op::Place {
+                placed_at,
+                overwrites,
+            } => {
+                encode_varint(1, &mut buf);
+                encode_varint(node.pins.len(), &mut buf);
+                for r in &node.pins {
+                    put_ref(r, &mut buf);
+                }
+                // placed_at: a foreign commitment — raw id, never a ref.
+                encode_id(placed_at, &mut buf);
+                encode_varint(overwrites.len(), &mut buf);
+                for r in overwrites {
+                    put_ref(r, &mut buf);
+                }
+            }
+            _ => unreachable!("applied kv nodes are puts or places"),
         }
     }
 
@@ -1769,6 +1835,12 @@ fn encode_hashkv_with_store(kv: &HashKv, include_store: bool) -> Vec<u8> {
 }
 
 pub fn decode_hashkv(bytes: &[u8]) -> Result<HashKv, DecodeError> {
+    decode_hashkv_v(bytes, true)
+}
+
+/// `tagged`: v2 form (per-node kind tag). Legacy (pre-Place) kv sections
+/// are tagless all-Put; `decode_hashweb` selects by the stream magic.
+fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
     let mut c = Cursor { bytes, pos: 0 };
     let origin = c.step(decode_id)?;
     let mut kv = HashKv::new(origin);
@@ -1787,26 +1859,42 @@ pub fn decode_hashkv(bytes: &[u8]) -> Result<HashKv, DecodeError> {
                     .ok_or(DecodeError::InvalidIdIndex(v - 1))
             }
         };
+        let tag = if tagged { c.step(decode_varint)? } else { 0 };
         let mut pins = BTreeSet::new();
         let np = c.step(decode_varint)?;
         for _ in 0..np {
             pins.insert(get_ref(&mut c)?);
         }
-        let key = c.step(decode_id)?;
-        let value = c.step(decode_id)?;
-        let mut overwrites = BTreeSet::new();
-        let no = c.step(decode_varint)?;
-        for _ in 0..no {
-            overwrites.insert(get_ref(&mut c)?);
-        }
-        let node = HashNode {
-            pins,
-            op: Op::Put {
-                key,
-                value,
-                overwrites,
-            },
+        let op = match tag {
+            0 => {
+                let key = c.step(decode_id)?;
+                let value = c.step(decode_id)?;
+                let mut overwrites = BTreeSet::new();
+                let no = c.step(decode_varint)?;
+                for _ in 0..no {
+                    overwrites.insert(get_ref(&mut c)?);
+                }
+                Op::Put {
+                    key,
+                    value,
+                    overwrites,
+                }
+            }
+            1 => {
+                let placed_at = c.step(decode_id)?;
+                let mut overwrites = BTreeSet::new();
+                let no = c.step(decode_varint)?;
+                for _ in 0..no {
+                    overwrites.insert(get_ref(&mut c)?);
+                }
+                Op::Place {
+                    placed_at,
+                    overwrites,
+                }
+            }
+            other => return Err(DecodeError::InvalidOpTag(other as u8)),
         };
+        let node = HashNode { pins, op };
         // Recomputed ids are the authoritative derivation.
         let id = node.id();
         emitted.push(id);
@@ -1861,8 +1949,15 @@ pub fn decode_hashkv_strict(bytes: &[u8]) -> Result<HashKv, DecodeError> {
 
 use crate::value::{KIND_KV as OBJ_KV, KIND_SEQ as OBJ_SEQ};
 
+/// Store-snapshot magic, v2 (Place op / tagged kv nodes). Snapshots
+/// without the magic are the pre-Place legacy form; `decode_hashweb`
+/// accepts both, `encode_hashweb` always emits v2 — a legacy state file
+/// silently upgrades on its next persist.
+const HASHWEB_MAGIC_V2: &[u8; 4] = b"HWB2";
+
 pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(HASHWEB_MAGIC_V2);
 
     // One store-wide artifact section: the store's values unioned with
     // every map's local store (inner stores are excluded from the nested
@@ -1929,7 +2024,11 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
 }
 
 pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
-    let mut c = Cursor { bytes, pos: 0 };
+    let tagged = bytes.starts_with(HASHWEB_MAGIC_V2);
+    let mut c = Cursor {
+        bytes,
+        pos: if tagged { HASHWEB_MAGIC_V2.len() } else { 0 },
+    };
     let mut web = HashWeb::new();
 
     let na = c.step(decode_varint)?;
@@ -1956,7 +2055,7 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
         // origin — never read from the wire.
         match kind {
             OBJ_KV => {
-                let m = decode_hashkv(inner)?;
+                let m = decode_hashkv_v(inner, tagged)?;
                 web.kvs.insert(crate::value::object_id(OBJ_KV, &m.origin()), m);
             }
             OBJ_SEQ => {
@@ -2726,5 +2825,25 @@ mod remove_roundtrip {
         let decoded = decode_hashseq(&encoded).unwrap();
 
         decoded.iter().collect::<String>() == seq.iter().collect::<String>() && seq == decoded
+    }
+}
+
+#[cfg(test)]
+mod legacy_compat {
+    /// Manual check: decode a pre-Place (legacy, no-magic) state file and
+    /// verify it re-encodes as v2 and round-trips. Run with
+    /// `LEGACY_SNAPSHOT=/path cargo test legacy_snapshot_upgrades -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn legacy_snapshot_upgrades() {
+        let path = std::env::var("LEGACY_SNAPSHOT").expect("set LEGACY_SNAPSHOT");
+        let bytes = std::fs::read(&path).expect("read snapshot");
+        let web = super::decode_hashweb(&bytes).expect("legacy decode");
+        eprintln!("decoded {} objects from legacy snapshot", web.object_count());
+        assert!(web.object_count() > 0);
+        let v2 = super::encode_hashweb(&web);
+        assert!(v2.starts_with(b"HWB2"));
+        let web2 = super::decode_hashweb_strict(&v2).expect("v2 strict");
+        assert_eq!(web2, web, "legacy state upgrades losslessly to v2");
     }
 }

@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 use crate::hashseq::IdMap;
 use crate::delivery::Delivery;
+use crate::placement::PlacementRegister;
 use crate::value::{TOMBSTONE, Value};
 use crate::{HashNode, Id, Op};
 
@@ -54,6 +55,9 @@ pub struct HashKv {
     /// this replica has seen bytes for. Reads without bytes are `pending`.
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
+    /// The containment register — where does this object live
+    /// (PLACEMENT_SPEC.md). `Place` is valid in any object kind.
+    pub(crate) placement: PlacementRegister,
     /// Parked orphans + the gate (non-map ops quarantine — the edge table).
     pub(crate) delivery: Delivery,
 }
@@ -79,6 +83,7 @@ impl HashKv {
             keys: IdMap::default(),
             values: IdMap::default(),
             tips: BTreeSet::new(),
+            placement: PlacementRegister::default(),
             delivery: Delivery::default(),
         };
         // The origin is axiomatically present: the map's frontier begins at
@@ -249,6 +254,23 @@ impl HashKv {
     /// edge-table rows. `Err` hands the node back for quarantine.
     #[allow(clippy::result_large_err)]
     fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), HashNode> {
+        // Place is admitted in any object kind (PLACEMENT_SPEC.md): the
+        // containment register concerns the object's placement, not its
+        // content projection. placed_at is a commitment — nothing to gate.
+        if let Op::Place {
+            placed_at,
+            overwrites,
+        } = &node.op
+        {
+            for r in node.iter_refs() {
+                self.tips.remove(r);
+            }
+            self.tips.insert(id);
+            self.placement.apply(id, *placed_at, overwrites.clone());
+            self.nodes.insert(id, node);
+            return Ok(());
+        }
+
         // Edge-table gate: only map ops are admitted here (a seq op in a
         // Map is ill-typed — stable, permanent).
         let Op::Put {
@@ -296,6 +318,29 @@ impl HashKv {
         for (id, node) in other.delivery.into_held() {
             self.apply_with_id(id, node);
         }
+    }
+
+    /// The containment register (PLACEMENT_SPEC.md read surface).
+    pub fn placement(&self) -> &PlacementRegister {
+        &self.placement
+    }
+
+    /// Author a `Place` claiming `placed_at`, superseding the placement
+    /// heads this replica sees. Returns the applied node (re-broadcast).
+    pub fn place(&mut self, placed_at: Id) -> HashNode {
+        let overwrites: BTreeSet<Id> =
+            self.placement.heads().iter().copied().collect();
+        let pins: BTreeSet<Id> =
+            BTreeSet::from_iter(self.tips.difference(&overwrites).cloned());
+        let node = HashNode {
+            pins,
+            op: Op::Place {
+                placed_at,
+                overwrites,
+            },
+        };
+        self.apply(node.clone());
+        node
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {

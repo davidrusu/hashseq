@@ -5,6 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::bitset::BitSet;
 use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepFrag, SweepPos};
 use crate::delivery::Delivery;
+use crate::placement::PlacementRegister;
 use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
@@ -88,6 +89,9 @@ pub enum Loc {
     MoveOp,
     /// A span-annotation mark op (stored in `mark_nodes`).
     MarkOp,
+    /// A containment-register place op (stored in `place_nodes`;
+    /// PLACEMENT_SPEC.md).
+    PlaceOp,
 }
 
 /// `Loc` packed into 8 bytes for the per-node `locs` Vec (the enum is 12).
@@ -105,6 +109,7 @@ impl PackedLoc {
     const KIND_MULTI_REMOVE: u64 = 3;
     const KIND_MOVE_OP: u64 = 4;
     const KIND_MARK_OP: u64 = 5;
+    const KIND_PLACE_OP: u64 = 6;
 
     #[inline]
     fn pack(handle: NodeIdx, pos: u32, kind: u64) -> Self {
@@ -122,6 +127,7 @@ impl PackedLoc {
             Self::KIND_REMOVE_CHAIN => Loc::RemoveChain { chain: handle, pos },
             Self::KIND_MOVE_OP => Loc::MoveOp,
             Self::KIND_MARK_OP => Loc::MarkOp,
+            Self::KIND_PLACE_OP => Loc::PlaceOp,
             _ => Loc::MultiRemove,
         }
     }
@@ -139,6 +145,7 @@ impl From<Loc> for PackedLoc {
             Loc::MultiRemove => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MULTI_REMOVE),
             Loc::MoveOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MOVE_OP),
             Loc::MarkOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MARK_OP),
+            Loc::PlaceOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_PLACE_OP),
         }
     }
 }
@@ -519,6 +526,11 @@ pub struct HashSeq {
     /// Anchor events for the mark sweep: anchor element (or origin) ->
     /// events crossing at its glue points. Empty in mark-free documents.
     mark_events: FxHashMap<NodeIdx, Vec<MarkEvent>>,
+    /// Applied place ops, by their own handle — this object's containment-
+    /// register history (PLACEMENT_SPEC.md). Retention: the full spine.
+    pub place_nodes: FxHashMap<NodeIdx, StoredPlace>,
+    /// The containment register: live heads + the last-agreed walk.
+    pub(crate) placement: PlacementRegister,
 
     pub(crate) tips: BTreeSet<Id>,
     /// The mark layer's own frontier: marks are downstream-only (content
@@ -545,6 +557,17 @@ struct MarkEvent {
     start: bool,
     /// Which of the anchor's two points: `After` (true) or `Before`.
     after: bool,
+}
+
+/// An applied `Place` op — the containment register's stored form
+/// (PLACEMENT_SPEC.md). `placed_at` is a foreign commitment, kept as a raw
+/// id (it is not in this object's id table); `overwrites`/`pins` are refs,
+/// interned.
+#[derive(Debug, Clone)]
+pub struct StoredPlace {
+    pub placed_at: Id,
+    pub overwrites: SortedIdVec,
+    pub pins: SortedIdVec,
 }
 
 impl PartialEq for HashSeq {
@@ -585,6 +608,8 @@ impl HashSeq {
             mark_nodes: FxHashMap::default(),
             mark_anchored_ops: FxHashSet::default(),
             mark_events: FxHashMap::default(),
+            place_nodes: FxHashMap::default(),
+            placement: PlacementRegister::default(),
             tips: BTreeSet::new(),
             mark_tips: BTreeSet::new(),
             delivery: Delivery::default(),
@@ -1586,6 +1611,58 @@ impl HashSeq {
         }
     }
 
+    fn apply_place(
+        &mut self,
+        id: Id,
+        pins: BTreeSet<Id>,
+        placed_at: Id,
+        overwrites: BTreeSet<Id>,
+    ) {
+        let idx = self.intern(id, Loc::PlaceOp);
+        let stored = StoredPlace {
+            placed_at,
+            overwrites: SortedIdVec::from_id_set(&overwrites, |d| self.idx_of_known(d)),
+            pins: SortedIdVec::from_id_set(&pins, |d| self.idx_of_known(d)),
+        };
+        self.place_nodes.insert(idx, stored);
+        self.placement.apply(id, placed_at, overwrites);
+    }
+
+    /// Reconstruct a place op's `HashNode` (for merge / re-broadcast).
+    pub fn place_node(&self, sp: &StoredPlace) -> HashNode {
+        HashNode {
+            pins: sp.pins.to_id_set(&self.ids),
+            op: Op::Place {
+                placed_at: sp.placed_at,
+                overwrites: sp.overwrites.to_id_set(&self.ids),
+            },
+        }
+    }
+
+    /// The containment register — where does this object live
+    /// (PLACEMENT_SPEC.md read surface).
+    pub fn placement(&self) -> &PlacementRegister {
+        &self.placement
+    }
+
+    /// Author a `Place` claiming `placed_at`, superseding the placement
+    /// heads this replica sees. Returns the applied node (re-broadcast).
+    pub fn place(&mut self, placed_at: Id) -> HashNode {
+        let overwrites: BTreeSet<Id> =
+            self.placement.heads().iter().copied().collect();
+        let pins: BTreeSet<Id> =
+            self.tips.difference(&overwrites).cloned().collect();
+        let node = HashNode {
+            pins,
+            op: Op::Place {
+                placed_at,
+                overwrites,
+            },
+        };
+        self.apply(node.clone());
+        node
+    }
+
     // ---- mark reads (arbitration happens here, per Law II) ----
 
     /// Sweep position of a mark anchor point: fixed at the anchor's base
@@ -2067,6 +2144,11 @@ impl HashSeq {
             // and op ranks), so no later op can flip the verdict. Checked in
             // the Mark dispatch below (fragment materialization needs &mut).
             Op::Mark { .. } => true,
+            // Place admits unconditionally (PLACEMENT_SPEC.md): placed_at
+            // is a value commitment nothing can verify at apply time, and
+            // every malformed relationship is inert at read time. No new
+            // gate rows.
+            Op::Place { .. } => true,
             _ => false,
         };
         if !admitted {
@@ -2128,6 +2210,10 @@ impl HashSeq {
                 to,
                 overwrites,
             } => self.apply_move(id, node.pins, target, to, overwrites),
+            Op::Place {
+                placed_at,
+                overwrites,
+            } => self.apply_place(id, node.pins, placed_at, overwrites),
             _ => unreachable!("gated above"),
         }
         Ok(())
@@ -2187,6 +2273,9 @@ impl HashSeq {
         for (idx, mk) in &self.mark_nodes {
             out.push((self.id_of(*idx), self.mark_node(mk)));
         }
+        for (idx, sp) in &self.place_nodes {
+            out.push((self.id_of(*idx), self.place_node(sp)));
+        }
         out
     }
 
@@ -2240,6 +2329,12 @@ impl HashSeq {
         // the orphan machinery orders them after their runs arrive.
         for (idx, mv) in &other.move_nodes {
             let node = other.move_node(*idx, mv);
+            self.apply_with_id(other.id_of(*idx), node);
+        }
+
+        // Place ops (containment register) — same discipline.
+        for (idx, sp) in &other.place_nodes {
+            let node = other.place_node(sp);
             self.apply_with_id(other.id_of(*idx), node);
         }
 

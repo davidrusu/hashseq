@@ -325,6 +325,122 @@ pub(crate) mod tests {
         assert_eq!(decoded, a);
     }
 
+    /// PLACEMENT_SPEC.md end to end: cross-container move is Insert (order
+    /// claim, in the destination) + Place (membership claim, in the moved
+    /// object's own DAG). Concurrent moves freeze at the last agreed
+    /// placement — no duplication is representable; the next Place naming
+    /// both heads resolves; Place ops survive the canonical snapshot.
+    #[test]
+    fn cross_container_move_via_placement_register() {
+        let mut a = HashWeb::new();
+        let child_origin = oid(0x10);
+        let child = a.create_seq(child_origin);
+        let p = a.create_seq(oid(0x20));
+        let q = a.create_seq(oid(0x30));
+        let r = a.create_seq(oid(0x40));
+        type_text(&mut a, &child, 0, "content");
+
+        // Birth: a containment link in P (payload = the child's ORIGIN —
+        // the containment type per the spec's typing rule).
+        let birth = a.seq_mut(&p).unwrap().insert_value(0, child_origin);
+        // Agreed initial placement (upgrades the child out of the legacy
+        // presence rule).
+        a.seq_mut(&child).unwrap().place(birth.id());
+        assert_eq!(a.seq(&child).unwrap().placement().chain(), vec![birth.id()]);
+
+        // Fork two replicas.
+        let mut b = a.clone();
+
+        // a moves the child into Q; b concurrently moves it into R.
+        let link_q = a.seq_mut(&q).unwrap().insert_value(0, child_origin);
+        a.seq_mut(&child).unwrap().place(link_q.id());
+        let link_r = b.seq_mut(&r).unwrap().insert_value(0, child_origin);
+        b.seq_mut(&child).unwrap().place(link_r.id());
+
+        // Merge both ways.
+        let mut ab = a.clone();
+        ab.merge(b.clone());
+        let mut ba = b.clone();
+        ba.merge(a.clone());
+
+        for web in [&ab, &ba] {
+            let reg = web.seq(&child).unwrap().placement();
+            assert!(reg.conflicted(), "two heads — surfaced, never silently won");
+            // Freeze: the chain starts at the last AGREED placement (the
+            // birth atom) — neither contender's destination renders, and
+            // exactly one placement candidate exists: no duplication.
+            assert_eq!(reg.chain(), vec![birth.id()],
+                "the chain starts below the contenders, at the agreed birth placement");
+        }
+        // Identical bytes on both merge orders (canonical encoding is the
+        // convergence test).
+        let bytes_ab = crate::encoding::encode_hashweb(&ab);
+        let bytes_ba = crate::encoding::encode_hashweb(&ba);
+        assert_eq!(bytes_ab, bytes_ba);
+
+        // A resolving Place naming both heads dominates.
+        let link_q2 = ab.seq_mut(&q).unwrap().insert_value(0, child_origin);
+        ab.seq_mut(&child).unwrap().place(link_q2.id());
+        let reg = ab.seq(&child).unwrap().placement();
+        assert!(!reg.conflicted());
+        assert_eq!(reg.chain()[0], link_q2.id());
+
+        // Place ops round-trip the canonical snapshot exactly.
+        let decoded = crate::encoding::decode_hashweb_strict(
+            &crate::encoding::encode_hashweb(&ab),
+        )
+        .expect("strict");
+        assert_eq!(decoded, ab);
+        assert_eq!(
+            decoded.seq(&child).unwrap().placement().chain(),
+            ab.seq(&child).unwrap().placement().chain()
+        );
+
+        // Kv objects carry the same register (a page is placeable too).
+        let page = ab.create_kv(oid(0x50));
+        let link_pg = ab.seq_mut(&p).unwrap().insert_value(0, oid(0x50));
+        ab.kv_mut(&page).unwrap().place(link_pg.id());
+        assert_eq!(ab.kv(&page).unwrap().placement().chain(), vec![link_pg.id()]);
+        let decoded = crate::encoding::decode_hashweb_strict(
+            &crate::encoding::encode_hashweb(&ab),
+        )
+        .expect("strict");
+        assert_eq!(
+            decoded.kv(&page).unwrap().placement().chain(),
+            vec![link_pg.id()]
+        );
+    }
+
+    /// Delivery-order independence: Place ops arriving before their
+    /// overwritten predecessors park on refs and converge identically.
+    #[test]
+    fn place_ops_converge_under_any_delivery_order() {
+        let mut a = HashWeb::new();
+        let child_origin = oid(0x11);
+        let child = a.create_seq(child_origin);
+        let p = a.create_seq(oid(0x21));
+        let l1 = a.seq_mut(&p).unwrap().insert_value(0, child_origin);
+        let pl1 = a.seq_mut(&child).unwrap().place(l1.id());
+        let l2 = a.seq_mut(&p).unwrap().insert_value(0, child_origin);
+        let pl2 = a.seq_mut(&child).unwrap().place(l2.id());
+        let expected = a.seq(&child).unwrap().placement().chain();
+        assert_eq!(expected, vec![l2.id(), l1.id()]);
+
+        // Reverse delivery: the superseder first — it parks on its
+        // overwritten ref, then wakes when the predecessor lands.
+        let mut fresh = HashWeb::new();
+        fresh.create_seq(child_origin);
+        let child2 = object_id(KIND_SEQ, &child_origin);
+        fresh.apply_to_with_id(child2, pl2.id(), pl2.clone());
+        assert_eq!(fresh.seq(&child2).unwrap().placement().heads().len(), 0);
+        fresh.apply_to_with_id(child2, pl1.id(), pl1.clone());
+        assert_eq!(
+            fresh.seq(&child2).unwrap().placement().chain(),
+            expected,
+            "late-delivered supersession converges"
+        );
+    }
+
     #[test]
     fn block_document_shape() {
         // A Notion-style block, composed in user space: creation is not a

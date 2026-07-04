@@ -5,6 +5,7 @@ pub mod hash_node;
 pub mod hashkv;
 pub mod hashseq;
 pub mod hashweb;
+pub mod placement;
 pub mod hashseq_iter;
 pub mod run;
 mod run_index;
