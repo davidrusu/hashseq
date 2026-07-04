@@ -710,3 +710,38 @@ Headings are deliberately SMALLER than body text — hierarchy by contrast
 of register (mono caps vs serif) rather than by size. On a flat store
 where structure is emergent from marks and refs, it felt right that
 structure whispers instead of shouts.
+
+---
+
+## 28 — The tree disappears under the keyboard
+
+Five behaviours that make the block tree feel like one continuous
+document: Enter-in-title opens a first block; arrows glide across block
+edges (up/down keep the caret column, left/right wrap); backspace/ctrl-d
+delete empty blocks; backspace at a block's start collapses it into its
+predecessor; ctrl-d at the end pulls the successor in.
+
+- **Merges copy structure, not just text.** mergeBlockInto walks the
+  source seq: text runs via textInsert, embed atoms re-inserted by ref,
+  then every markedSpans span re-marked (kind + value) at its new offset.
+  Comment marks are per-comment *kinds*, so a comment survives its block
+  being merged away — the sidebar just re-collects it from the new block.
+  Verified live: a `code` span crossed a merge intact.
+- **caretRangeFromPoint cannot detect line edges** — a probe point over
+  padding snaps back to the nearest text, i.e. the same line. The working
+  test compares the caret's line box against the rect of offset 0 / len
+  (same-line iff the boxes overlap within 0.6 line-heights) — robust
+  across headings, code regions, and image lines.
+- **Found a real pre-existing bug**: Enter's tail-split pre-stamped the
+  block's span signature, leaving the source editor's DOM and its diff
+  baseline (dataset.prev) holding text the seq no longer had — the next
+  edit would diff against fiction and corrupt the seq. The incremental
+  renderer's skip condition (sig equality) must only ever be updated by
+  the renderer itself.
+- Chrome represents a cleared block as a lone <br>, which extracts as
+  "\n" — "empty" for deletion purposes has two spellings.
+
+**Feedback**: block merge/split are pure app-level operations (text +
+refs + closed marks re-authored); the store needed nothing new. The
+per-comment-kind design proved itself — anchors survive arbitrary
+content surgery because they name *meaning*, not positions.
