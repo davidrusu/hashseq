@@ -948,3 +948,39 @@ placeholder, full stop** — structural probes run only after the lazy
 fetch definitively misses. Absence is a rendering state, not evidence
 of type. Genuine tables cost one placeholder-flicker round-trip on
 first sight; images can never be reclassified again.
+
+---
+
+## 35 — Lists: a whole-block attribute is a register, not a range
+
+Bulleted and numbered lists landed, and the first implementation was
+wrong in an instructive way. List-ness as a whole-block MARK (the
+codeblock idiom) unraveled immediately: an empty item's mark needs a
+seeded element to anchor on, and the moment Enter's tail-split migrated
+the seed into the next block, the mark collapsed onto tombstones and
+every item silently unlisted. Ranges need element anchors; a
+block-level fact has none to hold.
+
+The correct home is a REGISTER: `blockKind:<blockOrigin>` on the page
+kv, value 'bullet' | 'number'. No anchors, empty items trivial,
+concurrent flips MVR like any key, one put to inherit on Enter and one
+del to unwrap on Backspace. The register lives beside the block, not
+inside it — the same shape as Place (a fact ABOUT an object, homed
+where anchoring is natural).
+
+- Numbers are pure projection — computed at render over consecutive
+  numbered siblings per container (reorders renumber with nothing to
+  converge). CSS sibling counter-reset shadowing proved unreliable in
+  Chrome; a 15-line DOM pass replaced it. Attribute-only writes, so it
+  runs after every render without caret risk.
+- Lists exposed a latent Place-era bug: insertChildAt indexed raw seq
+  positions with membership indices — ghost atoms make those spaces
+  diverge, and Enter scattered new blocks mid-document. All child
+  indices now translate through the membership walk. Rule: once
+  membership filtering exists, EVERY index must state its space.
+
+**Feedback**: the app now has three attribute idioms with clean
+boundaries — inline ranges are marks, whole-block facts are kv
+registers, structure is refs. The mark/register split cost one failed
+attempt to learn; it belongs in the conventions doc next to
+formatting-vs-annotation (#11).
