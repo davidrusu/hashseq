@@ -814,3 +814,31 @@ kb's layout tree; the family doc's legacy state upgraded in place
 was net-negative lines in the tree logic. The supersession pattern
 (fourth instance) is doing what patterns should: every new register is
 cheaper than the last.
+
+---
+
+## 31 — Page tree on registers; orphans get a door back in
+
+The sidebar joined the layout tree on containment registers, closing the
+last remove+insert structural path in the app. Same recipe (membership
+in childrenOf, claim at birth/reparent, tombstone-place on delete;
+same-list reorder stays one seqMove), one new thing worth recording:
+
+- **Enumerability made the D4 surface cheap.** Blocks are anonymous seqs
+  — orphan detection there waits on the reverse index. Pages are kvs
+  with a title: one store read (kvObjects) enumerates every page ever,
+  and "registered but unreached by the walk" is exactly the unplaced
+  set. The '⚠ UNPLACED' strip below the tree surfaces them — clickable,
+  draggable back in — covering cycles, agreement-less conflicts, AND
+  stale clients that removed a registered page's atom without a
+  register write. Tombstone-placed and legacy-unreachable pages stay
+  buried: deletion still means deletion, in both eras.
+- Verified live: subpage claimed at birth; a deliberately mis-placed
+  page dropped out of the tree, appeared in the strip, and one drag
+  recovered it; delete tombstones and does NOT resurface in the strip.
+
+**Feedback**: "make the failure enumerable and it becomes a UI feature"
+— the recovery bin took ~40 lines because pages are a recognizable
+object shape. The layout tree's equivalent still needs the reverse
+index (PLACEMENT_SPEC open thread 1). Every structural edit in the app
+now flows through exactly two verbs: link+claim, tombstone-place.
