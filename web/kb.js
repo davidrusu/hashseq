@@ -484,20 +484,35 @@ function sendArtifact(idHex) {
 /// Content addressing makes the response verifiable AND immutable —
 /// fetched once per browser, ever. A 404 means it is not an artifact
 /// (a link to an unopened object, or bytes nobody pushed).
-const artifactFetchTried = new Set();
+/// Fetch state per id: 'pending' (in flight) | 'miss' (definitively not
+/// an artifact here — 404, verification failure, or offline). While a
+/// value is unresolved-but-not-missed, embeds render a PLACEHOLDER and
+/// never fall through to structural probes: an absent value is a
+/// rendering state, not a license to reclassify (the #13 debris made
+/// pending images probe as tables).
+const artifactFetchState = new Map();
 function requestArtifact(idHex) {
-  if (artifactFetchTried.has(idHex)) return;
-  if (!location.protocol.startsWith('http')) return;
-  artifactFetchTried.add(idHex);
+  if (artifactFetchState.has(idHex)) return;
+  if (!location.protocol.startsWith('http')) {
+    artifactFetchState.set(idHex, 'miss'); // file:// — structural probes may run
+    return;
+  }
+  artifactFetchState.set(idHex, 'pending');
   fetch('/artifact/' + idHex)
     .then(async (r) => {
-      if (!r.ok) return;
+      if (!r.ok) {
+        artifactFetchState.set(idHex, 'miss');
+        repaintEmbedsOf(idHex);
+        return;
+      }
       const buf = new Uint8Array(await r.arrayBuffer());
       const got = web.provideArtifactBytes(buf);
       if (got !== idHex) {
         console.warn('[kb] artifact id mismatch — discarded', idHex, got);
+        artifactFetchState.set(idHex, 'miss');
         return;
       }
+      artifactFetchState.delete(idHex); // resolves locally from here on
       persistLocalSoon();
       // Bytes arriving change no span signature, so the incremental
       // renderer would skip every affected block (the KaTeX lesson,
@@ -505,8 +520,24 @@ function requestArtifact(idHex) {
       repaintEmbedsOf(idHex);
     })
     .catch(() => {
-      artifactFetchTried.delete(idHex); // transient — retry on next render
+      // Network trouble: let structural probes run (tables must render
+      // offline), but allow a retry on a later render.
+      artifactFetchState.set(idHex, 'miss');
+      repaintEmbedsOf(idHex);
+      setTimeout(() => {
+        if (artifactFetchState.get(idHex) === 'miss') artifactFetchState.delete(idHex);
+      }, 15000);
     });
+}
+
+/// The placeholder for an unresolved value (HASHWEB_SPEC's
+/// pending/unavailable state, now a first-class rendering).
+function pendingEmbedNode(idHex) {
+  const box = document.createElement('span');
+  box.className = 'pending-embed';
+  box.textContent = `⧗ fetching ⟨${idHex.slice(0, 8)}⟩`;
+  box.title = 'content pending — the bytes have not arrived yet';
+  return box;
 }
 
 /// Force-rerender unfocused blocks that embed `idHex` (sig-equal skips
@@ -963,28 +994,31 @@ function renderEmbed(idx) {
     img.draggable = false;
     return img;
   }
-  const tableObj = WasmHashWeb.seqId(payload);
-  // Non-empty only: a real table's seq holds row refs. Empty seqs at a
-  // payload's derived id are debris from the old auto-open bug (#13) —
-  // matching them here classified pending IMAGES as tables (and returned
-  // before the lazy fetch could ever run). Probing untyped ids remains
-  // the wart #6/#13 named; the tagged vocabulary is still the real fix.
-  if (web.isSeq(tableObj) && web.textLen(tableObj) > 0) return objTableNode(tableObj);
   if (!web.resolveBytes(payload)) {
-    // The pending/unavailable value state (HASHWEB_SPEC): possibly an
-    // artifact whose bytes haven't arrived — try the lazy fetch; the
-    // render replaces this chip when bytes land.
-    requestArtifact(payload);
+    // Unresolved value: PLACEHOLDER until the fetch definitively misses.
+    // Structural probes must not run during the pending window — old
+    // auto-open debris (#13) makes them lie (images rendered as tables).
+    if (artifactFetchState.get(payload) !== 'miss') {
+      requestArtifact(payload);
+      return pendingEmbedNode(payload);
+    }
+    // Definitively not an artifact (or offline): structural probes.
+    const tableObj = WasmHashWeb.seqId(payload);
+    // Non-empty only — empty seqs at a payload's derived id are #13
+    // debris, not tables.
+    if (web.isSeq(tableObj) && web.textLen(tableObj) > 0) return objTableNode(tableObj);
     const chip = document.createElement('span');
     chip.className = 'page-link broken';
-    chip.textContent = `⟨…${payload.slice(0, 8)}⟩`;
-    chip.title = 'content pending — fetching';
+    chip.textContent = `⟨${payload.slice(0, 8)}…⟩`;
+    chip.title = 'unknown object reference';
     return chip;
   }
+  // Bytes resolved but not a renderable image (e.g. an undecodable
+  // format): an inert artifact chip, never a structural probe.
   const chip = document.createElement('span');
   chip.className = 'page-link broken';
   chip.textContent = `⟨${payload.slice(0, 8)}…⟩`;
-  chip.title = 'unknown object reference';
+  chip.title = 'artifact bytes present but not renderable';
   return chip;
 }
 
