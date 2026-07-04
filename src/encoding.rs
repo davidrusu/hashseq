@@ -1959,40 +1959,48 @@ pub fn encode_hashweb(web: &HashWeb) -> Vec<u8> {
     encode_hashweb_with(web, true)
 }
 
-/// The ops-only wire form: the identical stream with an EMPTY artifact
-/// section (the decoder accepts both — zero artifacts is a valid count).
-/// Ops verify without bytes (the pending/unavailable value state);
-/// artifact bytes travel separately — pushed once at upload (0xAF) or
-/// fetched lazily by content-addressed GET, where an immutable id makes
-/// the receiver's HTTP cache the artifact store.
+/// Artifacts at or below this size ride wire snapshots; larger ones
+/// travel by 0xAF push / lazy content-addressed GET. Small scalar
+/// artifacts (titles, mark kinds, code-block languages) are semantic
+/// load-bearing state — stripping them renders every fresh session
+/// title-less and mark-blind (found live); only BLOBS are worth
+/// lazy-loading. Both sides of every quiesce comparison use the same
+/// threshold, so the split is a pure function of state.
+pub const WIRE_ARTIFACT_MAX: usize = 1024;
+
+/// The wire snapshot: full op state, artifacts only up to
+/// `WIRE_ARTIFACT_MAX` (the decoder is unchanged — the section is just
+/// shorter). Large blobs verify by id (the pending state) and arrive by
+/// 0xAF push or lazy GET, where the immutable id makes the receiver's
+/// HTTP cache the artifact store.
 pub fn encode_hashweb_ops(web: &HashWeb) -> Vec<u8> {
     encode_hashweb_with(web, false)
 }
 
-fn encode_hashweb_with(web: &HashWeb, include_artifacts: bool) -> Vec<u8> {
+fn encode_hashweb_with(web: &HashWeb, include_all_artifacts: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(HASHWEB_MAGIC_V2);
 
     // One store-wide artifact section: the store's values unioned with
     // every map's local store (inner stores are excluded from the nested
     // streams — they are replica-local views, not canonical state).
-    if include_artifacts {
-        let mut artifacts: BTreeMap<Id, &Vec<u8>> = BTreeMap::new();
-        for (id, bytes) in web.values.iter() {
+    let mut artifacts: BTreeMap<Id, &Vec<u8>> = BTreeMap::new();
+    for (id, bytes) in web.values.iter() {
+        if include_all_artifacts || bytes.len() <= WIRE_ARTIFACT_MAX {
             artifacts.insert(*id, bytes);
         }
-        for m in web.kvs.values() {
-            for (id, bytes) in m.values.iter() {
+    }
+    for m in web.kvs.values() {
+        for (id, bytes) in m.values.iter() {
+            if include_all_artifacts || bytes.len() <= WIRE_ARTIFACT_MAX {
                 artifacts.entry(*id).or_insert(bytes);
             }
         }
-        encode_varint(artifacts.len(), &mut buf);
-        for bytes in artifacts.values() {
-            encode_varint(bytes.len(), &mut buf);
-            buf.extend_from_slice(bytes);
-        }
-    } else {
-        encode_varint(0, &mut buf);
+    }
+    encode_varint(artifacts.len(), &mut buf);
+    for bytes in artifacts.values() {
+        encode_varint(bytes.len(), &mut buf);
+        buf.extend_from_slice(bytes);
     }
 
     enum ObjRef<'a> {
