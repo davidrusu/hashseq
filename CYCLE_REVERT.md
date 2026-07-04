@@ -1,17 +1,34 @@
 # Cycle revert: the full problem statement (open design problem)
 
-Status: 2026-07-01, problem statement — **resolved the same day by
-dissolution; see below.** The body is preserved as the record for a future
-cross-container-move extension.
+Status: 2026-07-01, problem statement — resolved the same day by
+dissolution (same-container restriction). **Reopened and decided
+2026-07-04**: cross-container containment returned as the `Place` op
+(PLACEMENT_SPEC.md), and **D4 — detach the SCC — is adopted**, exactly as
+the leaning below records. The counterexample against the naive
+iterate-and-revert rule stands and remains the reason D1 is rejected. The
+acceptance criteria below are the implementation obligations
+(PLACEMENT_SPEC.md open threads 1–2 track the incremental-cache and
+property-harness items).
 
-## Resolution: dissolved by the same-container restriction
+## Resolution history: first dissolved, then decided
 
-`Move` is restricted to same-container destinations (HASHSEQ_SPEC.md — a
-stable gate): parent edges never change, containment stays the creation
-forest, and placement cycles are unrepresentable. The problem below no
-longer has an input. Cross-container relocation is remove + insert of the
-object's link; its concurrent-relocation residue is detectable multi-link
-duplication, flagged rather than frozen (MOVE.md "Reparenting").
+*2026-07-01:* `Move` restricted to same-container destinations
+(HASHSEQ_SPEC.md — a stable gate): parent edges never change, containment
+stays the creation forest, and placement cycles are unrepresentable. The
+problem below has no input. Cross-container relocation is remove + insert
+of the object's link; its concurrent-relocation residue is detectable
+multi-link duplication, flagged rather than frozen (MOVE.md
+"Reparenting").
+
+*2026-07-04:* that residue proved live (APP_NOTES.md #29 — duplicated
+blocks and images in a real document under concurrent structural edits).
+`Place` reintroduces mutable containment as a per-object register; the
+problem below has an input again, scoped exactly as the setup assumes
+(one containment register per object), and D4 is the adopted rule:
+contested registers freeze at last-agreed, frozen edges feed the p₀ graph
+like any other (an old agreed edge can still join a fresh cycle), and
+cyclic SCCs of the p₀ graph detach as flagged root-level clusters, one
+pass, no schedule.
 
 Two findings from the analysis survive elsewhere:
 

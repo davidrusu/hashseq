@@ -34,12 +34,15 @@ Sentinels are user-space objects, not protocol.
 
 `Move` is **same-container only**: the destination anchor must resolve
 within `target`'s own object — a stable gate, both sides hash-committed.
-Placement registers therefore never change parent edges, containment stays
-the creation forest, and placement cycles are unrepresentable
-(CYCLE_REVERT.md records the problem this dissolves). Cross-container
-relocation is deliberately *not* an op: it is remove + insert of the
-object's link, with concurrent relocations surfacing as detectable
-multi-link duplication (MOVE.md "Reparenting").
+Element placement registers therefore never change parent edges, and
+*intra-object* placement cycles stay unrepresentable. Cross-container
+relocation is not a seq op: it is `Insert` of the object's link in the
+destination plus `Place` in the moved object's own DAG — the containment
+register (PLACEMENT_SPEC.md, 2026-07-04; supersedes MOVE.md
+"Reparenting"'s remove+insert story, whose concurrent-relocation
+duplication residue proved live — APP_NOTES.md #29). Containment cycles
+across registers are handled read-time by D4 (detach the SCC,
+CYCLE_REVERT.md).
 
 ## Refs
 

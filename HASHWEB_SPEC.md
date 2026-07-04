@@ -81,6 +81,7 @@ Routed, not new:
 | `Seq` | gap → intra-gap order → total order by id; tombstone union; placement register → freeze, same-container (HASHSEQ_SPEC.md) |
 | `Kv` | key register → multi-head → MVR / freeze (HASHKV_SPEC.md) |
 | marks | (element, kind) register → multi-head → MVR / freeze (MARKS.md) |
+| any object | containment register → multi-head → freeze at last-agreed; cross-register cycles → detach the SCC, flagged (PLACEMENT_SPEC.md) |
 
 The substrate routes by object; the projection applies and resolves. State
 is a function of the op set per object; cross-object causality holds only
@@ -122,7 +123,9 @@ verdicts that are total, convergent, and stable:
 | `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the object's origin, in one `Seq`; inverted spans gate (MARKS.md) | gate |
 | `Mark . overwrites` | — | never gated: entries that are not covering same-kind marks are ignored by the definitional suppression filter (same class as `Put . overwrites` — kind- and coverage-scoping live in the read, not the gate) |
 | `Put . overwrites` | — | never gated: entries that are not puts on the same key are ignored by the definitional head-set filter |
-| op kind vs object kind | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv` | gate (reachable only by enveloping ops at a wrong-kind or colliding out-of-band seed — the kind is inside the derived object id, so honest kind mis-agreement is unrepresentable) |
+| `Place . placed_at` | any id | never edge-checked: a value commitment (payload class); a non-matching or garbage id is inert under the membership read rule (PLACEMENT_SPEC.md) |
+| `Place . overwrites` | — | never gated: entries that are not `Place` ops in the same object are ignored by the definitional head-set filter |
+| op kind vs object kind | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv`; `Place` in **either** (the containment register concerns the object's placement, not its content projection — PLACEMENT_SPEC.md) | gate (reachable only by enveloping ops at a wrong-kind or colliding out-of-band seed — the kind is inside the derived object id, so honest kind mis-agreement is unrepresentable) |
 | pins (unroled refs) | anything | always meaningful — pure frontier pins |
 | payloads / keys / values | any id | never edge-checked: values are not references, and payload kinds are not schema-gated (Objects, above) — schema is the renderer's concern |
 

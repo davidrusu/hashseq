@@ -110,6 +110,7 @@ anchor := varint( (ref_idx << 1) | side )     -- side: 0 = Before, 1 = After
 | 2   | `Move`   | `target: ref_idx`, `to: anchor`, `count`, `count` × `ref_idx` ascending (`overwrites`)                               |
 | 3   | `Put`    | `key: value`, `val: value`, `count`, `count` × `ref_idx` ascending (`overwrites`)                                    |
 | 4   | `Mark`   | `start: anchor`, `end: anchor`, `kind_v: value`, `val: value`, `count`, `count` × `ref_idx` ascending (`overwrites`) |
+| 5   | `Place`  | `placed_at: value`, `count`, `count` × `ref_idx` ascending (`overwrites`) — containment register, valid in any object's DAG (PLACEMENT_SPEC.md; added 2026-07-04 via the extension path) |
 
 Unknown kind tags are **not** malformed: the node is carried opaquely
 (envelope semantics only), per the extension path; ops that reference it in

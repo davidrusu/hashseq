@@ -102,6 +102,21 @@ undo because nothing was order-dependent in the first place.
 
 ## Reparenting: deliberately not a move
 
+> **Superseded 2026-07-04 by PLACEMENT_SPEC.md.** The residue this section
+> accepts — concurrent relocation duplicating live links, "flagged,
+> resolved by deleting a link" — fired in production within a day of an
+> app shipping keyboard-driven structural editing (APP_NOTES.md #29).
+> Cross-container containment is now the `Place` op: a containment
+> register in the moved object's own DAG (fourth instance of the
+> supersession pattern), membership decided by the register rather than
+> by the union of link atoms, freeze-at-last-agreed on conflict, and
+> **D4 — detach the SCC** (this document's and CYCLE_REVERT.md's own
+> recorded leaning) for the island problem that motivated the rejection
+> below. Same-container `Move` is unchanged; the analysis below stands as
+> the record of why the register must be single-homed in the moved object
+> and why order (container-side atoms) and membership (object-side
+> register) had to split.
+
 A cross-container `Move` would turn placement registers into mutable parent
 edges, and concurrent mutable parenthood has an irreducible failure mode:
 **islands** — "A under B" ∥ "B under A" are individually fine and jointly
