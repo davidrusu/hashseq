@@ -745,3 +745,39 @@ predecessor; ctrl-d at the end pulls the successor in.
 refs + closed marks re-authored); the store needed nothing new. The
 per-comment-kind design proved itself — anchors survive arbitrary
 content surgery because they name *meaning*, not positions.
+
+---
+
+## 29 — Live corruption postmortem: duplicate refs + stale clients
+
+The family doc developed repeating blocks/images and interleaved text.
+Two independent causes, both now fixed:
+
+1. **Duplicate tree refs.** A "move" in the layout tree is remove+insert
+   of a ref atom, and normalize's unwrap re-inserts child refs. Two
+   replicas doing structural ops concurrently can therefore double-refer
+   the same node — CRDT union keeps both atoms. The raw tree held 61
+   atoms for 34 unique nodes. Fix: the render walk dedupes tree-wide
+   (symptom invisible immediately), and normalizeTree self-heals — first
+   occurrence in document order wins, later atoms removed. The rule is
+   deterministic, so every replica repairs identically and repairs
+   converge instead of fighting.
+
+2. **Stale cached clients.** The text scrambling ("helooOK eyah…"
+   interleavings) is the fingerprint of the Enter-tail-split desync
+   fixed earlier — but a phone still running week-old cached kb.js kept
+   re-corrupting after the fix shipped. The sync server now sends
+   Cache-Control: no-cache; clients revalidate every load.
+
+Repair: backed up kb-state.bin first; healed refs via a normalize pass,
+restored block 1 to "heloo", removed two verbatim-duplicate debris
+blocks. One ambiguity left as-is: "Now we do!" sits inside the photo
+block and its original position is unknowable.
+
+**Feedback**: the substrate made the postmortem easy (nothing is ever
+lost; the backup was one cp) but the tree-on-a-seq design makes "move"
+a non-atomic remove+insert — a real CRDT-shape gap. A native move/ref
+primitive (or at least app-level move intents) is worth designing if
+structural editing stays this frequent. Also: convergence bugs need the
+self-heal to be deterministic — "first in doc order wins" is the whole
+trick.
