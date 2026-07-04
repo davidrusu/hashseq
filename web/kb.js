@@ -110,6 +110,27 @@ function placeNodeAt(nodeOrigin, elemId) {
   placeObjAt(web.createSeq(nodeOrigin), elemId);
 }
 
+// ---- block-kind registers ------------------------------------------------
+//
+// Whole-block attributes (list items today; extensible) are REGISTERS on
+// the page kv — `blockKind:<blockOrigin>` → 'bullet' | 'number' — never
+// marks: a range needs element anchors, and a block-level fact has none
+// to hold (a seeded 1-char mark unravels the moment the seed migrates —
+// found the hard way). Registers need no anchors, work on empty blocks,
+// and MVR concurrent flips like any kv key.
+
+function listKindOf(blockOrigin) {
+  if (!current || !blockOrigin) return null;
+  const v = stringsOf(current, 'blockKind:' + blockOrigin);
+  return v.includes('number') ? 'number' : v.includes('bullet') ? 'bullet' : null;
+}
+
+function setListKind(blockOrigin, kind) {
+  if (!current) return;
+  if (kind) web.putString(current, 'blockKind:' + blockOrigin, kind);
+  else web.del(current, 'blockKind:' + blockOrigin);
+}
+
 /// The winning link atom for a node, per the register: chain[0] is the
 /// single head's claim, or the last-agreed placement under conflict
 /// (freeze — contenders never render). TOMB = deleted. null = legacy.
@@ -181,10 +202,14 @@ function removeNodeFromParent(parentOrigin, nodeOrigin) {
 /// Link `nodeOrigin` into `parentOrigin` at child index and CLAIM the new
 /// atom — the one primitive behind birth, move, and reparent. Old atoms
 /// (if any) go dead by the membership rule; they are never tombstoned.
+/// `childIdx` counts LIVE children; ghost atoms make raw seq positions
+/// diverge from child indices, so translate through the membership walk
+/// (indexing raw positions directly scattered Enter-created blocks into
+/// the middle of documents once ghosts accumulated).
 function insertChildAt(parentOrigin, nodeOrigin, childIdx) {
   const p = web.createSeq(parentOrigin);
-  const off = childOffset(parentOrigin);
-  const at = Math.min(off + childIdx, web.textLen(p));
+  const kids = childNodes2(parentOrigin);
+  const at = childIdx < kids.length ? kids[childIdx].idx : web.textLen(p);
   const elemId = web.seqInsertRef(p, at, nodeOrigin);
   placeNodeAt(nodeOrigin, elemId);
   return elemId;
@@ -1678,6 +1703,12 @@ function renderEditableInto(ed, blockObj) {
   const hm = plain.match(/^(#{1,3}) /);
   ed.classList.remove('bl-h1', 'bl-h2', 'bl-h3');
   if (hm) ed.classList.add(`bl-h${hm[1].length}`);
+  // List items are a block-kind register on the page kv; the number
+  // itself is pure projection (CSS counters over consecutive numbered
+  // siblings) — reorders and inserts renumber with nothing to converge.
+  ed.classList.remove('bl-bullet', 'bl-number');
+  const lk = listKindOf(ed.closest('.block-col')?.dataset.origin);
+  if (lk) ed.classList.add(lk === 'number' ? 'bl-number' : 'bl-bullet');
   const spans = styledSpans(blockObj);
   let i = 0;
   let pos = 0;
@@ -1839,8 +1870,12 @@ function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
 function rerenderBlock(ed, blockObj, caretOff, preferAfter = false) {
   renderEditableInto(ed, blockObj);
   ed.dataset.prev = extractText(ed);
-  const row = ed.closest?.('.block-row');
-  if (row) row.dataset.sig = web.markedSpans(blockObj);
+  const col = ed.closest?.('.block-col');
+  if (col) {
+    col.dataset.sig =
+      web.markedSpans(blockObj) + '|' + (listKindOf(col.dataset.origin) ?? '');
+  }
+  renumberLists();
   if (caretOff != null) {
     ed.focus();
     setSelectionRangeIn(
@@ -2161,7 +2196,7 @@ function makeColumn(obj, origin) {
   ta.dataset.blockObj = obj;
 
   const refreshSig = () => {
-    col.dataset.sig = web.markedSpans(obj);
+    col.dataset.sig = web.markedSpans(obj) + '|' + (listKindOf(col.dataset.origin) ?? '');
   };
 
   const insertNewlineAtCaret = () => {
@@ -2225,6 +2260,14 @@ function makeColumn(obj, origin) {
       insertNewlineAtCaret();
       return;
     }
+    // Enter on an EMPTY list item exits the list (the universal idiom).
+    const listKind = listKindOf(col.dataset.origin);
+    if (listKind && extractText(ta) === '') {
+      setListKind(col.dataset.origin, null);
+      persistSoon();
+      rerenderBlock(ta, obj, 0);
+      return;
+    }
     // Enter: a new leaf after this one in its parent. A plain tail moves in.
     const caret = caretOffsetIn(ta) ?? extractText(ta).length;
     const text = extractText(ta);
@@ -2249,6 +2292,10 @@ function makeColumn(obj, origin) {
       // below sees the mismatch and rebuilds this editor without its old
       // tail. Pre-stamping the sig left the DOM (and dataset.prev) showing
       // text the seq no longer has.
+    }
+    if (listKind) {
+      // The list continues: the new item inherits the flavor.
+      setListKind(nb, listKind);
     }
     const parent = col.dataset.parentOrigin;
     const ci = childIndexOf(parent, col.dataset.origin);
@@ -2352,6 +2399,14 @@ function makeColumn(obj, origin) {
       return;
     }
     if (isBackspace && caret === 0) {
+      // A list item unwraps to a plain block first; the next press merges.
+      if (listKindOf(col.dataset.origin)) {
+        e.preventDefault();
+        setListKind(col.dataset.origin, null);
+        persistSoon();
+        rerenderBlock(ta, obj, 0);
+        return;
+      }
       // Collapse this block into the previous one; caret at the join.
       const { prev } = leafNeighbors(col.dataset.origin);
       if (!prev) return;
@@ -2436,10 +2491,11 @@ function makeColumn(obj, origin) {
 }
 
 function updateLeafContent(col, obj, ed) {
-  const sig = web.markedSpans(obj);
+  const spansJson = web.markedSpans(obj);
+  const sig = spansJson + '|' + (listKindOf(col.dataset.origin) ?? '');
   if (col.dataset.sig === sig) return;
   const focused = ed === document.activeElement || ed.contains(document.activeElement);
-  const seqText = JSON.parse(sig)
+  const seqText = JSON.parse(spansJson)
     .map((sp) => sp.text)
     .join('');
   if (focused && extractText(ed) === seqText) {
@@ -2491,6 +2547,33 @@ function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, singl
   parentEl.appendChild(col);
 }
 
+/// Number list items: a DOM-only pass (CSS sibling-counter shadowing is
+/// unreliable in Chrome). Consecutive numbered siblings count up within
+/// their container; any other block — or a container boundary — resets.
+/// Attribute-only writes: safe to run after any render, never disturbs
+/// the caret.
+function renumberLists() {
+  const walk = (parentEl) => {
+    let n = 0;
+    for (const child of parentEl.children) {
+      if (child.classList?.contains('node-container')) {
+        walk(child);
+        n = 0;
+        continue;
+      }
+      if (!child.classList?.contains('block-col')) continue;
+      const ed = child.querySelector('.block-ed');
+      if (ed?.classList.contains('bl-number')) {
+        n += 1;
+        ed.dataset.num = String(n);
+      } else {
+        n = 0;
+      }
+    }
+  };
+  walk(blocksEl);
+}
+
 function ensureAddButton() {
   let add = blocksEl.querySelector('.add-block');
   if (!add) {
@@ -2525,6 +2608,8 @@ function renderBlocks() {
   const add = ensureAddButton();
   for (const child of [...frag.childNodes]) blocksEl.insertBefore(child, add);
   if (blocksEl.lastChild !== add) blocksEl.appendChild(add);
+
+  renumberLists();
 
   blocksEl.ondragover = (e) => {
     if (dragCol) e.preventDefault();
@@ -2859,10 +2944,24 @@ function plainAt(blockObj, pos) {
 /// Ran after the typed char is already in the seq. Returns the new caret
 /// offset when a rule fired, else null.
 function maybeInputRule(ed, blockObj, typed) {
-  if (typed !== '`' && typed !== '$') return null;
+  if (typed !== '`' && typed !== '$' && typed !== ' ') return null;
   const text = ed.dataset.prev;
   const caret = caretOffsetIn(ed);
   if (caret == null || caret === 0) return null;
+  // '- ' / '* ' / 'N. ' at block start converts the block to a list
+  // item (the typed prefix tombstones; empty items get the block-kind
+  // seed space, same as code blocks).
+  if (typed === ' ') {
+    if (!plainAt(blockObj, 0)) return null;
+    const head = text.slice(0, caret);
+    let listKind = null;
+    if (caret === 2 && (head === '- ' || head === '* ')) listKind = 'bullet';
+    else if (/^\d{1,2}\. $/.test(head)) listKind = 'number';
+    if (!listKind) return null;
+    web.textRemove(blockObj, 0, caret);
+    setListKind(ed.closest('.block-col')?.dataset.origin, listKind);
+    return 0;
+  }
   const p = caret - 1;
   if (text[p] !== typed) return null;
 
@@ -3300,6 +3399,8 @@ const SLASH_ITEMS = [
   { key: 'H', label: 'Heading', desc: 'section title', run: (ta) => makeHeading(ta) },
   { key: '<>', label: 'Code block', desc: 'monospace', run: (ta) => makeBlockKind(ta, 'codeblock') },
   { key: 'S', label: 'Equation', desc: 'display math', run: (ta) => makeBlockKind(ta, 'eqblock') },
+  { key: '\u2022', label: 'Bulleted list', desc: 'list item', run: (ta) => makeListKind(ta, 'bullet') },
+  { key: '1.', label: 'Numbered list', desc: 'auto-numbered', run: (ta) => makeListKind(ta, 'number') },
   { key: '#', label: 'Table', desc: '2 by 2 grid', run: (ta) => insertTableAt(ta, caretNow(ta)) },
   { key: 'I', label: 'Image', desc: 'upload or paste', run: () => imageFileEl.click() },
   { key: 'P', label: 'Page link', desc: 'link a page', run: (ta, rect) => openLinkPicker(ta, caretNow(ta), rect) },
@@ -3317,6 +3418,13 @@ function makeHeading(ta) {
   if (!extractText(ta).startsWith('# ')) web.textInsert(obj, 0, '# ');
   persistSoon();
   rerenderBlock(ta, obj, extractText(ta).length);
+}
+
+function makeListKind(ta, listKind) {
+  const obj = ta.dataset.blockObj;
+  setListKind(ta.closest('.block-col')?.dataset.origin, listKind);
+  persistSoon();
+  rerenderBlock(ta, obj, caretNow(ta));
 }
 
 function makeBlockKind(ta, kind) {
