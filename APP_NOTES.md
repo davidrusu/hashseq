@@ -781,3 +781,36 @@ primitive (or at least app-level move intents) is worth designing if
 structural editing stays this frequent. Also: convergence bugs need the
 self-heal to be deterministic — "first in doc order wins" is the whole
 trick.
+
+---
+
+## 30 — Place lands: moves stop being remove+insert
+
+The duplicate-ref bug class (#29) is now dead at the CRDT level. `Place`
+(PLACEMENT_SPEC.md) is in the core, the wire, the wasm surface, and the
+kb's layout tree; the family doc's legacy state upgraded in place
+(HWB2 snapshot v2, first production registers minted live).
+
+- **The kb's tree layer got simpler, not more complex.** One primitive —
+  insertChildAt = link + claim — now covers birth, move, reparent, and
+  normalize's unwrap; delete is a tombstone-place. The old discipline
+  ("remember to remove the old atom, heal the duplicates") is gone
+  because membership is register-decided and old atoms are just ghosts.
+- **Stay-put freeze works in v1** because the register rides the moved
+  object's own DAG (chain[0] under conflict = last-agreed, computed
+  store-side). Contested blocks badge amber and stay where they were;
+  the next drag resolves. This is the UX MOVE.md originally argued for,
+  recovered by homing the op correctly.
+- **Legacy coexistence cost one branch**: register-empty → presence rule
+  + the #29 heal. First move upgrades a node permanently. No migration
+  event, no flag day — the two rules coexist per node.
+- Deferred, tracked in PLACEMENT_SPEC open threads: the page tree
+  (sidebar) still moves by legacy re-link; the D4 orphan-strip UI;
+  ghost-atom GC; incremental SCC (kb v1 resolves membership by chain[0]
+  only — full fallback-skipping and cycle detachment need the reverse
+  index).
+
+**Feedback**: the system grew its sixth op kind and the app-layer diff
+was net-negative lines in the tree logic. The supersession pattern
+(fourth instance) is doing what patterns should: every new register is
+cheaper than the last.
