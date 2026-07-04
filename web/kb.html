@@ -256,6 +256,12 @@
   .page-row.dragging { opacity:0.4; }
   .page-row.drop-into { box-shadow:inset 0 0 0 2px var(--red); background:var(--hover); }
   .empty-note { color:var(--muted); font-size:12px; padding:14px; letter-spacing:0.5px; }
+  .orphan-note {
+    margin-top:14px; padding:6px 12px; font-size:10px; letter-spacing:2px;
+    color:var(--amber); font-weight:600; border-top:1px dashed var(--amber);
+  }
+  .page-row.orphan { opacity:0.75; }
+  .page-row.orphan .name { text-decoration:underline dashed; text-underline-offset:3px; }
 
   /* ---- editor ---- */
   #editor-pane { flex:1; display:flex; flex-direction:column; min-width:0; }

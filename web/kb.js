@@ -85,22 +85,29 @@ function currentBody0() {
 const TOMB_ID = WasmHashWeb.tombstoneId();
 
 // Register reads memoized per render; any local write or remote merge
-// invalidates (placeNodeAt / render() clear).
+// invalidates (placeObjAt / render() clear). Keyed by OBJECT id — layout
+// nodes are seqs, pages are kvs, the register rides either.
 const placementMemo = new Map();
-function placementInfo(origin) {
-  let pl = placementMemo.get(origin);
+function placementOfObj(obj) {
+  let pl = placementMemo.get(obj);
   if (!pl) {
-    pl = JSON.parse(web.placementOf(web.createSeq(origin)));
-    placementMemo.set(origin, pl);
+    pl = JSON.parse(web.placementOf(obj));
+    placementMemo.set(obj, pl);
   }
   return pl;
 }
+function placementInfo(origin) {
+  return placementOfObj(web.createSeq(origin));
+}
 
-/// Claim: `nodeOrigin`'s placement = link atom `elemId` (or TOMB_ID to
-/// detach), superseding the heads this replica sees.
+/// Claim: `obj`'s placement = link atom `elemId` (or TOMB_ID to detach),
+/// superseding the heads this replica sees.
+function placeObjAt(obj, elemId) {
+  web.placeAt(obj, elemId);
+  placementMemo.delete(obj);
+}
 function placeNodeAt(nodeOrigin, elemId) {
-  web.placeAt(web.createSeq(nodeOrigin), elemId);
-  placementMemo.delete(nodeOrigin);
+  placeObjAt(web.createSeq(nodeOrigin), elemId);
 }
 
 /// The winning link atom for a node, per the register: chain[0] is the
@@ -274,13 +281,28 @@ function childrenListOf(parentObj) {
   return web.createSeq(WasmHashWeb.seqId(parentObj));
 }
 
+/// Child pages of a parent, membership-filtered exactly like the layout
+/// tree (PLACEMENT_SPEC.md): a registered page renders only at its
+/// claimed atom; legacy pages by presence (deduped).
 function childrenOf(parentObj) {
   const listObj = childrenListOf(parentObj);
   const out = [];
+  const seen = new Set();
   const n = web.textLen(listObj);
   for (let i = 0; i < n; i++) {
     const origin = web.payloadAt(listObj, i);
-    if (origin) out.push({ idx: i, origin, listObj });
+    if (!origin || seen.has(origin)) continue;
+    const pl = placementOfObj(web.createKv(origin));
+    if (pl.empty) {
+      seen.add(origin);
+      out.push({ idx: i, origin, listObj, legacy: true });
+      continue;
+    }
+    const w = pl.chain[0];
+    if (w && w !== TOMB_ID && web.seqIdAt(listObj, i) === w) {
+      seen.add(origin);
+      out.push({ idx: i, origin, listObj, conflicted: pl.conflicted });
+    }
   }
   return out;
 }
@@ -302,6 +324,8 @@ function openPagesUnder(parentObj, visited) {
       parentObj,
       listObj: c.listObj,
       idx: c.idx,
+      origin: c.origin,
+      conflicted: c.conflicted,
       title: titles[0] ?? 'Untitled',
       conflict: titles.length > 1 ? titles : null,
       subpages: openPagesUnder(pageObj, visited),
@@ -311,9 +335,38 @@ function openPagesUnder(parentObj, visited) {
   return out;
 }
 
+let orphanPages = [];
+
 function rebuildGraph() {
   pageMeta = new Map();
-  rootPages = openPagesUnder(WS, new Set());
+  const visited = new Set();
+  rootPages = openPagesUnder(WS, visited);
+  // The unplaced strip (the D4 recovery surface, page-tree edition):
+  // pages are enumerable — kvs with a title — so any REGISTERED page the
+  // walk never reached is surfaced instead of silently vanishing (cycle,
+  // agreement-less conflict, or a stale client's registerless delete of
+  // its atom). Legacy-unreachable pages stay buried: that is what
+  // deletion meant before registers.
+  orphanPages = [];
+  for (const rec of JSON.parse(web.kvObjects())) {
+    if (rec.obj === WS || visited.has(rec.obj)) continue;
+    const titles = stringsOf(rec.obj, 'title');
+    if (titles.length === 0) continue; // not a page
+    const pl = placementOfObj(rec.obj);
+    if (pl.empty || pl.chain[0] === TOMB_ID) continue; // legacy-dead or deleted
+    visited.add(rec.obj);
+    pageMeta.set(rec.obj, {
+      parentObj: null,
+      listObj: null,
+      idx: -1,
+      origin: rec.origin,
+      title: titles[0] ?? 'Untitled',
+      conflict: titles.length > 1 ? titles : null,
+      subpages: openPagesUnder(rec.obj, visited),
+      orphan: true,
+    });
+    orphanPages.push(rec.obj);
+  }
 }
 
 /// The page's body seq object, opening it if needed. null if no body yet.
@@ -1044,6 +1097,14 @@ function renderTree() {
         sub.textContent = '⚠ title conflict';
         row.appendChild(sub);
       }
+      if (meta.conflicted) {
+        const sub = document.createElement('span');
+        sub.className = 'sub';
+        sub.textContent = '⚑ contested';
+        sub.title = 'placement contested by a concurrent move — drag to resolve';
+        row.appendChild(sub);
+      }
+      if (meta.orphan) row.classList.add('orphan');
       row.onclick = () => {
         current = p;
         document.body.classList.remove('show-nav'); // overlay mode closes on pick
@@ -1052,7 +1113,7 @@ function renderTree() {
 
       row.draggable = true;
       row.ondragstart = (e) => {
-        treeDrag = { pageObj: p, listObj: meta.listObj, idx: meta.idx };
+        treeDrag = { pageObj: p, listObj: meta.listObj, idx: meta.idx, origin: meta.origin };
         row.classList.add('dragging');
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', meta.title);
@@ -1085,27 +1146,29 @@ function renderTree() {
         }
         const zone = dropZone(row, e);
         if (zone === 'into') {
-          // Become a subpage: append to the drop target's children list
-          // (derived origin — it exists the moment we name it).
+          // Become a subpage. Same list: one seqMove (order only, the
+          // register still names the moved atom's stable id). Cross-list:
+          // a fresh link + claim — the old atom goes dead by the
+          // membership rule, never removed (PLACEMENT_SPEC.md).
           const target = childrenListOf(p);
-          const origin = web.payloadAt(src.listObj, src.idx);
           if (src.listObj === target) {
-            web.seqMove(src.listObj, src.idx, web.textLen(target)); // already a child: move to end
+            web.seqMove(src.listObj, src.idx, web.textLen(target));
           } else {
-            web.textRemove(src.listObj, src.idx, 1);
-            web.seqInsertRef(target, web.textLen(target), origin);
+            const elemId = web.seqInsertRef(target, web.textLen(target), src.origin);
+            placeObjAt(src.pageObj, elemId);
           }
         } else {
+          if (meta.orphan) return; // no ordered slot next to an unplaced page
           const slot = meta.idx + (zone === 'above' ? 0 : 1);
           if (src.listObj === meta.listObj) {
             if (slot === src.idx || slot === src.idx + 1) return;
             web.seqMove(src.listObj, src.idx, slot); // same list: ONE Move op
           } else {
-            // Reparent: a Move cannot cross containers (same-container
-            // rule), so this is remove + insert — a new atom, new identity.
-            const origin = web.payloadAt(src.listObj, src.idx);
-            web.textRemove(src.listObj, src.idx, 1);
-            web.seqInsertRef(meta.listObj, slot, origin);
+            // Reparent = link + claim in the destination; the page's own
+            // register decides membership, so nothing is removed and
+            // concurrent reparents freeze instead of duplicating.
+            const elemId = web.seqInsertRef(meta.listObj, slot, src.origin);
+            placeObjAt(src.pageObj, elemId);
           }
         }
         persistSoon();
@@ -1117,6 +1180,13 @@ function renderTree() {
     }
   };
   emit(rootPages, 0);
+  if (orphanPages.length) {
+    const head = document.createElement('div');
+    head.className = 'orphan-note';
+    head.textContent = '⚠ UNPLACED — drag back into the tree';
+    treeEl.appendChild(head);
+    emit(orphanPages, 0);
+  }
 }
 
 function crumbPath(pageObj) {
@@ -2741,8 +2811,9 @@ titleEl.addEventListener('keydown', (e) => {
 function createPage(parentObj) {
   const origin = randOrigin();
   const list = childrenListOf(parentObj);
-  web.seqInsertRef(list, web.textLen(list), origin);
+  const elemId = web.seqInsertRef(list, web.textLen(list), origin);
   const page = web.createKv(origin);
+  placeObjAt(page, elemId); // claimed at birth
   web.putString(page, 'title', 'Untitled');
   const bodyOrigin = randOrigin();
   web.putRef(page, 'body', bodyOrigin);
@@ -2782,7 +2853,12 @@ document.getElementById('delete-page').onclick = (e) => {
   delete btn.dataset.armed;
   btn.textContent = 'DELETE PAGE';
   const meta = pageMeta.get(current);
-  web.textRemove(meta.listObj, meta.idx, 1);
+  // Delete = the register records detachment (unresurrectable by any
+  // fallback), the atom is tombstoned as hygiene.
+  placeObjAt(current, TOMB_ID);
+  if (meta?.listObj != null && meta.idx >= 0) {
+    web.textRemove(meta.listObj, meta.idx, 1);
+  }
   current = null;
   persistSoon();
   render();

@@ -872,6 +872,28 @@ impl WasmHashWeb {
         Ok(json.to_string())
     }
 
+    /// Every kv object as JSON `[{"obj":hex,"origin":hex}]`, obj-sorted.
+    /// The app's orphan scan: pages are kvs with a title key — enumerate,
+    /// check placement, surface the unplaced (PLACEMENT_SPEC.md open
+    /// thread 4's poor-man's D4 surface).
+    #[wasm_bindgen(js_name = kvObjects)]
+    pub fn kv_objects(&self) -> String {
+        let mut list: Vec<(Id, Id)> = self
+            .inner
+            .kvs
+            .iter()
+            .map(|(obj, kv)| (*obj, kv.origin()))
+            .collect();
+        list.sort();
+        let arr: Vec<serde_json::Value> = list
+            .into_iter()
+            .map(|(obj, origin)| {
+                serde_json::json!({"obj": id_to_hex(&obj), "origin": id_to_hex(&origin)})
+            })
+            .collect();
+        serde_json::Value::Array(arr).to_string()
+    }
+
     /// The tombstone value id (a derived constant): the `placed_at` for
     /// detach, the mark value for unmark.
     #[wasm_bindgen(js_name = tombstoneId)]
