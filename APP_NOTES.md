@@ -842,3 +842,44 @@ same-list reorder stays one seqMove), one new thing worth recording:
 object shape. The layout tree's equivalent still needs the reverse
 index (PLACEMENT_SPEC open thread 1). Every structural edit in the app
 now flows through exactly two verbs: link+claim, tombstone-place.
+
+---
+
+## 32 — Delta sync lands: 7MB → 107 bytes per edit
+
+The wall (#8, #19, #21) is down. Steady-state sync ships authored ops
+(0xDE frames) and one-shot artifact pushes (0xAF); whole snapshots are
+now only hello, reconnect-resync, and legacy-client compat. Measured
+live on the family doc: a one-character edit is 107 bytes on the wire,
+where yesterday it was the full ~7MB snapshot both ways.
+
+- **The outbox is authoring-side only, by construction.** Objects
+  record nodes only in their authoring helpers; every remote path
+  (merge, decode, delta apply) bypasses it, so echo is structurally
+  impossible — verified by test and by the relay loop (server relays
+  raw client frames to everyone including the sender; replay is
+  idempotent).
+- **Delta frames are addressed by (kind, origin), never object id** —
+  the receiver must be able to OPEN objects it has never seen, and the
+  id derivation is one-way. The #1 asymmetry became a wire-format
+  decision.
+- **Non-atomic delivery found a real bug in an old assumption.**
+  ensureTreeSchema saw a mid-arrival page (bodySchema flag not yet
+  landed), decided it was legacy, and rewrote the body atoms without
+  claims — tombstoning the claimed atoms, which remove-wins correctly
+  read as deletion. Every replica then converged on the destruction.
+  Two lessons: (a) a flat body already IS a valid tree — the flat
+  migration should only ever have set a flag; (b) **any convention
+  gated on "key absent" is a race under delta sync** — snapshot sync
+  delivered whole states atomically and hid this class entirely.
+  Migration triggers need to be monotone facts, not absences.
+- Artifacts ride once at upload; the server persists debounced (dirty
+  flag, 3s) and re-encodes fresh for hello — a stale hello would
+  strand a joiner between the snapshot and the deltas it missed.
+
+**Feedback**: the op DAG's refs made the transport almost trivial —
+out-of-order frames park and wake with zero new protocol state, and
+idempotent apply made relay/echo/replay a non-problem. The remaining
+sync gap from #21 is now only artifact laziness (hello still hauls all
+image bytes once per fresh browser; have/want negotiation or
+GET-by-id would finish the job).
