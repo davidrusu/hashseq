@@ -499,11 +499,30 @@ function requestArtifact(idHex) {
         return;
       }
       persistLocalSoon();
-      render();
+      // Bytes arriving change no span signature, so the incremental
+      // renderer would skip every affected block (the KaTeX lesson,
+      // third time): force-repaint blocks holding this atom.
+      repaintEmbedsOf(idHex);
     })
     .catch(() => {
       artifactFetchTried.delete(idHex); // transient — retry on next render
     });
+}
+
+/// Force-rerender unfocused blocks that embed `idHex` (sig-equal skips
+/// would leave stale pending chips after a lazy artifact lands).
+function repaintEmbedsOf(idHex) {
+  for (const ed of blocksEl.querySelectorAll('.block-ed')) {
+    if (ed === document.activeElement || ed.contains(document.activeElement)) continue;
+    const obj = ed.dataset.blockObj;
+    const t = web.text(obj);
+    for (let i = 0; i < t.length; i++) {
+      if (t[i] === ATOM && web.payloadAt(obj, i) === idHex) {
+        rerenderBlock(ed, obj, null);
+        break;
+      }
+    }
+  }
 }
 
 function persistNow(broadcast) {
@@ -945,7 +964,12 @@ function renderEmbed(idx) {
     return img;
   }
   const tableObj = WasmHashWeb.seqId(payload);
-  if (web.isSeq(tableObj)) return objTableNode(tableObj);
+  // Non-empty only: a real table's seq holds row refs. Empty seqs at a
+  // payload's derived id are debris from the old auto-open bug (#13) —
+  // matching them here classified pending IMAGES as tables (and returned
+  // before the lazy fetch could ever run). Probing untyped ids remains
+  // the wart #6/#13 named; the tagged vocabulary is still the real fix.
+  if (web.isSeq(tableObj) && web.textLen(tableObj) > 0) return objTableNode(tableObj);
   if (!web.resolveBytes(payload)) {
     // The pending/unavailable value state (HASHWEB_SPEC): possibly an
     // artifact whose bytes haven't arrived — try the lazy fetch; the
