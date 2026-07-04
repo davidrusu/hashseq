@@ -924,3 +924,19 @@ transport trivially cacheable AND verifiable (the client hashes what
 it fetched; a lying server buys nothing). The sync protocol the app
 needed is now: deltas + push-once blobs + lazy verified fetch +
 snapshot resync. Nothing on this list required a new store concept.
+
+---
+
+## 34 — The probing wart bites on schedule
+
+"Some images render as tables." No schema change — the embed
+classifier's probe order met lazy loading's pending window: with image
+bytes not yet arrived, `isSeq(seqId(payload))` matched EMPTY seq
+objects minted long ago by the #13 auto-open bug (nothing is ever
+deleted), so those images classified as tables and returned before the
+lazy fetch could fire. Fix: a real table's seq is never empty —
+require content. But the entry-worthy point is that #6/#13 predicted
+this exact failure class: every new rendering state (here: pending
+bytes) re-runs the same untyped-id ambiguity. The tagged value
+vocabulary stops being a nice-to-have the moment ids can be
+temporarily unresolvable — it should ride the next convention rev.
