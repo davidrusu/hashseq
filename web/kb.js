@@ -129,7 +129,7 @@ function replaceChild(parentOrigin, oldOrigin, newOrigin) {
 /// wrappers; a full walk from the body removes the former and unwraps the
 /// latter (trees are tiny, so a whole-tree normalize is cheap and simpler
 /// than incremental parent tracking).
-function normalizeTree(parentOrigin) {
+function normalizeTree(parentOrigin, seen = new Set()) {
   const p = web.createSeq(parentOrigin);
   const off = childOffset(parentOrigin);
   let i = off;
@@ -139,8 +139,18 @@ function normalizeTree(parentOrigin) {
       i++;
       continue;
     }
+    // Self-heal duplicate refs: concurrent structural ops (a move is
+    // remove+insert; normalize itself re-inserts on unwrap) can leave the
+    // same node referenced twice. First occurrence in document order wins
+    // — a deterministic rule, so every replica repairs identically and
+    // the repairs converge.
+    if (seen.has(childOrigin)) {
+      web.textRemove(p, i, 1);
+      continue;
+    }
+    seen.add(childOrigin);
     if (nodeIsContainer(childOrigin)) {
-      normalizeTree(childOrigin);
+      normalizeTree(childOrigin, seen);
       const kids = childNodes2(childOrigin);
       if (kids.length === 0) {
         web.textRemove(p, i, 1);
@@ -149,6 +159,7 @@ function normalizeTree(parentOrigin) {
       if (kids.length === 1) {
         web.textRemove(p, i, 1);
         web.seqInsertRef(p, i, kids[0].origin);
+        seen.delete(kids[0].origin); // re-check the hoisted child at this slot
         continue;
       }
     }
@@ -156,10 +167,15 @@ function normalizeTree(parentOrigin) {
   }
 }
 /// Every leaf block object across the whole tree (for comments etc).
-function allLeaves(parentOrigin) {
+/// Dedup across the WHOLE tree, not just per-parent: duplicate refs from
+/// concurrent edits must never surface twice (render heals visually even
+/// before normalizeTree repairs the data).
+function allLeaves(parentOrigin, seen = new Set()) {
   const out = [];
   for (const c of childNodes2(parentOrigin)) {
-    if (nodeIsContainer(c.origin)) out.push(...allLeaves(c.origin));
+    if (seen.has(c.origin)) continue;
+    seen.add(c.origin);
+    if (nodeIsContainer(c.origin)) out.push(...allLeaves(c.origin, seen));
     else out.push({ origin: c.origin, obj: web.createSeq(c.origin) });
   }
   return out;
@@ -2116,13 +2132,15 @@ function updateLeafContent(col, obj, ed) {
   }
 }
 
-function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, single) {
+function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, single, seen) {
+  if (seen.has(origin)) return; // duplicate ref — render first occurrence only
+  seen.add(origin);
   if (nodeIsContainer(origin)) {
     const cont = document.createElement('div');
     cont.className = 'node-container';
     cont.style.flexDirection = depth % 2 === 0 ? 'column' : 'row';
     for (const k of childNodes2(origin)) {
-      renderNodeInto(cont, k.origin, depth + 1, origin, prevLeaves, false);
+      renderNodeInto(cont, k.origin, depth + 1, origin, prevLeaves, false, seen);
     }
     parentEl.appendChild(cont);
     return;
@@ -2162,7 +2180,10 @@ function renderBlocks() {
   const frag = document.createDocumentFragment();
   const topKids = childNodes2(currentBodyOrigin);
   const single = topKids.length === 1 && !nodeIsContainer(topKids[0].origin);
-  for (const k of topKids) renderNodeInto(frag, k.origin, 1, currentBodyOrigin, prevLeaves, single);
+  const seen = new Set();
+  for (const k of topKids) {
+    renderNodeInto(frag, k.origin, 1, currentBodyOrigin, prevLeaves, single, seen);
+  }
 
   for (const c of prevLeaves.values()) c.remove();
   blocksEl

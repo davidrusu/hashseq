@@ -25,6 +25,7 @@ use axum::routing::get;
 use axum::Router;
 use tokio::sync::{broadcast, Mutex};
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use hashseq::encoding::{decode_hashweb, encode_hashweb};
 use hashseq::HashWeb;
@@ -92,6 +93,12 @@ async fn main() {
             }),
         )
         .fallback_service(ServeDir::new(web_dir))
+        // Clients must revalidate on every load: a phone running week-old
+        // cached kb.js against a fresher peer is how documents get mangled.
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        ))
         .with_state(app);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
