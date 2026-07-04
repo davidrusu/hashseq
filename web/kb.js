@@ -1620,6 +1620,143 @@ function newLeafToNewRow(bodyIdx) {
 /// Build a leaf block editor ONCE; renderBlocks keeps its tree context
 /// (origin/parentOrigin/depth) updated via dataset. Leaves persist across
 /// renders so an untouched block keeps its DOM caret and selection.
+// ---- cross-block keyboard flow -------------------------------------------------
+// The layout tree should be invisible to the keyboard: arrows glide across
+// block edges, and backspace / ctrl-d at an edge merges neighbours, as if
+// the blocks were one continuous document.
+
+/// Tree parent of a node (body children live at offset 0, containers at 1).
+function parentOfNode(nodeOrigin, parentOrigin = currentBodyOrigin) {
+  for (const c of childNodes2(parentOrigin)) {
+    if (c.origin === nodeOrigin) return parentOrigin;
+    if (nodeIsContainer(c.origin)) {
+      const r = parentOfNode(nodeOrigin, c.origin);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+function leafNeighbors(origin) {
+  const ls = allLeaves(currentBodyOrigin);
+  const i = ls.findIndex((l) => l.origin === origin);
+  return {
+    prev: i > 0 ? ls[i - 1] : null,
+    next: i >= 0 && i < ls.length - 1 ? ls[i + 1] : null,
+  };
+}
+
+function edOfOrigin(origin) {
+  return blocksEl.querySelector(`.block-col[data-origin="${origin}"] .block-ed`);
+}
+
+function focusLeaf(origin, offset) {
+  const ed = edOfOrigin(origin);
+  if (!ed) return;
+  ed.focus();
+  setSelectionRangeIn(ed, offset === 'end' ? extractText(ed).length : offset);
+}
+
+function removeLeaf(origin) {
+  const parent = parentOfNode(origin) ?? currentBodyOrigin;
+  removeNodeFromParent(parent, origin);
+  normalizeTree(currentBodyOrigin);
+}
+
+/// The caret's client rect; empty blocks fall back to the editor's box.
+function caretClientRect(ta) {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return null;
+  const range = sel.getRangeAt(0);
+  if (!ta.contains(range.startContainer)) return null;
+  const rects = range.getClientRects();
+  if (rects.length) return rects[0];
+  const rb = range.getBoundingClientRect();
+  if (rb.top || rb.height || rb.width) return rb;
+  return ta.getBoundingClientRect();
+}
+
+/// Client rect of a text offset, without touching the live selection.
+function rectAtOffset(ed, off) {
+  const hit = locateOffset(ed, off);
+  const r = document.createRange();
+  if (!hit) {
+    r.selectNodeContents(ed);
+    r.collapse(off === 0);
+  } else if (hit.after) {
+    r.setStartAfter(hit.after);
+    r.collapse(true);
+  } else if (hit.before) {
+    r.setStartBefore(hit.before);
+    r.collapse(true);
+  } else {
+    r.setStart(hit.node, hit.offset);
+    r.collapse(true);
+  }
+  const rects = r.getClientRects();
+  return rects[0] ?? r.getBoundingClientRect();
+}
+
+/// Is the caret on the block's first ('up') or last ('down') visual line?
+/// Same-line means the caret's line box overlaps the line box of the
+/// block's first (resp. last) text position — robust across mixed
+/// line-heights (headings, code regions, image lines). caretRangeFromPoint
+/// is useless here: it snaps points over padding back to the nearest text.
+function caretOnEdgeLine(ta, dir) {
+  if (extractText(ta).length === 0) return true;
+  const c = caretClientRect(ta);
+  if (!c) return false;
+  const edge = rectAtOffset(ta, dir === 'up' ? 0 : extractText(ta).length);
+  if (!edge || (!edge.height && !edge.top)) return true;
+  const tol = Math.max(c.height, edge.height, 8) * 0.6;
+  return dir === 'up' ? Math.abs(c.top - edge.top) < tol : Math.abs(c.bottom - edge.bottom) < tol;
+}
+
+/// Land the caret in `ed` on its first/last line, as close to client-x
+/// as possible — preserves the column when flowing between blocks.
+function placeCaretNearX(ed, x, fromTop) {
+  const r = ed.getBoundingClientRect();
+  const cx = Math.min(Math.max(x, r.left + 2), r.right - 2);
+  const y = fromTop ? r.top + 10 : r.bottom - 10;
+  const probe = document.caretRangeFromPoint(cx, y);
+  if (probe && ed.contains(probe.startContainer)) {
+    setSelectionRangeIn(ed, offsetOfPoint(ed, probe.startContainer, probe.startOffset));
+  } else {
+    setSelectionRangeIn(ed, fromTop ? 0 : extractText(ed).length);
+  }
+}
+
+/// Append src's content — text, embeds, and marks — onto the end of dst.
+/// Returns the offset in dst where src's content begins (the join point).
+function mergeBlockInto(dstObj, srcObj) {
+  const base = web.textLen(dstObj);
+  const txt = web.text(srcObj);
+  let i = 0;
+  while (i < txt.length) {
+    if (txt[i] === ATOM) {
+      const p = web.payloadAt(srcObj, i);
+      if (p != null) web.seqInsertRef(dstObj, base + i, p);
+      else web.textInsert(dstObj, base + i, ' ');
+      i++;
+    } else {
+      let j = i;
+      while (j < txt.length && txt[j] !== ATOM) j++;
+      web.textInsert(dstObj, base + i, txt.slice(i, j));
+      i = j;
+    }
+  }
+  let off = 0;
+  for (const sp of JSON.parse(web.markedSpans(srcObj))) {
+    const s = off;
+    const e = off + sp.text.length;
+    off = e;
+    for (const m of sp.marks) {
+      web.markRangeClosed(dstObj, base + s, base + e, m.kind, m.values[0] ?? '');
+    }
+  }
+  return base;
+}
+
 function makeColumn(obj, origin) {
   const col = document.createElement('div');
   col.className = 'block-col';
@@ -1761,7 +1898,10 @@ function makeColumn(obj, origin) {
     if (tail && tailPlain) {
       web.textRemove(obj, caret, text.length - caret);
       web.textInsert(nbObj, 0, tail);
-      refreshSig();
+      // No refreshSig() here: the col's sig must stay stale so the render
+      // below sees the mismatch and rebuilds this editor without its old
+      // tail. Pre-stamping the sig left the DOM (and dataset.prev) showing
+      // text the seq no longer has.
     }
     const parent = col.dataset.parentOrigin;
     const ci = childIndexOf(parent, col.dataset.origin);
@@ -1793,6 +1933,99 @@ function makeColumn(obj, origin) {
         exposeRegion(ta, obj, w.dataset.kind, Number(w.dataset.ord), start + len);
         return;
       }
+    }
+  });
+  // Cross-block flow: arrows glide over block edges; backspace / ctrl-d at
+  // an edge merges neighbours. The tree stays out of the keyboard's way.
+  ta.addEventListener('keydown', (e) => {
+    if (e.defaultPrevented) return;
+    if (e.metaKey || e.altKey) return;
+    const sel = window.getSelection();
+    if (!sel.rangeCount || !sel.getRangeAt(0).collapsed) return;
+
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.shiftKey && !e.ctrlKey) {
+      const dir = e.key === 'ArrowUp' ? 'up' : 'down';
+      if (!caretOnEdgeLine(ta, dir)) return;
+      const { prev, next } = leafNeighbors(col.dataset.origin);
+      if (dir === 'up' && !prev) {
+        e.preventDefault();
+        titleEl.focus();
+        titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length);
+        return;
+      }
+      const target = dir === 'up' ? prev : next;
+      if (!target) return;
+      const ted = edOfOrigin(target.origin);
+      if (!ted) return;
+      e.preventDefault();
+      const x = caretClientRect(ta)?.left ?? 0;
+      ted.focus();
+      placeCaretNearX(ted, x, dir === 'down');
+      return;
+    }
+    if (e.key === 'ArrowLeft' && !e.shiftKey && !e.ctrlKey && caretOffsetIn(ta) === 0) {
+      const { prev } = leafNeighbors(col.dataset.origin);
+      if (!prev) return;
+      e.preventDefault();
+      focusLeaf(prev.origin, 'end');
+      return;
+    }
+    if (
+      e.key === 'ArrowRight' &&
+      !e.shiftKey &&
+      !e.ctrlKey &&
+      caretOffsetIn(ta) === extractText(ta).length
+    ) {
+      const { next } = leafNeighbors(col.dataset.origin);
+      if (!next) return;
+      e.preventDefault();
+      focusLeaf(next.origin, 0);
+      return;
+    }
+
+    const isBackspace = e.key === 'Backspace' && !e.ctrlKey;
+    const isFwd = (e.key === 'd' && e.ctrlKey) || e.key === 'Delete';
+    if (!isBackspace && !isFwd) return;
+    const caret = caretOffsetIn(ta);
+    if (caret == null) return;
+    const len = web.textLen(obj);
+    const txt = web.text(obj);
+
+    if (txt === '' || txt === '\n') {
+      // Empty block (Chrome represents a cleared block as a lone <br>,
+      // which commits as a single newline): the delete deletes the block.
+      const { prev, next } = leafNeighbors(col.dataset.origin);
+      if (!prev && !next) return; // never delete the only block
+      e.preventDefault();
+      removeLeaf(col.dataset.origin);
+      persistSoon();
+      render();
+      const t = isBackspace ? (prev ?? next) : (next ?? prev);
+      focusLeaf(t.origin, t === prev ? 'end' : 0);
+      return;
+    }
+    if (isBackspace && caret === 0) {
+      // Collapse this block into the previous one; caret at the join.
+      const { prev } = leafNeighbors(col.dataset.origin);
+      if (!prev) return;
+      e.preventDefault();
+      const at = mergeBlockInto(prev.obj, obj);
+      removeLeaf(col.dataset.origin);
+      persistSoon();
+      render();
+      focusLeaf(prev.origin, at);
+      return;
+    }
+    if (isFwd && caret === len) {
+      // Pull the next block's content into this one; caret stays put.
+      const { next } = leafNeighbors(col.dataset.origin);
+      if (!next) return;
+      e.preventDefault();
+      mergeBlockInto(obj, next.obj);
+      removeLeaf(next.origin);
+      persistSoon();
+      render();
+      focusLeaf(col.dataset.origin, caret);
     }
   });
   ta.addEventListener('paste', (e) => {
@@ -2384,6 +2617,26 @@ titleEl.addEventListener('input', () => {
     persistSoon();
     render();
   }, 350);
+});
+// The title is line zero of the document: Enter opens a fresh first
+// block, ArrowDown flows into the body.
+titleEl.addEventListener('keydown', (e) => {
+  if (!current || !currentBodyOrigin) return;
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    clearTimeout(titleTimer);
+    web.putString(current, 'title', titleEl.value || 'Untitled');
+    const nb = makeLeafNode();
+    insertChildAt(currentBodyOrigin, nb, 0);
+    persistSoon();
+    render();
+    focusLeaf(nb, 0);
+  } else if (e.key === 'ArrowDown') {
+    const ls = allLeaves(currentBodyOrigin);
+    if (!ls.length) return;
+    e.preventDefault();
+    focusLeaf(ls[0].origin, 0);
+  }
 });
 
 function createPage(parentObj) {
