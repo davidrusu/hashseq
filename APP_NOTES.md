@@ -940,3 +940,11 @@ this exact failure class: every new rendering state (here: pending
 bytes) re-runs the same untyped-id ambiguity. The tagged value
 vocabulary stops being a nice-to-have the moment ids can be
 temporarily unresolvable — it should ride the next convention rev.
+
+*Addendum, same day:* one debris seq was non-empty (old +ROW clicks had
+written into it), so the emptiness guard missed it too. The durable
+rule that closed the class: **an unresolved value renders a
+placeholder, full stop** — structural probes run only after the lazy
+fetch definitively misses. Absence is a rendering state, not evidence
+of type. Genuine tables cost one placeholder-flicker round-trip on
+first sight; images can never be reclassified again.
