@@ -472,6 +472,20 @@ impl<'a> IntoIterator for &'a SortedIdVec {
     }
 }
 
+/// One element's placement register: its live move heads (Id order —
+/// convergence-safe, never replica-local) and the decider they resolve to
+/// under the last-agreed rule. `decider` is derived state, recomputed by
+/// the register's only writer (`apply_move`) whenever the head set
+/// changes, so reads are O(1): a contested (frozen) register used to be
+/// re-resolved — an O(history) walk — on every cursor, iterator and
+/// marked-spans read until an honest move collapsed it.
+#[derive(Debug, Clone, Default)]
+pub struct MoveRegister {
+    pub heads: SortedIdVec,
+    /// `None` = the creation placement (base slot).
+    pub decider: Option<NodeIdx>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HashSeq {
     /// The document's identity: ops anchor at this id to insert at top level.
@@ -502,9 +516,13 @@ pub struct HashSeq {
     /// Applied move ops, by their own handle (the placement-register
     /// history: `overwrites` edges are walked by the last-agreed rule).
     pub move_nodes: FxHashMap<NodeIdx, StoredMove>,
-    /// Placement registers: target element -> live move heads, in Id order
-    /// (convergence-safe; never replica-local order).
-    pub moves: FxHashMap<NodeIdx, SortedIdVec>,
+    /// Placement registers: target element -> live move heads + their
+    /// resolved decider (see `MoveRegister`).
+    pub moves: FxHashMap<NodeIdx, MoveRegister>,
+    #[cfg(test)]
+    /// How many contested resolutions `resolve_decider` has run (tests
+    /// assert reads never re-resolve).
+    pub(crate) resolutions: std::cell::Cell<usize>,
     /// Chained single-target removes (backspace/delete bursts), keyed by the
     /// first remove's handle.
     pub remove_runs: FxHashMap<NodeIdx, RemoveRun>,
@@ -607,6 +625,8 @@ impl HashSeq {
             remove_nodes: FxHashMap::default(),
             move_nodes: FxHashMap::default(),
             moves: FxHashMap::default(),
+            #[cfg(test)]
+            resolutions: std::cell::Cell::new(0),
             remove_runs: FxHashMap::default(),
             afters: FxHashMap::default(),
             elem_payloads: FxHashMap::default(),
@@ -1177,9 +1197,9 @@ impl HashSeq {
         // ignored, never errors.
         let reg = self.moves.entry(target_idx).or_default();
         for o in &overwrites {
-            reg.remove(o, &self.ids);
+            reg.heads.remove(o, &self.ids);
         }
-        reg.insert(idx, &self.ids);
+        reg.heads.insert(idx, &self.ids);
 
         let stored = StoredMove {
             target: target_idx,
@@ -1194,10 +1214,16 @@ impl HashSeq {
         };
         self.move_nodes.insert(idx, stored);
 
+        // The head set changed: resolve once, here, and cache it on the
+        // register (the history it depends on — `move_nodes` — is
+        // append-only, so nothing else can invalidate it).
+        let heads: Vec<NodeIdx> = self.moves[&target_idx].heads.iter().collect();
+        let new_decider = self.resolve_decider(heads);
+        self.moves.get_mut(&target_idx).expect("just written").decider = new_decider;
+
         // Remove beats move: a tombstoned element renders nowhere, so a
         // register change must not touch the index.
         if !self.is_removed(target_idx) {
-            let new_decider = self.decider_of(target_idx);
             if old_decider != new_decider {
                 self.rerender(target_idx, old_decider, new_decider);
             }
@@ -1228,7 +1254,7 @@ impl HashSeq {
     pub fn move_heads(&self, target: &Id) -> Vec<Id> {
         self.idx_of(target)
             .and_then(|t| self.moves.get(&t))
-            .map(|reg| reg.iter().map(|i| self.id_of(i)).collect())
+            .map(|reg| reg.heads.iter().map(|i| self.id_of(i)).collect())
             .unwrap_or_default()
     }
 
@@ -1237,7 +1263,7 @@ impl HashSeq {
     pub fn placement_conflicted(&self, target: &Id) -> bool {
         self.idx_of(target)
             .and_then(|t| self.moves.get(&t))
-            .is_some_and(|reg| reg.len() > 1)
+            .is_some_and(|reg| reg.heads.len() > 1)
     }
 
     /// The rendered placement of `target`: `None` = the creation placement
@@ -1260,8 +1286,7 @@ impl HashSeq {
     /// creation placement). Pure register read — removal is the caller's
     /// concern.
     pub(crate) fn decider_of(&self, t: NodeIdx) -> Option<NodeIdx> {
-        let reg = self.moves.get(&t)?;
-        self.resolve_decider(reg.iter().collect())
+        self.moves.get(&t)?.decider
     }
 
     fn move_anchor(&self, m: NodeIdx) -> Anchor {
@@ -1297,17 +1322,45 @@ impl HashSeq {
         seen
     }
 
+    /// The last-agreed decider of a head set. Called by `apply_move` only;
+    /// reads use the cached `MoveRegister::decider`.
     fn resolve_decider(&self, heads: Vec<NodeIdx>) -> Option<NodeIdx> {
+        // Ancestor sets are reused across the intersection, the maximal
+        // filter (which asks for every pair) and the recursion.
+        let mut ancestors: FxHashMap<NodeIdx, FxHashSet<NodeIdx>> = FxHashMap::default();
+        self.resolve_decider_with(heads, &mut ancestors)
+    }
+
+    /// `move_ancestors`, memoized for one resolution.
+    fn ancestors_memo<'m>(
+        &self,
+        m: NodeIdx,
+        target: NodeIdx,
+        memo: &'m mut FxHashMap<NodeIdx, FxHashSet<NodeIdx>>,
+    ) -> &'m FxHashSet<NodeIdx> {
+        memo.entry(m)
+            .or_insert_with(|| self.move_ancestors(m, target))
+    }
+
+    fn resolve_decider_with(
+        &self,
+        heads: Vec<NodeIdx>,
+        ancestors: &mut FxHashMap<NodeIdx, FxHashSet<NodeIdx>>,
+    ) -> Option<NodeIdx> {
         match heads.as_slice() {
             [] => None, // the creation placement — the implicit root
             [one] => Some(*one),
             many => {
+                #[cfg(test)]
+                self.resolutions.set(self.resolutions.get() + 1);
                 let target = self.move_nodes[&many[0]].target;
                 // Intersection of every head's transitive overwrites.
                 let mut iter = many.iter();
-                let mut common = self.move_ancestors(*iter.next().unwrap(), target);
+                let mut common = self
+                    .ancestors_memo(*iter.next().unwrap(), target, ancestors)
+                    .clone();
                 for h in iter {
-                    let anc = self.move_ancestors(*h, target);
+                    let anc = self.ancestors_memo(*h, target, ancestors);
                     common.retain(|c| anc.contains(c));
                     if common.is_empty() {
                         break;
@@ -1323,14 +1376,14 @@ impl HashSeq {
                 for &c in &members {
                     let dominated = members
                         .iter()
-                        .any(|&d| d != c && self.move_ancestors(d, target).contains(&c));
+                        .any(|&d| d != c && self.ancestors_memo(d, target, ancestors).contains(&c));
                     if !dominated {
                         maximal.push(c);
                     }
                 }
                 // Deterministic order (by id) for the recursion.
                 maximal.sort_by_key(|i| self.id_of(*i));
-                self.resolve_decider(maximal)
+                self.resolve_decider_with(maximal, ancestors)
             }
         }
     }
@@ -4652,6 +4705,45 @@ mod test {
             .filter(|(_, live)| live.iter().any(|(_, v)| *v != *crate::value::TOMBSTONE))
             .map(|(k, _)| k)
             .collect()
+    }
+
+    #[test]
+    fn contested_register_reads_never_re_resolve() {
+        let mut base = HashSeq::default();
+        base.insert_batch(0, "abcd".chars());
+        let a = base.id_at(0).unwrap();
+        let b = base.id_at(1).unwrap();
+        let c = base.id_at(2).unwrap();
+        let d = base.id_at(3).unwrap();
+        // A chain of agreed moves, then two concurrent forks: contested.
+        base.move_element(a, Anchor::After(b)).unwrap();
+        base.move_element(a, Anchor::After(c)).unwrap();
+        let mut r1 = base.clone();
+        let mut r2 = base.clone();
+        r1.move_element(a, Anchor::After(d)).unwrap();
+        r2.move_element(a, Anchor::Before(b)).unwrap();
+        let mut seq = r1;
+        seq.merge(r2);
+        assert!(seq.placement_conflicted(&a));
+        assert_eq!(seq.placement_of(&a), Some(Anchor::After(c)), "last agreed");
+
+        let resolved = seq.resolutions.get();
+        assert!(resolved > 0, "the merge resolved the contested register");
+        for _ in 0..50 {
+            let _ = seq.placement_of(&a);
+            let _ = seq.cursor_at(2);
+            let _ = seq.iter().count();
+            let _ = seq.marked_spans();
+            let _ = seq.iter_idxs_causal().count();
+        }
+        assert_eq!(seq.resolutions.get(), resolved, "reads are cache hits");
+
+        // A move naming both heads collapses the register: one more resolve
+        // is fine, but a single head resolves without a walk.
+        seq.move_element(a, Anchor::After(d)).unwrap();
+        assert!(!seq.placement_conflicted(&a));
+        assert_eq!(seq.placement_of(&a), Some(Anchor::After(d)));
+        assert_eq!(seq.resolutions.get(), resolved);
     }
 
     #[test]
