@@ -2427,6 +2427,18 @@ impl HashSeq {
         self.element_at(idx).map(|i| self.id_of(i))
     }
 
+    /// The id to anchor on for the element rendered at visible position
+    /// `pos` — what `cursor_at` uses for its neighbours: the element
+    /// itself, or, for a moved-in element, its deciding move op. Anchors
+    /// on an element resolve at that element's BASE slot (its ghost), so
+    /// anything built from visible positions (moves, marks) must go
+    /// through this to land where the user sees the element (MARKS.md
+    /// "op-anchored endpoint brackets wherever the op's target renders").
+    pub fn anchor_id_at(&self, pos: usize) -> Option<Id> {
+        let e = self.element_at(pos)?;
+        Some(self.id_of(self.render_anchor(e)))
+    }
+
     /// Return the current visible position of `id`, if it is present and not removed.
     pub fn position_of(&self, id: &Id) -> Option<usize> {
         let idx = self.idx_of(id)?;
@@ -4640,6 +4652,41 @@ mod test {
             .filter(|(_, live)| live.iter().any(|(_, v)| *v != *crate::value::TOMBSTONE))
             .map(|(k, _)| k)
             .collect()
+    }
+
+    #[test]
+    fn anchor_id_at_maps_moved_in_elements_to_their_move_op() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abcd".chars());
+        let a = seq.id_at(0).unwrap();
+        let d = seq.id_at(3).unwrap();
+        assert_eq!(seq.anchor_id_at(0), Some(a), "in place: the element itself");
+        let mv = seq.move_element(a, Anchor::After(d)).unwrap();
+        assert_eq!(seq.iter().collect::<String>(), "bcda");
+        assert_eq!(seq.id_at(3), Some(a));
+        assert_eq!(seq.anchor_id_at(3), Some(mv.id()), "moved in: its decider");
+        assert_eq!(seq.anchor_id_at(4), None);
+
+        // Marks built from visible positions the way the wasm layer does:
+        // [1,3) = "cd" is Before(c)..Before(anchor at 3), which must bracket
+        // the moved-in `a`'s rendered position, not its base ghost.
+        let s = Anchor::Before(seq.anchor_id_at(1).unwrap());
+        let e = Anchor::Before(seq.anchor_id_at(3).unwrap());
+        seq.mark_range(s, e, bold(), yes()).unwrap();
+        let spans: Vec<(String, bool)> = seq
+            .marked_spans()
+            .into_iter()
+            .map(|(t, m)| (t, !m.is_empty()))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![("b".into(), false), ("cd".into(), true), ("a".into(), false)]
+        );
+        // And a closed range over the moved-in element itself covers it.
+        let s = Anchor::Before(seq.anchor_id_at(3).unwrap());
+        let e = Anchor::After(seq.anchor_id_at(3).unwrap());
+        seq.mark_range(s, e, bold(), yes()).unwrap();
+        assert!(!seq.marks_at(&a).is_empty());
     }
 
     #[test]

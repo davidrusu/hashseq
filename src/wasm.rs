@@ -390,11 +390,13 @@ fn anchor_range(seq: &HashSeq, start: usize, end: usize) -> Result<(Anchor, Anch
     if start >= end || end > seq.len() {
         return Err(app_err("mark range out of bounds"));
     }
-    let s = Anchor::Before(seq.id_at(start).expect("start < len"));
+    // Anchor ids, not element ids: a moved-in element is represented by
+    // its deciding move op so the mark brackets where it renders.
+    let s = Anchor::Before(seq.anchor_id_at(start).expect("start < len"));
     let e = if end < seq.len() {
-        Anchor::Before(seq.id_at(end).expect("end < len"))
+        Anchor::Before(seq.anchor_id_at(end).expect("end < len"))
     } else {
-        Anchor::After(seq.id_at(end - 1).expect("end-1 < len"))
+        Anchor::After(seq.anchor_id_at(end - 1).expect("end-1 < len"))
     };
     Ok((s, e))
 }
@@ -402,6 +404,45 @@ fn anchor_range(seq: &HashSeq, start: usize, end: usize) -> Result<(Anchor, Anch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drag-reorder the way kb.js does: repeated seqMove on one list, so
+    /// after the first move every neighbour may be moved-in. The rendered
+    /// text must track a plain Vec model.
+    #[test]
+    fn seq_move_chain_tracks_the_visible_order() {
+        let mut web = WasmHashWeb::new();
+        let list = web.create_seq(&"ab".repeat(32)).unwrap();
+        web.text_insert(&list, 0, "abcd").unwrap();
+        let mut model: Vec<char> = "abcd".chars().collect();
+        for (from, to) in [(0, 4), (0, 4), (3, 1), (2, 0), (1, 3), (0, 2), (1, 4), (3, 0)] {
+            web.seq_move(&list, from, to).unwrap();
+            let ch = model.remove(from);
+            model.insert(if to > from { to - 1 } else { to }, ch);
+            let want: String = model.iter().collect();
+            assert_eq!(web.text(&list).unwrap(), want, "after move({from},{to})");
+        }
+        // Dropping onto itself (either side) is a no-op, not a gated op.
+        let before = web.text(&list).unwrap();
+        web.seq_move(&list, 1, 1).unwrap();
+        web.seq_move(&list, 1, 2).unwrap();
+        assert_eq!(web.text(&list).unwrap(), before);
+    }
+
+    /// Marks built from visible positions bracket moved-in text.
+    #[test]
+    fn mark_range_over_moved_in_text_applies() {
+        let mut web = WasmHashWeb::new();
+        let doc = web.create_seq(&"ac".repeat(32)).unwrap();
+        web.text_insert(&doc, 0, "abcd").unwrap();
+        web.seq_move(&doc, 0, 4).unwrap();
+        assert_eq!(web.text(&doc).unwrap(), "bcda");
+        // "cd" then the moved-in "a": both used to be gated or cover nothing.
+        web.mark_range(&doc, 1, 3, "bold", "on").unwrap();
+        web.mark_range_closed(&doc, 3, 4, "bold", "on").unwrap();
+        let spans = web.marked_spans(&doc).unwrap();
+        assert!(spans.contains("bold"), "{spans}");
+        assert!(!spans.contains("bcda"), "the run must split at the mark: {spans}");
+    }
 
     /// PLACEMENT_SPEC.md through the FFI: move a block between two
     /// containers by insert-link + placeAt; the chain resolves membership;
@@ -946,15 +987,19 @@ impl WasmHashWeb {
         if from >= len || to_slot > len {
             return Err(app_err("move out of bounds"));
         }
-        let target = seq.id_at(from).expect("from < len");
-        let to = if to_slot == len {
-            Anchor::After(seq.id_at(len - 1).expect("len > 0"))
-        } else {
-            Anchor::Before(seq.id_at(to_slot).expect("to_slot < len"))
-        };
-        if *to.id() == target {
+        if to_slot == from || to_slot == from + 1 {
             return Ok(()); // dropping onto itself
         }
+        // The target is the element; the destination is an anchor id (a
+        // moved-in neighbour is represented by its deciding move op), so
+        // the move lands where the user sees the neighbour, not at its
+        // base ghost.
+        let target = seq.id_at(from).expect("from < len");
+        let to = if to_slot == len {
+            Anchor::After(seq.anchor_id_at(len - 1).expect("len > 0"))
+        } else {
+            Anchor::Before(seq.anchor_id_at(to_slot).expect("to_slot < len"))
+        };
         seq.move_element(target, to)
             .map_err(|_| app_err("move not admissible"))?;
         Ok(())
@@ -1037,8 +1082,8 @@ impl WasmHashWeb {
         if start >= end || end > seq.len() {
             return Err(app_err("mark range out of bounds"));
         }
-        let s = Anchor::Before(seq.id_at(start).expect("start < len"));
-        let e = Anchor::After(seq.id_at(end - 1).expect("end-1 < len"));
+        let s = Anchor::Before(seq.anchor_id_at(start).expect("start < len"));
+        let e = Anchor::After(seq.anchor_id_at(end - 1).expect("end-1 < len"));
         let node = seq
             .mark_range(s, e, kind_id, value_id)
             .map_err(|_| app_err("mark not admissible: anchors do not bracket a span"))?;
