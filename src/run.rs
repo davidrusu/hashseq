@@ -176,11 +176,6 @@ impl Run {
         nodes
     }
 
-    pub fn first_node(&self) -> HashNode {
-        let first = self.run.chars().next().unwrap();
-        self.first_node_with_char(first)
-    }
-
     fn first_node_with_char(&self, first: char) -> HashNode {
         HashNode {
             pins: self.first_extra_deps.clone(),
@@ -199,16 +194,6 @@ impl Run {
     /// Get the ID of the last character in the run
     pub fn last_id(&self) -> Id {
         *self.elements.last().unwrap()
-    }
-
-    /// Get the run's ID (same as the first character's ID)
-    pub fn run_id(&self) -> Id {
-        self.first_id()
-    }
-
-    /// Find the position of a given ID within this run
-    pub fn find_position(&self, id: &Id) -> Option<usize> {
-        self.elements.iter().position(|elem_id| elem_id == id)
     }
 
     /// Extend this run by appending a character and return the new element's ID
@@ -239,50 +224,12 @@ impl Run {
         self.run.push(ch);
         self.elements.push(id);
     }
-
-    /// Split this run at the given position, returning the right portion
-    /// The left portion remains in self, the right portion is returned
-    ///
-    /// Example: run "abc" split at position 1 becomes "a" and "bc"
-    /// The right run's anchor becomes the ID of the last element of the left run
-    /// and is always `FirstOp::After` (the chain extends after the left tail).
-    pub fn split_at(&mut self, position: usize) -> Run {
-        assert!(
-            position > 0 && position < self.len(),
-            "Invalid split position"
-        );
-
-        let right_elements = self.elements.split_off(position);
-        let right_anchor = *self.elements.last().unwrap();
-
-        let byte_pos = self.run.char_indices().nth(position).unwrap().0;
-        let right_str = self.run.split_off(byte_pos);
-
-        // Interior deps at the split point become the right run's first deps
-        // (preserving the element's id); later offsets rebase.
-        let mut right_interior = self.interior_extra_deps.split_off(&position);
-        let right_first_deps = right_interior.remove(&position).unwrap_or_default();
-        let right_interior: BTreeMap<usize, BTreeSet<Id>> = right_interior
-            .into_iter()
-            .map(|(k, v)| (k - position, v))
-            .collect();
-
-        Run {
-            anchor: right_anchor,
-            first_op: FirstOp::After,
-            first_extra_deps: right_first_deps,
-            interior_extra_deps: right_interior,
-            run: right_str,
-            elements: right_elements,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen};
-    use quickcheck_macros::quickcheck;
 
     fn test_id(n: u8) -> Id {
         let mut id = [0u8; 32];
@@ -360,24 +307,6 @@ mod tests {
     /// Splitting at or around an interior-deps offset preserves ids: deps at
     /// the split point become the right run's first deps.
     #[test]
-    fn test_split_at_interior_deps_boundary() {
-        let dep = test_id(9);
-        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
-        run.extend('b');
-        run.extend_with_deps('c', BTreeSet::from_iter([dep]));
-        run.extend('d');
-        let original = run.decompress();
-
-        for at in 1..run.len() {
-            let mut left = run.clone();
-            let right = left.split_at(at);
-            let mut combined = left.decompress();
-            combined.extend(right.decompress());
-            assert_eq!(combined, original, "split at {at} changed identities");
-        }
-    }
-
-    #[test]
     fn test_new_run() {
         let anchor = test_id(0);
         let mut run = Run::new(anchor, BTreeSet::new(), 'a');
@@ -424,26 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn test_split_at() {
-        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
-        run.extend('b');
-        run.extend('c');
-
-        // Get IDs before split
-        let nodes_before = run.decompress();
-
-        let right_run = run.split_at(1);
-
-        // Left run should have 'a'
-        assert_eq!(run.run, "a");
-
-        // Right run should have 'bc' with anchor = ID of 'a'
-        assert_eq!(right_run.run, "bc");
-        assert_eq!(right_run.anchor, nodes_before[0].id());
-        assert_eq!(right_run.first_op, FirstOp::After);
-    }
-
-    #[test]
     fn test_first_and_last_id() {
         let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
         run.extend('b');
@@ -452,50 +361,5 @@ mod tests {
 
         assert_eq!(run.first_id(), nodes[0].id());
         assert_eq!(run.last_id(), nodes[2].id());
-        assert_eq!(run.run_id(), nodes[0].id());
-    }
-
-    #[test]
-    fn test_find_position() {
-        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
-        run.extend('b');
-        run.extend('c');
-        let nodes = run.decompress();
-
-        assert_eq!(run.find_position(&nodes[0].id()), Some(0));
-        assert_eq!(run.find_position(&nodes[1].id()), Some(1));
-        assert_eq!(run.find_position(&nodes[2].id()), Some(2));
-        assert_eq!(run.find_position(&test_id(99)), None);
-    }
-
-    #[quickcheck]
-    fn prop_split_preserves_decompress(run: Run, idx: usize) -> bool {
-        // split_at requires: 0 < position < len
-        // So valid range is 1..run.len()
-        if run.len() < 2 {
-            // Can't split a run with only 1 element
-            return true;
-        }
-
-        // Clamp idx to valid range [1, run.len())
-        let position = (idx % (run.len() - 1)).max(1);
-
-        // Get original decompressed nodes
-        let original_nodes = run.decompress();
-
-        // Split the run
-        let mut run_a = run.clone();
-        let run_b = run_a.split_at(position);
-
-        // Get decompressed nodes from both parts
-        let nodes_a = run_a.decompress();
-        let nodes_b = run_b.decompress();
-
-        // Concatenate the decompressed nodes
-        let mut combined_nodes = nodes_a;
-        combined_nodes.extend(nodes_b);
-
-        // Verify they match the original
-        original_nodes == combined_nodes
     }
 }
