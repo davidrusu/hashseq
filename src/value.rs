@@ -231,6 +231,23 @@ thread_local! {
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
+static ASCII_CHAR_OF_VALUE_ID: LazyLock<rustc_hash::FxHashMap<Id, char>> = LazyLock::new(|| {
+    ASCII_VALUE_IDS
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i as u8 as char))
+        .collect()
+});
+
+/// The char whose artifact `id` names, when that can be decided without
+/// the artifact: a pure function of `id` over the ASCII table, so every
+/// replica agrees. Non-ASCII char ids are not recognized (inverting them
+/// needs the artifact bytes, i.e. a value store); they read as opaque
+/// value commitments.
+pub fn ascii_char_of_value_id(id: &Id) -> Option<char> {
+    ASCII_CHAR_OF_VALUE_ID.get(id).copied()
+}
+
 /// `value_id` of a char artifact, cached.
 #[inline]
 pub fn char_value_id(c: char) -> Id {

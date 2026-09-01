@@ -361,7 +361,10 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(Payload, usize), DecodeError> {
         }
         0x01 => {
             let (id, n) = decode_id(rest)?;
-            Ok((Payload::Id(id), 1 + n))
+            // By-id is legal transport even for a small value (the sender
+            // may not hold the artifact); resolve it here when this replica
+            // can, so one node id has one stored form.
+            Ok((Payload::Id(id).resolved(), 1 + n))
         }
         other => Err(DecodeError::InvalidOpTag(other)),
     }
@@ -2384,6 +2387,44 @@ mod tests {
         let run = Run::from_text(anchor, FirstOp::After, BTreeSet::new(), "ab", interior.clone())
             .unwrap();
         assert_eq!(run.interior_extra_deps, interior);
+    }
+
+    #[test]
+    fn by_id_payload_for_a_known_char_resolves_on_decode() {
+        let a = test_id(1);
+        let inline = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(a, 'z'),
+        };
+        let by_id = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Insert {
+                at: Anchor::After(a),
+                payload: Payload::Id(crate::value::char_value_id('z')),
+            },
+        };
+        // Same node id (the preimage hashes the value id) ...
+        assert_eq!(inline.id(), by_id.id());
+        // ... and the by-id wire form decodes to the resolved (inline) node,
+        // so it re-encodes canonically.
+        let mut bytes = Vec::new();
+        encode_op(&EncodableOp::Node(by_id), &mut bytes);
+        let (op, _) = decode_op(&bytes).unwrap();
+        assert_eq!(op, EncodableOp::Node(inline.clone()));
+        let mut canonical = Vec::new();
+        encode_op(&EncodableOp::Node(inline), &mut canonical);
+        assert_ne!(canonical, bytes);
+        // Genuine by-id atoms (links, embeds, large values) stay by id.
+        let link = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Insert {
+                at: Anchor::After(a),
+                payload: Payload::Id(test_id(200)),
+            },
+        };
+        let mut bytes = Vec::new();
+        encode_op(&EncodableOp::Node(link.clone()), &mut bytes);
+        assert!(matches!(decode_op(&bytes), Ok((EncodableOp::Node(n), _)) if n == link));
     }
 
     #[test]

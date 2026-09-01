@@ -73,6 +73,23 @@ impl Payload {
             Payload::Id(id) => *id,
         }
     }
+
+    /// The stored form: a by-id payload whose value this replica can
+    /// resolve becomes the resolved value. Identity is unchanged (the
+    /// preimage hashes the value id either way); only the rendering is —
+    /// the char instead of an opaque atom. Resolution today is the ASCII
+    /// char table (see `value::ascii_char_of_value_id`); a value store
+    /// would widen it.
+    #[inline]
+    pub fn resolved(self) -> Payload {
+        match self {
+            Payload::Id(id) => match crate::value::ascii_char_of_value_id(&id) {
+                Some(c) => Payload::Char(c),
+                None => self,
+            },
+            Payload::Char(_) => self,
+        }
+    }
 }
 
 /// The op kinds. Named ids (anchor / targets / overwrites) live in the op's

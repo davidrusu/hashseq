@@ -931,7 +931,7 @@ impl HashSeq {
     /// visible position `idx` — an atom: a link or an artifact id.
     pub fn make_insert_value(&self, idx: usize, payload: Id) -> Option<HashNode> {
         let cursor = self.cursor_at(idx.min(self.len()))?;
-        Some(cursor.payload_node(Payload::Id(payload)))
+        Some(cursor.payload_node(Payload::Id(payload).resolved()))
     }
 
     /// Insert a value commitment id at visible position `idx`. The atom
@@ -2192,7 +2192,7 @@ impl HashSeq {
 
         match node.op {
             Op::Insert { at, payload } => {
-                let (ch, payload) = match payload {
+                let (ch, payload) = match payload.resolved() {
                     Payload::Char(c) => (c, None),
                     Payload::Id(v) => (ATOM_CHAR, Some(v)),
                 };
@@ -5024,6 +5024,35 @@ mod test {
         assert_eq!(decoded, seq);
         assert_eq!(decoded.marked_spans(), seq.marked_spans());
         assert_eq!(decoded.mark_tips(), seq.mark_tips());
+    }
+
+    #[test]
+    fn insert_value_of_a_char_id_is_the_char() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let node = seq.insert_value(1, crate::value::char_value_id('z'));
+        assert!(matches!(node.op, Op::Insert { payload: Payload::Char('z'), .. }));
+        assert_eq!(seq.iter().collect::<String>(), "azb");
+        let z = seq.id_at(1).unwrap();
+        assert_eq!(seq.payload_of(&z), None, "not an atom");
+
+        // The same node applied in its by-id form renders identically.
+        let mut other = HashSeq::default();
+        other.insert_batch(0, "ab".chars());
+        let by_id = HashNode {
+            pins: node.pins.clone(),
+            op: match &node.op {
+                Op::Insert { at, payload } => Op::Insert {
+                    at: *at,
+                    payload: Payload::Id(payload.value_id()),
+                },
+                _ => unreachable!(),
+            },
+        };
+        assert_eq!(by_id.id(), node.id());
+        other.apply(by_id);
+        assert_eq!(other.iter().collect::<String>(), "azb");
+        assert_eq!(other.payload_of(&z), None);
     }
 
     #[test]
