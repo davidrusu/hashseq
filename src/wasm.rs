@@ -1278,12 +1278,36 @@ impl WasmHashWeb {
         crate::encoding::encode_delta(&groups)
     }
 
+    /// Drain the ids (hex) of small value artifacts minted locally since
+    /// the last drain — the strings behind new titles, mark kinds/values,
+    /// languages. Push each with `artifactFrame` alongside the delta: ops
+    /// alone leave a live peer holding unresolved refs until resync.
+    #[wasm_bindgen(js_name = takeNewArtifacts)]
+    pub fn take_new_artifacts(&mut self) -> Vec<String> {
+        self.inner
+            .take_new_artifacts()
+            .iter()
+            .map(id_to_hex)
+            .collect()
+    }
+
     /// Apply a peer's 0xDE delta message. Idempotent; unknown objects are
-    /// opened from the frame's (kind, origin). Returns nodes delivered.
+    /// opened from the frame's (kind, origin). Returns the number of nodes
+    /// NEWLY delivered — 0 for an echo of our own ops or a replay, so the
+    /// caller can skip re-rendering when nothing changed.
     #[wasm_bindgen(js_name = applyDelta)]
     pub fn apply_delta(&mut self, bytes: &[u8]) -> Result<usize, JsValue> {
         crate::encoding::apply_delta(&mut self.inner, bytes)
             .map_err(|e| app_err(&format!("delta decode error: {e}")))
+    }
+
+    /// Would these artifact bytes be news to this replica? (False for our
+    /// own 0xAF push echoed back by the relay — the caller skips the
+    /// re-render.)
+    #[wasm_bindgen(js_name = hasArtifactBytes)]
+    pub fn has_artifact_bytes(&self, bytes: &[u8]) -> bool {
+        let id = crate::value::value_id_of_bytes(bytes);
+        self.inner.artifact_bytes(&id).is_some()
     }
 
     /// Store raw artifact bytes (the 0xAF frame payload); returns the

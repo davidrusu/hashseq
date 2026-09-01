@@ -168,9 +168,9 @@ pub enum Cursor {
         anchor: Id,
         extra_deps: BTreeSet<Id>,
     },
-    /// Insert immediately before `anchor`. Used when the cursor sits between two
-    /// causally-related neighbors and a fork at the left neighbor would otherwise
-    /// give hash-determined ordering.
+    /// Insert immediately before `anchor`. Used (per the Fugue rule) when the
+    /// left neighbor already has a right child, so a fork at the left neighbor
+    /// would otherwise give hash-determined ordering.
     Before {
         anchor: Id,
         extra_deps: BTreeSet<Id>,
@@ -867,28 +867,6 @@ impl HashSeq {
             Some(next) => self.region_first(next),
             None => anchor,
         }
-    }
-
-    /// Check if node `a` is causally before node `b`.
-    ///
-    /// Walks handle space: the common case (run-chain neighbors) follows
-    /// `elements` directly with no hashing at all.
-    fn is_causally_before(&self, a: NodeIdx, b: NodeIdx) -> bool {
-        let mut seen: FxHashSet<NodeIdx> = FxHashSet::default();
-        let mut boundary: Vec<NodeIdx> = self.afters_of(a).collect();
-        while let Some(n) = boundary.pop() {
-            if n == b {
-                return true;
-            }
-
-            seen.insert(n);
-            boundary.extend(self.afters_of(n).filter(|x| !seen.contains(x)));
-            if n != a {
-                boundary.extend(self.befores_of(n).filter(|x| !seen.contains(x)));
-            }
-        }
-
-        false
     }
 
     fn neighbours(&self, idx: usize) -> (Option<NodeIdx>, Option<NodeIdx>) {
@@ -2438,9 +2416,11 @@ impl HashSeq {
     /// Build a `Cursor` for inserting at position `idx`. This is the op-choice
     /// logic for all local inserts (`insert_batch` is built on it).
     ///
-    /// If the cursor sits between two causally-related neighbors, it uses
-    /// `InsertBefore(right)` so the insert has an explicit ordering constraint and
-    /// doesn't get hash-ordered into a fork. Otherwise it uses `InsertAfter(left)`.
+    /// Anchor choice follows the Fugue rule: if the left neighbor has no right
+    /// child, the insert becomes a right child of left (`After(left)`);
+    /// otherwise it becomes a left child of right (`Before(right)`), so the
+    /// insert has an explicit ordering constraint and doesn't get hash-ordered
+    /// into left's existing fork.
     /// At the start of a non-empty sequence, returns a `Before(id_at(0))` cursor.
     /// In an empty sequence, returns an `After(origin)` cursor. Returns `None`
     /// only when `idx` is out of bounds (> len).
@@ -2466,19 +2446,27 @@ impl HashSeq {
             left.map(|l| self.render_anchor(l)),
             right.map(|r| self.render_anchor(r)),
         ) {
-            (Some(left), Some(right)) => {
-                if self.is_causally_before(left, right) {
-                    let anchor = self.id_of(right);
-                    Some(Cursor::Before {
-                        extra_deps: self.tips_minus(&anchor),
-                        anchor,
-                    })
-                } else {
-                    let anchor = self.id_of(left);
-                    Some(Cursor::After {
-                        extra_deps: self.tips_minus(&anchor),
-                        anchor,
-                    })
+            (Some(left), Some(_)) => {
+                // Fugue rule. The Before anchor is left's traversal successor
+                // with tombstones included — not the visible right neighbor —
+                // and `region_first` guarantees it has no before-children, so
+                // the insert lands directly after left with no Id-ordered
+                // sibling race.
+                match self.afters_of(left).next() {
+                    Some(child) => {
+                        let anchor = self.id_of(self.region_first(child));
+                        Some(Cursor::Before {
+                            extra_deps: self.tips_minus(&anchor),
+                            anchor,
+                        })
+                    }
+                    None => {
+                        let anchor = self.id_of(left);
+                        Some(Cursor::After {
+                            extra_deps: self.tips_minus(&anchor),
+                            anchor,
+                        })
+                    }
                 }
             }
             (Some(left), None) => {
@@ -3746,15 +3734,16 @@ mod test {
             other => panic!("expected Before cursor at idx 0, got {other:?}"),
         }
 
-        // idx 1 sits between 'h' and 'i', which are causally related (run chain).
-        // Should be Before(right) so the insert lands deterministically between them.
+        // idx 1 sits between 'h' and 'i'; 'h' already has a right child (the
+        // run chain), so the Fugue rule picks Before(right) and the insert
+        // lands deterministically between them.
         match seq.cursor_at(1).expect("cursor at idx 1") {
             Cursor::Before { anchor, extra_deps } => {
                 assert_eq!(Some(anchor), seq.id_at(1));
                 assert!(!extra_deps.contains(&anchor));
             }
             other => panic!(
-                "expected Before cursor at idx 1 (causally related neighbors), got {other:?}"
+                "expected Before cursor at idx 1 (left neighbor has a right child), got {other:?}"
             ),
         }
 
@@ -3822,8 +3811,8 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "hello world".chars());
 
-        // Place cursor between "hello" and " world". The neighbors ('o' and ' ')
-        // are causally related, so cursor_at picks Before(' ').
+        // Place cursor between "hello" and " world". 'o' already has a right
+        // child (the run chain), so cursor_at picks Before(' ').
         let cursor = seq.cursor_at(5).expect("cursor after 'hello'");
         let space_id = seq.id_at(5).unwrap();
         assert!(
@@ -3846,9 +3835,10 @@ mod test {
         assert_eq!(String::from_iter(seq.iter()), "X hello,! world");
     }
 
-    /// Regression: inserting between causally-related neighbors via the cursor
-    /// model must use InsertBefore — not InsertAfter — to avoid hash-determined
-    /// fork ordering. Without this, A's run could end up after the existing run
+    /// Regression: inserting mid-run via the cursor model must use
+    /// InsertBefore — not InsertAfter — to avoid hash-determined fork
+    /// ordering (the left neighbor's right child is the run continuation).
+    /// Without this, A's run could end up after the existing run
     /// continuation instead of before it.
     #[test]
     fn test_cursor_between_run_chain_uses_insert_before() {

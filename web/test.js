@@ -324,8 +324,8 @@ section('Sync: independent edits merge');
   b.insert(0, 'world');
   const bytesA = a.encode();
   const bytesB = b.encode();
-  a.merge_encoded(bytesB);
-  b.merge_encoded(bytesA);
+  a.mergeEncoded(bytesB);
+  b.mergeEncoded(bytesA);
   assert(a.text(), b.text(), 'both peers agree after sync');
   assert(a.text().includes('hello'), true, 'merged contains "hello"');
   assert(a.text().includes('world'), true, 'merged contains "world"');
@@ -339,11 +339,11 @@ section('Sync: idempotent');
   b.insert(0, 'world');
   const bytesA = a.encode();
   const bytesB = b.encode();
-  a.merge_encoded(bytesB);
-  b.merge_encoded(bytesA);
+  a.mergeEncoded(bytesB);
+  b.mergeEncoded(bytesA);
   const text1 = a.text();
-  a.merge_encoded(b.encode());
-  b.merge_encoded(a.encode());
+  a.mergeEncoded(b.encode());
+  b.mergeEncoded(a.encode());
   assert(a.text(), text1, 'repeated sync is idempotent (peer A)');
   assert(b.text(), text1, 'repeated sync is idempotent (peer B)');
 }
@@ -353,14 +353,14 @@ section('Sync: edit-then-sync round trip');
   const a = new WasmHashSeq();
   const b = new WasmHashSeq();
   a.insert(0, 'hello ');
-  b.merge_encoded(a.encode());
+  b.mergeEncoded(a.encode());
   assert(b.text(), 'hello ', 'peer B has "hello " after first sync');
   b.insert(6, 'world');
   a.insert(6, 'there');
   const ba = b.encode();
   const ab = a.encode();
-  a.merge_encoded(ba);
-  b.merge_encoded(ab);
+  a.mergeEncoded(ba);
+  b.mergeEncoded(ab);
   assert(a.text(), b.text(), 'peers agree after concurrent edits');
   assert(a.text().includes('hello '), true, 'merged has common prefix');
   assert(a.text().includes('world'), true, 'merged has peer B edit');
@@ -452,7 +452,7 @@ section('Fuzz: encode/decode roundtrip (100 iterations)');
     const bytes = seq.encode();
     const seq2 = new WasmHashSeq();
     try {
-      seq2.merge_encoded(bytes);
+      seq2.mergeEncoded(bytes);
     } catch (e) {
       failed++;
       log(
@@ -508,8 +508,8 @@ section('Fuzz: two-peer sync (100 iterations)');
 
     // Cross-merge
     try {
-      a.merge_encoded(bytesB);
-      b.merge_encoded(bytesA);
+      a.mergeEncoded(bytesB);
+      b.mergeEncoded(bytesA);
     } catch (e) {
       failed++;
       log(
@@ -570,8 +570,8 @@ section('Fuzz: edit-sync-edit-sync cycles (50 iterations)');
       const bytesA = a.encode();
       const bytesB = b.encode();
       try {
-        a.merge_encoded(bytesB);
-        b.merge_encoded(bytesA);
+        a.mergeEncoded(bytesB);
+        b.mergeEncoded(bytesA);
       } catch (e) {
         failed++;
         log(

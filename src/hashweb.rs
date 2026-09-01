@@ -44,6 +44,14 @@ pub struct HashWeb {
     /// Authored-ops outboxes enabled on every object (delta sync;
     /// APP_NOTES #8). Off by default — servers and tests don't flush.
     pub(crate) outbox_enabled: bool,
+    /// Small value artifacts MINTED locally since the last drain (titles,
+    /// mark kinds/values, code-block languages — the vocabulary a peer
+    /// needs to read our ops). Deltas carry ops only and snapshots only
+    /// resync on reconnect, so without this a live peer sees a new title
+    /// as a raw unresolved ref until the next hello. Recorded only while
+    /// the outbox is enabled; blobs above the wire limit are pushed by
+    /// the uploader explicitly (0xAF at upload) and never land here.
+    pub(crate) new_artifacts: Vec<Id>,
 }
 
 impl PartialEq for HashWeb {
@@ -193,8 +201,21 @@ impl HashWeb {
 
     pub fn provide_value(&mut self, v: &Value) -> Id {
         let id = v.value_id();
-        self.values.entry(id).or_insert_with(|| v.encoded());
+        if let std::collections::hash_map::Entry::Vacant(e) = self.values.entry(id) {
+            let bytes = v.encoded();
+            if self.outbox_enabled && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
+                self.new_artifacts.push(id);
+            }
+            e.insert(bytes);
+        }
         id
+    }
+
+    /// Drain the ids of small artifacts minted since the last drain (see
+    /// `new_artifacts`). The caller pushes each as a 0xAF frame next to
+    /// the delta that references it.
+    pub fn take_new_artifacts(&mut self) -> Vec<Id> {
+        std::mem::take(&mut self.new_artifacts)
     }
 
     pub fn resolve(&self, value_id: &Id) -> Option<Value> {
@@ -224,6 +245,21 @@ impl HashWeb {
             kv.apply_with_id(id, node);
         } else {
             self.parked.entry(obj).or_default().push((id, node));
+        }
+    }
+
+    /// Has this replica already seen node `id` enveloped to `obj` — applied,
+    /// parked as an orphan inside the object, or parked store-wide on an
+    /// unopened object? The re-delivery dedup for echoes and replays.
+    pub fn knows(&self, obj: Id, id: &Id) -> bool {
+        if let Some(seq) = self.seqs.get(&obj) {
+            seq.contains_node(id) || seq.delivery.holds(id)
+        } else if let Some(kv) = self.kvs.get(&obj) {
+            kv.contains_node(id) || kv.delivery.holds(id)
+        } else {
+            self.parked
+                .get(&obj)
+                .is_some_and(|v| v.iter().any(|(pid, _)| pid == id))
         }
     }
 

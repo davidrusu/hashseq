@@ -217,6 +217,31 @@ duplicates healed deterministically) and corrupts nothing.
    reverse index (atom id → home object) as a required substrate cache —
    both pure Law II obligations (cache pinned to the definitional
    recompute).
+   - *Potential resolution — eager membership projection (not yet
+     implemented; current impl probes the register per containment edge at
+     read time).* Remove the per-edge read-time probe by materializing a
+     `live`/`home` bit per containment atom, maintained on `Place` apply:
+     single-head land is an O(1) `heads` update plus a bit flip on the ≤2
+     affected atoms (old home off, new home on); the walk then reads a bit,
+     no register lookup. The bit lives in the **substrate projection layer,
+     is a pure function of the op set, and is fully reversible** — freeze,
+     detach-the-SCC, and a late concurrent `Place` all flip it back — so it
+     is exactly the `Move` index-relocation discipline (MOVE.md "Apply
+     cost") applied to cross-container membership.
+     - **Rejected variant:** baking the decision into the *container's
+       tombstone op-state* (resolve last-agreed at apply time, tombstone
+       the losing atom). Fails on three counts: a `Place` can never be
+       known uncontended at apply time (a concurrent `Place` may arrive
+       arbitrarily late), so any apply-time winner is speculative and would
+       need un-tombstoning = replay; tombstones are append-only while
+       freeze/detach are reversible; and a `Place` in X cannot author a
+       backed tombstone op in a foreign container P (cross-object causal
+       write, no author/frontier, loses the freeze-fallback ghost).
+     - **Discriminating rule:** anything a later op can un-decide must live
+       in a recomputable cache, never in append-only op-set state.
+       Placement is un-decidable-later by construction; tombstones are
+       append-only — so the decision may be *cached* eagerly but never
+       *stored* as a tombstone.
 2. **Property harness** per CYCLE_REVERT.md acceptance criteria:
    definitional recompute vs incremental maintenance over randomized op
    sets *and* delivery orders; generators biased toward contended

@@ -442,15 +442,17 @@
     padding:6px 14px; overflow-x:auto; text-align:center;
   }
   #preview .math-src { color:var(--red); font-style:italic; }
-  #preview .obj-table { margin:4px 0 12px; }
-  #preview table { border-collapse:collapse; font-size:13px; }
-  #preview td {
+  /* Tables live inside editable blocks since the WYSIWYG move (#14);
+     these rules were still scoped to the retired #preview pane. */
+  #blocks .obj-table { margin:4px 0 12px; }
+  #blocks .obj-table table { border-collapse:collapse; font-size:13px; }
+  #blocks .obj-table td {
     border:1px solid var(--line); padding:4px 10px; text-align:left;
     min-width:90px; outline:none;
   }
-  #preview td:focus { background:var(--hover); }
-  #preview .table-tools { display:flex; gap:6px; margin-top:4px; }
-  #preview .table-tools button { font-size:10px; letter-spacing:1px; }
+  #blocks .obj-table td:focus { background:var(--hover); }
+  #blocks .table-tools { display:flex; gap:6px; margin-top:4px; }
+  #blocks .table-tools button { font-size:10px; letter-spacing:1px; }
   .page-link {
     color:var(--blue); cursor:pointer; text-decoration:underline dotted;
     text-underline-offset:3px;

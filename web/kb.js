@@ -21,13 +21,13 @@ await init();
 // ---- conventions ----------------------------------------------------------
 
 const WS_ORIGIN = (() => {
-  const label = new TextEncoder().encode('hashweb-kb.workspace.v1');
+  const label = new TextEncoder().encode('hashweb-kb.workspace.v2');
   const bytes = new Uint8Array(32);
   bytes.set(label.slice(0, 32));
   return hex(bytes);
 })();
 
-const STORAGE_KEY = 'hashweb-kb-snapshot-v3'; // v3: threaded composite comments
+const STORAGE_KEY = 'hashweb-kb-snapshot-v4'; // v4: full reset, workspace.v2 origin
 
 function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -470,6 +470,12 @@ function persistLocalSoon() {
 
 /// Drain authored ops onto the wire — cheap and immediate.
 function sendDeltas() {
+  // Vocabulary first: small artifacts minted since the last send (the
+  // string behind a new title, a comment's mark kind, a code block's
+  // language) go out as 0xAF frames BEFORE the ops that name them, so a
+  // live peer resolves them on arrival instead of holding raw refs until
+  // the next snapshot resync.
+  for (const id of web.takeNewArtifacts()) sendArtifact(id);
   const delta = web.takeDeltas();
   if (delta.length > 0) {
     try {
@@ -569,12 +575,15 @@ function pendingEmbedNode(idHex) {
 /// would leave stale pending chips after a lazy artifact lands).
 function repaintEmbedsOf(idHex) {
   for (const ed of blocksEl.querySelectorAll('.block-ed')) {
-    if (ed === document.activeElement || ed.contains(document.activeElement)) continue;
     const obj = ed.dataset.blockObj;
     const t = web.text(obj);
     for (let i = 0; i < t.length; i++) {
       if (t[i] === ATOM && web.payloadAt(obj, i) === idHex) {
-        rerenderBlock(ed, obj, null);
+        // The focused block is the common case — a table/image was just
+        // inserted there and its placeholder must resolve in place — so
+        // repaint it too, keeping the caret.
+        const focused = ed === document.activeElement || ed.contains(document.activeElement);
+        rerenderBlock(ed, obj, focused ? caretOffsetIn(ed) : null);
         break;
       }
     }
@@ -601,20 +610,31 @@ function handleSyncMessage(raw, replySnap) {
   if (theirs.length === 0) return;
   const savedEdit = captureEditState();
   if (theirs[0] === TAG_DELTA) {
+    let fresh = 0;
     try {
-      web.applyDelta(theirs);
+      fresh = web.applyDelta(theirs);
     } catch (err) {
       console.warn('[kb] bad delta:', err);
     }
+    // The relay echoes our own deltas back (and peers may replay). Nothing
+    // new means nothing to draw — and a full render() here would re-append
+    // the focused block, blurring it and closing the slash menu / link
+    // picker mid-keystroke.
+    if (fresh === 0) return;
     persistLocalSoon();
     render();
     restoreEditState(savedEdit);
     return;
   }
   if (theirs[0] === TAG_ARTIFACT) {
-    web.provideArtifactBytes(theirs.subarray(1));
+    const payload = theirs.subarray(1);
+    const known = web.hasArtifactBytes(payload);
+    const id = web.provideArtifactBytes(payload);
+    if (known) return; // our own push echoed back by the relay
+    artifactFetchState.delete(id); // resolves locally from here on
     persistLocalSoon();
-    render(); // pending images resolve
+    render(); // unresolved strings (titles, kinds) resolve
+    repaintEmbedsOf(id); // bytes change no span signature: explicit repaint
     restoreEditState(savedEdit);
     return;
   }
@@ -948,6 +968,21 @@ function reconcileMarkAffinity(ta, obj, p, n) {
     web.unmarkRange(obj, p, p + n, 'codeblock');
   }
 
+  // Exposed math regions (display equation / inline math being edited):
+  // the seq's end anchor is After(last) when the region reaches the end
+  // of the block, so appended source would fall outside by seq truth even
+  // though the DOM (and the author) put it inside the live span. Mirror
+  // the code-block rule: DOM membership wins.
+  const live = node.closest?.('.region-live');
+  const liveKind = live ? (live.classList.contains('eq-live') ? 'eqblock' : 'math') : null;
+  if (liveKind) {
+    const inMark = liveKind === 'eqblock' ? f.eqblock : f.math;
+    if (!inMark) {
+      const [a, b] = spanExtent((g) => (liveKind === 'eqblock' ? g.eqblock : g.math));
+      web.markRange(obj, a, b, liveKind, 'on'); // open while exposed; collapse re-closes
+    }
+  }
+
   // Comments: the highlight wrapper names its exact kinds.
   const hl = node.closest?.('.comment-hl');
   const domKinds = new Set((hl?.dataset.tags ?? '').split(',').filter(Boolean));
@@ -1092,6 +1127,14 @@ function objTableNode(tableObj) {
         applyDiff(cellObj, td.dataset.prev, td.textContent);
         td.dataset.prev = td.textContent;
         persistSoon();
+      });
+      // Catch up on repaints deferred while this cell had the caret (see
+      // updateLeafContent). After the focus has settled — if it moved to a
+      // sibling cell, the skip rule applies again.
+      td.addEventListener('blur', () => {
+        const ed = td.closest('.block-ed');
+        const col = ed?.closest('.block-col');
+        if (ed && col) setTimeout(() => updateLeafContent(col, ed.dataset.blockObj, ed), 0);
       });
     }
   }
@@ -1744,7 +1787,10 @@ function renderEditableInto(ed, blockObj) {
       if (isExposed('eqblock', ord)) {
         const live = document.createElement('span');
         live.className = 'region-live eq-live';
-        live.appendChild(document.createTextNode(tex));
+        // Trailing FILLER: a caret at the very end of an inline span is a
+        // boundary for Chrome, which then inserts OUTSIDE the span; a
+        // landing pad after the source keeps appended keystrokes inside.
+        live.appendChild(document.createTextNode(tex + FILLER));
         ed.appendChild(live);
       } else {
         const w = makeWidget(mathNode(tex.trim(), true), tex, 'w-eq');
@@ -1822,7 +1868,7 @@ function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
       if (isExposed('math', ord)) {
         const live = document.createElement('span');
         live.className = 'region-live math-live';
-        live.appendChild(document.createTextNode(src));
+        live.appendChild(document.createTextNode(src + FILLER)); // see eq-live
         ed.appendChild(live);
       } else {
         const w = makeWidget(mathNode(src, false), src, 'w-math');
@@ -1872,8 +1918,7 @@ function rerenderBlock(ed, blockObj, caretOff, preferAfter = false) {
   ed.dataset.prev = extractText(ed);
   const col = ed.closest?.('.block-col');
   if (col) {
-    col.dataset.sig =
-      web.markedSpans(blockObj) + '|' + (listKindOf(col.dataset.origin) ?? '');
+    col.dataset.sig = leafSig(col, blockObj, web.markedSpans(blockObj));
   }
   renumberLists();
   if (caretOff != null) {
@@ -2196,7 +2241,7 @@ function makeColumn(obj, origin) {
   ta.dataset.blockObj = obj;
 
   const refreshSig = () => {
-    col.dataset.sig = web.markedSpans(obj) + '|' + (listKindOf(col.dataset.origin) ?? '');
+    col.dataset.sig = leafSig(col, obj, web.markedSpans(obj));
   };
 
   const insertNewlineAtCaret = () => {
@@ -2205,9 +2250,20 @@ function makeColumn(obj, origin) {
     const r = sel.getRangeAt(0);
     if (!ta.contains(r.startContainer)) return;
     r.deleteContents();
-    const tn = document.createTextNode('\n');
+    // A newline at the END of a styled wrapper (code block region, exposed
+    // math, inline code) is a Chrome trap: even with the caret inside the
+    // wrapper's text node, the position after a trailing "\n" canonicalizes
+    // to the boundary and the next keystroke lands OUTSIDE the region. A
+    // FILLER after the newline gives the caret a non-boundary landing pad
+    // inside the wrapper (fillers are DOM-only; extractText strips them).
+    const host =
+      r.startContainer.nodeType === Node.TEXT_NODE
+        ? r.startContainer.parentElement
+        : r.startContainer;
+    const inWrapper = host !== ta && ta.contains(host) && host.closest('.cb-region, .region-live, code');
+    const tn = document.createTextNode(inWrapper ? '\n' + FILLER : '\n');
     r.insertNode(tn);
-    r.setStartAfter(tn);
+    r.setStart(tn, tn.data.length);
     r.collapse(true);
     sel.removeAllRanges();
     sel.addRange(r);
@@ -2490,10 +2546,52 @@ function makeColumn(obj, origin) {
   return col;
 }
 
+/// The part of a block's appearance that lives OUTSIDE its own seq: the
+/// rows/cells of embedded tables (a hashseq of hashseqs). Without this the
+/// span signature never changes when a row is added or a peer edits a
+/// cell, and the incremental renderer keeps the stale table.
+function embedSig(obj) {
+  const t = web.text(obj);
+  let sig = '';
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] !== ATOM) continue;
+    const payload = web.payloadAt(obj, i);
+    if (!payload) continue;
+    const tableObj = WasmHashWeb.seqId(payload);
+    if (!web.isSeq(tableObj)) continue;
+    const rows = web.textLen(tableObj);
+    sig += `[${payload.slice(0, 8)}:${rows}`;
+    for (let r = 0; r < rows; r++) {
+      const rowOrigin = web.payloadAt(tableObj, r);
+      if (!rowOrigin) continue;
+      const rowObj = WasmHashWeb.seqId(rowOrigin);
+      if (!web.isSeq(rowObj)) continue;
+      const cells = web.textLen(rowObj);
+      sig += `/${cells}`;
+      for (let c = 0; c < cells; c++) {
+        const cellOrigin = web.payloadAt(rowObj, c);
+        if (!cellOrigin) continue;
+        const cellObj = WasmHashWeb.seqId(cellOrigin);
+        if (web.isSeq(cellObj)) sig += ':' + JSON.stringify(web.text(cellObj));
+      }
+    }
+    sig += ']';
+  }
+  return sig;
+}
+
+function leafSig(col, obj, spansJson) {
+  return spansJson + '|' + (listKindOf(col.dataset.origin) ?? '') + '|' + embedSig(obj);
+}
+
 function updateLeafContent(col, obj, ed) {
   const spansJson = web.markedSpans(obj);
-  const sig = spansJson + '|' + (listKindOf(col.dataset.origin) ?? '');
+  const sig = leafSig(col, obj, spansJson);
   if (col.dataset.sig === sig) return;
+  // A table cell is being edited: rebuilding the block would yank the
+  // caret out of the cell. Leave the sig stale; the cell's blur catches up.
+  const ae = document.activeElement;
+  if (ae && ae.tagName === 'TD' && ed.contains(ae)) return;
   const focused = ed === document.activeElement || ed.contains(document.activeElement);
   const seqText = JSON.parse(spansJson)
     .map((sp) => sp.text)
@@ -3310,6 +3408,16 @@ function openLinkPicker(ta, at, anchorRect) {
   menu.style.left = `${anchorRect.left}px`;
   menu.style.top = `${anchorRect.bottom + 4}px`;
   document.body.appendChild(menu);
+  // Keep it on screen: a picker opened near the bottom edge (the common
+  // case — the slash menu sits under the caret) would otherwise hide its
+  // lower entries below the fold.
+  const mr = menu.getBoundingClientRect();
+  if (mr.bottom > window.innerHeight - 8) {
+    menu.style.top = `${Math.max(8, window.innerHeight - 8 - mr.height)}px`;
+  }
+  if (mr.right > window.innerWidth - 8) {
+    menu.style.left = `${Math.max(8, window.innerWidth - 8 - mr.width)}px`;
+  }
   setTimeout(() => {
     document.addEventListener('click', () => menu.remove(), { once: true });
   }, 0);
@@ -3360,6 +3468,16 @@ function applyInlineMark(kind) {
 for (const btn of selToolbar.querySelectorAll('button')) {
   btn.onclick = () => applyInlineMark(btn.dataset.act);
 }
+// ⌘E / Ctrl+E: inline code over the selection (the toolbar advertises it).
+document.addEventListener('keydown', (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+  if (e.key !== 'e' && e.key !== 'E') return;
+  if (!focusedTA()) return;
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return;
+  e.preventDefault();
+  applyInlineMark('code');
+});
 
 function hideSelToolbar() {
   selToolbar.classList.remove('show');
@@ -3417,7 +3535,8 @@ function makeHeading(ta) {
   const obj = ta.dataset.blockObj;
   if (!extractText(ta).startsWith('# ')) web.textInsert(obj, 0, '# ');
   persistSoon();
-  rerenderBlock(ta, obj, extractText(ta).length);
+  // Caret after the marker: read the store, not the (stale) DOM.
+  rerenderBlock(ta, obj, web.textLen(obj));
 }
 
 function makeListKind(ta, listKind) {
@@ -3433,6 +3552,13 @@ function makeBlockKind(ta, kind) {
   const len = web.textLen(obj);
   web.markRangeClosed(obj, 0, len, kind, '');
   persistSoon();
+  // An equation renders as a non-editable widget; a fresh one must open
+  // with its source EXPOSED (the whole block is one region: ord 0) or the
+  // caret lands outside the widget and the first keystrokes go plain.
+  if (kind === 'eqblock') {
+    exposeRegion(ta, obj, 'eqblock', 0, len);
+    return;
+  }
   rerenderBlock(ta, obj, len);
 }
 

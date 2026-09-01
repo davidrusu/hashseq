@@ -1229,6 +1229,22 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     }
 
+    // Causal depth of each block's head: force-emit victims are chosen in
+    // causal-time order, not id order. A soft cycle pairs an old chain with
+    // the newer blocks anchored into it (the chain's late interior deps
+    // reference them back); emitting the causally oldest block first lets
+    // every anchor into it resolve positionally, so only that block's own
+    // late deps spill to the dictionary — an id-order pick would instead
+    // force-emit an essentially random cycle member, spilling anchor after
+    // anchor until the old chain happens to be chosen.
+    let block_depth: Vec<u64> = blocks
+        .iter()
+        .map(|b| {
+            let idx = seq.idx_of(&b.head_id).expect("block heads are applied");
+            depth[idx.0 as usize]
+        })
+        .collect();
+
     let mut emit_pos = vec![usize::MAX; nb]; // block index -> emit position
     let mut order: Vec<usize> = Vec::with_capacity(nb);
     {
@@ -1237,12 +1253,14 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         while order.len() < nb {
             let i = match ready.pop_first() {
                 Some(i) => i,
-                // Soft cycle: force-emit the smallest-id block whose hard edges
-                // are satisfied (one always exists — the hard graph is acyclic).
+                // Soft cycle: force-emit the causally shallowest block whose
+                // hard edges are satisfied (one always exists — the hard
+                // graph is acyclic), ties by id order.
                 None => {
                     let i = *blocked
                         .iter()
-                        .find(|&&i| hard_indeg[i] == 0)
+                        .filter(|&&i| hard_indeg[i] == 0)
+                        .min_by_key(|&&i| (block_depth[i], i))
                         .expect("hard-edge DAG always has a free block");
                     blocked.remove(&i);
                     i
@@ -2912,7 +2930,8 @@ pub fn encode_delta(groups: &[(u8, Id, Vec<HashNode>)]) -> Vec<u8> {
 
 /// Apply a delta message to a store: open each addressed object
 /// (idempotent) and deliver its nodes through the normal apply path.
-/// Returns the number of nodes delivered.
+/// Returns the number of nodes NEWLY delivered (already-known nodes —
+/// echoes, replays — count zero).
 pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError> {
     if bytes.first() != Some(&DELTA_TAG) {
         return Err(DecodeError::InvalidOpTag(bytes.first().copied().unwrap_or(0)));
@@ -2940,7 +2959,11 @@ pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError
             c.pos += len;
             match op {
                 EncodableOp::Node(node) => {
-                    web.apply_to(obj, node);
+                    let id = node.id();
+                    if web.knows(obj, &id) {
+                        continue; // echo / replay: nothing new
+                    }
+                    web.apply_to_with_id(obj, id, node);
                     delivered += 1;
                 }
                 EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
@@ -2990,8 +3013,9 @@ mod delta_tests {
         b.provide_artifact_bytes(crate::value::Value::String("Doc".into()).encoded());
         assert_eq!(encode_hashweb(&a), encode_hashweb(&b));
 
-        // Echo/replay: applying the same delta again changes nothing.
-        apply_delta(&mut b, &msg).expect("replay ok");
+        // Echo/replay: applying the same delta again changes nothing —
+        // and reports nothing new (clients skip the re-render on 0).
+        assert_eq!(apply_delta(&mut b, &msg).expect("replay ok"), 0);
         assert_eq!(encode_hashweb(&a), encode_hashweb(&b));
         // Remote application recorded nothing: B (outbox off) and even an
         // outbox-enabled receiver never re-broadcast received ops.
@@ -2999,5 +3023,36 @@ mod delta_tests {
         c2.enable_outbox();
         apply_delta(&mut c2, &msg).expect("applies");
         assert!(c2.take_deltas().is_empty(), "remote ops never echo");
+    }
+
+    /// Small artifacts minted locally ride next to the delta (the title
+    /// string behind a put is vocabulary the peer needs NOW, not at the
+    /// next resync); dedupes, blobs, and received-not-minted values stay
+    /// out of the outbox.
+    #[test]
+    fn minted_small_artifacts_queue_once() {
+        use crate::value::Value;
+        let mut a = HashWeb::new();
+        assert!(a.take_new_artifacts().is_empty());
+        // Outbox off: nothing recorded (servers, tests).
+        a.provide_value(&Value::String("quiet".into()));
+        assert!(a.take_new_artifacts().is_empty());
+
+        a.enable_outbox();
+        let t = a.provide_value(&Value::String("Title".into()));
+        let again = a.provide_value(&Value::String("Title".into()));
+        assert_eq!(t, again);
+        let blob = a.provide_value(&Value::Bytes(vec![7u8; WIRE_ARTIFACT_MAX + 1]));
+        let small = a.provide_value(&Value::Bytes(vec![7u8; 16]));
+        let minted = a.take_new_artifacts();
+        assert_eq!(minted, vec![t, small], "once per new small value; blobs excluded");
+        assert!(a.take_new_artifacts().is_empty(), "drained");
+        assert!(a.artifact_bytes(&blob).is_some(), "the blob is still stored");
+
+        // Bytes that ARRIVE (0xAF / lazy GET) are not re-pushed.
+        let mut b = HashWeb::new();
+        b.enable_outbox();
+        b.provide_artifact_bytes(Value::String("Title".into()).encoded());
+        assert!(b.take_new_artifacts().is_empty(), "received artifacts never echo");
     }
 }
