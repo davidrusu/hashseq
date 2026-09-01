@@ -311,7 +311,12 @@ impl StoredRun {
     }
 
     pub fn char_at(&self, pos: usize) -> char {
-        self.text.chars().nth(pos).unwrap()
+        if self.text.len() == self.elements.len() {
+            // All single-byte chars: byte offset is char offset.
+            self.text.as_bytes()[pos] as char
+        } else {
+            self.text.chars().nth(pos).unwrap()
+        }
     }
 
     pub fn head(&self) -> NodeIdx {
@@ -1866,8 +1871,12 @@ impl HashSeq {
                 }
                 continue;
             }
+            // One sequential pass over the fragment's text: `char_at` per
+            // element would rescan the run from its start each time.
+            let mut chars = self.runs[&head].text.chars().skip(start as usize);
             for off in start..start + len {
                 let e = self.runs[&head].elements[off as usize];
+                let ch = chars.next().expect("fragment lies within its run");
                 // Element-anchored events fire at base slots (regional
                 // points never move); op-anchored events bracket the
                 // element at its rendered (destination) crossing.
@@ -1910,8 +1919,8 @@ impl HashSeq {
                         dirty = false;
                     }
                     match out.last_mut() {
-                        Some((text, last)) if *last == current => text.push(self.char_at(e)),
-                        _ => out.push((self.char_at(e).to_string(), current)),
+                        Some((text, last)) if *last == current => text.push(ch),
+                        _ => out.push((ch.to_string(), current)),
                     }
                 }
                 if kind == SweepFrag::Base

@@ -938,6 +938,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             let mut text = String::new();
             let mut interior = BTreeMap::new();
             let mut cur = e;
+            // Chains mostly walk a stored run in order; keep one `Chars`
+            // cursor per stored run instead of an O(pos) `nth` per element.
+            let mut chars: Option<(NodeIdx, u32, std::str::Chars<'_>)> = None;
             loop {
                 elem_canon[cur.0 as usize] = (ci, elements.len() as u32);
                 if !elements.is_empty() {
@@ -947,7 +950,22 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     }
                 }
                 elements.push(cur);
-                text.push(seq.char_at(cur));
+                let Loc::Run { run, pos } = seq.loc_of(cur) else {
+                    unreachable!("insert elements live in runs")
+                };
+                let ch = match &mut chars {
+                    Some((r, next, it)) if *r == run && *next == pos => {
+                        *next += 1;
+                        it.next().expect("pos < run len")
+                    }
+                    _ => {
+                        let mut it = seq.runs[&run].text.chars();
+                        let ch = it.nth(pos as usize).expect("pos < run len");
+                        chars = Some((run, pos + 1, it));
+                        ch
+                    }
+                };
+                text.push(ch);
                 match chain_child(cur) {
                     Some(next) => cur = next,
                     None => break,
@@ -1657,12 +1675,12 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     &mut |c| decode_ref(c, &id_list, &ranks),
                     &mut |c| decode_ref_set(c, &id_list, &ranks),
                 )?;
-                ranks.runs.push(run.elements.clone());
                 // `from_text` computed the element ids from the wire content —
                 // the authoritative derivation, so apply without rehashing.
                 for (id, node) in run.decompress_with_ids() {
                     seq.apply_with_id(id, node);
                 }
+                ranks.runs.push(run.elements);
             }
             BLK_REMOVE_FWD | BLK_REMOVE_BWD => {
                 // A chain of single-element removes over a contiguous span of

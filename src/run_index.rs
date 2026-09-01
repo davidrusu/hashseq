@@ -410,51 +410,54 @@ impl RunIndex {
     }
 
     /// Compare two sweep positions: treap in-order on slots (O(log F)
-    /// expected via root paths), then offset, then tie.
+    /// expected: climb to the lowest common ancestor, no allocation), then
+    /// offset, then tie.
     pub(crate) fn cmp_sweep(&self, a: SweepPos, b: SweepPos) -> std::cmp::Ordering {
+        use std::cmp::Ordering::{Greater, Less};
         if a.0 == b.0 {
             return (a.1, a.2).cmp(&(b.1, b.2));
         }
-        let pa = self.root_path(a.0);
-        let pb = self.root_path(b.0);
-        let mut i = 0;
-        while i < pa.len() && i < pb.len() && pa[i] == pb[i] {
-            i += 1;
+        let parent = |n: u32| self.frags[n as usize].parent;
+        let (mut x, mut y) = (a.0, b.0);
+        let (mut dx, mut dy) = (self.depth(x), self.depth(y));
+        // The child through which each side reaches the common ancestor;
+        // NIL when that side's own slot IS the ancestor.
+        let (mut cx, mut cy) = (NIL, NIL);
+        while dx > dy {
+            cx = x;
+            x = parent(x);
+            dx -= 1;
         }
-        if i == pa.len() {
+        while dy > dx {
+            cy = y;
+            y = parent(y);
+            dy -= 1;
+        }
+        while x != y {
+            cx = x;
+            x = parent(x);
+            cy = y;
+            y = parent(y);
+        }
+        let left = self.frags[x as usize].left;
+        if cx == NIL {
             // a's slot is an ancestor of b's: b's side of it decides.
-            return if pb[i] == self.frags[a.0 as usize].left {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            };
+            return if cy == left { Greater } else { Less };
         }
-        if i == pb.len() {
-            return if pa[i] == self.frags[b.0 as usize].left {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            };
+        if cy == NIL {
+            return if cx == left { Less } else { Greater };
         }
         // Divergence below a common ancestor: left subtree precedes.
-        let anc = pa[i - 1];
-        if pa[i] == self.frags[anc as usize].left {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        }
+        if cx == left { Less } else { Greater }
     }
 
-    /// Root-to-`n` path of treap slots.
-    fn root_path(&self, n: u32) -> Vec<u32> {
-        let mut path = vec![n];
-        let mut cur = n;
-        while self.frags[cur as usize].parent != NIL {
-            cur = self.frags[cur as usize].parent;
-            path.push(cur);
+    fn depth(&self, mut n: u32) -> usize {
+        let mut d = 0;
+        while self.frags[n as usize].parent != NIL {
+            n = self.frags[n as usize].parent;
+            d += 1;
         }
-        path.reverse();
-        path
+        d
     }
 
     /// Every fragment in treap (= rendered) order: `(head, start, len,
