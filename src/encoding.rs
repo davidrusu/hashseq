@@ -64,6 +64,15 @@ impl<'a> Cursor<'a> {
     /// element costs at least `min_bytes` to encode, so a count the input
     /// cannot possibly carry is `UnexpectedEof` up front rather than a
     /// pre-allocation sized by an untrusted varint.
+    /// The next `len` bytes, or `UnexpectedEof` — including when `len` is
+    /// large enough that `pos + len` would wrap.
+    fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
+        let end = self.pos.checked_add(len).ok_or(DecodeError::UnexpectedEof)?;
+        let slice = self.bytes.get(self.pos..end).ok_or(DecodeError::UnexpectedEof)?;
+        self.pos = end;
+        Ok(slice)
+    }
+
     fn count(&mut self, min_bytes: usize) -> Result<usize, DecodeError> {
         let n = self.step(decode_varint)?;
         let remaining = self.bytes.len().saturating_sub(self.pos);
@@ -1706,10 +1715,24 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 for _ in 0..num_segments {
                     let head = c.step(decode_varint)?;
                     if head & 1 == 1 {
+                        let rank = head >> 1;
                         let off = c.step(decode_varint)?;
                         let count = c.step(decode_varint)?;
-                        for i in off..off + count {
-                            targets.insert(ranks.run_elem(head >> 1, i)?);
+                        // Bound the range by the run before iterating: an
+                        // overflowing `off + count` would otherwise panic in
+                        // debug and wrap to an empty range in release,
+                        // silently dropping targets from the Remove.
+                        let run_len = ranks
+                            .runs
+                            .get(rank)
+                            .map(Vec::len)
+                            .ok_or(DecodeError::InvalidIdIndex(rank))?;
+                        let end = off
+                            .checked_add(count)
+                            .filter(|&end| end <= run_len)
+                            .ok_or(DecodeError::InvalidIdIndex(rank))?;
+                        for i in off..end {
+                            targets.insert(ranks.run_elem(rank, i)?);
                         }
                     } else {
                         targets.insert(ref_from_head(head, &mut c, &id_list, &ranks)?);
@@ -1959,11 +1982,7 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
     let na = c.step(decode_varint)?;
     for _ in 0..na {
         let len = c.step(decode_varint)?;
-        let b = bytes
-            .get(c.pos..c.pos + len)
-            .ok_or(DecodeError::UnexpectedEof)?
-            .to_vec();
-        c.pos += len;
+        let b = c.take(len)?.to_vec();
         let vid = crate::value::value_id_of_bytes(&b);
         kv.values.entry(vid).or_insert(b);
     }
@@ -2105,11 +2124,7 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
     let na = c.step(decode_varint)?;
     for _ in 0..na {
         let len = c.step(decode_varint)?;
-        let b = bytes
-            .get(c.pos..c.pos + len)
-            .ok_or(DecodeError::UnexpectedEof)?
-            .to_vec();
-        c.pos += len;
+        let b = c.take(len)?.to_vec();
         let vid = crate::value::value_id_of_bytes(&b);
         web.values.entry(vid).or_insert(b);
     }
@@ -2118,10 +2133,7 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
     for _ in 0..no {
         let kind = c.byte()?;
         let len = c.step(decode_varint)?;
-        let inner = bytes
-            .get(c.pos..c.pos + len)
-            .ok_or(DecodeError::UnexpectedEof)?;
-        c.pos += len;
+        let inner = c.take(len)?;
         // The store key is derived from the object's kind and inner
         // origin — never read from the wire.
         match kind {
@@ -2247,6 +2259,42 @@ mod tests {
         good.push(0);
         let decoded = decode_hashseq(&good).expect("in-range span decodes");
         assert_eq!(decoded.iter().collect::<String>(), "");
+    }
+
+    #[test]
+    fn remove_other_range_bounded_by_run() {
+        // Two chars removed as one batch encode as a BLK_REMOVE_OTHER block
+        // with a single (run 0, off 0, count 2) range segment.
+        let mut seq = HashSeq::new(test_id(7));
+        seq.insert(0, 'a');
+        seq.insert(1, 'b');
+        seq.remove_batch(0, 2).unwrap();
+        let bytes = encode_hashseq(&seq);
+        let n = bytes.len();
+        // ... ‖ 0x05 ‖ pins=0 ‖ segments=1 ‖ head=(run0,range) ‖ off=0 ‖ count=2 ‖ orphans=0
+        assert_eq!(&bytes[n - 7..], &[BLK_REMOVE_OTHER, 0, 1, 1, 0, 2, 0]);
+        assert_eq!(decode_hashseq(&bytes).unwrap().iter().count(), 0);
+
+        // off = usize::MAX, count = 2: `off + count` used to wrap.
+        let mut evil = bytes[..n - 3].to_vec();
+        encode_varint(usize::MAX, &mut evil);
+        evil.extend_from_slice(&[2, 0]);
+        assert_eq!(decode_hashseq(&evil).err(), Some(DecodeError::InvalidIdIndex(0)));
+
+        // off = 1, count = 2: past the end of a two-element run.
+        let mut evil = bytes[..n - 3].to_vec();
+        evil.extend_from_slice(&[1, 2, 0]);
+        assert_eq!(decode_hashseq(&evil).err(), Some(DecodeError::InvalidIdIndex(0)));
+    }
+
+    #[test]
+    fn cursor_take_rejects_wrapping_length() {
+        let bytes = [1u8, 2, 3];
+        let mut c = Cursor { bytes: &bytes, pos: 2 };
+        assert_eq!(c.take(usize::MAX).err(), Some(DecodeError::UnexpectedEof));
+        assert_eq!(c.take(2).err(), Some(DecodeError::UnexpectedEof));
+        assert_eq!(c.take(1), Ok(&bytes[2..]));
+        assert_eq!(c.pos, 3);
     }
 
     #[test]
@@ -3044,14 +3092,11 @@ pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError
         let n = c.step(decode_varint)?;
         for _ in 0..n {
             let len = c.step(decode_varint)?;
-            let slice = bytes
-                .get(c.pos..c.pos + len)
-                .ok_or(DecodeError::UnexpectedEof)?;
+            let slice = c.take(len)?;
             let (op, used) = decode_op(slice)?;
             if used != len {
                 return Err(DecodeError::UnexpectedEof);
             }
-            c.pos += len;
             match op {
                 EncodableOp::Node(node) => {
                     let id = node.id();
