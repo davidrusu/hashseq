@@ -2,6 +2,17 @@ use crate::{HashNode, Id, Op};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Why a wire run block could not be reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunError {
+    /// No text: a run has at least one element.
+    Empty,
+    /// An element's deps repeat its chain anchor (non-normalized pins).
+    RedundantDep,
+    /// An interior-deps offset addresses no element after the first.
+    DepOffsetOutOfRange(usize),
+}
+
 /// How the first element of a run is anchored relative to its `anchor` node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FirstOp {
@@ -56,21 +67,37 @@ impl Run {
     /// Reconstruct a run from its anchor and full text: the first char is anchored
     /// per `first_op`, the rest chain `InsertAfter`, carrying any interior extra
     /// deps at their offsets (which participate in each element's id).
-    /// Returns `None` for empty text.
+    ///
+    /// This is the wire path, so the fields are validated rather than
+    /// trusted: deps must not repeat the element's own chain anchor (nodes
+    /// are stored normalized, `pins = refs ∖ named`), and every interior
+    /// offset must address an element after the first. Both are checked as
+    /// the chain is derived, since element `i`'s id is what offset `i + 1`'s
+    /// deps may not name.
     pub fn from_text(
         anchor: Id,
         first_op: FirstOp,
         first_extra_deps: BTreeSet<Id>,
         text: &str,
         mut interior_extra_deps: BTreeMap<usize, BTreeSet<Id>>,
-    ) -> Option<Self> {
+    ) -> Result<Self, RunError> {
         let mut chars = text.chars();
-        let mut run = Self::with_first_op(anchor, first_op, first_extra_deps, chars.next()?);
+        let first = chars.next().ok_or(RunError::Empty)?;
+        if first_extra_deps.contains(&anchor) {
+            return Err(RunError::RedundantDep);
+        }
+        let mut run = Self::with_first_op(anchor, first_op, first_extra_deps, first);
         for (i, ch) in chars.enumerate() {
             let deps = interior_extra_deps.remove(&(i + 1)).unwrap_or_default();
+            if deps.contains(run.elements.last().unwrap()) {
+                return Err(RunError::RedundantDep);
+            }
             run.extend_with_deps(ch, deps);
         }
-        Some(run)
+        if let Some((&offset, _)) = interior_extra_deps.first_key_value() {
+            return Err(RunError::DepOffsetOutOfRange(offset));
+        }
+        Ok(run)
     }
 
     fn with_first_op(

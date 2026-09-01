@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::hashkv::HashKv;
 use crate::hashseq::{CausalRemove, Loc};
 use crate::hashweb::HashWeb;
-use crate::run::FirstOp;
+use crate::run::{FirstOp, RunError};
 use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,9 +16,25 @@ pub enum DecodeError {
     InvalidOpTag(u8),
     EmptyRun,
     InvalidIdIndex(usize),
+    /// A node's pins repeat an id one of its roles already names; nodes are
+    /// stored normalized (`pins = refs ∖ named`) and the wire form must be.
+    RedundantPin,
+    /// A run block's interior-deps offset addresses no element after the
+    /// first.
+    InvalidDepOffset(usize),
     /// The bytes decode but are not the canonical encoding of their op set
     /// (strict acceptance mode, ENCODING_SPEC.md).
     NotCanonical,
+}
+
+impl From<RunError> for DecodeError {
+    fn from(e: RunError) -> Self {
+        match e {
+            RunError::Empty => DecodeError::EmptyRun,
+            RunError::RedundantDep => DecodeError::RedundantPin,
+            RunError::DepOffsetOutOfRange(off) => DecodeError::InvalidDepOffset(off),
+        }
+    }
 }
 
 impl std::fmt::Display for DecodeError {
@@ -30,6 +46,10 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidOpTag(tag) => write!(f, "invalid operation tag: {}", tag),
             DecodeError::EmptyRun => write!(f, "run string cannot be empty"),
             DecodeError::InvalidIdIndex(idx) => write!(f, "invalid ID index: {}", idx),
+            DecodeError::RedundantPin => write!(f, "pins repeat an id the op names"),
+            DecodeError::InvalidDepOffset(off) => {
+                write!(f, "interior deps offset {} is outside the run", off)
+            }
             DecodeError::NotCanonical => write!(f, "bytes are not a canonical snapshot"),
         }
     }
@@ -80,6 +100,17 @@ impl<'a> Cursor<'a> {
             return Err(DecodeError::UnexpectedEof);
         }
         Ok(n)
+    }
+}
+
+/// Wire nodes must arrive in the stored form (`pins = refs ∖ named`): a
+/// pin that repeats a named id would hash to the same id yet re-encode to
+/// different bytes, so it is rejected rather than silently accepted.
+fn reject_redundant_pins(node: &HashNode) -> Result<(), DecodeError> {
+    if node.is_normalized() {
+        Ok(())
+    } else {
+        Err(DecodeError::RedundantPin)
     }
 }
 
@@ -268,8 +299,7 @@ fn decode_run_with(
         let offset = c.step(decode_varint)?;
         interior_extra_deps.insert(offset, ref_set(c)?);
     }
-    Run::from_text(anchor, first_op, first_extra_deps, &text, interior_extra_deps)
-        .ok_or(DecodeError::EmptyRun)
+    Ok(Run::from_text(anchor, first_op, first_extra_deps, &text, interior_extra_deps)?)
 }
 
 pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
@@ -607,7 +637,9 @@ fn decode_node_with(
         },
         other => return Err(DecodeError::InvalidOpTag(other)),
     };
-    Ok(HashNode { pins, op })
+    let node = HashNode { pins, op };
+    reject_redundant_pins(&node)?;
+    Ok(node)
 }
 
 // --- Unified operation type for batch encoding ---
@@ -1687,6 +1719,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                         pins,
                         op: Op::Remove(BTreeSet::from_iter([removed_id])),
                     };
+                    reject_redundant_pins(&node)?;
                     let id = node.id();
                     prev_remove_id = Some(id);
                     exposed.push(id);
@@ -1701,6 +1734,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     pins,
                     op: Op::Remove(std::iter::once(target).collect()),
                 };
+                reject_redundant_pins(&node)?;
                 let id = node.id();
                 ranks.removes.push(vec![id]);
                 seq.apply_with_id(id, node);
@@ -1742,6 +1776,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     pins,
                     op: Op::Remove(targets),
                 };
+                reject_redundant_pins(&node)?;
                 let id = node.id();
                 ranks.removes.push(vec![id]);
                 seq.apply_with_id(id, node);
@@ -1963,6 +1998,7 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
             other => return Err(DecodeError::InvalidOpTag(other as u8)),
         };
         let node = HashNode { pins, op };
+        reject_redundant_pins(&node)?;
         // Recomputed ids are the authoritative derivation.
         let id = node.id();
         emitted.push(id);
@@ -2285,6 +2321,69 @@ mod tests {
         let mut evil = bytes[..n - 3].to_vec();
         evil.extend_from_slice(&[1, 2, 0]);
         assert_eq!(decode_hashseq(&evil).err(), Some(DecodeError::InvalidIdIndex(0)));
+    }
+
+    #[test]
+    fn wire_pins_naming_a_named_id_are_rejected() {
+        // Honest form: Insert after `a` with no pins.
+        let a = test_id(1);
+        let honest = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(a, 'z'),
+        };
+        let mut bytes = Vec::new();
+        encode_op(&EncodableOp::Node(honest.clone()), &mut bytes);
+        // Standalone layout: TAG ‖ pins(count ‖ raw ids) ‖ anchor ‖ payload.
+        assert_eq!(bytes[1], 0, "pins count");
+        assert!(matches!(decode_op(&bytes), Ok((EncodableOp::Node(n), _)) if n == honest));
+        // Malleated form: the same op with `a` repeated in its pins. It would
+        // hash to the same id but re-encode to different bytes; refuse it.
+        let mut malleated = bytes.clone();
+        malleated[1] = 1;
+        malleated.splice(2..2, a.0);
+        assert_eq!(decode_op(&malleated).err(), Some(DecodeError::RedundantPin));
+    }
+
+    #[test]
+    fn run_deps_naming_the_chain_anchor_are_rejected() {
+        let anchor = test_id(1);
+        let stray = test_id(9);
+        let honest = Run::from_text(
+            anchor,
+            FirstOp::After,
+            BTreeSet::from([stray]),
+            "ab",
+            BTreeMap::new(),
+        )
+        .unwrap();
+        // First deps repeat the anchor.
+        let r = Run::from_text(
+            anchor,
+            FirstOp::After,
+            BTreeSet::from([stray, anchor]),
+            "ab",
+            BTreeMap::new(),
+        );
+        assert_eq!(r.err(), Some(RunError::RedundantDep));
+        // Interior deps at offset 1 repeat the first element (its chain anchor).
+        let interior = BTreeMap::from([(1, BTreeSet::from([honest.elements[0]]))]);
+        let r = Run::from_text(anchor, FirstOp::After, BTreeSet::from([stray]), "ab", interior);
+        assert_eq!(r.err(), Some(RunError::RedundantDep));
+    }
+
+    #[test]
+    fn run_interior_dep_offsets_must_address_an_element() {
+        let anchor = test_id(1);
+        let dep = test_id(9);
+        for bad in [0usize, 2, 5] {
+            let interior = BTreeMap::from([(bad, BTreeSet::from([dep]))]);
+            let r = Run::from_text(anchor, FirstOp::After, BTreeSet::new(), "ab", interior);
+            assert_eq!(r.err(), Some(RunError::DepOffsetOutOfRange(bad)), "offset {bad}");
+        }
+        let interior = BTreeMap::from([(1usize, BTreeSet::from([dep]))]);
+        let run = Run::from_text(anchor, FirstOp::After, BTreeSet::new(), "ab", interior.clone())
+            .unwrap();
+        assert_eq!(run.interior_extra_deps, interior);
     }
 
     #[test]

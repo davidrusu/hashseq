@@ -241,6 +241,21 @@ impl HashNode {
             .chain(self.op.named_set().into_iter().flatten())
     }
 
+    /// The ids a role of `op` already names.
+    fn named(&self) -> impl Iterator<Item = &Id> {
+        self.op
+            .named_primary()
+            .into_iter()
+            .chain(self.op.named_secondary())
+            .chain(self.op.named_set().into_iter().flatten())
+    }
+
+    /// `pins ∩ named = ∅` — the stored form every constructor maintains and
+    /// the wire decoders reject violations of (`DecodeError::RedundantPin`).
+    pub fn is_normalized(&self) -> bool {
+        self.named().all(|n| !self.pins.contains(n))
+    }
+
     /// The sorted, deduplicated `refs(u)` table — the envelope's refs.
     /// `pins` is normalized to exclude named ids, and `pins`/set roles are
     /// `BTreeSet`s (already sorted), so this is a merge.
@@ -257,19 +272,7 @@ impl HashNode {
     /// `id_preimage_is_the_canonical_encoding` locks this to
     /// `encoding::encode_node_preimage`.
     pub fn id(&self) -> Id {
-        debug_assert!(
-            {
-                let named: Vec<&Id> = self
-                    .op
-                    .named_primary()
-                    .into_iter()
-                    .chain(self.op.named_secondary())
-                    .chain(self.op.named_set().into_iter().flatten())
-                    .collect();
-                named.iter().all(|n| !self.pins.contains(n))
-            },
-            "pins must be normalized: refs ∖ named"
-        );
+        debug_assert!(self.is_normalized(), "pins must be normalized: refs ∖ named");
 
         let mut hasher = node_hasher();
 
