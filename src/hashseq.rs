@@ -1707,7 +1707,10 @@ impl HashSeq {
         let Some(x) = self.idx_of(id) else {
             return Vec::new();
         };
-        if self.mark_nodes.is_empty() {
+        // Only insert elements have a rendered position for marks to cover;
+        // the origin and op nodes (remove/move/mark/place ids, all of which
+        // `tips()` / `move_heads()` hand out) carry no marks.
+        if !matches!(self.loc_of(x), Loc::Run { .. }) || self.mark_nodes.is_empty() {
             return Vec::new();
         }
         let covering: Vec<NodeIdx> = self
@@ -4613,6 +4616,29 @@ mod test {
             .filter(|(_, live)| live.iter().any(|(_, v)| *v != *crate::value::TOMBSTONE))
             .map(|(k, _)| k)
             .collect()
+    }
+
+    #[test]
+    fn marks_at_non_element_ids_is_empty_not_a_panic() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+        let mark = seq.mark_range(Anchor::Before(a), Anchor::After(c), bold(), yes());
+        assert!(!seq.marks_at(&a).is_empty(), "sanity: the element is covered");
+
+        assert!(seq.marks_at(&seq.origin()).is_empty());
+        assert!(seq.marks_at(&mark.id()).is_empty());
+        let remove = seq.remove_batch(1, 1).unwrap();
+        assert!(seq.marks_at(&remove.id()).is_empty());
+        let mv = seq.move_element(a, Anchor::After(c));
+        assert!(seq.marks_at(&mv.id()).is_empty());
+        for tip in seq.tips().clone() {
+            let _ = seq.marks_at(&tip);
+        }
+        for head in seq.move_heads(&a) {
+            let _ = seq.marks_at(&head);
+        }
     }
 
     fn span_texts(seq: &HashSeq) -> Vec<(String, bool)> {
