@@ -537,10 +537,6 @@ pub struct HashSeq {
     pub elem_payloads: FxHashMap<NodeIdx, Id>,
     /// Applied mark ops, by their own handle (MARKS.md).
     pub mark_nodes: FxHashMap<NodeIdx, StoredMark>,
-    /// Move ops some mark anchors at (splice-point span endpoints): their
-    /// op fragments are retained like ops with splice children — a mark
-    /// point's position must never be lost. Monotone.
-    mark_anchored_ops: FxHashSet<NodeIdx>,
     /// Anchor events for the mark sweep: anchor element (or origin) ->
     /// events crossing at its glue points. Empty in mark-free documents.
     mark_events: FxHashMap<NodeIdx, Vec<MarkEvent>>,
@@ -631,7 +627,6 @@ impl HashSeq {
             afters: FxHashMap::default(),
             elem_payloads: FxHashMap::default(),
             mark_nodes: FxHashMap::default(),
-            mark_anchored_ops: FxHashSet::default(),
             mark_events: FxHashMap::default(),
             place_nodes: FxHashMap::default(),
             placement: PlacementRegister::default(),
@@ -1425,12 +1420,13 @@ impl HashSeq {
 
     /// Does anything anchor at `op`'s splice point — causal children or
     /// mark span endpoints? (Sibling-set entries are dropped when emptied,
-    /// so presence means non-empty; mark anchorage is monotone.) Anchored
-    /// ops keep a physical fragment at their rank for life.
+    /// so presence means non-empty; `mark_events` is keyed by anchor and
+    /// only ever grows, so an entry at `op` means a mark point sits there.)
+    /// Anchored ops keep a physical fragment at their rank for life.
     fn op_has_children(&self, op: NodeIdx) -> bool {
         self.afters.contains_key(&op)
             || self.befores_by_anchor.contains_key(&op)
-            || (!self.mark_anchored_ops.is_empty() && self.mark_anchored_ops.contains(&op))
+            || (!self.mark_events.is_empty() && self.mark_events.contains_key(&op))
     }
 
     /// Register `op` in its destination's sibling set (keyed by its own id,
@@ -1626,13 +1622,6 @@ impl HashSeq {
         let idx = self.intern(id, Loc::MarkOp);
         let (start_anchor, start_after) = self.glue_point(&start).expect("gated above");
         let (end_anchor, end_after) = self.glue_point(&end).expect("gated above");
-
-        // Op-anchored span endpoints pin their op's fragment for life.
-        for n in [start_anchor, end_anchor] {
-            if let Loc::MoveOp = self.loc_of(n) {
-                self.mark_anchored_ops.insert(n);
-            }
-        }
 
         for r in overwrites.iter().chain(pins.iter()) {
             self.mark_tips.remove(r);
@@ -2240,26 +2229,20 @@ impl HashSeq {
 
         // Marks live in their own layer: they never enter the text tips
         // (downstream-only — content never references marks; LAYERING.md).
-        if let Op::Mark {
-            start,
-            end,
-            kind_v,
-            value,
-            overwrites,
-        } = node.op
-        {
+        if let Op::Mark { start, end, .. } = &node.op {
+            let (start, end) = (*start, *end);
             if !self.mark_admissible(&start, &end) {
-                return Err(HashNode {
-                    pins: node.pins,
-                    op: Op::Mark {
-                        start,
-                        end,
-                        kind_v,
-                        value,
-                        overwrites,
-                    },
-                });
+                return Err(node);
             }
+            let Op::Mark {
+                kind_v,
+                value,
+                overwrites,
+                ..
+            } = node.op
+            else {
+                unreachable!("matched above")
+            };
             self.apply_mark(id, node.pins, start, end, kind_v, value, overwrites);
             return Ok(());
         }
@@ -2371,60 +2354,13 @@ impl HashSeq {
             "cannot merge documents with different origins"
         );
 
-        // Covers both After- and Before-anchored runs: decompress reconstructs
-        // the anchoring first node for either kind. Ids come from `other`'s
-        // id table — no rehashing on the merge path. Atom runs are excluded:
-        // their text is the U+FFFC placeholder, not the identity input —
-        // they re-present as reconstructed nodes below.
-        for run in other.runs.values() {
-            if other.is_atom(run.head()) {
-                continue;
-            }
-            for (id, node) in run.to_run(&other.ids).decompress_with_ids() {
-                self.apply_with_id(id, node);
-            }
-        }
-        for &e in other.elem_payloads.keys() {
-            self.apply_with_id(other.id_of(e), other.atom_node(e));
-        }
-
-        for remove_run in other.remove_runs.values() {
-            for (i, node) in other.remove_run_nodes(remove_run).into_iter().enumerate() {
-                self.apply_with_id(other.id_of(remove_run.links[i]), node);
-            }
-        }
-
-        for (idx, causal_remove) in &other.remove_nodes {
-            let node = HashNode {
-                pins: causal_remove.pins.to_id_set(&other.ids),
-                op: Op::Remove(
-                    causal_remove
-                        .nodes
-                        .iter()
-                        .map(|i| other.id_of(*i))
-                        .collect(),
-                ),
-            };
-            self.apply_with_id(other.id_of(*idx), node)
-        }
-
-        // Move ops (placement registers). They reference targets/anchors, so
-        // the orphan machinery orders them after their runs arrive.
-        for (idx, mv) in &other.move_nodes {
-            let node = other.move_node(*idx, mv);
-            self.apply_with_id(other.id_of(*idx), node);
-        }
-
-        // Place ops (containment register) — same discipline.
-        for (idx, sp) in &other.place_nodes {
-            let node = other.place_node(sp);
-            self.apply_with_id(other.id_of(*idx), node);
-        }
-
-        // Mark ops (span annotations) — same discipline.
-        for (idx, mk) in &other.mark_nodes {
-            let node = other.mark_node(mk);
-            self.apply_with_id(other.id_of(*idx), node);
+        // Every applied node, reconstructed by `all_nodes` (runs decompressed,
+        // atoms/removes/moves/places/marks from their side tables) with ids
+        // from `other`'s table — no rehashing on the merge path. Ops that
+        // reference elements not yet applied are ordered by the orphan
+        // machinery, so the emission order does not matter.
+        for (id, node) in other.all_nodes() {
+            self.apply_with_id(id, node);
         }
 
         // Apply parked orphans (ids were computed when they were parked)
