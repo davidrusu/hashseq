@@ -955,7 +955,8 @@ impl WasmHashWeb {
         if *to.id() == target {
             return Ok(()); // dropping onto itself
         }
-        seq.move_element(target, to);
+        seq.move_element(target, to)
+            .map_err(|_| app_err("move not admissible"))?;
         Ok(())
     }
 
@@ -1005,7 +1006,10 @@ impl WasmHashWeb {
             .seq_mut(&hex_to_id(obj_hex)?)
             .ok_or_else(|| app_err("no such seq object"))?;
         let (s, e) = anchor_range(seq, start, end)?;
-        Ok(id_to_hex(&seq.mark_range(s, e, kind_id, value_id).id()))
+        let node = seq
+            .mark_range(s, e, kind_id, value_id)
+            .map_err(|_| app_err("mark not admissible: anchors do not bracket a span"))?;
+        Ok(id_to_hex(&node.id()))
     }
 
     /// Like `markRange`, but with a CLOSED end: the end anchor is
@@ -1035,7 +1039,10 @@ impl WasmHashWeb {
         }
         let s = Anchor::Before(seq.id_at(start).expect("start < len"));
         let e = Anchor::After(seq.id_at(end - 1).expect("end-1 < len"));
-        Ok(id_to_hex(&seq.mark_range(s, e, kind_id, value_id).id()))
+        let node = seq
+            .mark_range(s, e, kind_id, value_id)
+            .map_err(|_| app_err("mark not admissible: anchors do not bracket a span"))?;
+        Ok(id_to_hex(&node.id()))
     }
 
     /// Remove `kind` formatting over `[start, end)` — a tombstone-valued
@@ -1056,7 +1063,10 @@ impl WasmHashWeb {
             .seq_mut(&hex_to_id(obj_hex)?)
             .ok_or_else(|| app_err("no such seq object"))?;
         let (s, e) = anchor_range(seq, start, end)?;
-        Ok(id_to_hex(&seq.unmark_range(s, e, kind_id).id()))
+        let node = seq
+            .unmark_range(s, e, kind_id)
+            .map_err(|_| app_err("unmark not admissible: anchors do not bracket a span"))?;
+        Ok(id_to_hex(&node.id()))
     }
 
     /// The rendered document as coalesced marked spans. JSON:

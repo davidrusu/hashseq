@@ -661,6 +661,23 @@ impl HashSeq {
         }
     }
 
+    /// Apply a locally-authored node and record it for delta sync only if
+    /// it was admitted. `Err` hands the node back: the gate refused it
+    /// (it sits in quarantine, `contains_node` is false) and nothing was
+    /// recorded, so peers are never sent an op this replica itself
+    /// rejected. Local deps are always applied, so a refusal is a gate
+    /// verdict, never a parked orphan.
+    fn author(&mut self, node: HashNode) -> Result<HashNode, HashNode> {
+        let id = node.id();
+        self.apply_with_id(id, node.clone());
+        if self.contains_node(&id) {
+            self.record_authored(&node);
+            Ok(node)
+        } else {
+            Err(node)
+        }
+    }
+
     pub fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
         self.id_to_idx.get(id, &self.ids)
     }
@@ -910,6 +927,9 @@ impl HashSeq {
             .expect("cursor_at is total for idx <= len");
         let first_node = cursor.first_node(first_ch);
 
+        // Cursor-derived inserts anchor on applied elements/origin and are
+        // always admitted, so recording before apply is safe here and saves
+        // a clone per char on the hot path (`author` is for gate-able ops).
         let mut prev_id = first_node.id();
         self.record_authored(&first_node);
         self.apply_with_id(prev_id, first_node);
@@ -940,9 +960,7 @@ impl HashSeq {
         let node = self
             .make_insert_value(idx, payload)
             .expect("cursor_at is total for clamped idx");
-        self.record_authored(&node);
-        self.apply(node.clone());
-        node
+        self.author(node).expect("cursor-derived inserts are always admitted")
     }
 
     pub fn remove(&mut self, idx: usize) {
@@ -956,9 +974,7 @@ impl HashSeq {
     /// `idx` is past the end (no characters were actually removed).
     pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
         let node = self.make_remove_batch(idx, amount)?;
-        self.record_authored(&node);
-        self.apply(node.clone());
-        Some(node)
+        Some(self.author(node).expect("removes of applied elements are always admitted"))
     }
 
     /// Build (without applying) the removal of `amount` characters starting
@@ -1452,8 +1468,10 @@ impl HashSeq {
     }
 
     /// Author a move of the element at `target` to the glued point `to`,
-    /// superseding the heads this replica sees. Returns the applied node.
-    pub fn move_element(&mut self, target: Id, to: Anchor) -> HashNode {
+    /// superseding the heads this replica sees. Returns the applied node;
+    /// `Err` = the gate refused it (target not an element, anchor not a
+    /// glue point, or a self-move): nothing applied, nothing queued.
+    pub fn move_element(&mut self, target: Id, to: Anchor) -> Result<HashNode, HashNode> {
         let overwrites: BTreeSet<Id> = self.move_heads(&target).into_iter().collect();
         let mut named: BTreeSet<Id> = overwrites.clone();
         named.insert(target);
@@ -1467,9 +1485,7 @@ impl HashSeq {
                 overwrites,
             },
         };
-        self.record_authored(&node);
-        self.apply(node.clone());
-        node
+        self.author(node)
     }
 
     /// Resolve a mark anchor to a glue point `(node, after-side)`: an
@@ -1660,9 +1676,9 @@ impl HashSeq {
                 overwrites,
             },
         };
-        self.record_authored(&node);
-        self.apply(node.clone());
-        node
+        // Place is unconditionally admitted (the gate table), so this
+        // cannot fail; `author` still keeps the record-after-apply order.
+        self.author(node).expect("Place ops are always admitted")
     }
 
     // ---- mark reads (arbitration happens here, per Law II) ----
@@ -1884,7 +1900,16 @@ impl HashSeq {
     /// Author a mark of `kind`/`value` over `[start, end]`, superseding the
     /// same-kind marks intersecting the range that this replica sees.
     /// Anchor-side choice encodes edge-expansion behavior (MARKS.md).
-    pub fn mark_range(&mut self, start: Anchor, end: Anchor, kind: Id, value: Id) -> HashNode {
+    /// `Err` = the gate refused it (an inverted span, e.g. anchors on
+    /// moved-in elements whose base slots cross): nothing applied, nothing
+    /// queued for peers; the built node is handed back.
+    pub fn mark_range(
+        &mut self,
+        start: Anchor,
+        end: Anchor,
+        kind: Id,
+        value: Id,
+    ) -> Result<HashNode, HashNode> {
         // Overwrites hygiene (open problem 1, simple form): name every
         // same-kind mark whose span intersects the new range.
         let (s, e) = (
@@ -1921,15 +1946,14 @@ impl HashSeq {
                 overwrites,
             },
         };
-        self.record_authored(&node);
-        self.apply(node.clone());
-        node
+        self.author(node)
     }
 
     /// Remove `kind` formatting over `[start, end]`: a mark whose value is
     /// the tombstone artifact (partial unmark is the same op over a
     /// sub-range — the overwritten mark keeps applying outside it).
-    pub fn unmark_range(&mut self, start: Anchor, end: Anchor, kind: Id) -> HashNode {
+    /// `Err` as for `mark_range`.
+    pub fn unmark_range(&mut self, start: Anchor, end: Anchor, kind: Id) -> Result<HashNode, HashNode> {
         self.mark_range(start, end, kind, *crate::value::TOMBSTONE)
     }
 
@@ -3872,7 +3896,7 @@ mod test {
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
 
-        seq.move_element(a, Anchor::After(c));
+        seq.move_element(a, Anchor::After(c)).unwrap();
         assert_eq!(seq.placement_of(&a), Some(Anchor::After(c)));
         assert!(!seq.placement_conflicted(&a));
         // the rendered order relocates `a` to the glued point after `c`
@@ -3889,8 +3913,8 @@ mod test {
         let b = seq.id_at(1).unwrap();
         let c = seq.id_at(2).unwrap();
 
-        seq.move_element(a, Anchor::After(b));
-        seq.move_element(a, Anchor::After(c));
+        seq.move_element(a, Anchor::After(b)).unwrap();
+        seq.move_element(a, Anchor::After(c)).unwrap();
         assert_eq!(seq.placement_of(&a), Some(Anchor::After(c)));
         assert_eq!(seq.move_heads(&a).len(), 1);
     }
@@ -3904,13 +3928,13 @@ mod test {
         let c = base.id_at(2).unwrap();
 
         // Both replicas agree on an initial placement, then race.
-        base.move_element(a, Anchor::After(b));
+        base.move_element(a, Anchor::After(b)).unwrap();
         let agreed = Anchor::After(b);
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        r1.move_element(a, Anchor::After(c));
-        r2.move_element(a, Anchor::Before(b));
+        r1.move_element(a, Anchor::After(c)).unwrap();
+        r2.move_element(a, Anchor::Before(b)).unwrap();
 
         let mut merged = r1.clone();
         merged.merge(r2.clone());
@@ -3930,7 +3954,7 @@ mod test {
         );
 
         // The next move naming both heads dominates and resolves.
-        merged.move_element(a, Anchor::After(c));
+        merged.move_element(a, Anchor::After(c)).unwrap();
         assert!(!merged.placement_conflicted(&a));
         assert_eq!(merged.placement_of(&a), Some(Anchor::After(c)));
     }
@@ -3945,8 +3969,8 @@ mod test {
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        r1.move_element(a, Anchor::After(c));
-        r2.move_element(a, Anchor::Before(b));
+        r1.move_element(a, Anchor::After(c)).unwrap();
+        r2.move_element(a, Anchor::Before(b)).unwrap();
 
         let mut merged = r1;
         merged.merge(r2);
@@ -3963,7 +3987,7 @@ mod test {
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
 
-        seq.move_element(a, Anchor::After(c));
+        seq.move_element(a, Anchor::After(c)).unwrap();
         let rendered = seq.position_of(&a).unwrap();
         assert_eq!(rendered, 2, "moved to the end");
         seq.remove(rendered); // tombstone a at its rendered position
@@ -3979,7 +4003,7 @@ mod test {
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
 
-        seq.move_element(c, Anchor::Before(a));
+        seq.move_element(c, Anchor::Before(a)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "cab");
         assert_eq!(seq.position_of(&c), Some(0));
         check_index_matches_iter(&seq);
@@ -3996,14 +4020,14 @@ mod test {
 
         // After(origin): the move op joins the top-level sibling set,
         // ordered against the run head by id — like any insert would be.
-        let m = seq.move_element(c, Anchor::After(origin));
+        let m = seq.move_element(c, Anchor::After(origin)).unwrap();
         let expect = if m.id() < a { "cab" } else { "abc" };
         assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
 
         // Before(origin): a before-child of the origin — releases before
         // everything (the origin's befores precede all top-level content).
-        seq.move_element(b, Anchor::Before(origin));
+        seq.move_element(b, Anchor::Before(origin)).unwrap();
         let text: String = seq.iter().collect();
         assert_eq!(text.len(), 3);
         assert!(text.starts_with('b'), "Before(origin) renders first: {text}");
@@ -4020,8 +4044,8 @@ mod test {
 
         // Two elements glued at the same point: order among them is the
         // move ops' id order, whatever the application order was.
-        let m1 = seq.move_element(a, Anchor::After(d));
-        let m2 = seq.move_element(b, Anchor::After(d));
+        let m1 = seq.move_element(a, Anchor::After(d)).unwrap();
+        let m2 = seq.move_element(b, Anchor::After(d)).unwrap();
         let expect = if m1.id() < m2.id() { "cdab" } else { "cdba" };
         assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
@@ -4040,7 +4064,7 @@ mod test {
 
         // Base [a b c]; a moves After(b) — the fork materializes, so b's
         // siblings are the c-continuation and the move op, id-ordered.
-        let m = seq.move_element(a, Anchor::After(b));
+        let m = seq.move_element(a, Anchor::After(b)).unwrap();
         let mut sibs = [(m.id(), 'a'), (c, 'c')];
         sibs.sort();
         let expect: String = std::iter::once('b').chain(sibs.iter().map(|s| s.1)).collect();
@@ -4069,7 +4093,7 @@ mod test {
         let a = seq.id_at(0).unwrap();
         let b = seq.id_at(1).unwrap();
 
-        let m = seq.move_element(a, Anchor::After(b));
+        let m = seq.move_element(a, Anchor::After(b)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "ba");
 
         let cnode = HashNode {
@@ -4090,11 +4114,11 @@ mod test {
         let c = seq.id_at(2).unwrap();
         let d = seq.id_at(3).unwrap();
 
-        seq.move_element(a, Anchor::After(d));
+        seq.move_element(a, Anchor::After(d)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "bcda");
-        seq.move_element(a, Anchor::Before(c));
+        seq.move_element(a, Anchor::Before(c)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "bacd");
-        seq.move_element(a, Anchor::After(a)); // self-move gates, no change
+        assert!(seq.move_element(a, Anchor::After(a)).is_err()); // self-move gates
         assert_eq!(seq.iter().collect::<String>(), "bacd");
         check_index_matches_iter(&seq);
     }
@@ -4108,7 +4132,7 @@ mod test {
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        r1.move_element(a, Anchor::After(d));
+        r1.move_element(a, Anchor::After(d)).unwrap();
         r2.insert(2, 'x');
 
         let mut m1 = r1.clone();
@@ -4143,7 +4167,7 @@ mod test {
         let b = base.id_at(1).unwrap();
         let c = base.id_at(2).unwrap();
 
-        let m0 = base.move_element(a, Anchor::After(b));
+        let m0 = base.move_element(a, Anchor::After(b)).unwrap();
         // a joins b's sibling set (against the c-continuation), by id.
         let mut sibs = [(m0.id(), 'a'), (c, 'c')];
         sibs.sort();
@@ -4152,8 +4176,8 @@ mod test {
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        r1.move_element(a, Anchor::After(c));
-        r2.move_element(a, Anchor::Before(b));
+        r1.move_element(a, Anchor::After(c)).unwrap();
+        r2.move_element(a, Anchor::Before(b)).unwrap();
 
         let mut merged = r1.clone();
         merged.merge(r2.clone());
@@ -4246,7 +4270,7 @@ mod test {
                     } else {
                         Anchor::Before(anchor)
                     };
-                    seq.move_element(target, to);
+                    let _ = seq.move_element(target, to); // self-moves gate
                 }
                 4 => {
                     // Insert anchored at a move op's splice point (any head
@@ -4345,13 +4369,13 @@ mod test {
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        let b = r1.move_element(x, Anchor::After(a));
+        let b = r1.move_element(x, Anchor::After(a)).unwrap();
         // c: type y right after the moved-in x — the cursor anchors at b's
         // splice point (After(b)), not at x's ghost.
         let pos = r1.position_of(&x).unwrap();
         r1.insert(pos + 1, 'y');
 
-        r2.move_element(x, Anchor::After(q));
+        r2.move_element(x, Anchor::After(q)).unwrap();
 
         let mut m1 = r1.clone();
         m1.merge(r2.clone());
@@ -4374,7 +4398,7 @@ mod test {
         check_index_matches_iter(&m2);
 
         // A resolving move naming both heads re-renders x; y keeps its spot.
-        m1.move_element(x, Anchor::After(a));
+        m1.move_element(x, Anchor::After(a)).unwrap();
         assert!(!m1.placement_conflicted(&x));
         assert_eq!(m1.placement_of(&x), Some(Anchor::After(a)));
         check_index_matches_iter(&m1);
@@ -4389,7 +4413,7 @@ mod test {
         let m = base.id_at(0).unwrap();
         let a = base.id_at(1).unwrap();
 
-        let b = base.move_element(m, Anchor::After(a));
+        let b = base.move_element(m, Anchor::After(a)).unwrap();
         assert_eq!(base.iter().collect::<String>(), "am");
         // Type y after the moved-in m: anchors After(b).
         base.insert(2, 'y');
@@ -4405,10 +4429,10 @@ mod test {
         // slot promotes back to rendering m. Children stay adjacent.
         let mut r1 = base.clone();
         let mut r2 = base.clone();
-        r1.move_element(m, Anchor::Before(a));
+        r1.move_element(m, Anchor::Before(a)).unwrap();
         assert_eq!(r1.iter().collect::<String>(), "mawy", "demoted: children keep b's rank");
         check_index_matches_iter(&r1);
-        r2.move_element(m, Anchor::After(a));
+        r2.move_element(m, Anchor::After(a)).unwrap();
 
         let mut m1 = r1.clone();
         m1.merge(r2.clone());
@@ -4431,7 +4455,7 @@ mod test {
         let m = seq.id_at(0).unwrap();
         let a = seq.id_at(1).unwrap();
 
-        seq.move_element(m, Anchor::After(a));
+        seq.move_element(m, Anchor::After(a)).unwrap();
         seq.insert(2, 'y'); // After(op)
         assert_eq!(seq.iter().collect::<String>(), "amy");
 
@@ -4448,7 +4472,7 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ma".chars());
         let m = seq.id_at(0).unwrap();
-        seq.move_element(m, Anchor::After(seq.id_at(1).unwrap()));
+        seq.move_element(m, Anchor::After(seq.id_at(1).unwrap())).unwrap();
         seq.insert(2, 'y');
         seq.insert(3, '!');
         assert_eq!(seq.iter().collect::<String>(), "amy!");
@@ -4546,14 +4570,14 @@ mod test {
 
         // move the atom to the end
         let b = seq.id_at(2).unwrap();
-        seq.move_element(atom, Anchor::After(b));
+        seq.move_element(atom, Anchor::After(b)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), format!("ab{ATOM_CHAR}"));
         assert_eq!(seq.payload_of(&atom), Some(v));
         check_index_matches_iter(&seq);
 
         // mark a range containing its rendered position
         let a = seq.id_at(0).unwrap();
-        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes());
+        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes()).unwrap();
         // regional membership: the atom moved beyond the end point — not marked
         assert!(kinds_at(&seq, 2).is_empty());
         assert_eq!(kinds_at(&seq, 0), vec![bold()]);
@@ -4579,7 +4603,7 @@ mod test {
             Anchor::After(a),
             crate::value::Value::String("b".into()).value_id(),
             crate::value::Value::Bool(true).value_id(),
-        );
+        ).unwrap();
 
         for anchor in [rm.id(), mk.id()] {
             seq.apply(HashNode {
@@ -4619,19 +4643,46 @@ mod test {
     }
 
     #[test]
+    fn gated_authoring_is_reported_and_never_queued_for_peers() {
+        let mut seq = HashSeq::default();
+        seq.outbox = Some(Vec::new());
+        seq.insert_batch(0, "abcd".chars());
+        let a = seq.id_at(0).unwrap();
+        let c = seq.id_at(2).unwrap();
+        let d = seq.id_at(3).unwrap();
+        seq.move_element(a, Anchor::After(d)).unwrap();
+        assert_eq!(seq.iter().collect::<String>(), "bcda");
+        let queued = seq.outbox.as_ref().unwrap().len();
+
+        // Anchors on the visible order, but `a`'s point sits at its base
+        // slot (the front): an inverted span, which the gate refuses.
+        let err = seq
+            .mark_range(Anchor::Before(c), Anchor::Before(a), bold(), yes())
+            .unwrap_err();
+        assert!(!seq.contains_node(&err.id()));
+        assert_eq!(seq.delivery.gated.len(), 1);
+        assert_eq!(seq.outbox.as_ref().unwrap().len(), queued, "nothing shipped");
+
+        // A self-move is refused the same way.
+        let err = seq.move_element(c, Anchor::After(c)).unwrap_err();
+        assert!(!seq.contains_node(&err.id()));
+        assert_eq!(seq.outbox.as_ref().unwrap().len(), queued);
+    }
+
+    #[test]
     fn marks_at_non_element_ids_is_empty_not_a_panic() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abc".chars());
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
-        let mark = seq.mark_range(Anchor::Before(a), Anchor::After(c), bold(), yes());
+        let mark = seq.mark_range(Anchor::Before(a), Anchor::After(c), bold(), yes()).unwrap();
         assert!(!seq.marks_at(&a).is_empty(), "sanity: the element is covered");
 
         assert!(seq.marks_at(&seq.origin()).is_empty());
         assert!(seq.marks_at(&mark.id()).is_empty());
         let remove = seq.remove_batch(1, 1).unwrap();
         assert!(seq.marks_at(&remove.id()).is_empty());
-        let mv = seq.move_element(a, Anchor::After(c));
+        let mv = seq.move_element(a, Anchor::After(c)).unwrap();
         assert!(seq.marks_at(&mv.id()).is_empty());
         for tip in seq.tips().clone() {
             let _ = seq.marks_at(&tip);
@@ -4657,7 +4708,7 @@ mod test {
 
         // Bold "hello": Before(h) .. Before(space) — the bold expansion
         // choice from the MARKS.md anchor table.
-        seq.mark_range(Anchor::Before(h), Anchor::Before(space), bold(), yes());
+        seq.mark_range(Anchor::Before(h), Anchor::Before(space), bold(), yes()).unwrap();
 
         assert_eq!(
             span_texts(&seq),
@@ -4679,9 +4730,9 @@ mod test {
 
         let link = crate::value::Value::String("link".into()).value_id();
         // bold: Before(a)..Before(b) — expanding end.
-        seq.mark_range(Anchor::Before(a), Anchor::Before(b), bold(), yes());
+        seq.mark_range(Anchor::Before(a), Anchor::Before(b), bold(), yes()).unwrap();
         // link: Before(a)..After(a) — non-expanding end.
-        seq.mark_range(Anchor::Before(a), Anchor::After(a), link, yes());
+        seq.mark_range(Anchor::Before(a), Anchor::After(a), link, yes()).unwrap();
 
         // Type between a and b (a before-child of b: inside Before(b),
         // outside After(a)).
@@ -4702,10 +4753,10 @@ mod test {
         seq.insert_batch(0, "abcde".chars());
         let ids: Vec<Id> = (0..5).map(|i| seq.id_at(i).unwrap()).collect();
 
-        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[4]), bold(), yes());
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[4]), bold(), yes()).unwrap();
         assert_eq!(span_texts(&seq), vec![("abcde".into(), true)]);
 
-        seq.unmark_range(Anchor::Before(ids[2]), Anchor::After(ids[2]), bold());
+        seq.unmark_range(Anchor::Before(ids[2]), Anchor::After(ids[2]), bold()).unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![
@@ -4723,13 +4774,13 @@ mod test {
         let mut base = HashSeq::default();
         base.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| base.id_at(i).unwrap()).collect();
-        base.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes());
+        base.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes()).unwrap();
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
         // r1 unbolds bc; r2 concurrently re-bolds cd.
-        r1.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold());
-        r2.mark_range(Anchor::Before(ids[2]), Anchor::After(ids[3]), bold(), yes());
+        r1.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold()).unwrap();
+        r2.mark_range(Anchor::Before(ids[2]), Anchor::After(ids[3]), bold(), yes()).unwrap();
 
         let mut m1 = r1.clone();
         m1.merge(r2.clone());
@@ -4753,8 +4804,8 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
-        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes());
-        seq.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold());
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes()).unwrap();
+        seq.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold()).unwrap();
 
         seq.apply(HashNode {
             pins: BTreeSet::new(),
@@ -4771,7 +4822,7 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
-        seq.mark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold(), yes());
+        seq.mark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold(), yes()).unwrap();
         seq.remove_batch(1, 2); // tombstone b, c
 
         seq.apply(HashNode {
@@ -4815,14 +4866,14 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
-        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[1]), bold(), yes());
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[1]), bold(), yes()).unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![("ab".into(), true), ("cd".into(), false)]
         );
 
         // Move bold `a` out to the end: it leaves the region and sheds.
-        seq.move_element(ids[0], Anchor::After(ids[3]));
+        seq.move_element(ids[0], Anchor::After(ids[3])).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "bcda");
         assert_eq!(
             span_texts(&seq),
@@ -4831,7 +4882,7 @@ mod test {
         assert!(kinds_at(&seq, 3).is_empty(), "moved out: shed");
 
         // Move plain `d` into the region: it acquires the bold.
-        seq.move_element(ids[3], Anchor::Before(ids[1]));
+        seq.move_element(ids[3], Anchor::Before(ids[1])).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "dbca");
         assert_eq!(
             span_texts(&seq),
@@ -4848,10 +4899,10 @@ mod test {
         let b1 = seq.id_at(6).unwrap();
         let o = seq.id_at(7).unwrap();
         let b2 = seq.id_at(8).unwrap();
-        seq.mark_range(Anchor::Before(b1), Anchor::After(b2), bold(), yes());
+        seq.mark_range(Anchor::Before(b1), Anchor::After(b2), bold(), yes()).unwrap();
 
         let h = seq.id_at(0).unwrap();
-        seq.move_element(o, Anchor::Before(h));
+        seq.move_element(o, Anchor::Before(h)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "ohello bb");
         assert_eq!(
             span_texts(&seq),
@@ -4869,21 +4920,21 @@ mod test {
         seq.insert_batch(0, "ma".chars());
         let m = seq.id_at(0).unwrap();
         let a = seq.id_at(1).unwrap();
-        let op = seq.move_element(m, Anchor::After(a));
+        let op = seq.move_element(m, Anchor::After(a)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "am");
 
         // Element end point: the moved-in m renders beyond After(a) — not
         // covered (regional membership).
-        let el = seq.mark_range(Anchor::Before(a), Anchor::After(a), bold(), yes());
+        let el = seq.mark_range(Anchor::Before(a), Anchor::After(a), bold(), yes()).unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![("a".into(), true), ("m".into(), false)]
         );
-        seq.unmark_range(Anchor::Before(a), Anchor::After(a), bold());
+        seq.unmark_range(Anchor::Before(a), Anchor::After(a), bold()).unwrap();
         let _ = el;
 
         // Op end point: brackets wherever the target renders — covered.
-        seq.mark_range(Anchor::Before(a), Anchor::After(op.id()), bold(), yes());
+        seq.mark_range(Anchor::Before(a), Anchor::After(op.id()), bold(), yes()).unwrap();
         assert_eq!(span_texts(&seq), vec![("am".into(), true)]);
         let m_pos = seq.position_of(&m).unwrap();
         assert_eq!(kinds_at(&seq, m_pos), vec![bold()]);
@@ -4899,9 +4950,9 @@ mod test {
         let m = seq.id_at(0).unwrap();
         let a = seq.id_at(1).unwrap();
         let b = seq.id_at(2).unwrap();
-        let op = seq.move_element(m, Anchor::After(b)); // b is the run tail
+        let op = seq.move_element(m, Anchor::After(b)).unwrap(); // b is the run tail
         assert_eq!(seq.iter().collect::<String>(), "abm");
-        seq.mark_range(Anchor::Before(b), Anchor::After(op.id()), bold(), yes());
+        seq.mark_range(Anchor::Before(b), Anchor::After(op.id()), bold(), yes()).unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![("a".into(), false), ("bm".into(), true)]
@@ -4909,7 +4960,7 @@ mod test {
 
         // Re-move m to the front: it leaves the span (whose end point stays
         // at the superseded op's rank); b remains covered.
-        seq.move_element(m, Anchor::Before(a));
+        seq.move_element(m, Anchor::Before(a)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "mab");
         assert_eq!(
             span_texts(&seq),
@@ -4935,7 +4986,7 @@ mod test {
         seq.insert_batch(0, "ma".chars());
         let m = seq.id_at(0).unwrap();
         let a = seq.id_at(1).unwrap();
-        let op = seq.move_element(m, Anchor::After(a)); // renders after a
+        let op = seq.move_element(m, Anchor::After(a)).unwrap(); // renders after a
 
         seq.apply(HashNode {
             pins: BTreeSet::new(),
@@ -4961,10 +5012,10 @@ mod test {
         let y = seq.id_at(1).unwrap();
         let a = seq.id_at(2).unwrap();
 
-        let op1 = seq.move_element(x, Anchor::After(a));
+        let op1 = seq.move_element(x, Anchor::After(a)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "yax");
 
-        seq.move_element(y, Anchor::After(op1.id()));
+        seq.move_element(y, Anchor::After(op1.id())).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "axy");
         assert_eq!(seq.placement_of(&y), Some(Anchor::After(op1.id())));
         check_index_matches_iter(&seq);
@@ -4988,20 +5039,20 @@ mod test {
         let x = seq.id_at(0).unwrap();
         let a = seq.id_at(1).unwrap();
         let b = seq.id_at(2).unwrap();
-        let op1 = seq.move_element(x, Anchor::After(b));
+        let op1 = seq.move_element(x, Anchor::After(b)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "abx");
-        seq.move_element(x, Anchor::Before(a));
+        seq.move_element(x, Anchor::Before(a)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "xab");
 
         // Move x to op1's splice point: back adjacent to op1's rank.
-        seq.move_element(x, Anchor::After(op1.id()));
+        seq.move_element(x, Anchor::After(op1.id())).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "abx");
         assert_eq!(seq.placement_of(&x), Some(Anchor::After(op1.id())));
         check_index_matches_iter(&seq);
 
         // The reaffirmation shape: anchor at the CURRENT decider works too.
         let op3 = seq.move_heads(&x)[0];
-        seq.move_element(x, Anchor::After(op3));
+        seq.move_element(x, Anchor::After(op3)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "abx");
         check_index_matches_iter(&seq);
 
@@ -5020,7 +5071,7 @@ mod test {
         source.insert_batch(0, "ab".chars());
         let a = source.id_at(0).unwrap();
         let b = source.id_at(1).unwrap();
-        let mark = source.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes());
+        let mark = source.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes()).unwrap();
 
         let mut fresh = HashSeq::default();
         fresh.apply(mark);
@@ -5042,8 +5093,8 @@ mod test {
         seq.insert_batch(0, "hello".chars());
         let h = seq.id_at(0).unwrap();
         let o = seq.id_at(4).unwrap();
-        seq.mark_range(Anchor::Before(h), Anchor::After(o), bold(), yes());
-        seq.unmark_range(Anchor::Before(seq.id_at(2).unwrap()), Anchor::After(seq.id_at(2).unwrap()), bold());
+        seq.mark_range(Anchor::Before(h), Anchor::After(o), bold(), yes()).unwrap();
+        seq.unmark_range(Anchor::Before(seq.id_at(2).unwrap()), Anchor::After(seq.id_at(2).unwrap()), bold()).unwrap();
 
         let decoded = crate::encoding::decode_hashseq(&crate::encoding::encode_hashseq(&seq))
             .expect("roundtrip");
@@ -5165,7 +5216,7 @@ mod test {
         let b = seq.id_at(1).unwrap();
         let c = seq.id_at(2).unwrap();
 
-        let q = seq.move_element(b, Anchor::After(c)).id();
+        let q = seq.move_element(b, Anchor::After(c)).unwrap().id();
         assert_eq!(seq.iter().collect::<String>(), "acb");
 
         seq.apply(raw_move(a, Anchor::After(c), &[q]));
@@ -5182,7 +5233,7 @@ mod test {
         seq.insert_batch(0, "abc".chars());
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
-        seq.move_element(a, Anchor::After(c));
+        seq.move_element(a, Anchor::After(c)).unwrap();
 
         let bytes = crate::encode_hashseq(&seq);
         let decoded = crate::decode_hashseq(&bytes).expect("decodes");
@@ -5198,7 +5249,7 @@ mod test {
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
         let mut other = seq.clone();
-        let mv = other.move_element(a, Anchor::After(c));
+        let mv = other.move_element(a, Anchor::After(c)).unwrap();
 
         let mut fresh = HashSeq::default();
         fresh.apply(mv); // parks: target unknown
