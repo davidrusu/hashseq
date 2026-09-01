@@ -143,3 +143,19 @@ Decision (David, 2026-09-02): replace the hand-fed outbox with a derived delta.
 6. Tests: local apply of a cursor-built node ships; remote nodes never echo; a gated authored op never ships; watermark after merge excludes the merged history.
 
 Invariant to keep: the delta must never include a node this replica quarantined — automatic, since gated nodes are not interned.
+
+### Q3. E4 — bounded `select`/`rank` on large fragments (additive, perf-gated)
+
+Constraint (David, 2026-09-02): the run index is the heart of hashseq's performance; nothing here may cost the measured gains. So NOT the S6 "collapse Small/Large" refactor — `Bits::Small(u64)` stays exactly as is (median fragments are a handful of chars; inline word, no allocation, single-word ops).
+
+Scope: inside `Bits::Large` only, keep a visible count per superblock of 8 words (512 elements). `select` skips whole blocks then scans ≤ 8 words; `rank` sums blocks below `k` then ≤ 8 words. `push_visible`/`set_bit`/`clear_bit` adjust one block count (O(1)); `split_bits` rebuilds. Today a 69k-element run (rustcode max) scans ~1,080 words per `RunIndex::get`, i.e. per `cursor_at` at its tail; p99.5 runs are ~500 chars so trace averages barely see it. Gate: `cargo run --release --example sequential_traces` vs `target/perf/review-after-e2.txt` — no regression on the small-run traces (clownschool, friendsforever, json-crdt) or it does not land.
+
+From S6, only the safety half: `debug_assert_eq!(frag.visible, popcount(bits))` at the six mutation sites (push_visible, split, set/clear) — catches a desync under test, zero release cost. No representation change.
+
+### Q4. S5 — `IndexTarget` as (slot kind, before: bool)
+
+Deferred. Collapses the four Moved/Splice arms of `attach_at` cleanly (the two Elem arms carry different split logic and stay). Pure readability; do it only alongside the next change that touches `attach_at`, and measure.
+
+## Pass summary (2026-09-02)
+
+All 12 confirmed correctness findings resolved and committed (#1–#13 incl. C6); 11 of 14 cleanup items resolved (R1–R3, S1–S4, E1–E3, E5); E4/S6 → Q3, S5 → Q4. Queued design work: Q1 value store, Q2 watermark+provenance delta. Trace throughput after the pass: 2.2–3.6M ops/s, all traces correct (`target/perf/review-after-e2.txt`).
