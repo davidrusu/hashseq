@@ -379,6 +379,17 @@ impl WasmHashSeq {
     pub fn merge_encoded(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
         let other =
             decode_hashseq(bytes).map_err(|e| JsValue::from_str(&format!("decode error: {e}")))?;
+        self.merge_same_origin(other).map_err(JsValue::from_str)
+    }
+}
+
+impl WasmHashSeq {
+    /// `HashSeq::merge` asserts equal origins; a snapshot of another
+    /// document (or a hostile header) must be an error, not a wasm trap.
+    fn merge_same_origin(&mut self, other: HashSeq) -> Result<(), &'static str> {
+        if other.origin() != self.inner.origin() {
+            return Err("cannot merge: different document origin");
+        }
         self.inner.merge(other);
         Ok(())
     }
@@ -426,6 +437,23 @@ mod tests {
         web.seq_move(&list, 1, 1).unwrap();
         web.seq_move(&list, 1, 2).unwrap();
         assert_eq!(web.text(&list).unwrap(), before);
+    }
+
+    #[test]
+    fn merge_encoded_of_another_document_is_an_error_not_a_trap() {
+        let mut a = WasmHashSeq { inner: HashSeq::new(Id([0xaa; 32])) };
+        let mut b = WasmHashSeq { inner: HashSeq::new(Id([0xbb; 32])) };
+        a.insert(0, "x");
+        b.insert(0, "y");
+        // (JsValue cannot be built natively, so exercise the inner check.)
+        let other = decode_hashseq(&b.encode()).unwrap();
+        assert!(a.merge_same_origin(other).is_err());
+        assert_eq!(a.text(), "x", "untouched");
+        // Same document still merges.
+        let mut a2 = WasmHashSeq { inner: HashSeq::new(Id([0xaa; 32])) };
+        a2.insert(0, "z");
+        a.merge_encoded(&a2.encode()).unwrap();
+        assert_eq!(a.text().len(), 2);
     }
 
     /// Marks built from visible positions bracket moved-in text.
