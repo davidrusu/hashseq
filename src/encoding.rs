@@ -328,11 +328,10 @@ pub fn encode_payload(p: &Payload, buf: &mut Vec<u8>) {
     match p {
         Payload::Char(c) => {
             let mut tmp = [0u8; 5];
-            tmp[0] = crate::value::VK_CHAR;
-            let n = c.encode_utf8(&mut tmp[1..]).len();
+            let artifact = crate::value::char_artifact(*c, &mut tmp);
             buf.push(0x00);
-            encode_varint(1 + n, buf);
-            buf.extend_from_slice(&tmp[..1 + n]);
+            encode_varint(artifact.len(), buf);
+            buf.extend_from_slice(artifact);
         }
         Payload::Id(id) => {
             buf.push(0x01);
@@ -375,33 +374,17 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(Payload, usize), DecodeError> {
 /// This is the reference encoder that `HashNode::id`'s streaming hasher is
 /// locked to by test.
 pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
-    use crate::hash_node::{KIND_INSERT, KIND_MARK, KIND_MOVE, KIND_PLACE, KIND_PUT, KIND_REMOVE};
+    use crate::hash_node::{
+        KIND_INSERT, KIND_MARK, KIND_MOVE, KIND_PLACE, KIND_PUT, KIND_REMOVE, sorted_subset_indices,
+        varint_len,
+    };
 
     let mut refs: Vec<Id> = node.iter_refs().copied().collect();
     refs.sort_unstable();
     refs.dedup();
     let ref_idx =
         |id: &Id| -> usize { refs.binary_search(id).expect("named id is in the refs table") };
-    let subset_idxs = |set: &BTreeSet<Id>| -> Vec<usize> {
-        let mut idxs = Vec::with_capacity(set.len());
-        let mut i = 0usize;
-        for want in set {
-            while refs[i] != *want {
-                i += 1;
-            }
-            idxs.push(i);
-            i += 1;
-        }
-        idxs
-    };
-    let varint_len = |mut v: usize| -> usize {
-        let mut n = 1;
-        while v >= 0x80 {
-            v >>= 7;
-            n += 1;
-        }
-        n
-    };
+    let subset_idxs = |set: &BTreeSet<Id>| sorted_subset_indices(&refs, set);
 
     let kind = match &node.op {
         Op::Insert { .. } => KIND_INSERT,
@@ -2733,7 +2716,7 @@ mod tests {
         // coverage.
         let e0 = a.id_at(0).unwrap();
         let last = a.id_at(a.len() - 1).unwrap();
-        let mv = a.move_element(e0, crate::Anchor::After(last));
+        let mv = a.move_element(e0, crate::Anchor::After(last)).unwrap();
         a.apply(HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(mv.id(), 'x'),
@@ -2745,7 +2728,7 @@ mod tests {
             crate::Anchor::After(s2),
             crate::value::Value::String("bold".into()).value_id(),
             crate::value::Value::Bool(true).value_id(),
-        );
+        ).unwrap();
         b.merge(a.clone());
 
         let bytes = encode_hashseq(&a);

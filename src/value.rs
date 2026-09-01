@@ -100,9 +100,8 @@ impl Value {
                 encode_zigzag(*i, buf);
             }
             Value::Char(c) => {
-                buf.push(VK_CHAR);
-                let mut tmp = [0u8; 4];
-                buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                let mut tmp = [0u8; 5];
+                buf.extend_from_slice(char_artifact(*c, &mut tmp));
             }
             Value::String(s) => {
                 buf.push(VK_STRING);
@@ -248,6 +247,16 @@ pub fn ascii_char_of_value_id(id: &Id) -> Option<char> {
     ASCII_CHAR_OF_VALUE_ID.get(id).copied()
 }
 
+/// A char's canonical artifact bytes (`VK_CHAR ‖ utf8`), written into a
+/// caller's stack buffer — the one layout `Value::encode`, `char_value_id`
+/// and the wire's inline payload form all share.
+#[inline]
+pub(crate) fn char_artifact(c: char, tmp: &mut [u8; 5]) -> &[u8] {
+    tmp[0] = VK_CHAR;
+    let n = c.encode_utf8(&mut tmp[1..]).len();
+    &tmp[..1 + n]
+}
+
 /// `value_id` of a char artifact, cached.
 #[inline]
 pub fn char_value_id(c: char) -> Id {
@@ -259,9 +268,7 @@ pub fn char_value_id(c: char) -> Id {
             return *id;
         }
         let mut tmp = [0u8; 5];
-        tmp[0] = VK_CHAR;
-        let n = c.encode_utf8(&mut tmp[1..]).len();
-        let id = value_id_of_bytes(&tmp[..1 + n]);
+        let id = value_id_of_bytes(char_artifact(c, &mut tmp));
         m.borrow_mut().insert(c, id);
         id
     })
