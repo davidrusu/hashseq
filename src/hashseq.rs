@@ -1065,9 +1065,8 @@ impl HashSeq {
         }
     }
 
-    fn insert_after(&mut self, id: Id, after: CausalInsert) {
-        // The anchor is a checked dependency, so it is interned.
-        let anchor = self.idx_of_known(&after.anchor);
+    /// `anchor` is `after.anchor` resolved (a checked dependency, so interned).
+    fn insert_after(&mut self, id: Id, anchor: NodeIdx, after: CausalInsert) {
 
         // A move-op anchor: content anchoring at the splice point — make
         // sure the op holds a physical rank first.
@@ -2085,9 +2084,8 @@ impl HashSeq {
         );
     }
 
-    fn insert_before(&mut self, id: Id, before: CausalInsert) {
-        // The anchor is a checked dependency, so it is interned.
-        let anchor = self.idx_of_known(&before.anchor);
+    /// `anchor` is `before.anchor` resolved (a checked dependency, so interned).
+    fn insert_before(&mut self, id: Id, anchor: NodeIdx, before: CausalInsert) {
 
         if let Loc::MoveOp = self.loc_of(anchor) {
             self.ensure_op_fragment(anchor);
@@ -2160,16 +2158,29 @@ impl HashSeq {
     /// interpret it and wake its waiters. A gated node wakes nothing — its
     /// dependents stay parked (the quarantine cascade).
     fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
-        let missing = node
-            .iter_refs()
-            .find(|d| !self.contains_node(d))
-            .copied();
+        // An insert's anchor is resolved here once and handed down: the
+        // dependency check, the admission gate and the run-extension fast
+        // path all need the same handle, and on the typing hot path that
+        // lookup was paid three times.
+        let (insert_anchor, missing) = match &node.op {
+            Op::Insert { at, .. } => match self.idx_of(at.id()) {
+                None => (None, Some(*at.id())),
+                Some(a) => (
+                    Some(a),
+                    node.pins.iter().find(|d| !self.contains_node(d)).copied(),
+                ),
+            },
+            _ => (
+                None,
+                node.iter_refs().find(|d| !self.contains_node(d)).copied(),
+            ),
+        };
         if let Some(missing) = missing {
             self.delivery.park(missing, id, node);
             return;
         }
         self.delivery.unpark(&id);
-        match self.interpret(id, node) {
+        match self.interpret(id, node, insert_anchor) {
             Ok(()) => self.delivery.wake(&id, queue),
             Err(node) => self.delivery.gate(id, node),
         }
@@ -2180,7 +2191,14 @@ impl HashSeq {
     // The Err carries the node back by value — same move the parameters
     // make; boxing would buy an allocation per gated op for nothing.
     #[allow(clippy::result_large_err)]
-    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), HashNode> {
+    /// `insert_anchor`: the resolved anchor handle when `node` is an
+    /// Insert (see `park_or_dispatch`), `None` otherwise.
+    fn interpret(
+        &mut self,
+        id: Id,
+        node: HashNode,
+        insert_anchor: Option<NodeIdx>,
+    ) -> Result<(), HashNode> {
         // The apply-time gate: ops this projection does not admit are
         // quarantined before touching tips or the index. They never intern,
         // so dependents stay parked (the correct edge-table semantics).
@@ -2190,7 +2208,7 @@ impl HashSeq {
             // else (a remove op, a mark op) gates: there is no gap to claim
             // at a node that never renders. Payloads are never checked
             // (opaque commitments — HASHSEQ_SPEC "Payload").
-            Op::Insert { at, .. } => self.idx_of(at.id()).is_some_and(|a| {
+            Op::Insert { .. } => insert_anchor.is_some_and(|a| {
                 matches!(self.loc_of(a), Loc::Run { .. } | Loc::Origin | Loc::MoveOp)
             }),
             // Removes admit unconditionally: a target that is not an insert
@@ -2274,9 +2292,10 @@ impl HashSeq {
                     ch,
                     payload,
                 };
+                let a = insert_anchor.expect("admitted above");
                 match at {
-                    Anchor::After(anchor) => self.insert_after(id, ci(anchor)),
-                    Anchor::Before(anchor) => self.insert_before(id, ci(anchor)),
+                    Anchor::After(anchor) => self.insert_after(id, a, ci(anchor)),
+                    Anchor::Before(anchor) => self.insert_before(id, a, ci(anchor)),
                 }
             }
             Op::Remove(nodes) => self.apply_remove(id, node.pins, nodes),
