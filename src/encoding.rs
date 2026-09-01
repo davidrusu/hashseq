@@ -59,6 +59,19 @@ impl<'a> Cursor<'a> {
         self.pos += 1;
         Ok(b)
     }
+
+    /// A wire-supplied element count, checked against the bytes left: each
+    /// element costs at least `min_bytes` to encode, so a count the input
+    /// cannot possibly carry is `UnexpectedEof` up front rather than a
+    /// pre-allocation sized by an untrusted varint.
+    fn count(&mut self, min_bytes: usize) -> Result<usize, DecodeError> {
+        let n = self.step(decode_varint)?;
+        let remaining = self.bytes.len().saturating_sub(self.pos);
+        if n > remaining / min_bytes.max(1) {
+            return Err(DecodeError::UnexpectedEof);
+        }
+        Ok(n)
+    }
 }
 
 // Reference-position codecs: the standalone node form writes refs as raw ids,
@@ -1586,7 +1599,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
 
     // Origin header (also the implicit first dictionary entry)
     let origin = c.step(decode_id)?;
-    let num_ids = c.step(decode_varint)?;
+    let num_ids = c.count(32)?;
     let mut id_list: Vec<Id> = Vec::with_capacity(num_ids + 1);
     id_list.push(origin);
     for _ in 0..num_ids {
@@ -1634,14 +1647,28 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 let start_idx = c.step(decode_varint)?;
                 let end_idx = c.step(decode_varint)?;
 
-                let span: Vec<usize> = if tag == BLK_REMOVE_BWD {
-                    (end_idx..=start_idx).rev().collect()
+                // Both ends are untrusted: bound them by the target run
+                // before sizing anything by their distance. An inverted span
+                // is empty, as the range would be.
+                let backward = tag == BLK_REMOVE_BWD;
+                let (lo, hi) = if backward {
+                    (end_idx, start_idx)
                 } else {
-                    (start_idx..=end_idx).collect()
+                    (start_idx, end_idx)
                 };
-                let mut exposed = Vec::with_capacity(span.len());
+                let run_len = ranks
+                    .runs
+                    .get(target_run)
+                    .map(Vec::len)
+                    .ok_or(DecodeError::InvalidIdIndex(target_run))?;
+                if lo <= hi && hi >= run_len {
+                    return Err(DecodeError::InvalidIdIndex(target_run));
+                }
+                let count = if lo <= hi { hi - lo + 1 } else { 0 };
+                let mut exposed = Vec::with_capacity(count);
                 let mut prev_remove_id: Option<Id> = None;
-                for elem_idx in span {
+                for i in 0..count {
+                    let elem_idx = if backward { hi - i } else { lo + i };
                     let removed_id = ranks.run_elem(target_run, elem_idx)?;
                     let pins = match prev_remove_id {
                         Some(prev_id) => BTreeSet::from_iter([prev_id]),
@@ -1863,7 +1890,7 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
     let origin = c.step(decode_id)?;
     let mut kv = HashKv::new(origin);
 
-    let n = c.step(decode_varint)?;
+    let n = c.count(1)?;
     let mut emitted: Vec<Id> = Vec::with_capacity(n);
     for _ in 0..n {
         let get_ref = |c: &mut Cursor| -> Result<Id, DecodeError> {
@@ -2152,6 +2179,74 @@ mod tests {
             assert_eq!(decoded, value);
             assert_eq!(size, buf.len());
         }
+    }
+
+    // ---- untrusted counts never size an allocation (see REVIEW_FINDINGS.md) ----
+    // Sizes here are chosen so a regression fails fast (capacity overflow
+    // panics immediately); mid-range sizes would instead fill all memory.
+
+    fn origin_then_varint(v: usize) -> Vec<u8> {
+        let mut b = vec![0u8; 32];
+        encode_varint(v, &mut b);
+        b
+    }
+
+    #[test]
+    fn hashseq_num_ids_bounded_by_input() {
+        let bytes = origin_then_varint(1 << 60);
+        assert_eq!(decode_hashseq(&bytes).err(), Some(DecodeError::UnexpectedEof));
+        // usize::MAX also used to overflow `num_ids + 1` in debug builds.
+        let bytes = origin_then_varint(usize::MAX);
+        assert_eq!(decode_hashseq(&bytes).err(), Some(DecodeError::UnexpectedEof));
+    }
+
+    #[test]
+    fn hashkv_entry_count_bounded_by_input() {
+        let bytes = origin_then_varint(1 << 60);
+        assert_eq!(decode_hashkv(&bytes).err(), Some(DecodeError::UnexpectedEof));
+    }
+
+    #[test]
+    fn remove_span_bounds_checked_before_walk() {
+        // origin ‖ num_ids=0 ‖ num_blocks=1 ‖ BLK_REMOVE_FWD ‖ deps=0 ‖
+        // target_run=0 ‖ start=0 ‖ end=usize::MAX — no run exists at all.
+        let mut b = vec![0u8; 32];
+        for v in [0, 1] {
+            encode_varint(v, &mut b);
+        }
+        b.push(BLK_REMOVE_FWD);
+        for v in [0, 0, 0, usize::MAX] {
+            encode_varint(v, &mut b);
+        }
+        assert_eq!(decode_hashseq(&b).err(), Some(DecodeError::InvalidIdIndex(0)));
+
+        // With a real one-element run, a span ending at the run length is
+        // still out of range; a proper span decodes.
+        let mut seq = HashSeq::new(test_id(7));
+        seq.insert(0, 'a');
+        let mut b = encode_hashseq(&seq);
+        // Splice a second block: bump num_blocks and append the remove span.
+        let num_blocks_pos = 32 + 1; // origin ‖ num_ids=0 ‖ num_blocks
+        assert_eq!(b[num_blocks_pos], 1);
+        b[num_blocks_pos] = 2;
+        let orphans = b.pop(); // trailing orphan count
+        assert_eq!(orphans, Some(0));
+        let mut bad = b.clone();
+        bad.push(BLK_REMOVE_FWD);
+        for v in [0, 0, 0, 1] {
+            encode_varint(v, &mut bad);
+        }
+        bad.push(0);
+        assert_eq!(decode_hashseq(&bad).err(), Some(DecodeError::InvalidIdIndex(0)));
+
+        let mut good = b;
+        good.push(BLK_REMOVE_FWD);
+        for v in [0, 0, 0, 0] {
+            encode_varint(v, &mut good);
+        }
+        good.push(0);
+        let decoded = decode_hashseq(&good).expect("in-range span decodes");
+        assert_eq!(decoded.iter().collect::<String>(), "");
     }
 
     #[test]

@@ -1259,19 +1259,21 @@ impl HashSeq {
     }
 
     /// Transitive overwrites of `m` within the register history (same-target
-    /// moves only — the definitional filter).
+    /// moves only — the definitional filter). The filter runs before an id
+    /// enters the set: `overwrites` is never validated at admission (foreign
+    /// ids are ignored, never errors), so a remote op may name an insert or
+    /// a move of another target, and those must not surface as candidate
+    /// deciders — `resolve_decider` indexes `move_nodes` by what comes back.
     fn move_ancestors(&self, m: NodeIdx, target: NodeIdx) -> FxHashSet<NodeIdx> {
         let mut seen: FxHashSet<NodeIdx> = FxHashSet::default();
         let mut stack: Vec<NodeIdx> = vec![m];
         while let Some(n) = stack.pop() {
             let Some(mv) = self.move_nodes.get(&n) else {
-                continue; // not a move op — filtered
+                continue;
             };
-            if mv.target != target {
-                continue; // another register — filtered
-            }
             for o in mv.overwrites.0.iter() {
-                if seen.insert(*o) {
+                let same_register = self.move_nodes.get(o).is_some_and(|m| m.target == target);
+                if same_register && seen.insert(*o) {
                     stack.push(*o);
                 }
             }
@@ -5063,6 +5065,60 @@ mod test {
         seq.apply(node);
         assert_eq!(seq.delivery.gated.len(), 1);
         let _ = b;
+    }
+
+    fn raw_move(target: Id, to: Anchor, overwrites: &[Id]) -> HashNode {
+        HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Move {
+                target,
+                to,
+                overwrites: overwrites.iter().copied().collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn foreign_overwrites_never_become_the_decider() {
+        // Two concurrent remote moves of `a` both "overwrite" `b`, an insert
+        // element. `b` is not a move op of `a`'s register, so it must not
+        // survive into the common-ancestor set — otherwise resolve_decider
+        // hands it to rerender, which indexes move_nodes by it and panics.
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+        let c = seq.id_at(2).unwrap();
+
+        seq.apply(raw_move(a, Anchor::After(c), &[b]));
+        seq.apply(raw_move(a, Anchor::Before(b), &[b]));
+        assert!(seq.placement_conflicted(&a));
+        // No genuine common ancestor: bottoms out at creation.
+        assert_eq!(seq.placement_of(&a), None);
+        assert_eq!(seq.iter().collect::<String>(), "abc");
+    }
+
+    #[test]
+    fn other_register_overwrites_never_become_the_decider() {
+        // Honest move of `b`, then two concurrent remote moves of `a` that
+        // both name `b`'s move op as overwritten. That op belongs to another
+        // register; treating it as `a`'s decider would re-place `b` on top
+        // of its existing destination fragment and corrupt the index.
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "abc".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+        let c = seq.id_at(2).unwrap();
+
+        let q = seq.move_element(b, Anchor::After(c)).id();
+        assert_eq!(seq.iter().collect::<String>(), "acb");
+
+        seq.apply(raw_move(a, Anchor::After(c), &[q]));
+        seq.apply(raw_move(a, Anchor::Before(c), &[q]));
+        assert!(seq.placement_conflicted(&a));
+        assert_eq!(seq.placement_of(&a), None);
+        assert_eq!(seq.placement_of(&b), Some(Anchor::After(c)));
+        assert_eq!(seq.iter().collect::<String>(), "acb");
     }
 
     #[test]
