@@ -39,6 +39,41 @@ function randOrigin() {
   return hex(b);
 }
 
+// ---- text offsets: CHARS, not UTF-16 code units ---------------------------
+//
+// The store indexes text by Unicode scalar value (an emoji is ONE slot);
+// DOM range points, `String#length` and `slice` count UTF-16 code units
+// (that emoji is TWO). Every offset kb.js keeps — carets, selections, diff
+// positions, mark ranges, widget starts — is a CHAR index in the store's
+// unit. UTF-16 leaks in at exactly two seams, and these helpers sit there:
+// DOM range points (offsetOfPoint / locateOffset) and JS string arithmetic
+// over DOM-extracted or store-returned strings.
+
+/// Char count of a string (`[...s].length` without the array).
+function cpLen(s) {
+  let n = 0;
+  for (const _ of s) n++;
+  return n;
+}
+/// UTF-16 offset → char index (a mid-surrogate offset rounds up).
+function cpIndex(str, utf16Idx) {
+  return cpLen(str.slice(0, utf16Idx));
+}
+/// Char index → UTF-16 offset (clamped to the string's end).
+function utf16Index(str, cpIdx) {
+  let i = 0;
+  let n = 0;
+  while (n < cpIdx && i < str.length) {
+    i += str.codePointAt(i) > 0xffff ? 2 : 1;
+    n++;
+  }
+  return i;
+}
+/// `str.slice` in char indices.
+function cpSlice(str, a, b) {
+  return str.slice(utf16Index(str, a), b == null ? undefined : utf16Index(str, b));
+}
+
 // ---- store boot ------------------------------------------------------------
 
 function loadStore() {
@@ -576,9 +611,9 @@ function pendingEmbedNode(idHex) {
 function repaintEmbedsOf(idHex) {
   for (const ed of blocksEl.querySelectorAll('.block-ed')) {
     const obj = ed.dataset.blockObj;
-    const t = web.text(obj);
-    for (let i = 0; i < t.length; i++) {
-      if (t[i] === ATOM && web.payloadAt(obj, i) === idHex) {
+    const chars = [...web.text(obj)]; // char-indexed, as payloadAt is
+    for (let i = 0; i < chars.length; i++) {
+      if (chars[i] === ATOM && web.payloadAt(obj, i) === idHex) {
         // The focused block is the common case — a table/image was just
         // inserted there and its placeholder must resolve in place — so
         // repaint it too, keeping the caret.
@@ -611,19 +646,21 @@ function handleSyncMessage(raw, replySnap) {
   const savedEdit = captureEditState();
   if (theirs[0] === TAG_DELTA) {
     let fresh = 0;
+    let failed = false;
     try {
       fresh = web.applyDelta(theirs);
     } catch (err) {
+      // A delta failing midway has still applied some nodes: draw them.
       console.warn('[kb] bad delta:', err);
+      failed = true;
     }
     // The relay echoes our own deltas back (and peers may replay). Nothing
     // new means nothing to draw — and a full render() here would re-append
     // the focused block, blurring it and closing the slash menu / link
     // picker mid-keystroke.
-    if (fresh === 0) return;
+    if (fresh === 0 && !failed) return;
     persistLocalSoon();
-    render();
-    restoreEditState(savedEdit);
+    remoteRender(savedEdit);
     return;
   }
   if (theirs[0] === TAG_ARTIFACT) {
@@ -633,19 +670,53 @@ function handleSyncMessage(raw, replySnap) {
     if (known) return; // our own push echoed back by the relay
     artifactFetchState.delete(id); // resolves locally from here on
     persistLocalSoon();
-    render(); // unresolved strings (titles, kinds) resolve
-    repaintEmbedsOf(id); // bytes change no span signature: explicit repaint
-    restoreEditState(savedEdit);
+    // render: unresolved strings (titles, kinds) resolve; then an explicit
+    // repaint — bytes change no span signature.
+    remoteRender(savedEdit, id);
     return;
   }
   // A snapshot: hello, reconnect resync, or a legacy peer.
-  web.mergeEncoded(theirs);
-  const mine = persistLocal();
+  let merged = true;
+  try {
+    web.mergeEncoded(theirs);
+  } catch (err) {
+    console.warn('[kb] bad snapshot:', err);
+    merged = false;
+  }
+  const mine = persistLocal(); // whatever landed before a failure, kept
   // Canonical bytes: equal op sets ⟺ identical snapshots. Re-send only
-  // while we know something they don't; equality ends the exchange.
-  if (!bytesEqual(mine, theirs)) replySnap(mine);
+  // while we know something they don't; equality ends the exchange. A
+  // frame we could not merge never converges — no reply, no ping-pong.
+  if (merged && !bytesEqual(mine, theirs)) replySnap(mine);
+  remoteRender(savedEdit);
+}
+
+// ---- remote renders vs. IME composition ------------------------------------
+//
+// A render mid-composition rebuilds the focused block and discards the
+// text the IME is still assembling. While a block composes, remote
+// renders are DEFERRED and replayed once on compositionend (after the
+// composed text is committed to the seq).
+let composing = false; // a block-ed composition is in flight
+let deferredRender = null; // { repaints: Set<idHex> } while composing
+
+function remoteRender(savedEdit, repaintId) {
+  if (composing) {
+    deferredRender ??= { repaints: new Set() };
+    if (repaintId) deferredRender.repaints.add(repaintId);
+    return;
+  }
   render();
+  if (repaintId) repaintEmbedsOf(repaintId);
   restoreEditState(savedEdit);
+}
+
+function flushDeferredRender() {
+  const d = deferredRender;
+  if (!d || composing) return;
+  deferredRender = null;
+  remoteRender(captureEditState());
+  for (const id of d.repaints) repaintEmbedsOf(id);
 }
 
 channel.onmessage = (e) => handleSyncMessage(e.data, (mine) => channel.postMessage(mine));
@@ -746,7 +817,7 @@ const viewMode = 'edit'; // WYSIWYG is the only mode now
 let renderTargetObj = null; // the seq renderBody is currently rendering
 let focusedBlockObj = null; // last-focused block (toolbar target)
 let exposedRegion = null; // {blockObj, kind:'math'|'eqblock', ord} — source shown for editing
-let treeDrag = null; // { pageObj, listObj, idx } — a sidebar drag in flight
+let treeDrag = null; // { pageObj, origin } — a sidebar drag in flight (slot resolved at drop)
 
 // ---- rendering: marks + light markup ----------------------------------------
 //
@@ -885,26 +956,30 @@ function chunkNodes(chars) {
 /// " \cdot ") and can slide the insertion point across a mark boundary.
 /// The caret says where the edit really happened — trust it when it
 /// checks out, fall back to the plain diff otherwise.
+/// `prev`/`next` are DOM strings; `caret` and the returned `p`/`n` are
+/// char indices — the diff runs over char arrays so an astral char (an
+/// emoji, a surrogate pair in UTF-16) is one slot, as it is in the seq.
 function applyDiffAt(obj, prev, next, caret) {
-  if (caret != null && next.length > prev.length) {
-    const n = next.length - prev.length;
+  const P = [...prev];
+  const N = [...next];
+  const same = (a, ai, b, bi, n) => {
+    for (let i = 0; i < n; i++) if (a[ai + i] !== b[bi + i]) return false;
+    return true;
+  };
+  if (caret != null && N.length > P.length) {
+    const n = N.length - P.length;
     const p = caret - n;
-    if (
-      p >= 0 &&
-      p <= prev.length &&
-      prev.slice(0, p) === next.slice(0, p) &&
-      prev.slice(p) === next.slice(p + n)
-    ) {
-      web.textInsert(obj, p, next.slice(p, p + n));
+    if (p >= 0 && p <= P.length && same(P, 0, N, 0, p) && same(P, p, N, p + n, P.length - p)) {
+      web.textInsert(obj, p, N.slice(p, p + n).join(''));
       return { kind: 'insert', p, n };
     }
-  } else if (caret != null && next.length < prev.length) {
-    const n = prev.length - next.length;
+  } else if (caret != null && N.length < P.length) {
+    const n = P.length - N.length;
     if (
       caret >= 0 &&
-      caret + n <= prev.length &&
-      prev.slice(0, caret) === next.slice(0, caret) &&
-      prev.slice(caret + n) === next.slice(caret)
+      caret + n <= P.length &&
+      same(P, 0, N, 0, caret) &&
+      same(P, caret + n, N, caret, N.length - caret)
     ) {
       web.textRemove(obj, caret, n);
       return { kind: 'remove', p: caret, n };
@@ -929,7 +1004,7 @@ function reconcileMarkAffinity(ta, obj, p, n) {
   if (!ta.contains(node)) return;
   const f = flagsAt(obj, p); // seq truth for the inserted chars
   if (!f) return;
-  const len = ta.dataset.prev.length;
+  const len = cpLen(ta.dataset.prev);
   const spanExtent = (pred) => {
     let s = p;
     while (s > 0) {
@@ -998,19 +1073,21 @@ function reconcileMarkAffinity(ta, obj, p, n) {
   }
 }
 
-/// A single-span text diff applied as seq ops.
+/// A single-span text diff applied as seq ops (char-indexed, see applyDiffAt).
 function applyDiff(obj, prev, next) {
+  const P = [...prev];
+  const N = [...next];
   let start = 0;
-  const maxStart = Math.min(prev.length, next.length);
-  while (start < maxStart && prev[start] === next[start]) start++;
-  let endPrev = prev.length;
-  let endNext = next.length;
-  while (endPrev > start && endNext > start && prev[endPrev - 1] === next[endNext - 1]) {
+  const maxStart = Math.min(P.length, N.length);
+  while (start < maxStart && P[start] === N[start]) start++;
+  let endPrev = P.length;
+  let endNext = N.length;
+  while (endPrev > start && endNext > start && P[endPrev - 1] === N[endNext - 1]) {
     endPrev--;
     endNext--;
   }
   if (endPrev > start) web.textRemove(obj, start, endPrev - start);
-  if (endNext > start) web.textInsert(obj, start, next.slice(start, endNext));
+  if (endNext > start) web.textInsert(obj, start, N.slice(start, endNext).join(''));
 }
 
 function sniffImage(b) {
@@ -1288,6 +1365,12 @@ function renderBody(el, bodyObj) {
 // ---- rendering ---------------------------------------------------------------
 
 function render() {
+  // A rebuild mid-drag rebuilds the rows/leaves under the pointer; the
+  // drop that follows would act on stale state — cancel the drag instead.
+  treeDrag = null;
+  dragCol = null;
+  // A title typed for one page must never land on the page we switch to.
+  if (titlePending && titlePending.page !== current) flushTitle();
   placementMemo.clear();
   rebuildGraph();
   if (current && !pageMeta.has(current)) current = null;
@@ -1360,7 +1443,9 @@ function renderTree() {
 
       row.draggable = true;
       row.ondragstart = (e) => {
-        treeDrag = { pageObj: p, listObj: meta.listObj, idx: meta.idx, origin: meta.origin };
+        // No index: it is resolved by origin at drop time (a remote render
+        // in between may have moved the row).
+        treeDrag = { pageObj: p, origin: meta.origin };
         row.classList.add('dragging');
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', meta.title);
@@ -1384,9 +1469,14 @@ function renderTree() {
         if (!treeDrag) return;
         e.preventDefault();
         clearTreeMarks();
-        const src = treeDrag;
+        const drag = treeDrag;
         treeDrag = null;
-        if (src.pageObj === p) return;
+        if (drag.pageObj === p) return;
+        // Resolve the source's live list + slot from the current graph
+        // (the same way dropOnLeaf re-derives via childIndexOf).
+        const srcMeta = pageMeta.get(drag.pageObj);
+        if (!srcMeta || srcMeta.listObj == null || srcMeta.idx < 0) return;
+        const src = { pageObj: drag.pageObj, origin: drag.origin, listObj: srcMeta.listObj, idx: srcMeta.idx };
         // Dropping into your own subtree would orphan the subtree.
         for (let anc = p; anc && pageMeta.has(anc); anc = pageMeta.get(anc).parentObj) {
           if (anc === src.pageObj) return;
@@ -1564,7 +1654,7 @@ function offsetOfPoint(blockEl, container, offset) {
   r.setEnd(container, offset);
   const div = document.createElement('div');
   div.appendChild(r.cloneContents());
-  return extractText(div).length;
+  return cpLen(extractText(div)); // char index (the DOM point is UTF-16)
 }
 
 function caretOffsetIn(blockEl) {
@@ -1588,35 +1678,41 @@ function selectionOffsetsIn(blockEl) {
   ];
 }
 
-/// Locate text offset `target` as a (node, offset) DOM point. With
-/// `preferAfter`, a target at the exact end of a text node resolves past
-/// it — placing the caret OUTSIDE any styled wrapper ending there (the
-/// affinity decides whether the next keystroke joins the span).
+/// Locate char offset `target` as a (node, offset) DOM point — the DOM
+/// offset is in UTF-16 units. With `preferAfter`, a target at the exact
+/// end of a text node resolves past it — placing the caret OUTSIDE any
+/// styled wrapper ending there (the affinity decides whether the next
+/// keystroke joins the span).
 function locateOffset(blockEl, target, preferAfter = false) {
   let remaining = target;
   const visit = (node) => {
     for (const child of node.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
-        const clean = child.data.replaceAll(FILLER, '').length;
+        const clean = cpLen(child.data.replaceAll(FILLER, ''));
         if (remaining < clean || (!preferAfter && remaining === clean)) {
-          // Map the cleaned offset to a raw one, stepping past fillers —
-          // landing AFTER a filler keeps the caret off element boundaries
-          // (Chrome normalizes boundary inserts into the previous span).
+          // Map the cleaned char offset to a raw UTF-16 one, stepping past
+          // fillers — landing AFTER a filler keeps the caret off element
+          // boundaries (Chrome normalizes boundary inserts into the
+          // previous span).
           let raw = 0;
           let seen = 0;
           while (
             raw < child.data.length &&
             (seen < remaining || child.data[raw] === FILLER)
           ) {
-            if (child.data[raw] !== FILLER) seen++;
-            raw++;
+            if (child.data[raw] === FILLER) {
+              raw++;
+              continue;
+            }
+            raw += child.data.codePointAt(raw) > 0xffff ? 2 : 1;
+            seen++;
           }
           return { node: child, offset: raw };
         }
         remaining -= clean;
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         if (child.dataset && child.dataset.text != null) {
-          const len = child.dataset.text.length;
+          const len = cpLen(child.dataset.text);
           if (remaining < len) return { node: child.parentNode, after: child };
           remaining -= len;
         } else if (child.tagName === 'BR') {
@@ -1681,7 +1777,7 @@ function regionExtent(blockObj, kind, ord) {
     }
     if (!inRegion && start !== null && n === ord) return [start, pos];
     if (!inRegion) start = null;
-    pos += sp.text.length;
+    pos += cpLen(sp.text);
   }
   return start !== null ? [start, pos] : null;
 }
@@ -1798,7 +1894,7 @@ function renderEditableInto(ed, blockObj) {
         w.dataset.start = start;
         w.dataset.kind = 'eqblock';
         w.dataset.ord = ord;
-        w.onclick = () => exposeRegion(ed, blockObj, 'eqblock', ord, start + tex.length);
+        w.onclick = () => exposeRegion(ed, blockObj, 'eqblock', ord, start + cpLen(tex));
         ed.appendChild(w);
       }
     } else {
@@ -1876,7 +1972,7 @@ function emitEditableChunks(ed, chars, blockObj, ords, isExposed) {
         w.dataset.start = start;
         w.dataset.kind = 'math';
         w.dataset.ord = ord;
-        w.onclick = () => exposeRegion(ed, blockObj, 'math', ord, start + src.length);
+        w.onclick = () => exposeRegion(ed, blockObj, 'math', ord, start + cpLen(src));
         ed.appendChild(w);
       }
       continue;
@@ -1925,7 +2021,7 @@ function rerenderBlock(ed, blockObj, caretOff, preferAfter = false) {
     ed.focus();
     setSelectionRangeIn(
       ed,
-      Math.min(caretOff, ed.dataset.prev.length),
+      Math.min(caretOff, cpLen(ed.dataset.prev)),
       undefined,
       preferAfter,
     );
@@ -2079,7 +2175,7 @@ function focusLeaf(origin, offset) {
   const ed = edOfOrigin(origin);
   if (!ed) return;
   ed.focus();
-  setSelectionRangeIn(ed, offset === 'end' ? extractText(ed).length : offset);
+  setSelectionRangeIn(ed, offset === 'end' ? cpLen(extractText(ed)) : offset);
 }
 
 function removeLeaf(origin) {
@@ -2128,10 +2224,11 @@ function rectAtOffset(ed, off) {
 /// line-heights (headings, code regions, image lines). caretRangeFromPoint
 /// is useless here: it snaps points over padding back to the nearest text.
 function caretOnEdgeLine(ta, dir) {
-  if (extractText(ta).length === 0) return true;
+  const n = cpLen(extractText(ta));
+  if (n === 0) return true;
   const c = caretClientRect(ta);
   if (!c) return false;
-  const edge = rectAtOffset(ta, dir === 'up' ? 0 : extractText(ta).length);
+  const edge = rectAtOffset(ta, dir === 'up' ? 0 : n);
   if (!edge || (!edge.height && !edge.top)) return true;
   const tol = Math.max(c.height, edge.height, 8) * 0.6;
   return dir === 'up' ? Math.abs(c.top - edge.top) < tol : Math.abs(c.bottom - edge.bottom) < tol;
@@ -2147,7 +2244,7 @@ function placeCaretNearX(ed, x, fromTop) {
   if (probe && ed.contains(probe.startContainer)) {
     setSelectionRangeIn(ed, offsetOfPoint(ed, probe.startContainer, probe.startOffset));
   } else {
-    setSelectionRangeIn(ed, fromTop ? 0 : extractText(ed).length);
+    setSelectionRangeIn(ed, fromTop ? 0 : cpLen(extractText(ed)));
   }
 }
 
@@ -2155,25 +2252,25 @@ function placeCaretNearX(ed, x, fromTop) {
 /// Returns the offset in dst where src's content begins (the join point).
 function mergeBlockInto(dstObj, srcObj) {
   const base = web.textLen(dstObj);
-  const txt = web.text(srcObj);
+  const chars = [...web.text(srcObj)]; // char-indexed, as the seq is
   let i = 0;
-  while (i < txt.length) {
-    if (txt[i] === ATOM) {
+  while (i < chars.length) {
+    if (chars[i] === ATOM) {
       const p = web.payloadAt(srcObj, i);
       if (p != null) web.seqInsertRef(dstObj, base + i, p);
       else web.textInsert(dstObj, base + i, ' ');
       i++;
     } else {
       let j = i;
-      while (j < txt.length && txt[j] !== ATOM) j++;
-      web.textInsert(dstObj, base + i, txt.slice(i, j));
+      while (j < chars.length && chars[j] !== ATOM) j++;
+      web.textInsert(dstObj, base + i, chars.slice(i, j).join(''));
       i = j;
     }
   }
   let off = 0;
   for (const sp of JSON.parse(web.markedSpans(srcObj))) {
     const s = off;
-    const e = off + sp.text.length;
+    const e = off + cpLen(sp.text);
     off = e;
     for (const m of sp.marks) {
       web.markRangeClosed(dstObj, base + s, base + e, m.kind, m.values[0] ?? '');
@@ -2325,13 +2422,14 @@ function makeColumn(obj, origin) {
       return;
     }
     // Enter: a new leaf after this one in its parent. A plain tail moves in.
-    const caret = caretOffsetIn(ta) ?? extractText(ta).length;
     const text = extractText(ta);
-    const tail = text.slice(caret);
+    const textLen = cpLen(text);
+    const caret = caretOffsetIn(ta) ?? textLen;
+    const tail = cpSlice(text, caret);
     const tailPlain =
       !tail.includes(ATOM) &&
       (() => {
-        for (let q = caret; q < text.length; q++) {
+        for (let q = caret; q < textLen; q++) {
           const f = flagsAt(obj, q);
           if (f && (f.code || f.math || f.codeblock !== null || f.eqblock || f.comments.length)) {
             return false;
@@ -2342,7 +2440,7 @@ function makeColumn(obj, origin) {
     const nb = makeLeafNode();
     const nbObj = web.createSeq(nb);
     if (tail && tailPlain) {
-      web.textRemove(obj, caret, text.length - caret);
+      web.textRemove(obj, caret, textLen - caret);
       web.textInsert(nbObj, 0, tail);
       // No refreshSig() here: the col's sig must stay stale so the render
       // below sees the mismatch and rebuilds this editor without its old
@@ -2372,7 +2470,7 @@ function makeColumn(obj, origin) {
     if (caret == null) return;
     for (const w of ta.querySelectorAll('.inline-widget.w-math, .inline-widget.w-eq')) {
       const start = Number(w.dataset.start);
-      const len = w.dataset.text.length;
+      const len = cpLen(w.dataset.text);
       if (e.key === 'ArrowRight' && caret === start) {
         e.preventDefault();
         exposeRegion(ta, obj, w.dataset.kind, Number(w.dataset.ord), start + 1);
@@ -2424,7 +2522,7 @@ function makeColumn(obj, origin) {
       e.key === 'ArrowRight' &&
       !e.shiftKey &&
       !e.ctrlKey &&
-      caretOffsetIn(ta) === extractText(ta).length
+      caretOffsetIn(ta) === cpLen(extractText(ta))
     ) {
       const { next } = leafNeighbors(col.dataset.origin);
       if (!next) return;
@@ -2494,7 +2592,7 @@ function makeColumn(obj, origin) {
     if (imgItem) {
       const file = imgItem.getAsFile();
       if (file) {
-        const at = caretOffsetIn(ta) ?? extractText(ta).length;
+        const at = caretOffsetIn(ta) ?? cpLen(extractText(ta));
         insertImageFile(file, ta, at);
         return;
       }
@@ -2502,11 +2600,10 @@ function makeColumn(obj, origin) {
     const clean = e.clipboardData.getData('text/plain').replaceAll(FILLER, '');
     document.execCommand('insertText', false, clean);
   });
-  ta.addEventListener('input', (e) => {
-    if (e.isComposing) return;
+  const onInput = (typed) => {
     commitBlockEdit();
     if (updateSlash(ta)) return;
-    const ruled = maybeInputRule(ta, obj, e.data);
+    const ruled = maybeInputRule(ta, obj, typed);
     if (ruled != null) {
       clearTimeout(normalizeTimer);
       rerenderBlock(ta, obj, ruled, true);
@@ -2518,6 +2615,22 @@ function makeColumn(obj, origin) {
         }
       }, 900);
     }
+  };
+  ta.addEventListener('input', (e) => {
+    if (e.isComposing) return; // committed on compositionend
+    onInput(e.data);
+  });
+  // IME: nothing rebuilds this block while a composition is assembling
+  // (remote renders are deferred, see remoteRender); the composed text is
+  // committed once, at the end, then any deferred render replays.
+  ta.addEventListener('compositionstart', () => {
+    composing = true;
+    clearTimeout(normalizeTimer);
+  });
+  ta.addEventListener('compositionend', () => {
+    composing = false;
+    onInput(null);
+    flushDeferredRender();
   });
   ta.addEventListener('drop', (e) => {
     if (dragCol) e.preventDefault();
@@ -2551,10 +2664,10 @@ function makeColumn(obj, origin) {
 /// span signature never changes when a row is added or a peer edits a
 /// cell, and the incremental renderer keeps the stale table.
 function embedSig(obj) {
-  const t = web.text(obj);
+  const chars = [...web.text(obj)]; // char-indexed, as payloadAt is
   let sig = '';
-  for (let i = 0; i < t.length; i++) {
-    if (t[i] !== ATOM) continue;
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i] !== ATOM) continue;
     const payload = web.payloadAt(obj, i);
     if (!payload) continue;
     const tableObj = WasmHashWeb.seqId(payload);
@@ -2747,7 +2860,7 @@ function restoreEditState(st) {
   if (!st) return;
   for (const ed of blocksEl.querySelectorAll('.block-ed')) {
     if (ed.dataset.blockObj !== st.obj) continue;
-    const len = extractText(ed).length;
+    const len = cpLen(extractText(ed));
     const back = (id, off) => {
       if (id == null) return 0;
       const p = web.seqPositionOf(st.obj, id);
@@ -2866,20 +2979,21 @@ function replaceThreadMessage(thread, idx, next) {
   let off = 0;
   let mi = 0;
   for (const line of text.split('\n')) {
+    const n = cpLen(line); // seq offsets are chars
     if (line !== '') {
       if (mi === idx) {
         if (next === line) return;
         if (next) {
-          if (line.length) web.textRemove(thread, off, line.length);
+          if (n) web.textRemove(thread, off, n);
           web.textInsert(thread, off, next);
         } else {
-          web.textRemove(thread, off, line.length + 1); // line + newline
+          web.textRemove(thread, off, n + 1); // line + newline
         }
         return;
       }
       mi++;
     }
-    off += line.length + 1;
+    off += n + 1;
   }
 }
 
@@ -3028,7 +3142,7 @@ function ensureBody() {
 function flagsAt(blockObj, pos) {
   let off = 0;
   for (const sp of styledSpans(blockObj)) {
-    off += sp.text.length;
+    off += cpLen(sp.text);
     if (pos < off) return sp;
   }
   return null;
@@ -3044,8 +3158,14 @@ function plainAt(blockObj, pos) {
 function maybeInputRule(ed, blockObj, typed) {
   if (typed !== '`' && typed !== '$' && typed !== ' ') return null;
   const text = ed.dataset.prev;
-  const caret = caretOffsetIn(ed);
-  if (caret == null || caret === 0) return null;
+  const caretCp = caretOffsetIn(ed);
+  if (caretCp == null || caretCp === 0) return null;
+  // The scanning below (lastIndexOf / slice) runs in UTF-16 units over
+  // `text`; every offset that reaches the store or comes back as a caret
+  // goes through C() — the delimiters themselves are BMP, so ±1/±2 steps
+  // around them are the same in both units.
+  const C = (u) => cpIndex(text, u);
+  const caret = utf16Index(text, caretCp);
   // '- ' / '* ' / 'N. ' at block start converts the block to a list
   // item (the typed prefix tombstones; empty items get the block-kind
   // seed space, same as code blocks).
@@ -3056,7 +3176,7 @@ function maybeInputRule(ed, blockObj, typed) {
     if (caret === 2 && (head === '- ' || head === '* ')) listKind = 'bullet';
     else if (/^\d{1,2}\. $/.test(head)) listKind = 'number';
     if (!listKind) return null;
-    web.textRemove(blockObj, 0, caret);
+    web.textRemove(blockObj, 0, caretCp);
     setListKind(ed.closest('.block-col')?.dataset.origin, listKind);
     return 0;
   }
@@ -3076,10 +3196,11 @@ function maybeInputRule(ed, blockObj, typed) {
           const co = os + line.length + 1; // content start (after fence newline)
           const ce = lineStart - 1; // the newline before the closing fence
           if (ce <= co) return null; // empty fence
-          web.markRangeClosed(blockObj, co, ce, 'codeblock', lang);
-          web.textRemove(blockObj, ce, caret - ce); // "\n```"
-          web.textRemove(blockObj, os, co - os); // "```lang\n"
-          return ce - (co - os);
+          const [osC, coC, ceC] = [C(os), C(co), C(ce)];
+          web.markRangeClosed(blockObj, coC, ceC, 'codeblock', lang);
+          web.textRemove(blockObj, ceC, caretCp - ceC); // "\n```"
+          web.textRemove(blockObj, osC, coC - osC); // "```lang\n"
+          return ceC - (coC - osC);
         }
         at = os - 1;
       }
@@ -3090,11 +3211,12 @@ function maybeInputRule(ed, blockObj, typed) {
     if (i === -1) return null;
     const content = text.slice(i + 1, p);
     if (!content || content.includes('\n') || content.includes(ATOM)) return null;
-    if (!plainAt(blockObj, i + 1) || !plainAt(blockObj, i)) return null;
-    web.markRangeClosed(blockObj, i + 1, p, 'code', 'on');
-    web.textRemove(blockObj, p, 1);
-    web.textRemove(blockObj, i, 1);
-    return p - 1;
+    const [iC, pC] = [C(i), C(p)];
+    if (!plainAt(blockObj, iC + 1) || !plainAt(blockObj, iC)) return null;
+    web.markRangeClosed(blockObj, iC + 1, pC, 'code', 'on');
+    web.textRemove(blockObj, pC, 1);
+    web.textRemove(blockObj, iC, 1);
+    return pC - 1;
   }
 
   // '$' rules.
@@ -3106,22 +3228,24 @@ function maybeInputRule(ed, blockObj, typed) {
     if (!content || content.includes('\n') || content.includes('$') || content.includes(ATOM)) {
       return null;
     }
-    if (!plainAt(blockObj, k + 2) || !plainAt(blockObj, k)) return null;
-    web.markRangeClosed(blockObj, k + 2, p - 1, 'eqblock', 'on');
-    web.textRemove(blockObj, p - 1, 2);
-    web.textRemove(blockObj, k, 2);
-    return p - 3;
+    const [kC, pC] = [C(k), C(p)];
+    if (!plainAt(blockObj, kC + 2) || !plainAt(blockObj, kC)) return null;
+    web.markRangeClosed(blockObj, kC + 2, pC - 1, 'eqblock', 'on');
+    web.textRemove(blockObj, pC - 1, 2);
+    web.textRemove(blockObj, kC, 2);
+    return pC - 3;
   }
   // $content$ → inline math.
   const i = text.lastIndexOf('$', p - 1);
   if (i === -1 || text[i - 1] === '$') return null;
   const content = text.slice(i + 1, p);
   if (!content || content.includes('\n') || content.includes(ATOM)) return null;
-  if (!plainAt(blockObj, i + 1) || !plainAt(blockObj, i)) return null;
-  web.markRangeClosed(blockObj, i + 1, p, 'math', 'on');
-  web.textRemove(blockObj, p, 1);
-  web.textRemove(blockObj, i, 1);
-  return p - 1;
+  const [iC, pC] = [C(i), C(p)];
+  if (!plainAt(blockObj, iC + 1) || !plainAt(blockObj, iC)) return null;
+  web.markRangeClosed(blockObj, iC + 1, pC, 'math', 'on');
+  web.textRemove(blockObj, pC, 1);
+  web.textRemove(blockObj, iC, 1);
+  return pC - 1;
 }
 
 /// Every block the current selection touches, with per-block offsets —
@@ -3162,13 +3286,24 @@ function focusedTA() {
   return null;
 }
 
+// Debounced title writes remember WHICH page was being titled: the timer
+// may fire after a switch to another page (render() flushes on switch).
 let titleTimer = null;
+let titlePending = null; // { page, value }
+function flushTitle() {
+  clearTimeout(titleTimer);
+  const pending = titlePending;
+  titlePending = null;
+  if (!pending) return;
+  web.putString(pending.page, 'title', pending.value || 'Untitled');
+  persistSoon();
+}
 titleEl.addEventListener('input', () => {
   if (!current) return;
+  titlePending = { page: current, value: titleEl.value };
   clearTimeout(titleTimer);
   titleTimer = setTimeout(() => {
-    web.putString(current, 'title', titleEl.value || 'Untitled');
-    persistSoon();
+    flushTitle();
     render();
   }, 350);
 });
@@ -3178,8 +3313,8 @@ titleEl.addEventListener('keydown', (e) => {
   if (!current || !currentBodyOrigin) return;
   if (e.key === 'Enter') {
     e.preventDefault();
-    clearTimeout(titleTimer);
-    web.putString(current, 'title', titleEl.value || 'Untitled');
+    titlePending = { page: current, value: titleEl.value };
+    flushTitle();
     const nb = makeLeafNode();
     insertChildAt(currentBodyOrigin, nb, 0);
     persistSoon();
@@ -3366,7 +3501,7 @@ imageFileEl.onchange = async () => {
     toast('Open a page first', true);
     return;
   }
-  const at = caretOffsetIn(ta) ?? extractText(ta).length;
+  const at = caretOffsetIn(ta) ?? cpLen(extractText(ta));
   await insertImageFile(file, ta, at);
 };
 
@@ -3528,7 +3663,7 @@ const slashMenu = document.getElementById('slash-menu');
 let slashState = null;
 
 function caretNow(ta) {
-  return caretOffsetIn(ta) ?? extractText(ta).length;
+  return caretOffsetIn(ta) ?? cpLen(extractText(ta));
 }
 
 function makeHeading(ta) {
@@ -3642,7 +3777,7 @@ function updateSlash(ta) {
     hideSlash();
     return false;
   }
-  const query = text.slice(slashState.slashAt + 1, caret);
+  const query = cpSlice(text, slashState.slashAt + 1, caret);
   if (query.includes(' ') || query.includes('\n')) {
     hideSlash();
     return false;
@@ -3660,7 +3795,7 @@ function runSlash(i) {
   const ta = st.ta;
   const obj = ta.dataset.blockObj;
   const cur = extractText(ta);
-  if (st.slashAt != null && cur.length >= st.slashAt) {
+  if (st.slashAt != null && cpLen(cur) >= st.slashAt) {
     const caret = caretNow(ta);
     if (caret > st.slashAt) {
       web.textRemove(obj, st.slashAt, caret - st.slashAt);

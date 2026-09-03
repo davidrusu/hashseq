@@ -24,21 +24,27 @@ function updateLen(peer, el) {
 let updatingA = false;
 let updatingB = false;
 
+// CodeMirror positions are UTF-16 code units; the peer indexes chars
+// (Unicode scalars — an emoji is one slot, not two).
+const cpLen = (s) => [...s].length;
+
 function makeUpdateListener(peer, lenEl, flagGetter, flagSetter) {
   return EditorView.updateListener.of((update) => {
     if (!update.docChanged || flagGetter()) return;
-    let offset = 0;
+    const before = update.startState.doc; // fromA/toA index this doc
+    let offset = 0; // char drift from earlier changes in this set
     update.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
-      const adjustedFrom = fromA + offset;
-      const removedLen = toA - fromA;
+      const adjustedFrom = cpLen(before.sliceString(0, fromA)) + offset;
+      const removedLen = cpLen(before.sliceString(fromA, toA));
       if (removedLen > 0) {
         peer.remove(adjustedFrom, removedLen);
       }
       const text = inserted.toString();
-      if (text.length > 0) {
+      const insertedLen = cpLen(text);
+      if (insertedLen > 0) {
         peer.insert(adjustedFrom, text);
       }
-      offset += text.length - removedLen;
+      offset += insertedLen - removedLen;
     });
     updateLen(peer, lenEl);
     statusEl.textContent = '';
@@ -93,7 +99,7 @@ document.getElementById('sync-btn').addEventListener('click', () => {
 
   // Cross-merge
   try {
-    peerA.merge_encoded(bytesB);
+    peerA.mergeEncoded(bytesB);
   } catch (e) {
     console.error('Peer A merge failed:', e);
     statusEl.textContent = `Merge into A failed: ${e}`;
@@ -101,7 +107,7 @@ document.getElementById('sync-btn').addEventListener('click', () => {
     return;
   }
   try {
-    peerB.merge_encoded(bytesA);
+    peerB.mergeEncoded(bytesA);
   } catch (e) {
     console.error('Peer B merge failed:', e);
     statusEl.textContent = `Merge into B failed: ${e}`;
@@ -122,7 +128,7 @@ document.getElementById('sync-btn').addEventListener('click', () => {
 
   statusEl.textContent =
     textA === textB
-      ? `Synced! Both peers agree on ${textA.length} characters.`
+      ? `Synced! Both peers agree on ${cpLen(textA)} characters.`
       : 'Warning: peers diverged (this should not happen with a CRDT).';
   statusEl.className = textA === textB ? 'status synced' : 'status';
 });
