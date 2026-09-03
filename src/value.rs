@@ -191,6 +191,11 @@ fn decode_zigzag(bytes: &[u8]) -> Option<(i64, usize)> {
         if shift >= 64 {
             return None;
         }
+        // The 10th byte carries the top bit only: anything more would be
+        // shifted out (`[0xFF×9, 0x7F]` must not alias `i64::MIN`).
+        if shift == 63 && b > 1 {
+            return None;
+        }
         z |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
             // minimal-form check: the last byte of a multibyte varint must be
@@ -351,5 +356,24 @@ mod tests {
         // 0x80 0x00 encodes 0 non-minimally.
         assert!(decode_zigzag(&[0x80, 0x00]).is_none());
         assert!(decode_zigzag(&[0x00]).is_some());
+    }
+
+    /// One Value, one artifact id: an overflowing 10th byte must not decode
+    /// to a value whose canonical bytes differ (two ids for `i64::MIN`).
+    #[test]
+    fn zigzag_rejects_overflowing_tenth_byte() {
+        let mut bytes = vec![VK_INT];
+        bytes.extend_from_slice(&[0xFF; 9]);
+        bytes.push(0x7F);
+        assert_eq!(Value::decode(&bytes), None);
+        // Eleven bytes: the continuation runs past 64 bits.
+        let mut long = vec![VK_INT];
+        long.extend_from_slice(&[0x80; 10]);
+        long.push(0x01);
+        assert_eq!(Value::decode(&long), None);
+        // The canonical form of i64::MIN is exactly 9×0xFF then 0x01.
+        let min = Value::Int(i64::MIN).encoded();
+        assert_eq!(&min[1..], &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        assert_eq!(Value::decode(&min), Some(Value::Int(i64::MIN)));
     }
 }

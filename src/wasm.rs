@@ -114,6 +114,12 @@ pub struct WasmRun {
 #[wasm_bindgen]
 impl WasmRun {
     /// Build an InsertAfter-rooted Run (first char lands immediately after `anchor`).
+    ///
+    /// `extraDeps` are the run's pins beyond the anchor. The anchor is a
+    /// ref already, so an entry naming it is dropped here: nodes are
+    /// stored normalized (`pins = refs ∖ named`) and a run built with the
+    /// anchor pinned would apply locally yet be rejected by every peer
+    /// (`RedundantDep`) — silent divergence.
     #[wasm_bindgen(js_name = newAfter)]
     pub fn new_after(
         anchor_hex: &str,
@@ -121,14 +127,16 @@ impl WasmRun {
         first: &str,
     ) -> Result<WasmRun, JsValue> {
         let anchor = hex_to_id(anchor_hex)?;
-        let deps = collect_deps(extra_deps)?;
+        let mut deps = collect_deps(extra_deps)?;
+        deps.remove(&anchor);
         Ok(WasmRun {
             inner: Run::new(anchor, deps, first_char(first)?),
         })
     }
 
     /// Build an InsertBefore-rooted Run (first char is constrained to land
-    /// immediately before `anchor`).
+    /// immediately before `anchor`). `extraDeps` as for `newAfter`: the
+    /// anchor is stripped if named.
     #[wasm_bindgen(js_name = newBefore)]
     pub fn new_before(
         anchor_hex: &str,
@@ -136,7 +144,8 @@ impl WasmRun {
         first: &str,
     ) -> Result<WasmRun, JsValue> {
         let anchor = hex_to_id(anchor_hex)?;
-        let deps = collect_deps(extra_deps)?;
+        let mut deps = collect_deps(extra_deps)?;
+        deps.remove(&anchor);
         Ok(WasmRun {
             inner: Run::new_before(anchor, deps, first_char(first)?),
         })
@@ -454,6 +463,33 @@ mod tests {
         a2.insert(0, "z");
         a.merge_encoded(&a2.encode()).unwrap();
         assert_eq!(a.text().len(), 2);
+    }
+
+    /// `newAfter`/`newBefore` strip the anchor from `extraDeps`: the run
+    /// stays normalized, so its encoded op is accepted by peers.
+    #[test]
+    fn run_builders_strip_the_anchor_from_extra_deps() {
+        let mut a = WasmHashSeq { inner: HashSeq::new(Id([0xcc; 32])) };
+        a.insert(0, "x");
+        let x = a.inner.id_at(0).unwrap();
+        let other = a.inner.origin();
+        let deps = vec![id_to_hex(&x), id_to_hex(&other)];
+        for run in [
+            WasmRun::new_after(&id_to_hex(&x), deps.clone(), "y").unwrap(),
+            WasmRun::new_before(&id_to_hex(&x), deps.clone(), "y").unwrap(),
+        ] {
+            assert_eq!(run.inner.first_extra_deps.len(), 1);
+            assert!(!run.inner.first_extra_deps.contains(&x));
+            // The op round-trips through the wire codec (a pinned anchor
+            // would be `RedundantPin` here).
+            let bytes = run.encode_op();
+            let (op, _) = decode_op(&bytes).expect("normalized run decodes");
+            let mut b = WasmHashSeq { inner: HashSeq::new(Id([0xcc; 32])) };
+            b.insert(0, "x");
+            assert!(matches!(op, EncodableOp::Run(_)));
+            b.inner.apply_op(op);
+            assert_eq!(b.text().len(), 2);
+        }
     }
 
     /// Marks built from visible positions bracket moved-in text.

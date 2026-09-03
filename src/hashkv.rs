@@ -53,10 +53,18 @@ pub struct HashKv {
     keys: IdMap<KeyState>,
     /// Value-artifact side store: artifact bytes by value id, for the ids
     /// this replica has seen bytes for. Reads without bytes are `pending`.
+    /// Standalone this is the whole store; inside a `HashWeb` it is the
+    /// per-object view of the store-wide one — the web mirrors in the
+    /// artifacts each delivered put names (`HashKv::hydrate`), and the
+    /// canonical snapshot carries the union.
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Authored-ops outbox (delta sync) — see `HashSeq::outbox`.
     pub(crate) outbox: Option<Vec<HashNode>>,
+    /// Small artifacts minted here since the last drain — the kv-level
+    /// half of `HashWeb::new_artifacts`; recorded only while the outbox
+    /// is attached, drained by `HashWeb::take_new_artifacts`.
+    pub(crate) new_artifacts: Vec<Id>,
     /// The containment register — where does this object live
     /// (PLACEMENT_SPEC.md). `Place` is valid in any object kind.
     pub(crate) placement: PlacementRegister,
@@ -86,6 +94,7 @@ impl HashKv {
             values: IdMap::default(),
             tips: BTreeSet::new(),
             outbox: None,
+            new_artifacts: Vec::new(),
             placement: PlacementRegister::default(),
             delivery: Delivery::default(),
         };
@@ -110,8 +119,44 @@ impl HashKv {
     /// Store a value artifact's bytes (resolves `pending` reads of its id).
     pub fn provide_value(&mut self, v: &Value) -> Id {
         let id = v.value_id();
-        self.values.entry(id).or_insert_with(|| v.encoded());
+        if let std::collections::hash_map::Entry::Vacant(e) = self.values.entry(id) {
+            let bytes = v.encoded();
+            if self.outbox.is_some() && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
+                self.new_artifacts.push(id);
+            }
+            e.insert(bytes);
+        }
         id
+    }
+
+    /// Mirror into this object's store the artifacts `node` names (a put's
+    /// key and value) that `store` holds — the web-side hydration that
+    /// keeps `get`/`resolve` on an object inside a `HashWeb` from missing
+    /// values the web holds. Bounded by what the node references.
+    pub(crate) fn hydrate(&mut self, node: &HashNode, store: &IdMap<Vec<u8>>) {
+        let Op::Put { key, value, .. } = &node.op else {
+            return;
+        };
+        for id in [key, value] {
+            if !self.values.contains_key(id)
+                && let Some(bytes) = store.get(id)
+            {
+                self.values.insert(*id, bytes.clone());
+            }
+        }
+    }
+
+    /// `hydrate` over every node this object holds (applied and parked).
+    pub(crate) fn hydrate_all(&mut self, store: &IdMap<Vec<u8>>) {
+        let nodes: Vec<HashNode> = self
+            .nodes
+            .values()
+            .cloned()
+            .chain(self.delivery.held().map(|(_, n)| n.clone()))
+            .collect();
+        for node in &nodes {
+            self.hydrate(node, store);
+        }
     }
 
     /// Resolve a value id to its artifact, if this replica holds the bytes.

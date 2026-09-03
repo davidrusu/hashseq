@@ -1005,7 +1005,7 @@ impl HashSeq {
         }
 
         let mut to_remove = BTreeSet::new();
-        for pos in idx..(idx + amount) {
+        for pos in idx..idx.saturating_add(amount) {
             if let Some(i) = self.element_at(pos) {
                 to_remove.insert(self.id_of(i));
             } else {
@@ -1951,8 +1951,10 @@ impl HashSeq {
     /// same-kind marks intersecting the range that this replica sees.
     /// Anchor-side choice encodes edge-expansion behavior (MARKS.md).
     /// `Err` = the gate refused it (an inverted span, e.g. anchors on
-    /// moved-in elements whose base slots cross): nothing applied, nothing
-    /// queued for peers; the built node is handed back.
+    /// moved-in elements whose base slots cross, or an anchor that is not
+    /// a glue point — an unknown id, a remove/mark/place op id): nothing
+    /// applied, nothing parked, nothing queued for peers; the built node
+    /// is handed back.
     pub fn mark_range(
         &mut self,
         start: Anchor,
@@ -1960,12 +1962,22 @@ impl HashSeq {
         kind: Id,
         value: Id,
     ) -> Result<HashNode, HashNode> {
+        let (Some(s), Some(e)) = (self.glue_point(&start), self.glue_point(&end)) else {
+            // Refused before authoring: `author` would park a node whose
+            // anchor is unknown as an orphan of our own making.
+            return Err(HashNode {
+                pins: BTreeSet::new(),
+                op: Op::Mark {
+                    start,
+                    end,
+                    kind_v: kind,
+                    value,
+                    overwrites: BTreeSet::new(),
+                },
+            });
+        };
         // Overwrites hygiene (open problem 1, simple form): name every
         // same-kind mark whose span intersects the new range.
-        let (s, e) = (
-            self.glue_point(&start).expect("anchor must be applied"),
-            self.glue_point(&end).expect("anchor must be applied"),
-        );
         for (n, _) in [s, e] {
             if let Loc::MoveOp = self.loc_of(n) {
                 self.ensure_op_fragment(n);
@@ -4820,6 +4832,39 @@ mod test {
         assert_eq!(kinds_at(&seq, 0), vec![bold()]);
         assert_eq!(kinds_at(&seq, 4), vec![bold()]);
         assert!(kinds_at(&seq, 5).is_empty());
+    }
+
+    /// A mark anchored on a non-glue id (unknown, or an op that is not an
+    /// element) is refused, not a panic — and leaves no trace: no orphan,
+    /// no tip change, nothing in the outbox.
+    #[test]
+    fn mark_range_on_non_glue_anchor_is_refused() {
+        let mut seq = HashSeq::default();
+        seq.outbox = Some(Vec::new());
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+        let b = seq.id_at(1).unwrap();
+        let rm = seq.remove_batch(1, 1).unwrap().id();
+        let tips = seq.tips().clone();
+        let mark_tips = seq.mark_tips().clone();
+        seq.outbox.as_mut().unwrap().clear();
+
+        let unknown = Id([0xEE; 32]);
+        assert!(seq.mark_range(Anchor::Before(a), Anchor::After(unknown), bold(), yes()).is_err());
+        assert!(seq.mark_range(Anchor::Before(unknown), Anchor::After(a), bold(), yes()).is_err());
+        // A remove op id is not a glue point either.
+        assert!(seq.mark_range(Anchor::Before(a), Anchor::After(rm), bold(), yes()).is_err());
+        assert!(seq.unmark_range(Anchor::Before(rm), Anchor::After(a), bold()).is_err());
+
+        assert_eq!(seq.orphans().count(), 0);
+        assert_eq!(seq.tips(), &tips);
+        assert_eq!(seq.mark_tips(), &mark_tips);
+        assert!(seq.outbox.as_ref().unwrap().is_empty());
+        // Still authors normally.
+        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes()).unwrap();
+        // remove_batch with a huge amount clamps instead of overflowing.
+        assert!(seq.remove_batch(0, usize::MAX).is_some());
+        assert_eq!(seq.iter().count(), 0);
     }
 
     /// Grow-at-edges is anchor choice, not a flag: `Before(next)` ends

@@ -37,8 +37,9 @@ pub struct HashWeb {
     /// Envelopes parked on object ids this store does not know yet;
     /// opening or adopting the object wakes them. Node-level parking
     /// lives inside each object's own delivery — the store keeps no
-    /// per-node state at all.
-    pub(crate) parked: FxHashMap<Id, Vec<(Id, HashNode)>>,
+    /// per-node state at all. Keyed by attacker-chosen object ids, so
+    /// std's SipHash, not Fx (the same reasoning as `Delivery::parked`).
+    pub(crate) parked: std::collections::HashMap<Id, Vec<(Id, HashNode)>>,
     /// Value-artifact side store shared across objects.
     pub(crate) values: IdMap<Vec<u8>>,
     /// Authored-ops outboxes enabled on every object (delta sync;
@@ -212,10 +213,17 @@ impl HashWeb {
     }
 
     /// Drain the ids of small artifacts minted since the last drain (see
-    /// `new_artifacts`). The caller pushes each as a 0xAF frame next to
-    /// the delta that references it.
+    /// `new_artifacts`) — store-wide mints plus every kv's own
+    /// (`kv_mut().put` mints through the object's store). The caller
+    /// pushes each as a 0xAF frame next to the delta that references it.
     pub fn take_new_artifacts(&mut self) -> Vec<Id> {
-        std::mem::take(&mut self.new_artifacts)
+        let mut out = std::mem::take(&mut self.new_artifacts);
+        for kv in self.kvs.values_mut() {
+            out.append(&mut kv.new_artifacts);
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     pub fn resolve(&self, value_id: &Id) -> Option<Value> {
@@ -242,9 +250,15 @@ impl HashWeb {
         if let Some(seq) = self.seqs.get_mut(&obj) {
             seq.apply_with_id(id, node);
         } else if let Some(kv) = self.kvs.get_mut(&obj) {
+            kv.hydrate(&node, &self.values);
             kv.apply_with_id(id, node);
         } else {
-            self.parked.entry(obj).or_default().push((id, node));
+            // Store-wide parking dedups by node id like the objects do:
+            // echoes, replays, and self-merges must not grow the list.
+            let envelopes = self.parked.entry(obj).or_default();
+            if !envelopes.iter().any(|(pid, _)| *pid == id) {
+                envelopes.push((id, node));
+            }
         }
     }
 
@@ -315,6 +329,14 @@ impl HashWeb {
         for (origin, m) in &other.kvs {
             for (vid, bytes) in m.value_store() {
                 self.values.entry(*vid).or_insert_with(|| bytes.clone());
+            }
+            // The object exists here now (adopted above): its own store
+            // unions like the store-wide one, so `HashKv::get` agrees with
+            // `HashKv::merge` on what it can resolve.
+            if let Some(mine) = self.kvs.get_mut(origin) {
+                for (vid, bytes) in m.value_store() {
+                    mine.values.entry(*vid).or_insert_with(|| bytes.clone());
+                }
             }
             for (id, node) in m.all_nodes() {
                 self.apply_to_with_id(*origin, id, node);
@@ -574,6 +596,79 @@ pub(crate) mod tests {
         assert_eq!(object_id(KIND_KV, &p1.id()), block);
     }
 
+    /// One store, one answer: a kv inside a web resolves through its own
+    /// `get` whatever the web holds for it — after a snapshot round-trip
+    /// (the artifact section is store-wide) and after a store merge (the
+    /// same union `HashKv::merge` performs), not only after local puts.
+    #[test]
+    fn kv_reads_agree_across_decode_and_merge() {
+        let mut doc = HashWeb::new();
+        let root = doc.create_kv(oid(9));
+        put(&mut doc, &root, s("color"), s("blue"));
+        // A value minted store-wide only (an artifact frame) and put by
+        // raw id: the authoring object never saw the bytes, so its own
+        // view stays pending here (`web.resolve` is the store-wide read);
+        // every replica that decodes or merges this store hydrates it.
+        let vid = doc.provide_value(&s("green"));
+        let key_id = doc.provide_value(&s("shade"));
+        doc.kv_mut(&root).unwrap().put_ids(key_id, vid);
+        assert_eq!(doc.kv(&root).unwrap().get(&s("shade")), None);
+        assert_eq!(doc.resolve(&vid), Some(s("green")));
+
+        let bytes = crate::encoding::encode_hashweb(&doc);
+        let decoded = crate::encoding::decode_hashweb(&bytes).expect("decodes");
+        let kv = decoded.kv(&root).unwrap();
+        assert_eq!(kv.get(&s("color")), Some(s("blue")));
+        assert_eq!(kv.get(&s("shade")), Some(s("green")));
+
+        let mut fresh = HashWeb::new();
+        fresh.merge(doc.clone());
+        let kv = fresh.kv(&root).unwrap();
+        assert_eq!(kv.get(&s("color")), Some(s("blue")));
+        assert_eq!(kv.get(&s("shade")), Some(s("green")));
+
+        // Delivery order: the op first, parked on an unknown object, the
+        // object opened later — hydration happens at delivery.
+        let nodes = doc.kv(&root).unwrap().all_nodes();
+        let mut late = HashWeb::new();
+        for (vid, b) in &doc.values {
+            late.values.insert(*vid, b.clone());
+        }
+        for (id, node) in &nodes {
+            late.apply_to_with_id(root, *id, node.clone());
+        }
+        late.create_kv(oid(9));
+        assert_eq!(late.kv(&root).unwrap().get(&s("color")), Some(s("blue")));
+    }
+
+    /// `kv_mut().put` inside a web mints artifacts that ship: they surface
+    /// in `take_new_artifacts` like store-wide mints, once each.
+    #[test]
+    fn kv_put_inside_web_ships_its_artifacts() {
+        let mut web = HashWeb::new();
+        let root = web.create_kv(oid(9));
+        web.enable_outbox();
+        web.kv_mut(&root).unwrap().put(s("title"), s("Hello"));
+        let mut minted = web.take_new_artifacts();
+        minted.sort();
+        let mut want = vec![s("title").value_id(), s("Hello").value_id()];
+        want.sort();
+        assert_eq!(minted, want);
+        assert!(web.take_new_artifacts().is_empty(), "drained");
+
+        // Minted store-wide and then again through the object: one id.
+        put(&mut web, &root, s("k"), s("v"));
+        let minted = web.take_new_artifacts();
+        assert_eq!(minted.len(), 2);
+        assert!(minted.contains(&s("k").value_id()));
+
+        // Off without an outbox (servers/tests don't flush).
+        let mut quiet = HashWeb::new();
+        let r = quiet.create_kv(oid(8));
+        quiet.kv_mut(&r).unwrap().put(s("a"), s("b"));
+        assert!(quiet.take_new_artifacts().is_empty());
+    }
+
     #[test]
     fn per_object_frontiers_stay_lean() {
         // Editing one object never enters another's tips (per-object tips).
@@ -639,6 +734,38 @@ pub(crate) mod tests {
         assert_eq!(fresh.create_seq(p.id()), child);
         assert_eq!(fresh.orphans().count(), 0);
         assert_eq!(read_text(&fresh, &child), "x");
+    }
+
+    /// Store-parked envelopes dedup by node id: a re-delivery, an echo, or
+    /// a self-merge leaves the parked list (and the canonical bytes)
+    /// unchanged — merge is idempotent for never-opened objects too.
+    #[test]
+    fn store_parked_envelopes_dedup_on_redelivery() {
+        let mut a = HashWeb::new();
+        let child = a.create_seq(oid(5));
+        type_text(&mut a, &child, 0, "xy");
+        let child_nodes = a.seq(&child).unwrap().all_nodes();
+
+        let mut fresh = HashWeb::new();
+        for (id, node) in &child_nodes {
+            fresh.apply_to_with_id(child, *id, node.clone());
+        }
+        let n = child_nodes.len();
+        assert_eq!(fresh.orphans().count(), n);
+        for (id, node) in &child_nodes {
+            fresh.apply_to_with_id(child, *id, node.clone());
+        }
+        assert_eq!(fresh.orphans().count(), n, "re-delivery is a no-op");
+        assert!(fresh.knows(child, &child_nodes[0].0));
+
+        let bytes = crate::encoding::encode_hashweb(&fresh);
+        fresh.merge(fresh.clone());
+        assert_eq!(fresh.orphans().count(), n, "self-merge is a no-op");
+        assert_eq!(crate::encoding::encode_hashweb(&fresh), bytes);
+
+        fresh.create_seq(oid(5));
+        assert_eq!(fresh.orphans().count(), 0);
+        assert_eq!(read_text(&fresh, &child), "xy");
     }
 
     #[test]

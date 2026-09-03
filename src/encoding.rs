@@ -19,6 +19,9 @@ pub enum DecodeError {
     /// A node's pins repeat an id one of its roles already names; nodes are
     /// stored normalized (`pins = refs ∖ named`) and the wire form must be.
     RedundantPin,
+    /// A node with no refs at all (GRAMMAR_SPEC Part A: `ref_count = 0` is
+    /// malformed) — it would anchor nowhere yet apply as a permanent tip.
+    NoRefs,
     /// A run block's interior-deps offset addresses no element after the
     /// first.
     InvalidDepOffset(usize),
@@ -47,6 +50,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::EmptyRun => write!(f, "run string cannot be empty"),
             DecodeError::InvalidIdIndex(idx) => write!(f, "invalid ID index: {}", idx),
             DecodeError::RedundantPin => write!(f, "pins repeat an id the op names"),
+            DecodeError::NoRefs => write!(f, "node has no refs"),
             DecodeError::InvalidDepOffset(off) => {
                 write!(f, "interior deps offset {} is outside the run", off)
             }
@@ -105,13 +109,19 @@ impl<'a> Cursor<'a> {
 
 /// Wire nodes must arrive in the stored form (`pins = refs ∖ named`): a
 /// pin that repeats a named id would hash to the same id yet re-encode to
-/// different bytes, so it is rejected rather than silently accepted.
-fn reject_redundant_pins(node: &HashNode) -> Result<(), DecodeError> {
-    if node.is_normalized() {
-        Ok(())
-    } else {
-        Err(DecodeError::RedundantPin)
+/// different bytes, so it is rejected rather than silently accepted. And
+/// every node commits to at least one ref (GRAMMAR_SPEC Part A): a
+/// ref-less node (an empty Remove, a Put/Place with no pins and nothing
+/// overwritten) would apply as a permanent tip and re-encode byte-identical,
+/// shipping to every peer. Run blocks are immune (their anchor is a ref).
+fn validate_node(node: &HashNode) -> Result<(), DecodeError> {
+    if !node.is_normalized() {
+        return Err(DecodeError::RedundantPin);
     }
+    if node.iter_refs().next().is_none() {
+        return Err(DecodeError::NoRefs);
+    }
+    Ok(())
 }
 
 // Reference-position codecs: the standalone node form writes refs as raw ids,
@@ -147,8 +157,13 @@ pub fn encode_varint(mut value: usize, buf: &mut Vec<u8>) {
     }
 }
 
+/// Minimal LEB128 only (GRAMMAR_SPEC canonicality meta-rules): every
+/// value has exactly one accepted byte string — no `80 00` for 0, and the
+/// 10th byte carries the top bit only (`[0x80×9, 0x7F]` is rejected, not
+/// truncated to `1<<63`). Accumulates in u64 so wasm32 sees the same
+/// verdicts; a value above `usize::MAX` is invalid there.
 pub fn decode_varint(bytes: &[u8]) -> Result<(usize, usize), DecodeError> {
-    let mut result: usize = 0;
+    let mut result: u64 = 0;
     let mut shift = 0;
     let mut pos = 0;
 
@@ -159,8 +174,15 @@ pub fn decode_varint(bytes: &[u8]) -> Result<(usize, usize), DecodeError> {
         let byte = bytes[pos];
         pos += 1;
 
-        result |= ((byte & 0x7F) as usize) << shift;
+        if shift == 63 && byte > 1 {
+            return Err(DecodeError::InvalidVarint);
+        }
+        result |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
+            if pos > 1 && byte == 0 {
+                return Err(DecodeError::InvalidVarint);
+            }
+            let result = usize::try_from(result).map_err(|_| DecodeError::InvalidVarint)?;
             return Ok((result, pos));
         }
         shift += 7;
@@ -624,7 +646,7 @@ fn decode_node_with(
         other => return Err(DecodeError::InvalidOpTag(other)),
     };
     let node = HashNode { pins, op };
-    reject_redundant_pins(&node)?;
+    validate_node(&node)?;
     Ok(node)
 }
 
@@ -1723,7 +1745,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                         pins,
                         op: Op::Remove(BTreeSet::from_iter([removed_id])),
                     };
-                    reject_redundant_pins(&node)?;
+                    validate_node(&node)?;
                     let id = node.id();
                     prev_remove_id = Some(id);
                     exposed.push(id);
@@ -1738,7 +1760,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     pins,
                     op: Op::Remove(std::iter::once(target).collect()),
                 };
-                reject_redundant_pins(&node)?;
+                validate_node(&node)?;
                 let id = node.id();
                 ranks.removes.push(vec![id]);
                 seq.apply_with_id(id, node);
@@ -1780,7 +1802,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     pins,
                     op: Op::Remove(targets),
                 };
-                reject_redundant_pins(&node)?;
+                validate_node(&node)?;
                 let id = node.id();
                 ranks.removes.push(vec![id]);
                 seq.apply_with_id(id, node);
@@ -2002,7 +2024,7 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
             other => return Err(DecodeError::InvalidOpTag(other as u8)),
         };
         let node = HashNode { pins, op };
-        reject_redundant_pins(&node)?;
+        validate_node(&node)?;
         // Recomputed ids are the authoritative derivation.
         let id = node.id();
         emitted.push(id);
@@ -2178,7 +2200,10 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
         // origin — never read from the wire.
         match kind {
             OBJ_KV => {
-                let m = decode_hashkv_v(inner, tagged)?;
+                let mut m = decode_hashkv_v(inner, tagged)?;
+                // The artifact section is store-wide; the object's own
+                // store is its view of it (see `HashKv::hydrate`).
+                m.hydrate_all(&web.values);
                 web.kvs.insert(crate::value::object_id(OBJ_KV, &m.origin()), m);
             }
             OBJ_SEQ => {
@@ -2236,6 +2261,87 @@ mod tests {
     // ---- untrusted counts never size an allocation (see REVIEW_FINDINGS.md) ----
     // Sizes here are chosen so a regression fails fast (capacity overflow
     // panics immediately); mid-range sizes would instead fill all memory.
+
+    /// Minimal LEB128 only: one accepted byte string per value.
+    #[test]
+    fn varint_rejects_non_minimal_and_overflow() {
+        assert_eq!(decode_varint(&[0x00]).unwrap(), (0, 1));
+        assert_eq!(decode_varint(&[0x80, 0x00]).err(), Some(DecodeError::InvalidVarint));
+        assert_eq!(
+            decode_varint(&[0x81, 0x80, 0x00]).err(),
+            Some(DecodeError::InvalidVarint)
+        );
+        // 10th byte may carry the top bit only.
+        let mut b = vec![0x80u8; 9];
+        b.push(0x7F);
+        assert_eq!(decode_varint(&b).err(), Some(DecodeError::InvalidVarint));
+        let mut b = vec![0x80u8; 9];
+        b.push(0x02);
+        assert_eq!(decode_varint(&b).err(), Some(DecodeError::InvalidVarint));
+        let mut max = vec![0xFFu8; 9];
+        max.push(0x01);
+        if usize::BITS == 64 {
+            assert_eq!(decode_varint(&max).unwrap(), (usize::MAX, 10));
+        } else {
+            assert_eq!(decode_varint(&max).err(), Some(DecodeError::InvalidVarint));
+        }
+        // 11 bytes of continuation is past 64 bits.
+        let mut long = vec![0x80u8; 10];
+        long.push(0x01);
+        assert_eq!(decode_varint(&long).err(), Some(DecodeError::InvalidVarint));
+        // Every encoder output is minimal.
+        for v in [0usize, 1, 127, 128, 300, 1 << 20, 1 << 35, usize::MAX] {
+            let mut buf = Vec::new();
+            encode_varint(v, &mut buf);
+            assert_eq!(decode_varint(&buf).unwrap(), (v, buf.len()));
+        }
+    }
+
+    /// GRAMMAR_SPEC Part A: `ref_count = 0` is malformed. A ref-less node
+    /// would apply as a permanent tip and re-encode byte-identical, so it
+    /// is rejected at every decoder arm.
+    #[test]
+    fn zero_ref_nodes_are_rejected() {
+        // Standalone node: Remove with no pins and no targets.
+        assert_eq!(
+            decode_op(&[TAG_REMOVE, 0, 0]).err(),
+            Some(DecodeError::NoRefs)
+        );
+
+        // Seq snapshot: empty seq + block `05 00 00` (BLK_REMOVE_OTHER,
+        // pins=0, segments=0).
+        let mut b = encode_hashseq(&HashSeq::new(test_id(1)));
+        assert_eq!(b.len(), 35);
+        let num_blocks_pos = 32 + 1;
+        assert_eq!(b[num_blocks_pos], 0);
+        b[num_blocks_pos] = 1;
+        assert_eq!(b.pop(), Some(0)); // orphan count
+        b.extend_from_slice(&[BLK_REMOVE_OTHER, 0, 0]);
+        b.push(0);
+        assert_eq!(decode_hashseq(&b).err(), Some(DecodeError::NoRefs));
+        assert_eq!(decode_hashseq_strict(&b).err(), Some(DecodeError::NoRefs));
+
+        // Seq snapshot orphan section: a ref-less Remove parked there.
+        let mut b = encode_hashseq(&HashSeq::new(test_id(1)));
+        assert_eq!(b.pop(), Some(0));
+        b.extend_from_slice(&[1, TAG_REMOVE, 0, 0]);
+        assert_eq!(decode_hashseq(&b).err(), Some(DecodeError::NoRefs));
+
+        // Kv snapshot: a Put with no pins and nothing overwritten.
+        let mut b = test_id(2).0.to_vec();
+        b.extend_from_slice(&[1, 0, 0]); // n=1 ‖ tag=Put ‖ pins=0
+        b.extend_from_slice(&[3u8; 32]); // key
+        b.extend_from_slice(&[4u8; 32]); // value
+        b.extend_from_slice(&[0, 0, 0]); // overwrites=0 ‖ held=0 ‖ artifacts=0
+        assert_eq!(decode_hashkv(&b).err(), Some(DecodeError::NoRefs));
+
+        // Delivery through a web delta refuses it too.
+        let mut d = vec![DELTA_TAG, OBJ_SEQ];
+        d.extend_from_slice(&test_id(1).0);
+        d.extend_from_slice(&[1, 3, TAG_REMOVE, 0, 0]);
+        let mut web = HashWeb::new();
+        assert_eq!(apply_delta(&mut web, &d).err(), Some(DecodeError::NoRefs));
+    }
 
     fn origin_then_varint(v: usize) -> Vec<u8> {
         let mut b = vec![0u8; 32];
@@ -3056,6 +3162,43 @@ mod family_wire {
         assert_eq!(decoded.create_seq(p.id()), child);
         assert_eq!(decoded.orphans().count(), 0);
         assert_eq!(read_text(&decoded, &child), "x");
+    }
+
+    /// A snapshot whose trailing section repeats a parked envelope decodes
+    /// to ONE parked envelope (store-wide parking dedups by node id); the
+    /// doubled bytes are then non-canonical and strict rejects them.
+    #[test]
+    fn web_duplicated_parked_envelope_decodes_once() {
+        let mut a = HashWeb::new();
+        let child = a.create_seq(Id([5; 32]));
+        type_text(&mut a, &child, 0, "x");
+        let child_nodes = a.seq(&child).unwrap().all_nodes();
+        let mut fresh = HashWeb::new();
+        for (id, node) in &child_nodes {
+            fresh.apply_to_with_id(child, *id, node.clone());
+        }
+        let bytes = encode_hashweb(&fresh);
+
+        // The trailing section is `count ‖ (obj ‖ node)*`; rebuild it with
+        // the single envelope repeated.
+        let mut envelope = Vec::new();
+        encode_id(&child, &mut envelope);
+        encode_hash_node(&child_nodes[0].1, &mut envelope);
+        let head = bytes.len() - envelope.len() - 1;
+        assert_eq!(bytes[head], 1);
+        assert_eq!(&bytes[head + 1..], &envelope[..]);
+        let mut doubled = bytes[..head].to_vec();
+        doubled.push(2);
+        doubled.extend_from_slice(&envelope);
+        doubled.extend_from_slice(&envelope);
+
+        let decoded = decode_hashweb(&doubled).expect("transport decode");
+        assert_eq!(decoded.orphans().count(), 1);
+        assert_eq!(encode_hashweb(&decoded), bytes);
+        assert_eq!(
+            decode_hashweb_strict(&doubled).err(),
+            Some(DecodeError::NotCanonical)
+        );
     }
 
     #[test]
