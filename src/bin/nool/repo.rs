@@ -59,13 +59,20 @@ pub fn find_repo() -> Option<PathBuf> {
 
 pub fn init() -> Result<(), String> {
     if let Some(existing) = find_repo() {
-        return Err(format!("already inside a nool repo at {}", existing.display()));
+        return Err(format!(
+            "already inside a nool repo at {}",
+            existing.display()
+        ));
     }
     let root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     std::fs::create_dir_all(root.join(".nool")).map_err(|e| format!("creating .nool: {e}"))?;
     let mut web = HashWeb::new();
     let registry = web.create_kv(random_id()?);
-    let repo = Repo { root, web, registry };
+    let repo = Repo {
+        root,
+        web,
+        registry,
+    };
     // `root` first: a dir only counts as a repo once `store` exists.
     std::fs::write(repo.root.join(".nool/root"), hex::encode(registry.0))
         .map_err(|e| format!("writing .nool/root: {e}"))?;
@@ -115,9 +122,16 @@ impl Repo {
             .map_err(|e| format!("reading .nool/store: {e}"))?;
         let web = decode_hashweb(&bytes).map_err(|e| format!("decoding .nool/store: {e:?}"))?;
         if web.kv(&registry).is_none() {
-            return Err(format!("registry {} missing from store", short_id(&registry)));
+            return Err(format!(
+                "registry {} missing from store",
+                short_id(&registry)
+            ));
         }
-        Ok(Self { root, web, registry })
+        Ok(Self {
+            root,
+            web,
+            registry,
+        })
     }
 
     fn save(&self) -> Result<(), String> {
@@ -133,11 +147,18 @@ impl Repo {
     fn rel(&self, arg: &str) -> Result<String, String> {
         let cwd = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
         let full = cwd.join(arg);
-        let full = match (full.parent().and_then(|p| p.canonicalize().ok()), full.file_name()) {
+        let full = match (
+            full.parent().and_then(|p| p.canonicalize().ok()),
+            full.file_name(),
+        ) {
             (Some(parent), Some(name)) => parent.join(name),
-            _ => lexical_normalize(&full).ok_or_else(|| format!("{arg}: escapes the filesystem root"))?,
+            _ => lexical_normalize(&full)
+                .ok_or_else(|| format!("{arg}: escapes the filesystem root"))?,
         };
-        let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
         let parts: Vec<String> = full
             .strip_prefix(&root)
             .map_err(|_| format!("{arg}: outside the repo at {}", home_rel(&self.root)))?
@@ -392,7 +413,12 @@ impl Repo {
                 _ => still_missing.push(rel),
             }
         }
-        Ok(Stage { modified, moves, missing: still_missing, untracked })
+        Ok(Stage {
+            modified,
+            moves,
+            missing: still_missing,
+            untracked,
+        })
     }
 
     /// Working-tree scan for files not in the registry. Hidden files and
@@ -461,7 +487,11 @@ impl Repo {
                     }
                 }
             };
-            let flag = if t.conflicted { " [registry conflict — resolved deterministically]" } else { "" };
+            let flag = if t.conflicted {
+                " [registry conflict — resolved deterministically]"
+            } else {
+                ""
+            };
             println!("  {rel}: {state}{flag}");
         }
         for (from, to, _) in &stage.moves {
@@ -542,7 +572,10 @@ impl Repo {
                 continue;
             }
             self.write_working(&rel, &committed)?;
-            println!("{rel}: restored to last commit ({} chars)", committed.chars().count());
+            println!(
+                "{rel}: restored to last commit ({} chars)",
+                committed.chars().count()
+            );
         }
         Ok(())
     }
@@ -554,12 +587,18 @@ impl Repo {
             .unwrap_or(0);
         println!("repo:     {}", home_rel(&self.root));
         println!("registry: {}", hex::encode(self.registry.0));
-        println!("store:    {store_bytes} bytes, {} object(s)", self.web.object_count());
+        println!(
+            "store:    {store_bytes} bytes, {} object(s)",
+            self.web.object_count()
+        );
         println!("tracked:  {} file(s)", tracked.len());
         for (rel, t) in &tracked {
             let seq = self.web.seq(&t.obj);
             let (chars, tips) = seq.map(|s| (s.len(), s.tips().len())).unwrap_or((0, 0));
-            println!("  {rel}: {chars} chars, {tips} tip(s), doc {}", short_id(&t.obj));
+            println!(
+                "  {rel}: {chars} chars, {tips} tip(s), doc {}",
+                short_id(&t.obj)
+            );
         }
         Ok(())
     }
@@ -567,7 +606,9 @@ impl Repo {
     fn merge_cmd(&mut self, args: &[String]) -> Result<(), String> {
         let (args, force) = take_flag(args, "--force");
         let [other] = args.as_slice() else {
-            return Err(format!("usage: nool merge [--force] <other-repo-dir | store-file>\n\n{USAGE}"));
+            return Err(format!(
+                "usage: nool merge [--force] <other-repo-dir | store-file>\n\n{USAGE}"
+            ));
         };
         self.require_clean()?;
         let theirs = self.load_other(Path::new(other))?;
@@ -598,7 +639,9 @@ impl Repo {
                 out,
             ),
             _ => {
-                return Err(format!("usage: nool delta <receiver> [<source>] <out>\n\n{USAGE}"));
+                return Err(format!(
+                    "usage: nool delta <receiver> [<source>] <out>\n\n{USAGE}"
+                ));
             }
         };
         let source = source.as_ref().unwrap_or(&self.web);
@@ -629,7 +672,9 @@ impl Repo {
     fn apply_cmd(&mut self, args: &[String]) -> Result<(), String> {
         let (args, force) = take_flag(args, "--force");
         let [path] = args.as_slice() else {
-            return Err(format!("usage: nool apply [--force] <delta-file>\n\n{USAGE}"));
+            return Err(format!(
+                "usage: nool apply [--force] <delta-file>\n\n{USAGE}"
+            ));
         };
         self.require_clean()?;
         let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
@@ -670,7 +715,9 @@ impl Repo {
         }
         self.save()?;
         let (changed, deleted) = self.sync_or_hint(&before)?;
-        println!("applied {path}: {delivered} new op(s), {changed} file(s) changed, {deleted} deleted");
+        println!(
+            "applied {path}: {delivered} new op(s), {changed} file(s) changed, {deleted} deleted"
+        );
         Ok(())
     }
 
@@ -731,7 +778,10 @@ impl Repo {
     /// After the store changed underneath a clean tree (merge, apply):
     /// delete unregistered files, write changed/new realizations, and note
     /// fresh registry conflicts. Returns (files changed, files deleted).
-    fn sync_working_tree(&self, before: &BTreeMap<String, Tracked>) -> Result<(usize, usize), String> {
+    fn sync_working_tree(
+        &self,
+        before: &BTreeMap<String, Tracked>,
+    ) -> Result<(usize, usize), String> {
         let after = self.tracked();
         let mut deleted = 0;
         for rel in before.keys() {
@@ -751,11 +801,16 @@ impl Repo {
             let disk = self.read_disk(rel)?;
             if disk.as_deref() != Some(content.as_str()) {
                 self.write_working(rel, &content)?;
-                println!("{rel}: {}", if disk.is_some() { "updated" } else { "created" });
+                println!(
+                    "{rel}: {}",
+                    if disk.is_some() { "updated" } else { "created" }
+                );
                 changed += 1;
             }
             if t.conflicted && !before.get(rel).is_some_and(|b| b.conflicted) {
-                println!("{rel}: concurrent registry conflict (track or move on both sides) — resolved the same way on every replica; nothing is lost from the store");
+                println!(
+                    "{rel}: concurrent registry conflict (track or move on both sides) — resolved the same way on every replica; nothing is lost from the store"
+                );
             }
         }
         Ok((changed, deleted))
@@ -787,7 +842,8 @@ impl Repo {
     fn write_working(&self, rel: &str, content: &str) -> Result<(), String> {
         let abs = self.abs(rel);
         if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
         std::fs::write(&abs, content).map_err(|e| format!("writing {rel}: {e}"))
     }
@@ -808,7 +864,8 @@ fn home_rel(path: &Path) -> String {
 /// exactly one kv per repo (the registry), so clones share it and independent
 /// inits never do.
 fn share_registry(a: &HashWeb, b: &HashWeb) -> bool {
-    a.objects().any(|obj| a.kv(obj).is_some() && b.kv(obj).is_some())
+    a.objects()
+        .any(|obj| a.kv(obj).is_some() && b.kv(obj).is_some())
 }
 
 /// A store operand: a repo directory (its `.nool/store`) or a bare store file.
@@ -818,14 +875,13 @@ fn read_store(path: &Path) -> Result<HashWeb, String> {
     } else {
         path.to_path_buf()
     };
-    let bytes =
-        std::fs::read(&store).map_err(|e| format!("reading {}: {e}", store.display()))?;
+    let bytes = std::fs::read(&store).map_err(|e| format!("reading {}: {e}", store.display()))?;
     decode_hashweb(&bytes).map_err(|e| format!("decoding {}: {e:?}", store.display()))
 }
 
 fn read_registry_id(path: &Path) -> Result<Id, String> {
-    let hex_str = std::fs::read_to_string(path)
-        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let hex_str =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("{}: {e}", path.display()))?;
     let bytes: [u8; 32] = bytes
         .try_into()
@@ -895,7 +951,10 @@ fn tracked_files(web: &HashWeb, registry: &Id) -> BTreeMap<String, (Id, bool)> {
 ///
 /// Returns (tracked, unsafe keys skipped): a live entry whose key fails
 /// `safe_key` is never tracked, so it can't become a path outside the repo.
-fn tracked_files_checked(web: &HashWeb, registry: &Id) -> (BTreeMap<String, (Id, bool)>, Vec<String>) {
+fn tracked_files_checked(
+    web: &HashWeb,
+    registry: &Id,
+) -> (BTreeMap<String, (Id, bool)>, Vec<String>) {
     let mut out = BTreeMap::new();
     let mut skipped = Vec::new();
     let Some(kv) = web.kv(registry) else {
@@ -904,7 +963,9 @@ fn tracked_files_checked(web: &HashWeb, registry: &Id) -> (BTreeMap<String, (Id,
     let resolve = |vid: &Id| kv.resolve(vid).or_else(|| web.resolve(vid));
     let key_ids: Vec<Id> = kv.keys().copied().collect();
     for key_id in key_ids {
-        let Some(Value::String(path)) = resolve(&key_id) else { continue };
+        let Some(Value::String(path)) = resolve(&key_id) else {
+            continue;
+        };
         let vids = match kv.read_id(&key_id) {
             Read::Absent => continue,
             Read::One(vid) => vec![vid],
@@ -915,7 +976,9 @@ fn tracked_files_checked(web: &HashWeb, registry: &Id) -> (BTreeMap<String, (Id,
         let puts: Vec<Id> = kv.heads(&key_id).to_vec();
         let mut live: Vec<(Id, Id, bool)> = Vec::new(); // (value id, obj, placement conflict)
         for (put_id, vid) in puts.iter().zip(&vids) {
-            let Some(obj) = resolve(vid).and_then(as_obj_id) else { continue };
+            let Some(obj) = resolve(vid).and_then(as_obj_id) else {
+                continue;
+            };
             match web.seq(&obj).map(|s| s.placement()) {
                 Some(reg) if !reg.is_empty() => {
                     let home = reg.entry(&reg.heads()[0]).map(|e| e.placed_at);
@@ -996,7 +1059,9 @@ mod tests {
         let obj = tracked_files(&a, &registry)["readme.md"].0;
         a.seq_mut(&obj).unwrap().insert_batch(6, "world\n".chars());
         track(&mut b, &registry, "notes.md", "note\n", Id([3u8; 32]));
-        b.kv_mut(&registry).unwrap().del(Value::String("readme.md".into()));
+        b.kv_mut(&registry)
+            .unwrap()
+            .del(Value::String("readme.md".into()));
 
         let mut ab = decode_hashweb(&encode_hashweb(&a)).unwrap();
         ab.merge(decode_hashweb(&encode_hashweb(&b)).unwrap());
@@ -1014,7 +1079,10 @@ mod tests {
         assert!(files_ab.contains_key("notes.md"));
         assert!(!files_ab.contains_key("readme.md"));
         // And the edited history is retained even though unregistered.
-        assert_eq!(ab.seq(&obj).unwrap().iter().collect::<String>(), "hello\nworld\n");
+        assert_eq!(
+            ab.seq(&obj).unwrap().iter().collect::<String>(),
+            "hello\nworld\n"
+        );
     }
 
     #[test]
@@ -1053,11 +1121,20 @@ mod tests {
 
         // b diverges: edits readme, tracks a new nested file.
         b.seq_mut(&obj).unwrap().insert_batch(6, "again\n".chars());
-        track(&mut b, &registry, "docs/new-notes.md", "an idea\n", Id([3u8; 32]));
+        track(
+            &mut b,
+            &registry,
+            "docs/new-notes.md",
+            "an idea\n",
+            Id([3u8; 32]),
+        );
 
         // Delta for receiver `a` from source `b`, through the file container.
         let (groups, artifacts) = crate::delta::diff(&a, &b);
-        assert!(!artifacts.is_empty(), "registry puts must ship their artifacts");
+        assert!(
+            !artifacts.is_empty(),
+            "registry puts must ship their artifacts"
+        );
         let file = crate::delta::encode_file(&groups, &artifacts);
 
         let mut via_delta = decode_hashweb(&encode_hashweb(&a)).unwrap();
@@ -1111,7 +1188,10 @@ mod tests {
             // the concurrent edit landed in the same history.
             assert_eq!(files.keys().collect::<Vec<_>>(), ["final.md"]);
             assert_eq!(files["final.md"].0, obj);
-            assert_eq!(web.seq(&obj).unwrap().iter().collect::<String>(), "more text\n");
+            assert_eq!(
+                web.seq(&obj).unwrap().iter().collect::<String>(),
+                "more text\n"
+            );
         }
     }
 

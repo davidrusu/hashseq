@@ -25,7 +25,11 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
-fn with_one_file(cmd: &str, args: &[String], f: fn(&str) -> Result<(), String>) -> Result<(), String> {
+fn with_one_file(
+    cmd: &str,
+    args: &[String],
+    f: fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
     match args {
         [file] => f(file).map_err(|e| format!("{cmd} {file}: {e}")),
         _ => Err(format!("`{cmd}` takes exactly one file\n\n{USAGE}")),
@@ -44,7 +48,9 @@ fn load_seq(sidecar: &str) -> Result<HashSeq, String> {
     let bytes = match std::fs::read(sidecar) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!("{sidecar} not found — is this file tracked? (nool track)"));
+            return Err(format!(
+                "{sidecar} not found — is this file tracked? (nool track)"
+            ));
         }
         Err(e) => return Err(format!("reading {sidecar}: {e}")),
     };
@@ -80,7 +86,11 @@ fn track(file: &str) -> Result<(), String> {
 }
 
 fn commit_many(files: &[String]) -> Result<(), String> {
-    let files = if files.is_empty() { tracked_in_cwd()? } else { files.to_vec() };
+    let files = if files.is_empty() {
+        tracked_in_cwd()?
+    } else {
+        files.to_vec()
+    };
     for file in &files {
         commit(file).map_err(|e| format!("commit {file}: {e}"))?;
     }
@@ -106,7 +116,11 @@ fn commit(file: &str) -> Result<(), String> {
 }
 
 fn status(files: &[String]) -> Result<(), String> {
-    let files = if files.is_empty() { tracked_in_cwd()? } else { files.to_vec() };
+    let files = if files.is_empty() {
+        tracked_in_cwd()?
+    } else {
+        files.to_vec()
+    };
     if files.is_empty() {
         println!("no tracked files here (nool track <file>)");
         return Ok(());
@@ -160,7 +174,11 @@ pub fn diff_cmd(args: &[String]) -> Result<(), String> {
             let (right, ro) = diff_side(b)?;
             (left, right, lo, ro)
         }
-        _ => return Err(format!("usage: nool diff <file> | nool diff <a> <b>\n\n{USAGE}")),
+        _ => {
+            return Err(format!(
+                "usage: nool diff <file> | nool diff <a> <b>\n\n{USAGE}"
+            ));
+        }
     };
     if let (Some(lo), Some(ro)) = (left_origin, right_origin)
         && lo != ro
@@ -194,7 +212,9 @@ fn merge_cmd(args: &[String]) -> Result<(), String> {
 
     let working: Vec<char> = read_working(file)?.chars().collect();
     if realize(&ours).chars().collect::<Vec<_>>() != working {
-        return Err(format!("{file} has uncommitted edits — run `nool commit {file}` first"));
+        return Err(format!(
+            "{file} has uncommitted edits — run `nool commit {file}` first"
+        ));
     }
 
     let theirs_bytes =
@@ -227,7 +247,9 @@ fn merge_cmd(args: &[String]) -> Result<(), String> {
 /// missing, written to a delta file it can apply to reach the union.
 fn delta_cmd(args: &[String]) -> Result<(), String> {
     let [recv, src, out] = args else {
-        return Err(format!("usage: nool delta <receiver.nool> <source.nool> <out>\n\n{USAGE}"));
+        return Err(format!(
+            "usage: nool delta <receiver.nool> <source.nool> <out>\n\n{USAGE}"
+        ));
     };
     let base = load_seq(recv)?;
     let have = load_seq(src)?;
@@ -255,7 +277,10 @@ fn delta_cmd(args: &[String]) -> Result<(), String> {
     if ops == 0 {
         println!("{out}: empty delta — {recv} already has everything");
     } else {
-        println!("{out}: {ops} op(s), {} bytes — apply with `nool apply <file> {out}`", bytes.len());
+        println!(
+            "{out}: {ops} op(s), {} bytes — apply with `nool apply <file> {out}`",
+            bytes.len()
+        );
     }
     Ok(())
 }
@@ -269,7 +294,9 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
     let sidecar = sidecar_path(file);
     let seq = load_seq(&sidecar)?;
     if realize(&seq) != read_working(file)? {
-        return Err(format!("{file} has uncommitted edits — run `nool commit {file}` first"));
+        return Err(format!(
+            "{file} has uncommitted edits — run `nool commit {file}` first"
+        ));
     }
     let bytes = std::fs::read(delta_path).map_err(|e| format!("reading {delta_path}: {e}"))?;
     let (artifacts, msg) = delta::parse_file(&bytes)?;
@@ -299,7 +326,8 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
     for artifact in artifacts {
         web.provide_artifact_bytes(artifact);
     }
-    let delivered = apply_delta(&mut web, msg).map_err(|e| format!("applying {delta_path}: {e:?}"))?;
+    let delivered =
+        apply_delta(&mut web, msg).map_err(|e| format!("applying {delta_path}: {e:?}"))?;
     if delivered == 0 {
         println!("{file}: nothing new — already converged");
         return Ok(());

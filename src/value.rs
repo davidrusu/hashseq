@@ -373,7 +373,10 @@ mod tests {
         assert_eq!(Value::decode(&long), None);
         // The canonical form of i64::MIN is exactly 9×0xFF then 0x01.
         let min = Value::Int(i64::MIN).encoded();
-        assert_eq!(&min[1..], &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        assert_eq!(
+            &min[1..],
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
+        );
         assert_eq!(Value::decode(&min), Some(Value::Int(i64::MIN)));
     }
 }

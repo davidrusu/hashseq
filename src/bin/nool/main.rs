@@ -98,7 +98,8 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = std::path::PathBuf::from(tmp);
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
     let written = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())

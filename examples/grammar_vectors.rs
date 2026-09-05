@@ -11,7 +11,10 @@ fn main() {
     println!("TOMBSTONE = {}", hex(&TOMBSTONE));
     println!("value_id('a') = {}", hex(&char_value_id('a')));
     let x = Id([0x11; 32]);
-    println!("object_id(seq, 0x11*32) = {}", hex(&object_id(KIND_SEQ, &x)));
+    println!(
+        "object_id(seq, 0x11*32) = {}",
+        hex(&object_id(KIND_SEQ, &x))
+    );
     println!("object_id(kv, 0x11*32)  = {}", hex(&object_id(KIND_KV, &x)));
 
     let origin = Id([0x00; 32]);

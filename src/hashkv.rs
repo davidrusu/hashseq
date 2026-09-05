@@ -12,8 +12,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::hashseq::IdMap;
+use crate::bitset::BitSet;
 use crate::delivery::Delivery;
+use crate::hashseq::IdMap;
 use crate::placement::PlacementRegister;
 use crate::value::{TOMBSTONE, Value};
 use crate::{HashNode, Id, Op};
@@ -59,11 +60,20 @@ pub struct HashKv {
     /// canonical snapshot carries the union.
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
-    /// Authored-ops outbox (delta sync) — see `HashSeq::outbox`.
-    pub(crate) outbox: Option<Vec<HashNode>>,
+    /// Applied node ids in apply order — the map's arena, append-only
+    /// (parked and gated nodes never enter). Its length is the delta-sync
+    /// watermark; see `HashSeq::authored`.
+    pub(crate) order: Vec<Id>,
+    /// Provenance parallel to `order`: set for nodes authored here
+    /// (`author`, `put_ids`, `place`), clear for received ones.
+    pub(crate) authored: BitSet,
+    /// Delta sync is on (`HashWeb::enable_outbox`): minted small artifacts
+    /// are tracked in `new_artifacts`. Deltas themselves are derived from
+    /// `order` + `authored` and need no switch.
+    pub(crate) delta_sync: bool,
     /// Small artifacts minted here since the last drain — the kv-level
-    /// half of `HashWeb::new_artifacts`; recorded only while the outbox
-    /// is attached, drained by `HashWeb::take_new_artifacts`.
+    /// half of `HashWeb::new_artifacts`; recorded only while delta sync
+    /// is on, drained by `HashWeb::take_new_artifacts`.
     pub(crate) new_artifacts: Vec<Id>,
     /// The containment register — where does this object live
     /// (PLACEMENT_SPEC.md). `Place` is valid in any object kind.
@@ -93,7 +103,9 @@ impl HashKv {
             keys: IdMap::default(),
             values: IdMap::default(),
             tips: BTreeSet::new(),
-            outbox: None,
+            order: Vec::new(),
+            authored: BitSet::default(),
+            delta_sync: false,
             new_artifacts: Vec::new(),
             placement: PlacementRegister::default(),
             delivery: Delivery::default(),
@@ -121,7 +133,7 @@ impl HashKv {
         let id = v.value_id();
         if let std::collections::hash_map::Entry::Vacant(e) = self.values.entry(id) {
             let bytes = v.encoded();
-            if self.outbox.is_some() && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
+            if self.delta_sync && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
                 self.new_artifacts.push(id);
             }
             e.insert(bytes);
@@ -183,8 +195,7 @@ impl HashKv {
             .map(|ks| ks.heads.iter().copied().collect())
             .unwrap_or_default();
         // pins = frontier ∖ named (normalized storage of refs = pins ∪ named)
-        let pins: BTreeSet<Id> =
-            BTreeSet::from_iter(self.tips.difference(&overwrites).cloned());
+        let pins: BTreeSet<Id> = BTreeSet::from_iter(self.tips.difference(&overwrites).cloned());
         HashNode {
             pins,
             op: Op::Put {
@@ -195,20 +206,27 @@ impl HashKv {
         }
     }
 
-    /// Record a locally-authored node (delta sync) — authoring paths only.
-    #[inline]
-    pub(crate) fn record_authored(&mut self, node: &HashNode) {
-        if let Some(ob) = &mut self.outbox {
-            ob.push(node.clone());
+    /// The local-authoring seam (see `HashSeq::author`): apply a node this
+    /// replica built and flag it as authored so delta sync ships it.
+    /// `apply` is the remote path and never sets the flag. Map ops built
+    /// here are always admitted; a node already present is returned as is
+    /// (authored earlier, or received — never an echo).
+    pub fn author(&mut self, node: HashNode) -> HashNode {
+        let id = node.id();
+        if self.contains_node(&id) {
+            return node;
         }
+        self.apply_with_id(id, node.clone());
+        if self.order.last() == Some(&id) {
+            self.authored.set(self.order.len() - 1);
+        }
+        node
     }
 
     /// `put` by raw ids (links, already-provided artifacts, tombstone).
     pub fn put_ids(&mut self, key: Id, value: Id) -> HashNode {
         let node = self.make_put(key, value);
-        self.record_authored(&node);
-        self.apply(node.clone());
-        node
+        self.author(node)
     }
 
     /// Delete a key: a put of the tombstone artifact.
@@ -221,7 +239,10 @@ impl HashKv {
 
     /// The live head set of `key` (put node ids, id-ordered).
     pub fn heads(&self, key: &Id) -> &[Id] {
-        self.keys.get(key).map(|k| k.heads.as_slice()).unwrap_or(&[])
+        self.keys
+            .get(key)
+            .map(|k| k.heads.as_slice())
+            .unwrap_or(&[])
     }
 
     /// MVR read: the value ids of the live heads.
@@ -292,10 +313,7 @@ impl HashKv {
     /// interpret it and wake its waiters. A gated node wakes nothing — its
     /// dependents stay parked (the quarantine cascade).
     fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
-        let missing = node
-            .iter_refs()
-            .find(|d| !self.contains_node(d))
-            .copied();
+        let missing = node.iter_refs().find(|d| !self.contains_node(d)).copied();
         if let Some(missing) = missing {
             self.delivery.park(missing, id, node);
             return;
@@ -324,7 +342,7 @@ impl HashKv {
             }
             self.tips.insert(id);
             self.placement.apply(id, *placed_at, overwrites.clone());
-            self.nodes.insert(id, node);
+            self.admit(id, node);
             return Ok(());
         }
 
@@ -354,8 +372,42 @@ impl HashKv {
         let pos = ks.heads.binary_search(&id).unwrap_or_else(|p| p);
         ks.heads.insert(pos, id);
 
-        self.nodes.insert(id, node);
+        self.admit(id, node);
         Ok(())
+    }
+
+    /// Store an admitted node: the register history plus the arena slot
+    /// (received provenance until `author` flags it).
+    fn admit(&mut self, id: Id, node: HashNode) {
+        self.nodes.insert(id, node);
+        self.order.push(id);
+        self.authored.push(false);
+    }
+
+    /// The arena length — the delta-sync watermark (see
+    /// `HashSeq::arena_len`).
+    pub fn arena_len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Every node applied since watermark `w`, in apply order (causally
+    /// safe: each node's refs precede it).
+    pub fn nodes_since(&self, w: usize) -> impl Iterator<Item = (Id, HashNode)> + '_ {
+        self.order[w.min(self.order.len())..]
+            .iter()
+            .map(|id| (*id, self.nodes[id].clone()))
+    }
+
+    /// The delta since watermark `w`: nodes authored here at or after `w`,
+    /// in apply order.
+    pub fn authored_since(&self, w: usize) -> Vec<(Id, HashNode)> {
+        (w..self.order.len())
+            .filter(|&i| self.authored.get(i))
+            .map(|i| {
+                let id = self.order[i];
+                (id, self.nodes[&id].clone())
+            })
+            .collect()
     }
 
     pub fn merge(&mut self, other: Self) {
@@ -385,10 +437,8 @@ impl HashKv {
     /// Author a `Place` claiming `placed_at`, superseding the placement
     /// heads this replica sees. Returns the applied node (re-broadcast).
     pub fn place(&mut self, placed_at: Id) -> HashNode {
-        let overwrites: BTreeSet<Id> =
-            self.placement.heads().iter().copied().collect();
-        let pins: BTreeSet<Id> =
-            BTreeSet::from_iter(self.tips.difference(&overwrites).cloned());
+        let overwrites: BTreeSet<Id> = self.placement.heads().iter().copied().collect();
+        let pins: BTreeSet<Id> = BTreeSet::from_iter(self.tips.difference(&overwrites).cloned());
         let node = HashNode {
             pins,
             op: Op::Place {
@@ -396,9 +446,7 @@ impl HashKv {
                 overwrites,
             },
         };
-        self.record_authored(&node);
-        self.apply(node.clone());
-        node
+        self.author(node)
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
@@ -415,7 +463,6 @@ impl HashKv {
         self.values.iter()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -567,9 +614,7 @@ mod tests {
     }
 
     fn reads(kv: &HashKv) -> Vec<(i64, Read)> {
-        (0..4)
-            .map(|k| (k, kv.read(&Value::Int(k))))
-            .collect()
+        (0..4).map(|k| (k, kv.read(&Value::Int(k)))).collect()
     }
 
     #[quickcheck]

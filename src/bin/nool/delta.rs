@@ -128,7 +128,11 @@ pub fn group_heads(msg: &[u8]) -> Result<Vec<(u8, Id, usize)>, String> {
         for _ in 0..n {
             let (len, used) = decode_varint(&msg[pos..]).map_err(|e| format!("{e:?}"))?;
             pos += used;
-            if pos.checked_add(len).and_then(|end| msg.get(pos..end)).is_none() {
+            if pos
+                .checked_add(len)
+                .and_then(|end| msg.get(pos..end))
+                .is_none()
+            {
                 return Err("truncated delta node".into());
             }
             pos += len;
@@ -176,7 +180,10 @@ mod tests {
         }
         let delivered = apply_delta(&mut web, msg).unwrap();
         assert_eq!(delivered, 5);
-        assert_eq!(web.seq(&obj).unwrap().iter().collect::<String>(), "base camp\n");
+        assert_eq!(
+            web.seq(&obj).unwrap().iter().collect::<String>(),
+            "base camp\n"
+        );
         // Replay: nothing new.
         assert_eq!(apply_delta(&mut web, msg).unwrap(), 0);
     }

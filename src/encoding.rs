@@ -91,8 +91,14 @@ impl<'a> Cursor<'a> {
     /// The next `len` bytes, or `UnexpectedEof` — including when `len` is
     /// large enough that `pos + len` would wrap.
     fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
-        let end = self.pos.checked_add(len).ok_or(DecodeError::UnexpectedEof)?;
-        let slice = self.bytes.get(self.pos..end).ok_or(DecodeError::UnexpectedEof)?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or(DecodeError::UnexpectedEof)?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(DecodeError::UnexpectedEof)?;
         self.pos = end;
         Ok(slice)
     }
@@ -321,7 +327,13 @@ fn decode_run_with(
         let offset = c.step(decode_varint)?;
         interior_extra_deps.insert(offset, ref_set(c)?);
     }
-    Ok(Run::from_text(anchor, first_op, first_extra_deps, &text, interior_extra_deps)?)
+    Ok(Run::from_text(
+        anchor,
+        first_op,
+        first_extra_deps,
+        &text,
+        interior_extra_deps,
+    )?)
 }
 
 pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
@@ -331,12 +343,9 @@ pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
         RUN_OP_BEFORE => crate::run::FirstOp::Before,
         other => return Err(DecodeError::InvalidOpTag(other)),
     };
-    let run = decode_run_with(
-        &mut c,
-        first_op,
-        &mut |c| c.step(decode_id),
-        &mut |c| c.step(decode_id_set),
-    )?;
+    let run = decode_run_with(&mut c, first_op, &mut |c| c.step(decode_id), &mut |c| {
+        c.step(decode_id_set)
+    })?;
     Ok((run, c.pos))
 }
 
@@ -397,15 +406,17 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(Payload, usize), DecodeError> {
 /// locked to by test.
 pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
     use crate::hash_node::{
-        KIND_INSERT, KIND_MARK, KIND_MOVE, KIND_PLACE, KIND_PUT, KIND_REMOVE, sorted_subset_indices,
-        varint_len,
+        KIND_INSERT, KIND_MARK, KIND_MOVE, KIND_PLACE, KIND_PUT, KIND_REMOVE,
+        sorted_subset_indices, varint_len,
     };
 
     let mut refs: Vec<Id> = node.iter_refs().copied().collect();
     refs.sort_unstable();
     refs.dedup();
-    let ref_idx =
-        |id: &Id| -> usize { refs.binary_search(id).expect("named id is in the refs table") };
+    let ref_idx = |id: &Id| -> usize {
+        refs.binary_search(id)
+            .expect("named id is in the refs table")
+    };
     let subset_idxs = |set: &BTreeSet<Id>| sorted_subset_indices(&refs, set);
 
     let kind = match &node.op {
@@ -522,7 +533,12 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
 /// (refs positional). Reference fields go through `ref_`/`ref_set`; value
 /// fields (payload, Put key/value, Mark kind/value) always ride raw — values
 /// are not references.
-fn encode_node_with(node: &HashNode, buf: &mut Vec<u8>, ref_: &mut PutRef, ref_set: &mut PutRefSet) {
+fn encode_node_with(
+    node: &HashNode,
+    buf: &mut Vec<u8>,
+    ref_: &mut PutRef,
+    ref_set: &mut PutRefSet,
+) {
     fn anchor(a: &Anchor, buf: &mut Vec<u8>, ref_: &mut PutRef) {
         buf.push(a.side_bit() as u8);
         ref_(a.id(), buf);
@@ -674,12 +690,9 @@ pub fn decode_op(bytes: &[u8]) -> Result<(EncodableOp, usize), DecodeError> {
     let op = if tag == TAG_RUN {
         EncodableOp::Run(c.step(decode_run)?)
     } else {
-        let node = decode_node_with(
-            tag,
-            &mut c,
-            &mut |c| c.step(decode_id),
-            &mut |c| c.step(decode_id_set),
-        )?;
+        let node = decode_node_with(tag, &mut c, &mut |c| c.step(decode_id), &mut |c| {
+            c.step(decode_id_set)
+        })?;
         EncodableOp::Node(node)
     };
     Ok((op, c.pos))
@@ -1054,7 +1067,10 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         let parent = if i > 0 {
             Some(seq.remove_runs[&key].links[i - 1])
         } else {
-            let deps: Vec<Id> = seq.remove_runs[&key].first_extra_deps.iter_ids(&seq.ids).collect();
+            let deps: Vec<Id> = seq.remove_runs[&key]
+                .first_extra_deps
+                .iter_ids(&seq.ids)
+                .collect();
             match deps[..] {
                 [d] => seq.idx_of(&d).filter(|di| link_pos.contains_key(di)),
                 _ => None,
@@ -1263,7 +1279,10 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             }
             f(target, true);
         }
-        Payload::Other { extra_deps, targets } => {
+        Payload::Other {
+            extra_deps,
+            targets,
+        } => {
             for id in extra_deps {
                 f(id, false);
             }
@@ -1528,7 +1547,10 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 encode_ref_set(extra_deps, pe, &mut buf);
                 encode_ref(target, pe, &mut buf);
             }
-            Payload::Other { extra_deps, targets } => {
+            Payload::Other {
+                extra_deps,
+                targets,
+            } => {
                 buf.push(BLK_REMOVE_OTHER);
                 encode_ref_set(extra_deps, pe, &mut buf);
                 // Targets are a set (order is free), and a `remove_batch` deletes
@@ -1617,7 +1639,12 @@ fn decode_ref(c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Result<Id, Decod
 
 /// The tail of a ref whose head varint is already consumed (`BLK_REMOVE_OTHER`
 /// segment heads reuse the ref forms, with run-element heads meaning a range).
-fn ref_from_head(v: usize, c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Result<Id, DecodeError> {
+fn ref_from_head(
+    v: usize,
+    c: &mut Cursor,
+    id_list: &[Id],
+    ranks: &Ranks,
+) -> Result<Id, DecodeError> {
     if v & 1 == 1 {
         let off = c.step(decode_varint)?;
         ranks.run_elem(v >> 1, off)
@@ -1637,7 +1664,11 @@ fn ref_from_head(v: usize, c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Res
     }
 }
 
-fn decode_ref_set(c: &mut Cursor, id_list: &[Id], ranks: &Ranks) -> Result<BTreeSet<Id>, DecodeError> {
+fn decode_ref_set(
+    c: &mut Cursor,
+    id_list: &[Id],
+    ranks: &Ranks,
+) -> Result<BTreeSet<Id>, DecodeError> {
     let count = c.step(decode_varint)?;
     let mut ids = BTreeSet::new();
     for _ in 0..count {
@@ -2204,11 +2235,13 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
                 // The artifact section is store-wide; the object's own
                 // store is its view of it (see `HashKv::hydrate`).
                 m.hydrate_all(&web.values);
-                web.kvs.insert(crate::value::object_id(OBJ_KV, &m.origin()), m);
+                web.kvs
+                    .insert(crate::value::object_id(OBJ_KV, &m.origin()), m);
             }
             OBJ_SEQ => {
                 let s = decode_hashseq(inner)?;
-                web.seqs.insert(crate::value::object_id(OBJ_SEQ, &s.origin()), s);
+                web.seqs
+                    .insert(crate::value::object_id(OBJ_SEQ, &s.origin()), s);
             }
             other => return Err(DecodeError::InvalidOpTag(other)),
         }
@@ -2266,7 +2299,10 @@ mod tests {
     #[test]
     fn varint_rejects_non_minimal_and_overflow() {
         assert_eq!(decode_varint(&[0x00]).unwrap(), (0, 1));
-        assert_eq!(decode_varint(&[0x80, 0x00]).err(), Some(DecodeError::InvalidVarint));
+        assert_eq!(
+            decode_varint(&[0x80, 0x00]).err(),
+            Some(DecodeError::InvalidVarint)
+        );
         assert_eq!(
             decode_varint(&[0x81, 0x80, 0x00]).err(),
             Some(DecodeError::InvalidVarint)
@@ -2352,16 +2388,25 @@ mod tests {
     #[test]
     fn hashseq_num_ids_bounded_by_input() {
         let bytes = origin_then_varint(1 << 60);
-        assert_eq!(decode_hashseq(&bytes).err(), Some(DecodeError::UnexpectedEof));
+        assert_eq!(
+            decode_hashseq(&bytes).err(),
+            Some(DecodeError::UnexpectedEof)
+        );
         // usize::MAX also used to overflow `num_ids + 1` in debug builds.
         let bytes = origin_then_varint(usize::MAX);
-        assert_eq!(decode_hashseq(&bytes).err(), Some(DecodeError::UnexpectedEof));
+        assert_eq!(
+            decode_hashseq(&bytes).err(),
+            Some(DecodeError::UnexpectedEof)
+        );
     }
 
     #[test]
     fn hashkv_entry_count_bounded_by_input() {
         let bytes = origin_then_varint(1 << 60);
-        assert_eq!(decode_hashkv(&bytes).err(), Some(DecodeError::UnexpectedEof));
+        assert_eq!(
+            decode_hashkv(&bytes).err(),
+            Some(DecodeError::UnexpectedEof)
+        );
     }
 
     #[test]
@@ -2376,7 +2421,10 @@ mod tests {
         for v in [0, 0, 0, usize::MAX] {
             encode_varint(v, &mut b);
         }
-        assert_eq!(decode_hashseq(&b).err(), Some(DecodeError::InvalidIdIndex(0)));
+        assert_eq!(
+            decode_hashseq(&b).err(),
+            Some(DecodeError::InvalidIdIndex(0))
+        );
 
         // With a real one-element run, a span ending at the run length is
         // still out of range; a proper span decodes.
@@ -2395,7 +2443,10 @@ mod tests {
             encode_varint(v, &mut bad);
         }
         bad.push(0);
-        assert_eq!(decode_hashseq(&bad).err(), Some(DecodeError::InvalidIdIndex(0)));
+        assert_eq!(
+            decode_hashseq(&bad).err(),
+            Some(DecodeError::InvalidIdIndex(0))
+        );
 
         let mut good = b;
         good.push(BLK_REMOVE_FWD);
@@ -2425,12 +2476,18 @@ mod tests {
         let mut evil = bytes[..n - 3].to_vec();
         encode_varint(usize::MAX, &mut evil);
         evil.extend_from_slice(&[2, 0]);
-        assert_eq!(decode_hashseq(&evil).err(), Some(DecodeError::InvalidIdIndex(0)));
+        assert_eq!(
+            decode_hashseq(&evil).err(),
+            Some(DecodeError::InvalidIdIndex(0))
+        );
 
         // off = 1, count = 2: past the end of a two-element run.
         let mut evil = bytes[..n - 3].to_vec();
         evil.extend_from_slice(&[1, 2, 0]);
-        assert_eq!(decode_hashseq(&evil).err(), Some(DecodeError::InvalidIdIndex(0)));
+        assert_eq!(
+            decode_hashseq(&evil).err(),
+            Some(DecodeError::InvalidIdIndex(0))
+        );
     }
 
     #[test]
@@ -2477,7 +2534,13 @@ mod tests {
         assert_eq!(r.err(), Some(RunError::RedundantDep));
         // Interior deps at offset 1 repeat the first element (its chain anchor).
         let interior = BTreeMap::from([(1, BTreeSet::from([honest.elements[0]]))]);
-        let r = Run::from_text(anchor, FirstOp::After, BTreeSet::from([stray]), "ab", interior);
+        let r = Run::from_text(
+            anchor,
+            FirstOp::After,
+            BTreeSet::from([stray]),
+            "ab",
+            interior,
+        );
         assert_eq!(r.err(), Some(RunError::RedundantDep));
     }
 
@@ -2488,11 +2551,21 @@ mod tests {
         for bad in [0usize, 2, 5] {
             let interior = BTreeMap::from([(bad, BTreeSet::from([dep]))]);
             let r = Run::from_text(anchor, FirstOp::After, BTreeSet::new(), "ab", interior);
-            assert_eq!(r.err(), Some(RunError::DepOffsetOutOfRange(bad)), "offset {bad}");
+            assert_eq!(
+                r.err(),
+                Some(RunError::DepOffsetOutOfRange(bad)),
+                "offset {bad}"
+            );
         }
         let interior = BTreeMap::from([(1usize, BTreeSet::from([dep]))]);
-        let run = Run::from_text(anchor, FirstOp::After, BTreeSet::new(), "ab", interior.clone())
-            .unwrap();
+        let run = Run::from_text(
+            anchor,
+            FirstOp::After,
+            BTreeSet::new(),
+            "ab",
+            interior.clone(),
+        )
+        .unwrap();
         assert_eq!(run.interior_extra_deps, interior);
     }
 
@@ -2537,7 +2610,10 @@ mod tests {
     #[test]
     fn cursor_take_rejects_wrapping_length() {
         let bytes = [1u8, 2, 3];
-        let mut c = Cursor { bytes: &bytes, pos: 2 };
+        let mut c = Cursor {
+            bytes: &bytes,
+            pos: 2,
+        };
         assert_eq!(c.take(usize::MAX).err(), Some(DecodeError::UnexpectedEof));
         assert_eq!(c.take(2).err(), Some(DecodeError::UnexpectedEof));
         assert_eq!(c.take(1), Ok(&bytes[2..]));
@@ -2629,10 +2705,7 @@ mod tests {
     fn test_standalone_node_forms_roundtrip() {
         node_roundtrips([], Op::insert_after(Id::default(), 'a'));
         node_roundtrips([test_id(9)], Op::insert_before(test_id(5), 'z'));
-        node_roundtrips(
-            [],
-            Op::Remove([test_id(1), test_id(2), test_id(3)].into()),
-        );
+        node_roundtrips([], Op::Remove([test_id(1), test_id(2), test_id(3)].into()));
         node_roundtrips(
             [test_id(9)],
             Op::Move {
@@ -2852,7 +2925,8 @@ mod tests {
             crate::Anchor::After(s2),
             crate::value::Value::String("bold".into()).value_id(),
             crate::value::Value::Bool(true).value_id(),
-        ).unwrap();
+        )
+        .unwrap();
         b.merge(a.clone());
 
         let bytes = encode_hashseq(&a);
@@ -2964,7 +3038,11 @@ mod tests {
         for &(is_insert, idx, ch) in ops {
             let idx = idx as usize;
             if is_insert {
-                let at = if seq.is_empty() { 0 } else { idx % (seq.len() + 1) };
+                let at = if seq.is_empty() {
+                    0
+                } else {
+                    idx % (seq.len() + 1)
+                };
                 seq.insert(at, ch);
             } else if !seq.is_empty() {
                 seq.remove(idx % seq.len());
@@ -3059,7 +3137,11 @@ mod family_wire {
         let decoded = decode_hashkv_strict(&bytes).expect("strict");
         assert_eq!(decoded, kv);
         assert_eq!(kv_reads(&decoded), kv_reads(&kv));
-        assert_eq!(decoded.get(&s("name")), Some(s("david")), "artifacts travel");
+        assert_eq!(
+            decoded.get(&s("name")),
+            Some(s("david")),
+            "artifacts travel"
+        );
         assert_eq!(decoded.get(&s("n")), Some(Value::Int(9)));
         assert_eq!(decoded.tips(), kv.tips());
     }
@@ -3310,7 +3392,10 @@ mod legacy_compat {
         let path = std::env::var("LEGACY_SNAPSHOT").expect("set LEGACY_SNAPSHOT");
         let bytes = std::fs::read(&path).expect("read snapshot");
         let web = super::decode_hashweb(&bytes).expect("legacy decode");
-        eprintln!("decoded {} objects from legacy snapshot", web.object_count());
+        eprintln!(
+            "decoded {} objects from legacy snapshot",
+            web.object_count()
+        );
         assert!(web.object_count() > 0);
         let v2 = super::encode_hashweb(&web);
         assert!(v2.starts_with(b"HWB2"));
@@ -3319,7 +3404,7 @@ mod legacy_compat {
     }
 }
 
-// --- Delta wire frames (APP_NOTES #8: the authored-ops outbox) ---
+// --- Delta wire frames (APP_NOTES #8: authored-ops deltas) ---
 //
 // Steady-state sync ships ops, not snapshots. A delta message is
 //
@@ -3337,7 +3422,7 @@ mod legacy_compat {
 pub const DELTA_TAG: u8 = 0xDE;
 pub const ARTIFACT_TAG: u8 = 0xAF;
 
-/// Encode drained outbox groups (`HashWeb::take_deltas`) as one message.
+/// Encode drained delta groups (`HashWeb::take_deltas`) as one message.
 pub fn encode_delta(groups: &[(u8, Id, Vec<HashNode>)]) -> Vec<u8> {
     let mut buf = vec![DELTA_TAG];
     let mut nb = Vec::new();
@@ -3361,7 +3446,9 @@ pub fn encode_delta(groups: &[(u8, Id, Vec<HashNode>)]) -> Vec<u8> {
 /// echoes, replays — count zero).
 pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError> {
     if bytes.first() != Some(&DELTA_TAG) {
-        return Err(DecodeError::InvalidOpTag(bytes.first().copied().unwrap_or(0)));
+        return Err(DecodeError::InvalidOpTag(
+            bytes.first().copied().unwrap_or(0),
+        ));
     }
     let mut c = Cursor { bytes, pos: 1 };
     let mut delivered = 0usize;
@@ -3405,7 +3492,7 @@ mod delta_tests {
         Id([n; 32])
     }
 
-    /// The delta loop end to end: author on A (outbox enabled), drain,
+    /// The delta loop end to end: author on A, drain,
     /// apply on B — states converge to identical canonical bytes; replay
     /// and echo are no-ops; artifact frames ride separately.
     #[test]
@@ -3441,8 +3528,8 @@ mod delta_tests {
         // and reports nothing new (clients skip the re-render on 0).
         assert_eq!(apply_delta(&mut b, &msg).expect("replay ok"), 0);
         assert_eq!(encode_hashweb(&a), encode_hashweb(&b));
-        // Remote application recorded nothing: B (outbox off) and even an
-        // outbox-enabled receiver never re-broadcast received ops.
+        // Received nodes carry no authored bit: neither B nor a receiver
+        // with delta sync enabled ever re-broadcasts received ops.
         let mut c2 = HashWeb::new();
         c2.enable_outbox();
         apply_delta(&mut c2, &msg).expect("applies");
@@ -3452,13 +3539,13 @@ mod delta_tests {
     /// Small artifacts minted locally ride next to the delta (the title
     /// string behind a put is vocabulary the peer needs NOW, not at the
     /// next resync); dedupes, blobs, and received-not-minted values stay
-    /// out of the outbox.
+    /// out of the minted set.
     #[test]
     fn minted_small_artifacts_queue_once() {
         use crate::value::Value;
         let mut a = HashWeb::new();
         assert!(a.take_new_artifacts().is_empty());
-        // Outbox off: nothing recorded (servers, tests).
+        // Delta sync off: nothing recorded (servers, tests).
         a.provide_value(&Value::String("quiet".into()));
         assert!(a.take_new_artifacts().is_empty());
 
@@ -3469,14 +3556,24 @@ mod delta_tests {
         let blob = a.provide_value(&Value::Bytes(vec![7u8; WIRE_ARTIFACT_MAX + 1]));
         let small = a.provide_value(&Value::Bytes(vec![7u8; 16]));
         let minted = a.take_new_artifacts();
-        assert_eq!(minted, vec![t, small], "once per new small value; blobs excluded");
+        assert_eq!(
+            minted,
+            vec![t, small],
+            "once per new small value; blobs excluded"
+        );
         assert!(a.take_new_artifacts().is_empty(), "drained");
-        assert!(a.artifact_bytes(&blob).is_some(), "the blob is still stored");
+        assert!(
+            a.artifact_bytes(&blob).is_some(),
+            "the blob is still stored"
+        );
 
         // Bytes that ARRIVE (0xAF / lazy GET) are not re-pushed.
         let mut b = HashWeb::new();
         b.enable_outbox();
         b.provide_artifact_bytes(Value::String("Title".into()).encoded());
-        assert!(b.take_new_artifacts().is_empty(), "received artifacts never echo");
+        assert!(
+            b.take_new_artifacts().is_empty(),
+            "received artifacts never echo"
+        );
     }
 }

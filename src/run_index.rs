@@ -569,9 +569,7 @@ impl RunIndex {
     /// Restore the element's visibility bit at its base slot (a placement
     /// returning to the creation placement).
     pub(crate) fn restore_base(&mut self, (head, off): ElemRef) {
-        let slot = self
-            .frag_containing(head, off)
-            .expect("element is indexed");
+        let slot = self.frag_containing(head, off).expect("element is indexed");
         let f = &mut self.frags[slot as usize];
         let k = off - f.start;
         debug_assert!(!f.bit(k), "restore_base on a visible element");

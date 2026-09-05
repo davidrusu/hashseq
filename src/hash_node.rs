@@ -289,7 +289,10 @@ impl HashNode {
     /// `id_preimage_is_the_canonical_encoding` locks this to
     /// `encoding::encode_node_preimage`.
     pub fn id(&self) -> Id {
-        debug_assert!(self.is_normalized(), "pins must be normalized: refs ∖ named");
+        debug_assert!(
+            self.is_normalized(),
+            "pins must be normalized: refs ∖ named"
+        );
 
         let mut hasher = node_hasher();
 
@@ -334,8 +337,8 @@ impl HashNode {
             Op::Remove(targets) => {
                 // Ascending target indices via a sorted merge walk.
                 let idxs = sorted_subset_indices(&refs, targets);
-                let body_len = varint_len(idxs.len())
-                    + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
+                let body_len =
+                    varint_len(idxs.len()) + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
                 update_varint(&mut hasher, body_len);
                 update_varint(&mut hasher, idxs.len());
                 for i in idxs {

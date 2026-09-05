@@ -281,7 +281,11 @@ mod tests {
         let av: Vec<char> = a.chars().collect();
         let bv: Vec<char> = b.chars().collect();
         let edits = diff_edits(&av, &bv);
-        assert_eq!(apply_script(&av, &bv, &edits), bv, "{a:?} -> {b:?} via {edits:?}");
+        assert_eq!(
+            apply_script(&av, &bv, &edits),
+            bv,
+            "{a:?} -> {b:?} via {edits:?}"
+        );
     }
 
     #[test]
@@ -303,7 +307,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(0x6e6f6f6c); // "nool"
         for _ in 0..500 {
             let len_a = rng.gen_range(0..80);
-            let a: String = (0..len_a).map(|_| (b'a' + rng.gen_range(0..4)) as char).collect();
+            let a: String = (0..len_a)
+                .map(|_| (b'a' + rng.gen_range(0..4)) as char)
+                .collect();
             // Mutate a into b so diffs have realistic shared structure.
             let mut b: Vec<char> = a.chars().collect();
             for _ in 0..rng.gen_range(0..10) {
@@ -322,7 +328,10 @@ mod tests {
     #[test]
     fn line_diff_shows_trailing_newline_changes() {
         let out = render_line_diff(&lines("a\nb\n"), &lines("a\nb"));
-        assert_eq!(out, "@@ -2,1 +2,1 @@\n- b\n+ b\n\\ No newline at end of file\n");
+        assert_eq!(
+            out,
+            "@@ -2,1 +2,1 @@\n- b\n+ b\n\\ No newline at end of file\n"
+        );
         let out = render_line_diff(&lines("a\r\n"), &lines("a\n"));
         assert_eq!(out, "@@ -1,1 +1,1 @@\n- a\r\n+ a\n");
         assert_eq!(render_line_diff(&lines("a\n"), &lines("a\n")), "");

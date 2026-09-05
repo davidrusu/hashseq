@@ -853,12 +853,17 @@ now only hello, reconnect-resync, and legacy-client compat. Measured
 live on the family doc: a one-character edit is 107 bytes on the wire,
 where yesterday it was the full ~7MB snapshot both ways.
 
-- **The outbox is authoring-side only, by construction.** Objects
-  record nodes only in their authoring helpers; every remote path
-  (merge, decode, delta apply) bypasses it, so echo is structurally
-  impossible — verified by test and by the relay loop (server relays
-  raw client frames to everyone including the sender; replay is
-  idempotent).
+- **The delta is authoring-side only, by construction.** Originally an
+  outbox that only the authoring helpers fed; since 2026-09-05 it is
+  derived instead: each object's arena is append-only in apply order
+  and carries one provenance bit per node (set by the `author` seam and
+  `insert_batch`, never by `apply`), so a delta is "arena since the
+  watermark, filtered to authored". Every remote path (merge, decode,
+  delta apply) leaves the bit clear, so echo is structurally impossible
+  — verified by test and by the relay loop (server relays raw client
+  frames to everyone including the sender; replay is idempotent). It
+  also means a node an app builds itself (a `Cursor::first_node`) ships
+  when handed to `author`, where the outbox silently dropped it.
 - **Delta frames are addressed by (kind, origin), never object id** —
   the receiver must be able to OPEN objects it has never seen, and the
   id derivation is one-way. The #1 asymmetry became a wire-format

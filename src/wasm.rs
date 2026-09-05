@@ -434,7 +434,16 @@ mod tests {
         let list = web.create_seq(&"ab".repeat(32)).unwrap();
         web.text_insert(&list, 0, "abcd").unwrap();
         let mut model: Vec<char> = "abcd".chars().collect();
-        for (from, to) in [(0, 4), (0, 4), (3, 1), (2, 0), (1, 3), (0, 2), (1, 4), (3, 0)] {
+        for (from, to) in [
+            (0, 4),
+            (0, 4),
+            (3, 1),
+            (2, 0),
+            (1, 3),
+            (0, 2),
+            (1, 4),
+            (3, 0),
+        ] {
             web.seq_move(&list, from, to).unwrap();
             let ch = model.remove(from);
             model.insert(if to > from { to - 1 } else { to }, ch);
@@ -450,8 +459,12 @@ mod tests {
 
     #[test]
     fn merge_encoded_of_another_document_is_an_error_not_a_trap() {
-        let mut a = WasmHashSeq { inner: HashSeq::new(Id([0xaa; 32])) };
-        let mut b = WasmHashSeq { inner: HashSeq::new(Id([0xbb; 32])) };
+        let mut a = WasmHashSeq {
+            inner: HashSeq::new(Id([0xaa; 32])),
+        };
+        let mut b = WasmHashSeq {
+            inner: HashSeq::new(Id([0xbb; 32])),
+        };
         a.insert(0, "x");
         b.insert(0, "y");
         // (JsValue cannot be built natively, so exercise the inner check.)
@@ -459,7 +472,9 @@ mod tests {
         assert!(a.merge_same_origin(other).is_err());
         assert_eq!(a.text(), "x", "untouched");
         // Same document still merges.
-        let mut a2 = WasmHashSeq { inner: HashSeq::new(Id([0xaa; 32])) };
+        let mut a2 = WasmHashSeq {
+            inner: HashSeq::new(Id([0xaa; 32])),
+        };
         a2.insert(0, "z");
         a.merge_encoded(&a2.encode()).unwrap();
         assert_eq!(a.text().len(), 2);
@@ -469,7 +484,9 @@ mod tests {
     /// stays normalized, so its encoded op is accepted by peers.
     #[test]
     fn run_builders_strip_the_anchor_from_extra_deps() {
-        let mut a = WasmHashSeq { inner: HashSeq::new(Id([0xcc; 32])) };
+        let mut a = WasmHashSeq {
+            inner: HashSeq::new(Id([0xcc; 32])),
+        };
         a.insert(0, "x");
         let x = a.inner.id_at(0).unwrap();
         let other = a.inner.origin();
@@ -484,7 +501,9 @@ mod tests {
             // would be `RedundantPin` here).
             let bytes = run.encode_op();
             let (op, _) = decode_op(&bytes).expect("normalized run decodes");
-            let mut b = WasmHashSeq { inner: HashSeq::new(Id([0xcc; 32])) };
+            let mut b = WasmHashSeq {
+                inner: HashSeq::new(Id([0xcc; 32])),
+            };
             b.insert(0, "x");
             assert!(matches!(op, EncodableOp::Run(_)));
             b.inner.apply_op(op);
@@ -505,7 +524,10 @@ mod tests {
         web.mark_range_closed(&doc, 3, 4, "bold", "on").unwrap();
         let spans = web.marked_spans(&doc).unwrap();
         assert!(spans.contains("bold"), "{spans}");
-        assert!(!spans.contains("bcda"), "the run must split at the mark: {spans}");
+        assert!(
+            !spans.contains("bcda"),
+            "the run must split at the mark: {spans}"
+        );
     }
 
     /// PLACEMENT_SPEC.md through the FFI: move a block between two
@@ -634,7 +656,10 @@ mod tests {
         web.text_insert(&body, 2, "XX").unwrap(); // inside the marked region
         let spans: serde_json::Value =
             serde_json::from_str(&web.marked_spans(&body).unwrap()).unwrap();
-        assert_eq!(spans[0]["text"], "elXXlo", "insert inherits the region's mark");
+        assert_eq!(
+            spans[0]["text"], "elXXlo",
+            "insert inherits the region's mark"
+        );
         web.unmark_range(&body, 0, 6, "code").unwrap();
         let spans: serde_json::Value =
             serde_json::from_str(&web.marked_spans(&body).unwrap()).unwrap();
@@ -763,7 +788,10 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(&a.structure_json()).unwrap();
         let nodes = v["nodes"].as_array().unwrap();
-        eprintln!("SPLIT STRUCTURE: {}", serde_json::to_string_pretty(&nodes).unwrap());
+        eprintln!(
+            "SPLIT STRUCTURE: {}",
+            serde_json::to_string_pretty(&nodes).unwrap()
+        );
 
         let left = nodes.iter().find(|n| n["text"] == "a").unwrap();
         // Both forked continuations re-anchor (after) 'a'.
@@ -793,7 +821,10 @@ mod tests {
         let deps = x["deps"].as_array().unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0]["box"], run["id"], "dep lands in the run's box");
-        assert_eq!(deps[0]["off"], 4, "...at the tip 'o', not the anchor offset");
+        assert_eq!(
+            deps[0]["off"], 4,
+            "...at the tip 'o', not the anchor offset"
+        );
     }
 }
 
@@ -1344,8 +1375,7 @@ impl WasmHashWeb {
     #[wasm_bindgen(js_name = applyTo)]
     pub fn apply_to(&mut self, obj_hex: &str, op_bytes: &[u8]) -> Result<(), JsValue> {
         let obj = hex_to_id(obj_hex)?;
-        let (op, _) =
-            decode_op(op_bytes).map_err(|e| app_err(&format!("decode op: {e}")))?;
+        let (op, _) = decode_op(op_bytes).map_err(|e| app_err(&format!("decode op: {e}")))?;
         match op {
             EncodableOp::Node(node) => self.inner.apply_to(obj, node),
             EncodableOp::Run(run) => {
@@ -1380,13 +1410,12 @@ impl WasmHashWeb {
     /// Merge a peer snapshot: union of knowledge.
     #[wasm_bindgen(js_name = mergeEncoded)]
     pub fn merge_encoded(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
-        let other =
-            decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
+        let other = decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
         self.inner.merge(other);
         Ok(())
     }
 
-    /// Drain the authored-ops outbox as one 0xDE delta message; empty if
+    /// Drain the authored-ops delta as one 0xDE delta message; empty if
     /// nothing was authored since the last take (APP_NOTES #8).
     #[wasm_bindgen(js_name = takeDeltas)]
     pub fn take_deltas(&mut self) -> Vec<u8> {

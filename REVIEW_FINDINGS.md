@@ -128,6 +128,24 @@ Decision (David, 2026-09-02): never refuse the by-id payload form; resolve the i
 
 ### Q2. Derive the delta outbox from an arena watermark + provenance (from #9 / Altitude #6)
 
+**RESOLVED** 2026-09-05. Landed as planned, with two deviations from the steps below:
+`apply`/`apply_with_id` stay the remote path (decode, merge, delta, nool replay all
+call them) and the local seam is the now-public `HashSeq::author` / `HashKv::author`
+— so Altitude #6 closes by handing a cursor-built node to `author`, not by making
+`apply` local. Step 4 (reset watermarks after a snapshot merge) was dropped: with
+provenance filtering an inbound merge never adds shippable nodes, and resetting
+would drop authored-but-undrained ones. `HashSeq.authored: BitSet` parallel to `ids`,
+`HashKv.order: Vec<Id>` + `authored`, `node_at` reconstructs one handle from its
+`Loc` (per-handle twin of `all_nodes`), `nodes_since(w)` / `authored_since(w)` /
+`arena_len()` on both objects, `HashWeb.delta_marks` per object id, `take_deltas`
+unchanged outside. `outbox`/`record_authored` deleted; `enable_outbox` now only
+gates minted-artifact tracking. Tests `delta_is_derived_from_the_arena_and_provenance`,
+`nodes_since_reconstructs_every_kind_exactly` (every stored form hashes back to its
+id; apply order replays with nothing parked). Perf: `target/perf/q2-derived-delta.txt`
+vs `review-after-e2.txt`, all traces within run noise (≤2%).
+
+Original plan:
+
 Decision (David, 2026-09-02): replace the hand-fed outbox with a derived delta.
 
 **Watermark.** The node arena (`HashSeq.ids`, `HashKv` equivalent) is append-only in apply order: `intern` pushes and returns `NodeIdx(ids.len())`, only admitted paths intern (parked/gated nodes never do), nothing is removed or reordered. So `w = ids.len()` taken when a delta is drained to peer P names exactly "everything applied at that moment" = the causal closure of the tips at that moment. Delta for P = nodes at `ids[w..]`; then `w = ids.len()`. Late-arriving concurrent nodes get high indices, which is correct (P lacked them too). The number is local per replica and per object — keep one per (peer, object) on the sender's side; a peer cannot name it.

@@ -28,14 +28,22 @@ impl BitSet {
     /// Set bit `i` to 1. Panics if `i` is out of range.
     #[inline]
     pub fn set(&mut self, i: usize) {
-        assert!(i < self.len, "BitSet index {i} out of range (len {})", self.len);
+        assert!(
+            i < self.len,
+            "BitSet index {i} out of range (len {})",
+            self.len
+        );
         self.words[i / 64] |= 1u64 << (i % 64);
     }
 
     /// Whether bit `i` is set. Panics if `i` is out of range.
     #[inline]
     pub fn get(&self, i: usize) -> bool {
-        assert!(i < self.len, "BitSet index {i} out of range (len {})", self.len);
+        assert!(
+            i < self.len,
+            "BitSet index {i} out of range (len {})",
+            self.len
+        );
         (self.words[i / 64] >> (i % 64)) & 1 == 1
     }
 

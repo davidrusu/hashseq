@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
-use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepFrag, SweepPos};
 use crate::delivery::Delivery;
 use crate::placement::PlacementRegister;
+use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepFrag, SweepPos};
 use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
@@ -42,15 +42,13 @@ impl IdIndex {
         }
     }
 
-    fn insert(&mut self, id: Id, idx: NodeIdx, ids: &[Id]) {
+    fn insert(&mut self, id: Id, idx: NodeIdx) {
         match self.prefix.entry(id_prefix(&id)) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(idx);
             }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                if ids[e.get().0 as usize] == id {
-                    e.insert(idx);
-                } else {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if *e.get() != idx {
                     self.spill.insert(id, idx);
                 }
             }
@@ -165,6 +163,7 @@ pub enum Cursor {
     /// Insert immediately after `anchor`. In an empty sequence the anchor is
     /// the document origin.
     After {
+        // HERE
         anchor: Id,
         extra_deps: BTreeSet<Id>,
     },
@@ -555,11 +554,14 @@ pub struct HashSeq {
     /// The mark layer's own frontier: marks are downstream-only (content
     /// never references marks), so mark ops never enter the text tips.
     pub(crate) mark_tips: BTreeSet<Id>,
-    /// Authored-ops outbox (APP_NOTES #8 / delta sync): locally-authored
-    /// nodes since the last drain, in apply order. `None` = disabled (the
-    /// default — servers and tests never author-and-forget). Remote
-    /// application paths never record; only the authoring helpers do.
-    pub(crate) outbox: Option<Vec<HashNode>>,
+    /// Provenance, one bit per handle: set for nodes this replica authored
+    /// (the [`Self::author`] seam and `insert_batch`), clear for everything
+    /// that arrived — merge, decode, delta, replay. Delta sync (APP_NOTES
+    /// #8) is derived from it: the arena is append-only in apply order, so
+    /// "authored since watermark `w`" is `ids[w..]` filtered by this bit
+    /// ([`Self::authored_since`]). Nothing is recorded at authoring time
+    /// and nothing received can echo.
+    pub(crate) authored: BitSet,
     /// Parked orphans + the gate (see `delivery::Delivery`). Gated here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
     /// (a map op in a seq), non-char insert payloads (the value column
@@ -637,7 +639,7 @@ impl HashSeq {
             placement: PlacementRegister::default(),
             tips: BTreeSet::new(),
             mark_tips: BTreeSet::new(),
-            outbox: None,
+            authored: BitSet::default(),
             delivery: Delivery::default(),
             index: RunIndex::default(),
         };
@@ -667,31 +669,51 @@ impl HashSeq {
         self.ids.push(id);
         self.locs.push(loc.into());
         self.removed.push(false);
-        self.id_to_idx.insert(id, idx, &self.ids);
+        self.authored.push(false);
+        self.id_to_idx.insert(id, idx);
         idx
     }
 
-    /// Record a locally-authored node into the outbox (delta sync). Called
-    /// ONLY by authoring helpers — never by apply — so remote and replayed
-    /// ops can never echo back onto the wire.
-    #[inline]
-    pub(crate) fn record_authored(&mut self, node: &HashNode) {
-        if let Some(ob) = &mut self.outbox {
-            ob.push(node.clone());
-        }
+    /// The arena length — the delta-sync watermark. Interning is append-
+    /// only and in apply order (parked and gated nodes never intern), so
+    /// the length taken at one moment names exactly "everything applied
+    /// so far", and `authored_since(w)` later yields what this replica
+    /// wrote after that moment.
+    pub fn arena_len(&self) -> usize {
+        self.ids.len()
     }
 
-    /// Apply a locally-authored node and record it for delta sync only if
-    /// it was admitted. `Err` hands the node back: the gate refused it
-    /// (it sits in quarantine, `contains_node` is false) and nothing was
-    /// recorded, so peers are never sent an op this replica itself
-    /// rejected. Local deps are always applied, so a refusal is a gate
-    /// verdict, never a parked orphan.
-    fn author(&mut self, node: HashNode) -> Result<HashNode, HashNode> {
+    /// Flag the node just interned as locally authored. Every admitted
+    /// node interns exactly one handle, so after an admitted apply the
+    /// node sits at the arena tail.
+    #[inline]
+    fn mark_last_authored(&mut self, id: &Id) {
+        let last = self.ids.len() - 1;
+        debug_assert_eq!(self.ids[last], *id, "the authored node is the arena tail");
+        self.authored.set(last);
+    }
+
+    /// The local-authoring seam: apply a node this replica built (the
+    /// authoring helpers, or a `Cursor::first_node`/`payload_node` the
+    /// caller assembled) and flag it as authored so delta sync ships it.
+    /// `apply` is the remote path — merge, decode, delta, replay — and
+    /// never sets the flag, so received ops can never echo.
+    ///
+    /// `Err` hands the node back: the gate refused it (it sits in
+    /// quarantine, `contains_node` is false) and it is never shipped, so
+    /// peers are not sent an op this replica itself rejected. Local deps
+    /// are always applied, so a refusal is a gate verdict, never a parked
+    /// orphan. A node already present is returned `Ok` untouched: it was
+    /// either authored earlier (already flagged) or received (the peer
+    /// has it).
+    pub fn author(&mut self, node: HashNode) -> Result<HashNode, HashNode> {
         let id = node.id();
+        if self.contains_node(&id) {
+            return Ok(node);
+        }
         self.apply_with_id(id, node.clone());
         if self.contains_node(&id) {
-            self.record_authored(&node);
+            self.mark_last_authored(&id);
             Ok(node)
         } else {
             Err(node)
@@ -948,11 +970,11 @@ impl HashSeq {
         let first_node = cursor.first_node(first_ch);
 
         // Cursor-derived inserts anchor on applied elements/origin and are
-        // always admitted, so recording before apply is safe here and saves
-        // a clone per char on the hot path (`author` is for gate-able ops).
+        // always admitted, so the hot path applies directly and flags the
+        // arena tail — no clone, no Result (`author` is for gate-able ops).
         let mut prev_id = first_node.id();
-        self.record_authored(&first_node);
         self.apply_with_id(prev_id, first_node);
+        self.mark_last_authored(&prev_id);
 
         // After the first apply, tips == {prev_id}, so the chained nodes carry no
         // extra deps.
@@ -962,8 +984,8 @@ impl HashSeq {
                 op: Op::insert_after(prev_id, ch),
             };
             prev_id = node.id();
-            self.record_authored(&node);
             self.apply_with_id(prev_id, node);
+            self.mark_last_authored(&prev_id);
         }
     }
 
@@ -980,7 +1002,8 @@ impl HashSeq {
         let node = self
             .make_insert_value(idx, payload)
             .expect("cursor_at is total for clamped idx");
-        self.author(node).expect("cursor-derived inserts are always admitted")
+        self.author(node)
+            .expect("cursor-derived inserts are always admitted")
     }
 
     pub fn remove(&mut self, idx: usize) {
@@ -994,7 +1017,10 @@ impl HashSeq {
     /// `idx` is past the end (no characters were actually removed).
     pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
         let node = self.make_remove_batch(idx, amount)?;
-        Some(self.author(node).expect("removes of applied elements are always admitted"))
+        Some(
+            self.author(node)
+                .expect("removes of applied elements are always admitted"),
+        )
     }
 
     /// Build (without applying) the removal of `amount` characters starting
@@ -1067,7 +1093,6 @@ impl HashSeq {
 
     /// `anchor` is `after.anchor` resolved (a checked dependency, so interned).
     fn insert_after(&mut self, id: Id, anchor: NodeIdx, after: CausalInsert) {
-
         // A move-op anchor: content anchoring at the splice point — make
         // sure the op holds a physical rank first.
         if let Loc::MoveOp = self.loc_of(anchor) {
@@ -1088,10 +1113,7 @@ impl HashSeq {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
                 let deps = SortedIdVec::from_id_set(&after.pins, |d| self.idx_of_known(d));
-                self.runs
-                    .get_mut(&run)
-                    .unwrap()
-                    .extend(idx, after.ch, deps);
+                self.runs.get_mut(&run).unwrap().extend(idx, after.ch, deps);
                 self.index.extend_run(run, pos + 1);
                 return;
             }
@@ -1131,7 +1153,10 @@ impl HashSeq {
         }
 
         // run extension is handled in the fast path above, fork/split updates the afters set
-        self.afters.entry(anchor).or_default().insert(idx, &self.ids);
+        self.afters
+            .entry(anchor)
+            .or_default()
+            .insert(idx, &self.ids);
 
         // Resolve the target node only now: the split above may have
         // relocated it into the right-hand run.
@@ -1218,7 +1243,10 @@ impl HashSeq {
         // append-only, so nothing else can invalidate it).
         let heads: Vec<NodeIdx> = self.moves[&target_idx].heads.iter().collect();
         let new_decider = self.resolve_decider(heads);
-        self.moves.get_mut(&target_idx).expect("just written").decider = new_decider;
+        self.moves
+            .get_mut(&target_idx)
+            .expect("just written")
+            .decider = new_decider;
 
         // Remove beats move: a tombstoned element renders nowhere, so a
         // register change must not touch the index.
@@ -1547,9 +1575,7 @@ impl HashSeq {
     fn glue_point(&self, a: &Anchor) -> Option<(NodeIdx, bool)> {
         let i = self.idx_of(a.id())?;
         match self.loc_of(i) {
-            Loc::Run { .. } | Loc::Origin | Loc::MoveOp => {
-                Some((i, matches!(a, Anchor::After(_))))
-            }
+            Loc::Run { .. } | Loc::Origin | Loc::MoveOp => Some((i, matches!(a, Anchor::After(_)))),
             _ => None,
         }
     }
@@ -1584,7 +1610,10 @@ impl HashSeq {
                 .expect("deciders render their target");
             return (slot, 0, tie);
         }
-        let slot = self.index.splice_slot(op).expect("anchored ops keep a slot");
+        let slot = self
+            .index
+            .splice_slot(op)
+            .expect("anchored ops keep a slot");
         (slot, 0, tie)
     }
 
@@ -1632,16 +1661,22 @@ impl HashSeq {
         }
         self.mark_tips.insert(id);
 
-        self.mark_events.entry(start_anchor).or_default().push(MarkEvent {
-            op: idx,
-            start: true,
-            after: start_after,
-        });
-        self.mark_events.entry(end_anchor).or_default().push(MarkEvent {
-            op: idx,
-            start: false,
-            after: end_after,
-        });
+        self.mark_events
+            .entry(start_anchor)
+            .or_default()
+            .push(MarkEvent {
+                op: idx,
+                start: true,
+                after: start_after,
+            });
+        self.mark_events
+            .entry(end_anchor)
+            .or_default()
+            .push(MarkEvent {
+                op: idx,
+                start: false,
+                after: end_after,
+            });
 
         let stored = StoredMark {
             start_after,
@@ -1660,7 +1695,11 @@ impl HashSeq {
     pub fn mark_node(&self, mk: &StoredMark) -> HashNode {
         let anchor = |after: bool, n: NodeIdx| {
             let id = self.id_of(n);
-            if after { Anchor::After(id) } else { Anchor::Before(id) }
+            if after {
+                Anchor::After(id)
+            } else {
+                Anchor::Before(id)
+            }
         };
         HashNode {
             pins: mk.pins.to_id_set(&self.ids),
@@ -1674,13 +1713,7 @@ impl HashSeq {
         }
     }
 
-    fn apply_place(
-        &mut self,
-        id: Id,
-        pins: BTreeSet<Id>,
-        placed_at: Id,
-        overwrites: BTreeSet<Id>,
-    ) {
+    fn apply_place(&mut self, id: Id, pins: BTreeSet<Id>, placed_at: Id, overwrites: BTreeSet<Id>) {
         let idx = self.intern(id, Loc::PlaceOp);
         let stored = StoredPlace {
             placed_at,
@@ -1711,10 +1744,8 @@ impl HashSeq {
     /// Author a `Place` claiming `placed_at`, superseding the placement
     /// heads this replica sees. Returns the applied node (re-broadcast).
     pub fn place(&mut self, placed_at: Id) -> HashNode {
-        let overwrites: BTreeSet<Id> =
-            self.placement.heads().iter().copied().collect();
-        let pins: BTreeSet<Id> =
-            self.tips.difference(&overwrites).cloned().collect();
+        let overwrites: BTreeSet<Id> = self.placement.heads().iter().copied().collect();
+        let pins: BTreeSet<Id> = self.tips.difference(&overwrites).cloned().collect();
         let node = HashNode {
             pins,
             op: Op::Place {
@@ -1805,7 +1836,11 @@ impl HashSeq {
                     .map(|&m| (self.id_of(m), self.mark_nodes[&m].value))
                     .collect();
                 live.sort();
-                if live.is_empty() { None } else { Some((kind, live)) }
+                if live.is_empty() {
+                    None
+                } else {
+                    Some((kind, live))
+                }
             })
             .collect()
     }
@@ -1830,9 +1865,9 @@ impl HashSeq {
         let mut active: FxHashSet<NodeIdx> = FxHashSet::default();
         let mut ended: FxHashSet<NodeIdx> = FxHashSet::default();
         let fire = |events: &Vec<MarkEvent>,
-                        after: bool,
-                        active: &mut FxHashSet<NodeIdx>,
-                        ended: &mut FxHashSet<NodeIdx>|
+                    after: bool,
+                    active: &mut FxHashSet<NodeIdx>,
+                    ended: &mut FxHashSet<NodeIdx>|
          -> bool {
             let mut changed = false;
             for ev in events.iter().filter(|ev| ev.after == after) {
@@ -1880,8 +1915,7 @@ impl HashSeq {
                 // points never move); op-anchored events bracket the
                 // element at its rendered (destination) crossing.
                 let op_events = if kind == SweepFrag::MovedIn && !self.mark_events.is_empty() {
-                    self.decider_of(e)
-                        .and_then(|op| self.mark_events.get(&op))
+                    self.decider_of(e).and_then(|op| self.mark_events.get(&op))
                 } else {
                     None
                 };
@@ -2015,7 +2049,12 @@ impl HashSeq {
     /// the tombstone artifact (partial unmark is the same op over a
     /// sub-range — the overwritten mark keeps applying outside it).
     /// `Err` as for `mark_range`.
-    pub fn unmark_range(&mut self, start: Anchor, end: Anchor, kind: Id) -> Result<HashNode, HashNode> {
+    pub fn unmark_range(
+        &mut self,
+        start: Anchor,
+        end: Anchor,
+        kind: Id,
+    ) -> Result<HashNode, HashNode> {
         self.mark_range(start, end, kind, *crate::value::TOMBSTONE)
     }
 
@@ -2098,7 +2137,6 @@ impl HashSeq {
 
     /// `anchor` is `before.anchor` resolved (a checked dependency, so interned).
     fn insert_before(&mut self, id: Id, anchor: NodeIdx, before: CausalInsert) {
-
         if let Loc::MoveOp = self.loc_of(anchor) {
             self.ensure_op_fragment(anchor);
         }
@@ -2235,8 +2273,7 @@ impl HashSeq {
             // splice points ARE live); self-moves gate.
             Op::Move { target, to, .. } => {
                 let t = self.idx_of(target);
-                let target_ok =
-                    t.is_some_and(|t| matches!(self.loc_of(t), Loc::Run { .. }));
+                let target_ok = t.is_some_and(|t| matches!(self.loc_of(t), Loc::Run { .. }));
                 // Destination: an element, the origin, or another move op's
                 // splice point — including an op that moves this same
                 // target ("put x where that op placed it"): the excision of
@@ -2325,7 +2362,6 @@ impl HashSeq {
         Ok(())
     }
 
-
     /// Reconstruct a remove chain's `HashNode`s (for merge / re-broadcast).
     pub fn remove_run_nodes(&self, rr: &RemoveRun) -> Vec<HashNode> {
         rr.targets
@@ -2338,6 +2374,93 @@ impl HashSeq {
                     BTreeSet::from_iter([self.id_of(rr.links[i - 1])])
                 },
                 op: Op::Remove(BTreeSet::from_iter([self.id_of(*target)])),
+            })
+            .collect()
+    }
+
+    /// Reconstruct the node behind one handle from its stored form (the
+    /// per-handle twin of `all_nodes`, which walks the side tables in
+    /// bulk). Ids come from the local table — no rehashing. The origin has
+    /// no node.
+    fn node_at(&self, idx: NodeIdx) -> Option<HashNode> {
+        Some(match self.loc_of(idx) {
+            Loc::Origin => return None,
+            Loc::Run { run, pos } => {
+                if self.is_atom(idx) {
+                    return Some(self.atom_node(idx));
+                }
+                let r = &self.runs[&run];
+                let pos = pos as usize;
+                let ch = r.char_at(pos);
+                if pos == 0 {
+                    let at = match r.first_op {
+                        FirstOp::After => Anchor::After(r.anchor),
+                        FirstOp::Before => Anchor::Before(r.anchor),
+                    };
+                    HashNode {
+                        pins: r.first_extra_deps.to_id_set(&self.ids),
+                        op: Op::Insert {
+                            at,
+                            payload: Payload::Char(ch),
+                        },
+                    }
+                } else {
+                    HashNode {
+                        pins: r
+                            .interior_extra_deps
+                            .get(&pos)
+                            .map(|d| d.to_id_set(&self.ids))
+                            .unwrap_or_default(),
+                        op: Op::insert_after(self.id_of(r.elements[pos - 1]), ch),
+                    }
+                }
+            }
+            Loc::RemoveChain { chain, pos } => {
+                let rr = &self.remove_runs[&chain];
+                let pos = pos as usize;
+                HashNode {
+                    pins: if pos == 0 {
+                        rr.first_extra_deps.to_id_set(&self.ids)
+                    } else {
+                        BTreeSet::from_iter([self.id_of(rr.links[pos - 1])])
+                    },
+                    op: Op::Remove(BTreeSet::from_iter([self.id_of(rr.targets[pos])])),
+                }
+            }
+            Loc::MultiRemove => {
+                let cr = &self.remove_nodes[&idx];
+                HashNode {
+                    pins: cr.pins.to_id_set(&self.ids),
+                    op: Op::Remove(cr.nodes.iter().map(|i| self.id_of(*i)).collect()),
+                }
+            }
+            Loc::MoveOp => self.move_node(idx, &self.move_nodes[&idx]),
+            Loc::MarkOp => self.mark_node(&self.mark_nodes[&idx]),
+            Loc::PlaceOp => self.place_node(&self.place_nodes[&idx]),
+        })
+    }
+
+    /// Every node applied since watermark `w` (an earlier `arena_len`), in
+    /// apply order — a causally safe order: each node's refs precede it.
+    /// Parked orphans and gated nodes are never interned, so they never
+    /// appear.
+    pub fn nodes_since(&self, w: usize) -> impl Iterator<Item = (Id, HashNode)> + '_ {
+        (w..self.ids.len()).filter_map(move |i| {
+            let idx = NodeIdx(i as u32);
+            self.node_at(idx).map(|n| (self.ids[i], n))
+        })
+    }
+
+    /// The delta since watermark `w`: nodes this replica authored
+    /// (`author`, the authoring helpers) at or after `w`, in apply order.
+    /// Received nodes are skipped before reconstruction, so a drain over a
+    /// remote-heavy stretch of the arena costs a bit test per handle.
+    pub fn authored_since(&self, w: usize) -> Vec<(Id, HashNode)> {
+        (w..self.ids.len())
+            .filter(|&i| self.authored.get(i))
+            .filter_map(|i| {
+                let idx = NodeIdx(i as u32);
+                self.node_at(idx).map(|n| (self.ids[i], n))
             })
             .collect()
     }
@@ -2367,9 +2490,7 @@ impl HashSeq {
                 self.id_of(*idx),
                 HashNode {
                     pins: causal_remove.pins.to_id_set(&self.ids),
-                    op: Op::Remove(
-                        causal_remove.nodes.iter().map(|i| self.id_of(*i)).collect(),
-                    ),
+                    op: Op::Remove(causal_remove.nodes.iter().map(|i| self.id_of(*i)).collect()),
                 },
             ));
         }
@@ -4071,7 +4192,10 @@ mod test {
         seq.move_element(b, Anchor::Before(origin)).unwrap();
         let text: String = seq.iter().collect();
         assert_eq!(text.len(), 3);
-        assert!(text.starts_with('b'), "Before(origin) renders first: {text}");
+        assert!(
+            text.starts_with('b'),
+            "Before(origin) renders first: {text}"
+        );
         check_index_matches_iter(&seq);
     }
 
@@ -4108,7 +4232,9 @@ mod test {
         let m = seq.move_element(a, Anchor::After(b)).unwrap();
         let mut sibs = [(m.id(), 'a'), (c, 'c')];
         sibs.sort();
-        let expect: String = std::iter::once('b').chain(sibs.iter().map(|s| s.1)).collect();
+        let expect: String = std::iter::once('b')
+            .chain(sibs.iter().map(|s| s.1))
+            .collect();
         assert_eq!(seq.iter().collect::<String>(), expect);
 
         // A later insert anchored After(b) joins the same sibling order.
@@ -4118,7 +4244,9 @@ mod test {
         };
         let mut sibs = [(m.id(), 'a'), (c, 'c'), (x.id(), 'x')];
         sibs.sort();
-        let expect: String = std::iter::once('b').chain(sibs.iter().map(|s| s.1)).collect();
+        let expect: String = std::iter::once('b')
+            .chain(sibs.iter().map(|s| s.1))
+            .collect();
         seq.apply(x);
         assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
@@ -4212,7 +4340,9 @@ mod test {
         // a joins b's sibling set (against the c-continuation), by id.
         let mut sibs = [(m0.id(), 'a'), (c, 'c')];
         sibs.sort();
-        let agreed: String = std::iter::once('b').chain(sibs.iter().map(|s| s.1)).collect();
+        let agreed: String = std::iter::once('b')
+            .chain(sibs.iter().map(|s| s.1))
+            .collect();
         assert_eq!(base.iter().collect::<String>(), agreed);
 
         let mut r1 = base.clone();
@@ -4424,10 +4554,7 @@ mod test {
         m2.merge(r1.clone());
 
         assert_eq!(m1, m2);
-        assert_eq!(
-            m1.iter().collect::<String>(),
-            m2.iter().collect::<String>()
-        );
+        assert_eq!(m1.iter().collect::<String>(), m2.iter().collect::<String>());
         assert!(m1.placement_conflicted(&x));
         // x froze at its base slot (creation placement).
         assert_eq!(m1.placement_of(&x), None);
@@ -4471,7 +4598,11 @@ mod test {
         let mut r1 = base.clone();
         let mut r2 = base.clone();
         r1.move_element(m, Anchor::Before(a)).unwrap();
-        assert_eq!(r1.iter().collect::<String>(), "mawy", "demoted: children keep b's rank");
+        assert_eq!(
+            r1.iter().collect::<String>(),
+            "mawy",
+            "demoted: children keep b's rank"
+        );
         check_index_matches_iter(&r1);
         r2.move_element(m, Anchor::After(a)).unwrap();
 
@@ -4513,7 +4644,8 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ma".chars());
         let m = seq.id_at(0).unwrap();
-        seq.move_element(m, Anchor::After(seq.id_at(1).unwrap())).unwrap();
+        seq.move_element(m, Anchor::After(seq.id_at(1).unwrap()))
+            .unwrap();
         seq.insert(2, 'y');
         seq.insert(3, '!');
         assert_eq!(seq.iter().collect::<String>(), "amy!");
@@ -4539,7 +4671,11 @@ mod test {
         let atom_id = node.id();
         assert_eq!(seq.payload_of(&atom_id), Some(link));
         assert_eq!(seq.id_at(1), Some(atom_id));
-        assert_eq!(seq.payload_of(&seq.id_at(0).unwrap()), None, "chars have no column entry");
+        assert_eq!(
+            seq.payload_of(&seq.id_at(0).unwrap()),
+            None,
+            "chars have no column entry"
+        );
         check_index_matches_iter(&seq);
     }
 
@@ -4578,12 +4714,13 @@ mod test {
         let mut m2 = r2;
         m2.merge(r1);
         assert_eq!(m1, m2);
-        assert_eq!(
-            m1.iter().collect::<String>(),
-            m2.iter().collect::<String>()
-        );
+        assert_eq!(m1.iter().collect::<String>(), m2.iter().collect::<String>());
         let e1 = crate::encoding::encode_hashseq(&m1);
-        assert_eq!(e1, crate::encoding::encode_hashseq(&m2), "byte-canonical with atoms");
+        assert_eq!(
+            e1,
+            crate::encoding::encode_hashseq(&m2),
+            "byte-canonical with atoms"
+        );
         let decoded = crate::encoding::decode_hashseq_strict(&e1).expect("strict");
         assert_eq!(decoded, m1);
         let atom_pos = decoded
@@ -4618,7 +4755,8 @@ mod test {
 
         // mark a range containing its rendered position
         let a = seq.id_at(0).unwrap();
-        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes())
+            .unwrap();
         // regional membership: the atom moved beyond the end point — not marked
         assert!(kinds_at(&seq, 2).is_empty());
         assert_eq!(kinds_at(&seq, 0), vec![bold()]);
@@ -4627,7 +4765,11 @@ mod test {
         let pos = seq.position_of(&atom).unwrap();
         seq.remove(pos);
         assert_eq!(seq.iter().collect::<String>(), "ab");
-        assert_eq!(seq.payload_of(&atom), Some(v), "column persists for tombstones");
+        assert_eq!(
+            seq.payload_of(&atom),
+            Some(v),
+            "column persists for tombstones"
+        );
     }
 
     /// The Insert.at gate row: anchors must be glued points (elements,
@@ -4639,12 +4781,14 @@ mod test {
         seq.insert_batch(0, "ab".chars());
         let rm = seq.remove_batch(0, 1).unwrap();
         let a = seq.id_at(0).unwrap();
-        let mk = seq.mark_range(
-            Anchor::Before(a),
-            Anchor::After(a),
-            crate::value::Value::String("b".into()).value_id(),
-            crate::value::Value::Bool(true).value_id(),
-        ).unwrap();
+        let mk = seq
+            .mark_range(
+                Anchor::Before(a),
+                Anchor::After(a),
+                crate::value::Value::String("b".into()).value_id(),
+                crate::value::Value::Bool(true).value_id(),
+            )
+            .unwrap();
 
         for anchor in [rm.id(), mk.id()] {
             seq.apply(HashNode {
@@ -4656,10 +4800,9 @@ mod test {
         assert_eq!(seq.iter().collect::<String>(), "b");
         check_index_matches_iter(&seq);
         // ...and the doc still roundtrips with the quarantined pair aboard.
-        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
-            &seq,
-        ))
-        .expect("strict");
+        let decoded =
+            crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(&seq))
+                .expect("strict");
         assert_eq!(decoded.delivery.gated.len(), 2);
     }
 
@@ -4748,7 +4891,11 @@ mod test {
             .collect();
         assert_eq!(
             spans,
-            vec![("b".into(), false), ("cd".into(), true), ("a".into(), false)]
+            vec![
+                ("b".into(), false),
+                ("cd".into(), true),
+                ("a".into(), false)
+            ]
         );
         // And a closed range over the moved-in element itself covers it.
         let s = Anchor::Before(seq.anchor_id_at(3).unwrap());
@@ -4760,14 +4907,14 @@ mod test {
     #[test]
     fn gated_authoring_is_reported_and_never_queued_for_peers() {
         let mut seq = HashSeq::default();
-        seq.outbox = Some(Vec::new());
         seq.insert_batch(0, "abcd".chars());
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
         let d = seq.id_at(3).unwrap();
         seq.move_element(a, Anchor::After(d)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "bcda");
-        let queued = seq.outbox.as_ref().unwrap().len();
+        let queued = seq.authored_since(0).len();
+        assert_eq!(queued, 5);
 
         // Anchors on the visible order, but `a`'s point sits at its base
         // slot (the front): an inverted span, which the gate refuses.
@@ -4776,12 +4923,129 @@ mod test {
             .unwrap_err();
         assert!(!seq.contains_node(&err.id()));
         assert_eq!(seq.delivery.gated.len(), 1);
-        assert_eq!(seq.outbox.as_ref().unwrap().len(), queued, "nothing shipped");
+        assert_eq!(seq.authored_since(0).len(), queued, "nothing shipped");
 
         // A self-move is refused the same way.
         let err = seq.move_element(c, Anchor::After(c)).unwrap_err();
         assert!(!seq.contains_node(&err.id()));
-        assert_eq!(seq.outbox.as_ref().unwrap().len(), queued);
+        assert_eq!(seq.authored_since(0).len(), queued);
+    }
+
+    /// The delta is derived, not recorded: `authored_since(w)` is the
+    /// arena tail filtered by provenance. Locally built nodes handed to
+    /// `author` ship (a cursor-built insert used to fall through `apply`
+    /// and never leave); received nodes never do, whichever path they
+    /// take in; a watermark taken after a merge excludes that history.
+    #[test]
+    fn delta_is_derived_from_the_arena_and_provenance() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let w = seq.arena_len();
+        assert_eq!(seq.authored_since(0).len(), 2);
+        assert!(seq.authored_since(w).is_empty(), "drained");
+
+        // A cursor-built node applied through the authoring seam ships.
+        let node = seq.cursor_at(2).unwrap().first_node('c');
+        let id = node.id();
+        seq.author(node).unwrap();
+        let delta = seq.authored_since(w);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].0, id);
+        assert_eq!(delta[0].1.id(), id, "reconstructed node hashes to its id");
+        let w = seq.arena_len();
+
+        // Received nodes (remote apply, merge) never ship, however they
+        // interleave with local ones.
+        let mut peer = HashSeq::default();
+        peer.insert_batch(0, "xyz".chars());
+        let remote: Vec<(Id, HashNode)> = peer.all_nodes();
+        seq.apply(remote[0].1.clone());
+        seq.insert(0, 'L');
+        let local = seq.id_at(0).unwrap();
+        seq.merge(peer.clone());
+        assert_eq!(seq.iter().count(), 3 + 1 + 3);
+        let delta = seq.authored_since(w);
+        assert_eq!(
+            delta.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![local]
+        );
+
+        // Re-authoring a known node is a no-op, not an echo.
+        let w = seq.arena_len();
+        let dup = seq.author(remote[0].1.clone()).unwrap();
+        assert_eq!(dup.id(), remote[0].0);
+        assert!(seq.authored_since(w).is_empty());
+
+        // The peer's own view: its watermark after merging us excludes
+        // what it merged, and its next edit is the whole delta.
+        let mut peer = peer;
+        peer.merge(seq.clone());
+        let pw = peer.arena_len();
+        peer.insert(0, 'P');
+        let d = peer.authored_since(pw);
+        assert_eq!(d.len(), 1);
+        assert_eq!(peer.authored_since(0).len(), 4, "xyz + P");
+    }
+
+    /// `nodes_since(0)` reconstructs every stored form — run heads and
+    /// interior elements (after splits), atoms, remove chains, multi-target
+    /// removes, moves, marks, places — to the exact node that was applied:
+    /// each hashes to its stored id, and the set equals `all_nodes`.
+    #[test]
+    fn nodes_since_reconstructs_every_kind_exactly() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello wörld".chars());
+        seq.insert_batch(3, "XY".chars()); // splits the first run
+        let payload = Id([0x42; 32]);
+        seq.insert_value(2, payload); // an atom
+        seq.remove_batch(6, 3).unwrap(); // a multi-target remove
+        seq.remove(0); // a remove chain of two
+        seq.remove(0);
+        let a = seq.id_at(0).unwrap();
+        let z = seq.id_at(seq.len() - 1).unwrap();
+        seq.move_element(a, Anchor::After(z)).unwrap();
+        seq.mark_range(
+            Anchor::Before(seq.id_at(1).unwrap()),
+            Anchor::After(z),
+            bold(),
+            yes(),
+        )
+        .unwrap();
+        seq.unmark_range(
+            Anchor::Before(seq.id_at(1).unwrap()),
+            Anchor::After(z),
+            bold(),
+        )
+        .unwrap();
+        seq.place(Id([0x77; 32]));
+
+        let since: Vec<(Id, HashNode)> = seq.nodes_since(0).collect();
+        assert_eq!(
+            since.len(),
+            seq.arena_len() - 1,
+            "every handle but the origin"
+        );
+        for (id, node) in &since {
+            assert_eq!(node.id(), *id, "reconstruction is exact: {node:?}");
+        }
+        let mut all = seq.all_nodes();
+        let mut got = since.clone();
+        all.sort_by_key(|(id, _)| *id);
+        got.sort_by_key(|(id, _)| *id);
+        assert_eq!(all, got);
+        // Everything here was authored, so the delta is the full history.
+        assert_eq!(seq.authored_since(0), since);
+        // Apply order is causally safe: a fresh replica replays it with
+        // nothing parked.
+        let mut fresh = HashSeq::default();
+        for (id, node) in &since {
+            fresh.apply_with_id(*id, node.clone());
+            assert_eq!(fresh.orphans().count(), 0);
+        }
+        assert_eq!(
+            fresh.iter().collect::<String>(),
+            seq.iter().collect::<String>()
+        );
     }
 
     #[test]
@@ -4790,8 +5054,13 @@ mod test {
         seq.insert_batch(0, "abc".chars());
         let a = seq.id_at(0).unwrap();
         let c = seq.id_at(2).unwrap();
-        let mark = seq.mark_range(Anchor::Before(a), Anchor::After(c), bold(), yes()).unwrap();
-        assert!(!seq.marks_at(&a).is_empty(), "sanity: the element is covered");
+        let mark = seq
+            .mark_range(Anchor::Before(a), Anchor::After(c), bold(), yes())
+            .unwrap();
+        assert!(
+            !seq.marks_at(&a).is_empty(),
+            "sanity: the element is covered"
+        );
 
         assert!(seq.marks_at(&seq.origin()).is_empty());
         assert!(seq.marks_at(&mark.id()).is_empty());
@@ -4823,7 +5092,8 @@ mod test {
 
         // Bold "hello": Before(h) .. Before(space) — the bold expansion
         // choice from the MARKS.md anchor table.
-        seq.mark_range(Anchor::Before(h), Anchor::Before(space), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(h), Anchor::Before(space), bold(), yes())
+            .unwrap();
 
         assert_eq!(
             span_texts(&seq),
@@ -4836,32 +5106,44 @@ mod test {
 
     /// A mark anchored on a non-glue id (unknown, or an op that is not an
     /// element) is refused, not a panic — and leaves no trace: no orphan,
-    /// no tip change, nothing in the outbox.
+    /// no tip change, nothing in the delta.
     #[test]
     fn mark_range_on_non_glue_anchor_is_refused() {
         let mut seq = HashSeq::default();
-        seq.outbox = Some(Vec::new());
         seq.insert_batch(0, "ab".chars());
         let a = seq.id_at(0).unwrap();
         let b = seq.id_at(1).unwrap();
         let rm = seq.remove_batch(1, 1).unwrap().id();
         let tips = seq.tips().clone();
         let mark_tips = seq.mark_tips().clone();
-        seq.outbox.as_mut().unwrap().clear();
+        let w = seq.arena_len();
 
         let unknown = Id([0xEE; 32]);
-        assert!(seq.mark_range(Anchor::Before(a), Anchor::After(unknown), bold(), yes()).is_err());
-        assert!(seq.mark_range(Anchor::Before(unknown), Anchor::After(a), bold(), yes()).is_err());
+        assert!(
+            seq.mark_range(Anchor::Before(a), Anchor::After(unknown), bold(), yes())
+                .is_err()
+        );
+        assert!(
+            seq.mark_range(Anchor::Before(unknown), Anchor::After(a), bold(), yes())
+                .is_err()
+        );
         // A remove op id is not a glue point either.
-        assert!(seq.mark_range(Anchor::Before(a), Anchor::After(rm), bold(), yes()).is_err());
-        assert!(seq.unmark_range(Anchor::Before(rm), Anchor::After(a), bold()).is_err());
+        assert!(
+            seq.mark_range(Anchor::Before(a), Anchor::After(rm), bold(), yes())
+                .is_err()
+        );
+        assert!(
+            seq.unmark_range(Anchor::Before(rm), Anchor::After(a), bold())
+                .is_err()
+        );
 
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.tips(), &tips);
         assert_eq!(seq.mark_tips(), &mark_tips);
-        assert!(seq.outbox.as_ref().unwrap().is_empty());
+        assert!(seq.authored_since(w).is_empty());
         // Still authors normally.
-        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes())
+            .unwrap();
         // remove_batch with a huge amount clamps instead of overflowing.
         assert!(seq.remove_batch(0, usize::MAX).is_some());
         assert_eq!(seq.iter().count(), 0);
@@ -4878,9 +5160,11 @@ mod test {
 
         let link = crate::value::Value::String("link".into()).value_id();
         // bold: Before(a)..Before(b) — expanding end.
-        seq.mark_range(Anchor::Before(a), Anchor::Before(b), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(a), Anchor::Before(b), bold(), yes())
+            .unwrap();
         // link: Before(a)..After(a) — non-expanding end.
-        seq.mark_range(Anchor::Before(a), Anchor::After(a), link, yes()).unwrap();
+        seq.mark_range(Anchor::Before(a), Anchor::After(a), link, yes())
+            .unwrap();
 
         // Type between a and b (a before-child of b: inside Before(b),
         // outside After(a)).
@@ -4890,7 +5174,11 @@ mod test {
         });
         let x_pos = seq.position_of(&seq.id_at(1).unwrap()).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "axb");
-        assert_eq!(kinds_at(&seq, x_pos), vec![bold()], "bold expands, link does not");
+        assert_eq!(
+            kinds_at(&seq, x_pos),
+            vec![bold()],
+            "bold expands, link does not"
+        );
     }
 
     /// Partial unmark: the overwritten bold keeps applying outside the
@@ -4901,10 +5189,12 @@ mod test {
         seq.insert_batch(0, "abcde".chars());
         let ids: Vec<Id> = (0..5).map(|i| seq.id_at(i).unwrap()).collect();
 
-        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[4]), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[4]), bold(), yes())
+            .unwrap();
         assert_eq!(span_texts(&seq), vec![("abcde".into(), true)]);
 
-        seq.unmark_range(Anchor::Before(ids[2]), Anchor::After(ids[2]), bold()).unwrap();
+        seq.unmark_range(Anchor::Before(ids[2]), Anchor::After(ids[2]), bold())
+            .unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![
@@ -4922,13 +5212,16 @@ mod test {
         let mut base = HashSeq::default();
         base.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| base.id_at(i).unwrap()).collect();
-        base.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes()).unwrap();
+        base.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes())
+            .unwrap();
 
         let mut r1 = base.clone();
         let mut r2 = base.clone();
         // r1 unbolds bc; r2 concurrently re-bolds cd.
-        r1.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold()).unwrap();
-        r2.mark_range(Anchor::Before(ids[2]), Anchor::After(ids[3]), bold(), yes()).unwrap();
+        r1.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold())
+            .unwrap();
+        r2.mark_range(Anchor::Before(ids[2]), Anchor::After(ids[3]), bold(), yes())
+            .unwrap();
 
         let mut m1 = r1.clone();
         m1.merge(r2.clone());
@@ -4952,8 +5245,10 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
-        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes()).unwrap();
-        seq.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold()).unwrap();
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[3]), bold(), yes())
+            .unwrap();
+        seq.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold())
+            .unwrap();
 
         seq.apply(HashNode {
             pins: BTreeSet::new(),
@@ -4970,7 +5265,8 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
-        seq.mark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold(), yes())
+            .unwrap();
         seq.remove_batch(1, 2); // tombstone b, c
 
         seq.apply(HashNode {
@@ -5014,7 +5310,8 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let ids: Vec<Id> = (0..4).map(|i| seq.id_at(i).unwrap()).collect();
-        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[1]), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(ids[0]), Anchor::After(ids[1]), bold(), yes())
+            .unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![("ab".into(), true), ("cd".into(), false)]
@@ -5047,7 +5344,8 @@ mod test {
         let b1 = seq.id_at(6).unwrap();
         let o = seq.id_at(7).unwrap();
         let b2 = seq.id_at(8).unwrap();
-        seq.mark_range(Anchor::Before(b1), Anchor::After(b2), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(b1), Anchor::After(b2), bold(), yes())
+            .unwrap();
 
         let h = seq.id_at(0).unwrap();
         seq.move_element(o, Anchor::Before(h)).unwrap();
@@ -5073,16 +5371,20 @@ mod test {
 
         // Element end point: the moved-in m renders beyond After(a) — not
         // covered (regional membership).
-        let el = seq.mark_range(Anchor::Before(a), Anchor::After(a), bold(), yes()).unwrap();
+        let el = seq
+            .mark_range(Anchor::Before(a), Anchor::After(a), bold(), yes())
+            .unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![("a".into(), true), ("m".into(), false)]
         );
-        seq.unmark_range(Anchor::Before(a), Anchor::After(a), bold()).unwrap();
+        seq.unmark_range(Anchor::Before(a), Anchor::After(a), bold())
+            .unwrap();
         let _ = el;
 
         // Op end point: brackets wherever the target renders — covered.
-        seq.mark_range(Anchor::Before(a), Anchor::After(op.id()), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(a), Anchor::After(op.id()), bold(), yes())
+            .unwrap();
         assert_eq!(span_texts(&seq), vec![("am".into(), true)]);
         let m_pos = seq.position_of(&m).unwrap();
         assert_eq!(kinds_at(&seq, m_pos), vec![bold()]);
@@ -5100,7 +5402,8 @@ mod test {
         let b = seq.id_at(2).unwrap();
         let op = seq.move_element(m, Anchor::After(b)).unwrap(); // b is the run tail
         assert_eq!(seq.iter().collect::<String>(), "abm");
-        seq.mark_range(Anchor::Before(b), Anchor::After(op.id()), bold(), yes()).unwrap();
+        seq.mark_range(Anchor::Before(b), Anchor::After(op.id()), bold(), yes())
+            .unwrap();
         assert_eq!(
             span_texts(&seq),
             vec![("a".into(), false), ("bm".into(), true)]
@@ -5118,10 +5421,9 @@ mod test {
 
         // Roundtrip carries op-anchored marks (they park until the op
         // applies, then re-anchor identically).
-        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
-            &seq,
-        ))
-        .expect("strict");
+        let decoded =
+            crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(&seq))
+                .expect("strict");
         assert_eq!(decoded, seq);
         assert_eq!(decoded.marked_spans(), seq.marked_spans());
     }
@@ -5169,10 +5471,9 @@ mod test {
         check_index_matches_iter(&seq);
 
         // Roundtrip + merge-order determinism.
-        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
-            &seq,
-        ))
-        .expect("strict");
+        let decoded =
+            crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(&seq))
+                .expect("strict");
         assert_eq!(decoded, seq);
         assert_eq!(decoded.iter().collect::<String>(), "axy");
     }
@@ -5204,10 +5505,9 @@ mod test {
         assert_eq!(seq.iter().collect::<String>(), "abx");
         check_index_matches_iter(&seq);
 
-        let decoded = crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(
-            &seq,
-        ))
-        .expect("strict");
+        let decoded =
+            crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(&seq))
+                .expect("strict");
         assert_eq!(decoded, seq);
         assert_eq!(decoded.iter().collect::<String>(), "abx");
     }
@@ -5219,7 +5519,9 @@ mod test {
         source.insert_batch(0, "ab".chars());
         let a = source.id_at(0).unwrap();
         let b = source.id_at(1).unwrap();
-        let mark = source.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes()).unwrap();
+        let mark = source
+            .mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes())
+            .unwrap();
 
         let mut fresh = HashSeq::default();
         fresh.apply(mark);
@@ -5241,8 +5543,14 @@ mod test {
         seq.insert_batch(0, "hello".chars());
         let h = seq.id_at(0).unwrap();
         let o = seq.id_at(4).unwrap();
-        seq.mark_range(Anchor::Before(h), Anchor::After(o), bold(), yes()).unwrap();
-        seq.unmark_range(Anchor::Before(seq.id_at(2).unwrap()), Anchor::After(seq.id_at(2).unwrap()), bold()).unwrap();
+        seq.mark_range(Anchor::Before(h), Anchor::After(o), bold(), yes())
+            .unwrap();
+        seq.unmark_range(
+            Anchor::Before(seq.id_at(2).unwrap()),
+            Anchor::After(seq.id_at(2).unwrap()),
+            bold(),
+        )
+        .unwrap();
 
         let decoded = crate::encoding::decode_hashseq(&crate::encoding::encode_hashseq(&seq))
             .expect("roundtrip");
@@ -5256,7 +5564,13 @@ mod test {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ab".chars());
         let node = seq.insert_value(1, crate::value::char_value_id('z'));
-        assert!(matches!(node.op, Op::Insert { payload: Payload::Char('z'), .. }));
+        assert!(matches!(
+            node.op,
+            Op::Insert {
+                payload: Payload::Char('z'),
+                ..
+            }
+        ));
         assert_eq!(seq.iter().collect::<String>(), "azb");
         let z = seq.id_at(1).unwrap();
         assert_eq!(seq.payload_of(&z), None, "not an atom");
@@ -5405,5 +5719,4 @@ mod test {
         fresh.merge(seq);
         assert_eq!(fresh.placement_of(&a), Some(Anchor::After(c)));
     }
-
 }

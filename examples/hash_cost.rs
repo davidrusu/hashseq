@@ -14,7 +14,10 @@ fn bench(name: &str, n: u32, mut f: impl FnMut()) {
     for _ in 0..n {
         f();
     }
-    println!("{name:>34}: {:6.1} ns/op", t.elapsed().as_nanos() as f64 / n as f64);
+    println!(
+        "{name:>34}: {:6.1} ns/op",
+        t.elapsed().as_nanos() as f64 / n as f64
+    );
 }
 
 fn main() {
@@ -80,6 +83,10 @@ fn main() {
     a.update(&buf68);
     let mut b = blake3::Hasher::new_from_context_key(&ctx_key);
     b.update(&buf68);
-    assert_eq!(a.finalize(), b.finalize(), "hazmat path must match derive_key");
+    assert_eq!(
+        a.finalize(),
+        b.finalize(),
+        "hazmat path must match derive_key"
+    );
     println!("   hazmat output == derive_key: verified");
 }

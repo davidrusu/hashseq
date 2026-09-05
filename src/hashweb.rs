@@ -42,15 +42,24 @@ pub struct HashWeb {
     pub(crate) parked: std::collections::HashMap<Id, Vec<(Id, HashNode)>>,
     /// Value-artifact side store shared across objects.
     pub(crate) values: IdMap<Vec<u8>>,
-    /// Authored-ops outboxes enabled on every object (delta sync;
-    /// APP_NOTES #8). Off by default — servers and tests don't flush.
-    pub(crate) outbox_enabled: bool,
+    /// Delta sync is on (`enable_outbox`; APP_NOTES #8): minted small
+    /// artifacts are tracked for `take_new_artifacts`. Off by default —
+    /// servers and tests don't flush. The deltas themselves need no
+    /// switch: they are derived from each object's arena and provenance
+    /// bits (`HashSeq::authored_since`), so nothing is recorded per op.
+    pub(crate) delta_sync: bool,
+    /// Delta-sync watermarks, per object id: the object's arena length at
+    /// the last `take_deltas`. Everything at or past it is what this
+    /// replica applied since — filtered to what it authored, that is the
+    /// next delta. One upstream (the single-peer case); a per-peer map
+    /// would be a map of these.
+    pub(crate) delta_marks: IdMap<usize>,
     /// Small value artifacts MINTED locally since the last drain (titles,
     /// mark kinds/values, code-block languages — the vocabulary a peer
     /// needs to read our ops). Deltas carry ops only and snapshots only
     /// resync on reconnect, so without this a live peer sees a new title
     /// as a raw unresolved ref until the next hello. Recorded only while
-    /// the outbox is enabled; blobs above the wire limit are pushed by
+    /// delta sync is enabled; blobs above the wire limit are pushed by
     /// the uploader explicitly (0xAF at upload) and never land here.
     pub(crate) new_artifacts: Vec<Id>,
 }
@@ -79,11 +88,7 @@ impl HashWeb {
     pub fn create_seq(&mut self, origin: Id) -> Id {
         let obj = object_id(KIND_SEQ, &origin);
         if !self.is_object(&obj) {
-            let mut seq = HashSeq::new(origin);
-            if self.outbox_enabled {
-                seq.outbox = Some(Vec::new());
-            }
-            self.seqs.insert(obj, seq);
+            self.seqs.insert(obj, HashSeq::new(origin));
             self.wake(obj);
         }
         obj
@@ -94,9 +99,7 @@ impl HashWeb {
         let obj = object_id(KIND_KV, &origin);
         if !self.is_object(&obj) {
             let mut kv = HashKv::new(origin);
-            if self.outbox_enabled {
-                kv.outbox = Some(Vec::new());
-            }
+            kv.delta_sync = self.delta_sync;
             self.kvs.insert(obj, kv);
             self.wake(obj);
         }
@@ -132,41 +135,39 @@ impl HashWeb {
         self.kvs.get_mut(obj)
     }
 
-    /// Turn on authored-ops outboxes for every current and future object
-    /// (delta sync). Idempotent; existing outbox contents are preserved.
+    /// Turn on delta sync for this store: small artifacts minted from now
+    /// on are tracked for `take_new_artifacts` (every current and future
+    /// object). Idempotent. `take_deltas` itself works either way — the
+    /// delta is derived, not recorded.
     pub fn enable_outbox(&mut self) {
-        self.outbox_enabled = true;
-        for seq in self.seqs.values_mut() {
-            if seq.outbox.is_none() {
-                seq.outbox = Some(Vec::new());
-            }
-        }
+        self.delta_sync = true;
         for kv in self.kvs.values_mut() {
-            if kv.outbox.is_none() {
-                kv.outbox = Some(Vec::new());
-            }
+            kv.delta_sync = true;
         }
     }
 
-    /// Drain every object's outbox: `(kind, origin, nodes)` groups sorted
-    /// by object id — the openable wire address (an object id cannot be
-    /// opened; the frame must carry kind + origin).
+    /// The delta since the last drain: `(kind, origin, nodes)` groups
+    /// sorted by object id — the openable wire address (an object id
+    /// cannot be opened; the frame must carry kind + origin). Each group is
+    /// what this replica AUTHORED in that object since its watermark, in
+    /// apply order; received nodes (merge, decode, delta, replay) are never
+    /// included, so nothing echoes. Advances every watermark.
     pub fn take_deltas(&mut self) -> Vec<(u8, Id, Vec<HashNode>)> {
         let mut out: Vec<(Id, (u8, Id, Vec<HashNode>))> = Vec::new();
-        for (obj, seq) in self.seqs.iter_mut() {
-            let origin = seq.origin();
-            if let Some(ob) = &mut seq.outbox
-                && !ob.is_empty()
-            {
-                out.push((*obj, (KIND_SEQ, origin, std::mem::take(ob))));
+        for (obj, seq) in &self.seqs {
+            let w = self.delta_marks.get(obj).copied().unwrap_or(0);
+            let nodes: Vec<HashNode> = seq.authored_since(w).into_iter().map(|(_, n)| n).collect();
+            self.delta_marks.insert(*obj, seq.arena_len());
+            if !nodes.is_empty() {
+                out.push((*obj, (KIND_SEQ, seq.origin(), nodes)));
             }
         }
-        for (obj, kv) in self.kvs.iter_mut() {
-            let origin = kv.origin();
-            if let Some(ob) = &mut kv.outbox
-                && !ob.is_empty()
-            {
-                out.push((*obj, (KIND_KV, origin, std::mem::take(ob))));
+        for (obj, kv) in &self.kvs {
+            let w = self.delta_marks.get(obj).copied().unwrap_or(0);
+            let nodes: Vec<HashNode> = kv.authored_since(w).into_iter().map(|(_, n)| n).collect();
+            self.delta_marks.insert(*obj, kv.arena_len());
+            if !nodes.is_empty() {
+                out.push((*obj, (KIND_KV, kv.origin(), nodes)));
             }
         }
         out.sort_by_key(|(obj, _)| *obj);
@@ -204,7 +205,7 @@ impl HashWeb {
         let id = v.value_id();
         if let std::collections::hash_map::Entry::Vacant(e) = self.values.entry(id) {
             let bytes = v.encoded();
-            if self.outbox_enabled && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
+            if self.delta_sync && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
                 self.new_artifacts.push(id);
             }
             e.insert(bytes);
@@ -304,16 +305,10 @@ impl HashWeb {
             .collect();
         for (obj, origin, is_seq) in adopt {
             if is_seq {
-                let mut seq = HashSeq::new(origin);
-                if self.outbox_enabled {
-                    seq.outbox = Some(Vec::new());
-                }
-                self.seqs.insert(obj, seq);
+                self.seqs.insert(obj, HashSeq::new(origin));
             } else {
                 let mut kv = HashKv::new(origin);
-                if self.outbox_enabled {
-                    kv.outbox = Some(Vec::new());
-                }
+                kv.delta_sync = self.delta_sync;
                 self.kvs.insert(obj, kv);
             }
             self.wake(obj);
@@ -356,7 +351,6 @@ impl HashWeb {
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
         self.parked.values().flatten().map(|(_, node)| node)
     }
-
 }
 
 #[cfg(test)]
@@ -414,8 +408,16 @@ pub(crate) mod tests {
         let mut a = HashWeb::new();
         let mut b = HashWeb::new();
         let s1 = a.create_seq(oid(1));
-        assert_eq!(a.create_seq(oid(1)), s1, "idempotent: same seed, same object");
-        assert_ne!(s1, oid(1), "the handle is the derived object id, not the seed");
+        assert_eq!(
+            a.create_seq(oid(1)),
+            s1,
+            "idempotent: same seed, same object"
+        );
+        assert_ne!(
+            s1,
+            oid(1),
+            "the handle is the derived object id, not the seed"
+        );
         let k2 = b.create_kv(oid(2));
         type_text(&mut a, &s1, 0, "hi");
         put(&mut b, &k2, s("k"), s("v"));
@@ -432,7 +434,11 @@ pub(crate) mod tests {
         for (id, node) in nodes {
             fresh.apply_to_with_id(s1, id, node);
         }
-        assert_eq!(fresh.orphans().count(), 2, "both envelopes park on the unknown object id");
+        assert_eq!(
+            fresh.orphans().count(),
+            2,
+            "both envelopes park on the unknown object id"
+        );
         fresh.create_seq(oid(1));
         assert_eq!(fresh.orphans().count(), 0, "adoption wakes transitively");
         assert_eq!(read_text(&fresh, &s1), "hi");
@@ -449,10 +455,8 @@ pub(crate) mod tests {
         assert!(confused.kv(&k1).unwrap().delivery.gated.is_empty());
 
         // Roundtrip of a multi-root store.
-        let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(
-            &a,
-        ))
-        .expect("strict");
+        let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(&a))
+            .expect("strict");
         assert_eq!(decoded, a);
     }
 
@@ -500,8 +504,11 @@ pub(crate) mod tests {
             // Freeze: the chain starts at the last AGREED placement (the
             // birth atom) — neither contender's destination renders, and
             // exactly one placement candidate exists: no duplication.
-            assert_eq!(reg.chain(), vec![birth.id()],
-                "the chain starts below the contenders, at the agreed birth placement");
+            assert_eq!(
+                reg.chain(),
+                vec![birth.id()],
+                "the chain starts below the contenders, at the agreed birth placement"
+            );
         }
         // Identical bytes on both merge orders (canonical encoding is the
         // convergence test).
@@ -517,10 +524,8 @@ pub(crate) mod tests {
         assert_eq!(reg.chain()[0], link_q2.id());
 
         // Place ops round-trip the canonical snapshot exactly.
-        let decoded = crate::encoding::decode_hashweb_strict(
-            &crate::encoding::encode_hashweb(&ab),
-        )
-        .expect("strict");
+        let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(&ab))
+            .expect("strict");
         assert_eq!(decoded, ab);
         assert_eq!(
             decoded.seq(&child).unwrap().placement().chain(),
@@ -531,11 +536,12 @@ pub(crate) mod tests {
         let page = ab.create_kv(oid(0x50));
         let link_pg = ab.seq_mut(&p).unwrap().insert_value(0, oid(0x50));
         ab.kv_mut(&page).unwrap().place(link_pg.id());
-        assert_eq!(ab.kv(&page).unwrap().placement().chain(), vec![link_pg.id()]);
-        let decoded = crate::encoding::decode_hashweb_strict(
-            &crate::encoding::encode_hashweb(&ab),
-        )
-        .expect("strict");
+        assert_eq!(
+            ab.kv(&page).unwrap().placement().chain(),
+            vec![link_pg.id()]
+        );
+        let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(&ab))
+            .expect("strict");
         assert_eq!(
             decoded.kv(&page).unwrap().placement().chain(),
             vec![link_pg.id()]
@@ -662,7 +668,7 @@ pub(crate) mod tests {
         assert_eq!(minted.len(), 2);
         assert!(minted.contains(&s("k").value_id()));
 
-        // Off without an outbox (servers/tests don't flush).
+        // Off unless delta sync is enabled (servers/tests don't flush).
         let mut quiet = HashWeb::new();
         let r = quiet.create_kv(oid(8));
         quiet.kv_mut(&r).unwrap().put(s("a"), s("b"));
@@ -824,7 +830,7 @@ pub(crate) mod tests {
     /// A link atom: a seq element whose payload is another object's origin
     /// id — rendering resolves it by id, nothing embeds.
     #[test]
-    fn link_atoms_reference_other_objects()  {
+    fn link_atoms_reference_other_objects() {
         let mut doc = HashWeb::new();
         let a = doc.create_seq(oid(3));
         let b = doc.create_seq(oid(4));
@@ -840,7 +846,11 @@ pub(crate) mod tests {
         doc.apply_to(a, node.clone());
         let seq = doc.seq(&a).unwrap();
         let atom = seq.id_at(6).unwrap();
-        assert_eq!(seq.payload_of(&atom), Some(b), "the link target's origin id");
+        assert_eq!(
+            seq.payload_of(&atom),
+            Some(b),
+            "the link target's origin id"
+        );
         assert_eq!(read_text(&doc, &b), "the target");
     }
 

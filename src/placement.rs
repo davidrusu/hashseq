@@ -103,10 +103,7 @@ impl PlacementRegister {
     /// Members of `set` not transitively overwritten by another member.
     fn maximal(&self, set: &BTreeSet<Id>) -> Vec<Id> {
         set.iter()
-            .filter(|m| {
-                !set.iter()
-                    .any(|n| n != *m && self.closure(n).contains(*m))
-            })
+            .filter(|m| !set.iter().any(|n| n != *m && self.closure(n).contains(*m)))
             .copied()
             .collect()
     }
@@ -209,10 +206,7 @@ mod tests {
         ];
         // NOTE: delivery guarantees overwritten-before-superseder; test
         // every order consistent with that partial order.
-        let orders: Vec<Vec<usize>> = vec![
-            vec![0, 1, 2, 3],
-            vec![0, 2, 1, 3],
-        ];
+        let orders: Vec<Vec<usize>> = vec![vec![0, 1, 2, 3], vec![0, 2, 1, 3]];
         let mut results = Vec::new();
         for ord in orders {
             let mut r = PlacementRegister::default();
