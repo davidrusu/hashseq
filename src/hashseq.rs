@@ -159,21 +159,9 @@ impl From<Loc> for PackedLoc {
 /// `Run` built from a cursor (`into_run`) can be applied later — even after
 /// concurrent mutations — and will land in the causally correct position.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Cursor {
-    /// Insert immediately after `anchor`. In an empty sequence the anchor is
-    /// the document origin.
-    After {
-        // HERE
-        anchor: Id,
-        extra_deps: BTreeSet<Id>,
-    },
-    /// Insert immediately before `anchor`. Used (per the Fugue rule) when the
-    /// left neighbor already has a right child, so a fork at the left neighbor
-    /// would otherwise give hash-determined ordering.
-    Before {
-        anchor: Id,
-        extra_deps: BTreeSet<Id>,
-    },
+pub struct Cursor {
+    pub at: Anchor,
+    pub pins: BTreeSet<Id>,
 }
 
 impl Cursor {
@@ -186,21 +174,17 @@ impl Cursor {
     /// Build the insert node for any payload — a char, or a value
     /// commitment id (a link or an artifact).
     pub fn payload_node(self, payload: Payload) -> HashNode {
-        let (pins, at) = match self {
-            Cursor::After { anchor, extra_deps } => (extra_deps, Anchor::After(anchor)),
-            Cursor::Before { anchor, extra_deps } => (extra_deps, Anchor::Before(anchor)),
-        };
         HashNode {
-            pins,
-            op: Op::Insert { at, payload },
+            pins: self.pins,
+            op: Op::insert(self.at, payload),
         }
     }
 
     /// Build a `Run` starting at this cursor with `first` as its first character.
     pub fn into_run(self, first: char) -> Run {
-        match self {
-            Cursor::After { anchor, extra_deps } => Run::new(anchor, extra_deps, first),
-            Cursor::Before { anchor, extra_deps } => Run::new_before(anchor, extra_deps, first),
+        match self.at {
+            Anchor::After(anchor) => Run::new(anchor, self.pins, first),
+            Anchor::Before(anchor) => Run::new_before(anchor, self.pins, first),
         }
     }
 }
@@ -2633,52 +2617,31 @@ impl HashSeq {
             return None;
         }
         let (left, right) = self.neighbours(idx);
-        match (
+        let at = match (
             left.map(|l| self.render_anchor(l)),
             right.map(|r| self.render_anchor(r)),
         ) {
             (Some(left), Some(_)) => {
+                // TODO: why not the visible right neighbor?
+
                 // Fugue rule. The Before anchor is left's traversal successor
                 // with tombstones included — not the visible right neighbor —
                 // and `region_first` guarantees it has no before-children, so
                 // the insert lands directly after left with no Id-ordered
                 // sibling race.
                 match self.afters_of(left).next() {
-                    Some(child) => {
-                        let anchor = self.id_of(self.region_first(child));
-                        Some(Cursor::Before {
-                            extra_deps: self.tips_minus(&anchor),
-                            anchor,
-                        })
-                    }
-                    None => {
-                        let anchor = self.id_of(left);
-                        Some(Cursor::After {
-                            extra_deps: self.tips_minus(&anchor),
-                            anchor,
-                        })
-                    }
+                    Some(child) => Anchor::Before(self.id_of(self.region_first(child))),
+                    None => Anchor::After(self.id_of(left)),
                 }
             }
-            (Some(left), None) => {
-                let anchor = self.id_of(left);
-                Some(Cursor::After {
-                    extra_deps: self.tips_minus(&anchor),
-                    anchor,
-                })
-            }
-            (None, Some(right)) => {
-                let anchor = self.id_of(right);
-                Some(Cursor::Before {
-                    extra_deps: self.tips_minus(&anchor),
-                    anchor,
-                })
-            }
-            (None, None) => Some(Cursor::After {
-                extra_deps: self.tips_minus(&self.origin),
-                anchor: self.origin,
-            }),
-        }
+            (Some(left), None) => Anchor::After(self.id_of(left)),
+            (None, Some(right)) => Anchor::Before(self.id_of(right)),
+            (None, None) => Anchor::After(self.origin),
+        };
+        Some(Cursor {
+            pins: self.tips_minus(&at.id()),
+            at,
+        })
     }
 
     /// Apply an `EncodableOp` to the sequence. `Run` ops are decompressed into their
@@ -3908,7 +3871,7 @@ mod test {
     fn test_cursor_at_edges() {
         let seq = HashSeq::default();
         assert!(
-            matches!(seq.cursor_at(0), Some(Cursor::After { anchor, .. }) if anchor == seq.origin()),
+            matches!(seq.cursor_at(0), Some(Cursor { at: Anchor::After(anchor), .. }) if anchor == seq.origin()),
             "empty seq at 0 yields an After(origin) cursor"
         );
 
@@ -3918,9 +3881,12 @@ mod test {
         // idx 0 in a non-empty seq → Before(id_at(0)) so leading inserts get an
         // explicit ordering constraint relative to the first visible char.
         match seq.cursor_at(0).expect("cursor at idx 0") {
-            Cursor::Before { anchor, extra_deps } => {
+            Cursor {
+                at: Anchor::Before(anchor),
+                pins,
+            } => {
                 assert_eq!(Some(anchor), seq.id_at(0));
-                assert!(!extra_deps.contains(&anchor));
+                assert!(!pins.contains(&anchor));
             }
             other => panic!("expected Before cursor at idx 0, got {other:?}"),
         }
@@ -3929,9 +3895,12 @@ mod test {
         // run chain), so the Fugue rule picks Before(right) and the insert
         // lands deterministically between them.
         match seq.cursor_at(1).expect("cursor at idx 1") {
-            Cursor::Before { anchor, extra_deps } => {
+            Cursor {
+                at: Anchor::Before(anchor),
+                pins,
+            } => {
                 assert_eq!(Some(anchor), seq.id_at(1));
-                assert!(!extra_deps.contains(&anchor));
+                assert!(!pins.contains(&anchor));
             }
             other => panic!(
                 "expected Before cursor at idx 1 (left neighbor has a right child), got {other:?}"
@@ -3940,9 +3909,12 @@ mod test {
 
         // idx == len: no right neighbor → After(last).
         match seq.cursor_at(seq.len()).expect("cursor at end") {
-            Cursor::After { anchor, extra_deps } => {
+            Cursor {
+                at: Anchor::After(anchor),
+                pins,
+            } => {
                 assert_eq!(Some(anchor), seq.id_at(seq.len() - 1));
-                assert!(!extra_deps.contains(&anchor));
+                assert!(!pins.contains(&anchor));
             }
             other => panic!("expected After cursor at end, got {other:?}"),
         }
@@ -4007,7 +3979,7 @@ mod test {
         let cursor = seq.cursor_at(5).expect("cursor after 'hello'");
         let space_id = seq.id_at(5).unwrap();
         assert!(
-            matches!(&cursor, Cursor::Before { anchor, .. } if *anchor == space_id),
+            matches!(&cursor, Cursor { at: Anchor::Before(anchor), .. } if *anchor == space_id),
             "expected Before cursor anchored at ' ', got {cursor:?}",
         );
 
@@ -4037,7 +4009,13 @@ mod test {
         seq.insert_batch(0, "hello world".chars());
 
         let cursor = seq.cursor_at(5).unwrap();
-        assert!(matches!(cursor, Cursor::Before { .. }));
+        assert!(matches!(
+            cursor,
+            Cursor {
+                at: Anchor::Before(_),
+                ..
+            }
+        ));
 
         let mut run = cursor.into_run(' ');
         for ch in "mighty".chars() {

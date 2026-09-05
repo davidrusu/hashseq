@@ -339,8 +339,14 @@ impl WasmHashSeq {
     pub fn cursor_at(&self, idx: usize) -> Option<WasmCursor> {
         self.inner.cursor_at(idx).map(|cursor| {
             let (op, anchor, extra_deps) = match cursor {
-                Cursor::After { anchor, extra_deps } => ("after", anchor, extra_deps),
-                Cursor::Before { anchor, extra_deps } => ("before", anchor, extra_deps),
+                Cursor {
+                    at: Anchor::After(anchor),
+                    pins,
+                } => ("after", anchor, pins),
+                Cursor {
+                    at: Anchor::Before(anchor),
+                    pins,
+                } => ("before", anchor, pins),
             };
             WasmCursor {
                 op: op.to_string(),

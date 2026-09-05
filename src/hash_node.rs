@@ -139,20 +139,16 @@ pub enum Op {
 }
 
 impl Op {
-    /// Convenience ctor: insert `ch` after `anchor`.
-    pub fn insert_after(anchor: Id, ch: char) -> Op {
-        Op::Insert {
-            at: Anchor::After(anchor),
-            payload: Payload::Char(ch),
-        }
+    pub fn insert(at: Anchor, payload: Payload) -> Op {
+        Op::Insert { at, payload }
     }
 
-    /// Convenience ctor: insert `ch` before `anchor`.
-    pub fn insert_before(anchor: Id, ch: char) -> Op {
-        Op::Insert {
-            at: Anchor::Before(anchor),
-            payload: Payload::Char(ch),
-        }
+    pub fn insert_after(at: Id, ch: char) -> Op {
+        Self::insert(Anchor::After(at), Payload::Char(ch))
+    }
+
+    pub fn insert_before(at: Id, ch: char) -> Op {
+        Self::insert(Anchor::Before(at), Payload::Char(ch))
     }
 
     #[inline]
