@@ -6,7 +6,7 @@ use crate::bitset::BitSet;
 use crate::delivery::Delivery;
 use crate::placement::PlacementRegister;
 use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepFrag, SweepPos};
-use crate::{Anchor, EncodableOp, FirstOp, HashNode, Id, Op, Payload, Run};
+use crate::{Anchor, EncodableOp, HashNode, Id, Op, Payload, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
 /// already a BLAKE3 hash, so adversaries cannot craft colliding keys without
@@ -182,10 +182,7 @@ impl Cursor {
 
     /// Build a `Run` starting at this cursor with `first` as its first character.
     pub fn into_run(self, first: char) -> Run {
-        match self.at {
-            Anchor::After(anchor) => Run::new(anchor, self.pins, first),
-            Anchor::Before(anchor) => Run::new_before(anchor, self.pins, first),
-        }
+        Run::new(self.at, self.pins, first)
     }
 }
 
@@ -273,13 +270,12 @@ impl RemoveRun {
 /// `seq.id_of(elements[i])`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRun {
-    pub anchor: Id,
-    pub first_op: FirstOp,
-    pub first_extra_deps: SortedIdVec,
+    pub at: Anchor,
+    pub first_pins: SortedIdVec,
     /// Extra deps of interior elements (offset >= 1), sparse — see
     /// [`Run::interior_extra_deps`]. Lets a typing burst extend its run
     /// across a remove instead of starting a new run per burst.
-    pub interior_extra_deps: BTreeMap<usize, SortedIdVec>,
+    pub interior_pins: BTreeMap<usize, SortedIdVec>,
     pub text: String,
     pub elements: Vec<NodeIdx>,
 }
@@ -312,8 +308,7 @@ impl StoredRun {
 
     fn extend(&mut self, idx: NodeIdx, ch: char, extra_deps: SortedIdVec) {
         if !extra_deps.is_empty() {
-            self.interior_extra_deps
-                .insert(self.elements.len(), extra_deps);
+            self.interior_pins.insert(self.elements.len(), extra_deps);
         }
         self.text.push(ch);
         self.elements.push(idx);
@@ -328,17 +323,16 @@ impl StoredRun {
         let right_text = self.text.split_off(byte_pos);
         // Deps at the split point become the right run's first deps (its
         // head keeps its id); later offsets rebase.
-        let mut right_interior = self.interior_extra_deps.split_off(&at);
-        let right_first_deps = right_interior.remove(&at).unwrap_or_default();
+        let mut right_interior = self.interior_pins.split_off(&at);
+        let right_first_pins = right_interior.remove(&at).unwrap_or_default();
         let right_interior: BTreeMap<usize, SortedIdVec> = right_interior
             .into_iter()
             .map(|(k, v)| (k - at, v))
             .collect();
         StoredRun {
-            anchor: right_anchor,
-            first_op: FirstOp::After,
-            first_extra_deps: right_first_deps,
-            interior_extra_deps: right_interior,
+            at: Anchor::After(right_anchor),
+            first_pins: right_first_pins,
+            interior_pins: right_interior,
             text: right_text,
             elements: right_elements,
         }
@@ -348,11 +342,10 @@ impl StoredRun {
     /// id table (`ids[elements[i]]`) — no rehashing.
     pub fn to_run(&self, ids: &[Id]) -> Run {
         Run {
-            anchor: self.anchor,
-            first_op: self.first_op,
-            first_extra_deps: self.first_extra_deps.to_id_set(ids),
-            interior_extra_deps: self
-                .interior_extra_deps
+            at: self.at,
+            first_pins: self.first_pins.to_id_set(ids),
+            interior_pins: self
+                .interior_pins
                 .iter()
                 .map(|(off, deps)| (*off, deps.to_id_set(ids)))
                 .collect(),
@@ -754,14 +747,11 @@ impl HashSeq {
         };
         let r = &self.runs[&run];
         debug_assert_eq!(r.elements.len(), 1, "atoms never chain");
-        let at = match r.first_op {
-            FirstOp::After => Anchor::After(r.anchor),
-            FirstOp::Before => Anchor::Before(r.anchor),
-        };
+
         HashNode {
-            pins: r.first_extra_deps.to_id_set(&self.ids),
+            pins: r.first_pins.to_id_set(&self.ids),
             op: Op::Insert {
-                at,
+                at: r.at,
                 payload: Payload::Id(self.elem_payloads[&e]),
             },
         }
@@ -1123,10 +1113,9 @@ impl HashSeq {
         self.runs.insert(
             idx,
             StoredRun {
-                anchor: after.anchor,
-                first_op: FirstOp::After,
-                first_extra_deps,
-                interior_extra_deps: BTreeMap::new(),
+                at: Anchor::After(after.anchor),
+                first_pins: first_extra_deps,
+                interior_pins: BTreeMap::new(),
                 text: after.ch.to_string(),
                 elements: vec![idx],
             },
@@ -2137,10 +2126,9 @@ impl HashSeq {
         self.runs.insert(
             idx,
             StoredRun {
-                anchor: before.anchor,
-                first_op: FirstOp::Before,
-                first_extra_deps,
-                interior_extra_deps: BTreeMap::new(),
+                at: Anchor::Before(before.anchor),
+                first_pins: first_extra_deps,
+                interior_pins: BTreeMap::new(),
                 text: before.ch.to_string(),
                 elements: vec![idx],
             },
@@ -2377,21 +2365,17 @@ impl HashSeq {
                 let pos = pos as usize;
                 let ch = r.char_at(pos);
                 if pos == 0 {
-                    let at = match r.first_op {
-                        FirstOp::After => Anchor::After(r.anchor),
-                        FirstOp::Before => Anchor::Before(r.anchor),
-                    };
                     HashNode {
-                        pins: r.first_extra_deps.to_id_set(&self.ids),
+                        pins: r.first_pins.to_id_set(&self.ids),
                         op: Op::Insert {
-                            at,
+                            at: r.at,
                             payload: Payload::Char(ch),
                         },
                     }
                 } else {
                     HashNode {
                         pins: r
-                            .interior_extra_deps
+                            .interior_pins
                             .get(&pos)
                             .map(|d| d.to_id_set(&self.ids))
                             .unwrap_or_default(),
@@ -3307,7 +3291,7 @@ mod test {
         );
         // the deps landed as interior deps on some run
         assert!(
-            seq.runs.values().any(|r| !r.interior_extra_deps.is_empty()),
+            seq.runs.values().any(|r| !r.interior_pins.is_empty()),
             "remove dep should be stored as interior extra-deps"
         );
         // and the encoding roundtrips identically
@@ -3949,7 +3933,7 @@ mod test {
         seq_a.insert(0, 'x');
         let mut seq_b = seq_a.clone();
 
-        let anchor = seq_a.id_at(0).unwrap();
+        let anchor = Anchor::After(seq_a.id_at(0).unwrap());
         let mut run = Run::new(anchor, BTreeSet::new(), 'a');
         run.extend('b');
         run.extend('c');

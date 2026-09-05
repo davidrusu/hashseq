@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::hashkv::HashKv;
 use crate::hashseq::{CausalRemove, Loc};
 use crate::hashweb::HashWeb;
-use crate::run::{FirstOp, RunError};
+use crate::run::RunError;
 use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,17 +293,17 @@ const RUN_OP_AFTER: u8 = 0x00;
 const RUN_OP_BEFORE: u8 = 0x01;
 
 pub fn encode_run(run: &Run, buf: &mut Vec<u8>) {
-    buf.push(match run.first_op {
-        crate::run::FirstOp::After => RUN_OP_AFTER,
-        crate::run::FirstOp::Before => RUN_OP_BEFORE,
+    buf.push(match run.at {
+        Anchor::After(_) => RUN_OP_AFTER,
+        Anchor::Before(_) => RUN_OP_BEFORE,
     });
-    encode_id(&run.anchor, buf);
-    encode_id_set(&run.first_extra_deps, buf);
+    encode_id(&run.at.id(), buf);
+    encode_id_set(&run.first_pins, buf);
     encode_string(&run.run, buf);
     // Interior extra-deps: varint count + (varint offset, id_set) entries,
     // ascending offsets (BTreeMap iteration order).
-    encode_varint(run.interior_extra_deps.len(), buf);
-    for (offset, deps) in &run.interior_extra_deps {
+    encode_varint(run.interior_pins.len(), buf);
+    for (offset, deps) in &run.interior_pins {
         encode_varint(*offset, buf);
         encode_id_set(deps, buf);
     }
@@ -314,38 +314,28 @@ pub fn encode_run(run: &Run, buf: &mut Vec<u8>) {
 /// snapshot run block (positional refs).
 fn decode_run_with(
     c: &mut Cursor,
-    first_op: crate::run::FirstOp,
-    ref_: &mut GetRef,
+    at: Anchor,
     ref_set: &mut GetRefSet,
 ) -> Result<Run, DecodeError> {
-    let anchor = ref_(c)?;
-    let first_extra_deps = ref_set(c)?;
+    let first_pins = ref_set(c)?;
     let text = c.step(decode_string)?;
     let num_interior = c.step(decode_varint)?;
-    let mut interior_extra_deps = BTreeMap::new();
+    let mut interior_pins = BTreeMap::new();
     for _ in 0..num_interior {
         let offset = c.step(decode_varint)?;
-        interior_extra_deps.insert(offset, ref_set(c)?);
+        interior_pins.insert(offset, ref_set(c)?);
     }
-    Ok(Run::from_text(
-        anchor,
-        first_op,
-        first_extra_deps,
-        &text,
-        interior_extra_deps,
-    )?)
+    Ok(Run::from_text(at, first_pins, &text, interior_pins)?)
 }
 
 pub fn decode_run(bytes: &[u8]) -> Result<(Run, usize), DecodeError> {
     let mut c = Cursor { bytes, pos: 0 };
-    let first_op = match c.byte()? {
-        RUN_OP_AFTER => crate::run::FirstOp::After,
-        RUN_OP_BEFORE => crate::run::FirstOp::Before,
+    let anchor = match c.byte()? {
+        RUN_OP_AFTER => Anchor::After(c.step(decode_id)?),
+        RUN_OP_BEFORE => Anchor::Before(c.step(decode_id)?),
         other => return Err(DecodeError::InvalidOpTag(other)),
     };
-    let run = decode_run_with(&mut c, first_op, &mut |c| c.step(decode_id), &mut |c| {
-        c.step(decode_id_set)
-    })?;
+    let run = decode_run_with(&mut c, anchor, &mut |c| c.step(decode_id_set))?;
     Ok((run, c.pos))
 }
 
@@ -796,9 +786,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // other extender heads its own block. Chains extend *through* interior
     // extra-deps (typing across a delete never splits a canonical run).
     struct CanonRun {
-        first_op: FirstOp,
-        anchor: Id,
-        first_deps: BTreeSet<Id>,
+        at: Anchor,
+        first_pins: BTreeSet<Id>,
         text: String,
         interior: BTreeMap<usize, BTreeSet<Id>>,
         elements: Vec<NodeIdx>,
@@ -827,16 +816,16 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     let r = &seq.runs[&run];
                     if pos > 0 {
                         bump(r.elements[pos as usize - 1]);
-                        if let Some(p) = r.interior_extra_deps.get(&(pos as usize)) {
+                        if let Some(p) = r.interior_pins.get(&(pos as usize)) {
                             for h in p.iter() {
                                 bump(h);
                             }
                         }
                     } else {
-                        if let Some(a) = seq.idx_of(&r.anchor) {
+                        if let Some(a) = seq.idx_of(&r.at.id()) {
                             bump(a);
                         }
-                        for h in r.first_extra_deps.iter() {
+                        for h in r.first_pins.iter() {
                             bump(h);
                         }
                     }
@@ -928,28 +917,28 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         };
         let r = &seq.runs[&run];
         if pos == 0 {
-            r.first_extra_deps.to_id_set(&seq.ids)
+            r.first_pins.to_id_set(&seq.ids)
         } else {
-            r.interior_extra_deps
+            r.interior_pins
                 .get(&(pos as usize))
                 .map(|d| d.to_id_set(&seq.ids))
                 .unwrap_or_default()
         }
     };
     // One element's anchor: (side, anchor id, anchor element if it is one).
-    let elem_anchor = |e: NodeIdx| -> (FirstOp, Id, Option<NodeIdx>) {
+    let elem_anchor = |e: NodeIdx| -> (Anchor, Option<NodeIdx>) {
         let Loc::Run { run, pos } = seq.loc_of(e) else {
             unreachable!("insert elements live in runs")
         };
         if pos > 0 {
             let p = seq.runs[&run].elements[pos as usize - 1];
-            (FirstOp::After, seq.id_of(p), Some(p))
+            (Anchor::After(seq.id_of(p)), Some(p))
         } else {
             let r = &seq.runs[&run];
             let anchor_elem = seq
-                .idx_of(&r.anchor)
+                .idx_of(&r.at.id())
                 .filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }));
-            (r.first_op, r.anchor, anchor_elem)
+            (r.at, anchor_elem)
         }
     };
 
@@ -961,10 +950,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             if seq.is_atom(e) {
                 continue; // atoms travel as individual trailing nodes
             }
-            let (first_op, anchor, anchor_elem) = elem_anchor(e);
-            let continues = first_op == FirstOp::After
-                && anchor_elem.is_some_and(|p| chain_child(p) == Some(e));
-            if continues {
+            let (anchor, anchor_elem) = elem_anchor(e);
+            if anchor.is_after() && anchor_elem.is_some_and(|p| chain_child(p) == Some(e)) {
                 continue; // an interior member of some canonical chain
             }
             // e heads a canonical run: walk smallest-child extensions.
@@ -1007,9 +994,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 }
             }
             canon_runs.push(CanonRun {
-                first_op,
-                anchor,
-                first_deps: elem_pins(e),
+                at: anchor,
+                first_pins: elem_pins(e),
                 text,
                 interior,
                 elements,
@@ -1256,8 +1242,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let visit_refs = |block: &Block, f: &mut dyn FnMut(&Id, bool)| match &block.payload {
         Payload::Run(ci) => {
             let cr = &canon_runs[*ci];
-            f(&cr.anchor, false);
-            for id in &cr.first_deps {
+            f(&cr.at.id(), false);
+            for id in &cr.first_pins {
                 f(id, false);
             }
             for deps in cr.interior.values() {
@@ -1510,12 +1496,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         match &block.payload {
             Payload::Run(ci) => {
                 let cr = &canon_runs[*ci];
-                buf.push(match cr.first_op {
-                    FirstOp::After => BLK_RUN_AFTER,
-                    FirstOp::Before => BLK_RUN_BEFORE,
+                buf.push(match cr.at {
+                    Anchor::After(_) => BLK_RUN_AFTER,
+                    Anchor::Before(_) => BLK_RUN_BEFORE,
                 });
-                encode_ref(&cr.anchor, pe, &mut buf);
-                encode_ref_set(&cr.first_deps, pe, &mut buf);
+                encode_ref(&cr.at.id(), pe, &mut buf);
+                encode_ref_set(&cr.first_pins, pe, &mut buf);
                 encode_string(&cr.text, &mut buf);
                 encode_varint(cr.interior.len(), &mut buf);
                 for (offset, deps) in &cr.interior {
@@ -1717,17 +1703,14 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         let tag = c.byte()?;
         match tag {
             BLK_RUN_AFTER | BLK_RUN_BEFORE => {
-                let first_op = if tag == BLK_RUN_AFTER {
-                    crate::run::FirstOp::After
+                let anchor = if tag == BLK_RUN_AFTER {
+                    Anchor::After(decode_ref(&mut c, &id_list, &ranks)?)
                 } else {
-                    crate::run::FirstOp::Before
+                    Anchor::Before(decode_ref(&mut c, &id_list, &ranks)?)
                 };
-                let run = decode_run_with(
-                    &mut c,
-                    first_op,
-                    &mut |c| decode_ref(c, &id_list, &ranks),
-                    &mut |c| decode_ref_set(c, &id_list, &ranks),
-                )?;
+                let run =
+                    decode_run_with(&mut c, anchor, &mut |c| decode_ref_set(c, &id_list, &ranks))?;
+
                 // `from_text` computed the element ids from the wire content —
                 // the authoritative derivation, so apply without rehashing.
                 for (id, node) in run.decompress_with_ids() {
@@ -2516,8 +2499,7 @@ mod tests {
         let anchor = test_id(1);
         let stray = test_id(9);
         let honest = Run::from_text(
-            anchor,
-            FirstOp::After,
+            Anchor::After(anchor),
             BTreeSet::from([stray]),
             "ab",
             BTreeMap::new(),
@@ -2525,8 +2507,7 @@ mod tests {
         .unwrap();
         // First deps repeat the anchor.
         let r = Run::from_text(
-            anchor,
-            FirstOp::After,
+            Anchor::After(anchor),
             BTreeSet::from([stray, anchor]),
             "ab",
             BTreeMap::new(),
@@ -2535,8 +2516,7 @@ mod tests {
         // Interior deps at offset 1 repeat the first element (its chain anchor).
         let interior = BTreeMap::from([(1, BTreeSet::from([honest.elements[0]]))]);
         let r = Run::from_text(
-            anchor,
-            FirstOp::After,
+            Anchor::After(anchor),
             BTreeSet::from([stray]),
             "ab",
             interior,
@@ -2550,7 +2530,7 @@ mod tests {
         let dep = test_id(9);
         for bad in [0usize, 2, 5] {
             let interior = BTreeMap::from([(bad, BTreeSet::from([dep]))]);
-            let r = Run::from_text(anchor, FirstOp::After, BTreeSet::new(), "ab", interior);
+            let r = Run::from_text(Anchor::After(anchor), BTreeSet::new(), "ab", interior);
             assert_eq!(
                 r.err(),
                 Some(RunError::DepOffsetOutOfRange(bad)),
@@ -2559,14 +2539,13 @@ mod tests {
         }
         let interior = BTreeMap::from([(1usize, BTreeSet::from([dep]))]);
         let run = Run::from_text(
-            anchor,
-            FirstOp::After,
+            Anchor::After(anchor),
             BTreeSet::new(),
             "ab",
             interior.clone(),
         )
         .unwrap();
-        assert_eq!(run.interior_extra_deps, interior);
+        assert_eq!(run.interior_pins, interior);
     }
 
     #[test]
@@ -2657,7 +2636,7 @@ mod tests {
     #[test]
     fn test_run_roundtrip() {
         let anchor = test_id(0);
-        let mut run = Run::new(anchor, BTreeSet::new(), 'a');
+        let mut run = Run::new(Anchor::After(anchor), BTreeSet::new(), 'a');
         run.extend('b');
         run.extend('c');
 
@@ -2676,7 +2655,7 @@ mod tests {
         deps.insert(test_id(1));
         deps.insert(test_id(2));
 
-        let mut run = Run::new(anchor, deps, 'x');
+        let mut run = Run::new(Anchor::After(anchor), deps, 'x');
         run.extend('y');
 
         let mut buf = Vec::new();
@@ -2737,7 +2716,7 @@ mod tests {
     #[test]
     fn test_unicode_run() {
         let anchor = test_id(0);
-        let mut run = Run::new(anchor, BTreeSet::new(), '\u{1f600}');
+        let mut run = Run::new(Anchor::After(anchor), BTreeSet::new(), '\u{1f600}');
         run.extend('\u{4e2d}');
         run.extend('\u{00e9}');
 

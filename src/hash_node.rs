@@ -49,6 +49,14 @@ impl Anchor {
             Anchor::After(_) => 1,
         }
     }
+
+    pub fn is_after(&self) -> bool {
+        matches!(self, Anchor::After(_))
+    }
+
+    pub fn is_before(&self) -> bool {
+        matches!(self, Anchor::Before(_))
+    }
 }
 
 /// An insert's payload — semantically always a value commitment (an id); the

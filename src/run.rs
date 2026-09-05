@@ -1,4 +1,4 @@
-use crate::{HashNode, Id, Op};
+use crate::{Anchor, HashNode, Id, Op, Payload};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,16 +13,6 @@ pub enum RunError {
     DepOffsetOutOfRange(usize),
 }
 
-/// How the first element of a run is anchored relative to its `anchor` node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FirstOp {
-    /// First char is `InsertAfter(anchor, ch)`. Subsequent chars chain InsertAfter.
-    After,
-    /// First char is `InsertBefore(anchor, ch)`. Subsequent chars chain InsertAfter
-    /// from the first char.
-    Before,
-}
-
 /// A run represents a sequence of consecutive characters that can be compressed
 /// together instead of storing each as an individual HashNode.
 ///
@@ -33,18 +23,14 @@ pub enum FirstOp {
 /// 1-char `FirstOp::Before` run, extended in place as the typing burst continues.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
-    /// The node this run is anchored against (semantic role depends on `first_op`).
-    pub anchor: Id,
-    /// How the first element relates to `anchor`.
-    pub first_op: FirstOp,
-    /// Extra dependencies for the first element of the run
-    /// This is needed to correctly reconstruct the node's hash when decompressing
-    pub first_extra_deps: BTreeSet<Id>,
-    /// Extra dependencies of interior elements (offset >= 1), sparse: only
+    pub at: Anchor,
+    /// Pins for the first element of the run
+    pub first_pins: BTreeSet<Id>,
+    /// Pins of interior elements (offset >= 1), sparse: only
     /// non-empty sets are stored. This is what lets a typing burst keep
     /// extending its run across a remove elsewhere — the next char carries
-    /// `extra_deps = {remove_id}` without starting a new run.
-    pub interior_extra_deps: BTreeMap<usize, BTreeSet<Id>>,
+    /// `pins = {remove_id}` without starting a new run.
+    pub interior_pins: BTreeMap<usize, BTreeSet<Id>>,
     /// The string content of this run
     pub run: String,
     /// Cached element IDs for O(1) lookup (avoids recomputing hashes)
@@ -53,20 +39,24 @@ pub struct Run {
 
 impl Run {
     /// Create a new InsertAfter-rooted run.
-    pub fn new(insert_after: Id, first_extra_deps: BTreeSet<Id>, first: char) -> Self {
-        Self::with_first_op(insert_after, FirstOp::After, first_extra_deps, first)
-    }
-
-    /// Create a new InsertBefore-rooted run. The first character is constrained to
-    /// appear immediately before `anchor`; subsequent characters chain InsertAfter
-    /// from the first.
-    pub fn new_before(anchor: Id, first_extra_deps: BTreeSet<Id>, first: char) -> Self {
-        Self::with_first_op(anchor, FirstOp::Before, first_extra_deps, first)
+    pub fn new(at: Anchor, first_pins: BTreeSet<Id>, first: char) -> Self {
+        let first_node = HashNode {
+            pins: first_pins.clone(),
+            op: Op::insert(at, Payload::Char(first)),
+        };
+        let first_id = first_node.id();
+        Self {
+            at,
+            first_pins,
+            interior_pins: BTreeMap::new(),
+            run: first.to_string(),
+            elements: vec![first_id],
+        }
     }
 
     /// Reconstruct a run from its anchor and full text: the first char is anchored
-    /// per `first_op`, the rest chain `InsertAfter`, carrying any interior extra
-    /// deps at their offsets (which participate in each element's id).
+    /// per `first_op`, the rest chain `InsertAfter`, carrying any interior pins
+    /// at their offsets (which participate in each element's id).
     ///
     /// This is the wire path, so the fields are validated rather than
     /// trusted: deps must not repeat the element's own chain anchor (nodes
@@ -75,53 +65,28 @@ impl Run {
     /// the chain is derived, since element `i`'s id is what offset `i + 1`'s
     /// deps may not name.
     pub fn from_text(
-        anchor: Id,
-        first_op: FirstOp,
-        first_extra_deps: BTreeSet<Id>,
+        at: Anchor,
+        first_pins: BTreeSet<Id>,
         text: &str,
-        mut interior_extra_deps: BTreeMap<usize, BTreeSet<Id>>,
+        mut interior_pins: BTreeMap<usize, BTreeSet<Id>>,
     ) -> Result<Self, RunError> {
         let mut chars = text.chars();
         let first = chars.next().ok_or(RunError::Empty)?;
-        if first_extra_deps.contains(&anchor) {
+        if first_pins.contains(&at.id()) {
             return Err(RunError::RedundantDep);
         }
-        let mut run = Self::with_first_op(anchor, first_op, first_extra_deps, first);
+        let mut run = Self::new(at, first_pins, first);
         for (i, ch) in chars.enumerate() {
-            let deps = interior_extra_deps.remove(&(i + 1)).unwrap_or_default();
+            let deps = interior_pins.remove(&(i + 1)).unwrap_or_default();
             if deps.contains(run.elements.last().unwrap()) {
                 return Err(RunError::RedundantDep);
             }
-            run.extend_with_deps(ch, deps);
+            run.extend_with_pins(ch, deps);
         }
-        if let Some((&offset, _)) = interior_extra_deps.first_key_value() {
+        if let Some((&offset, _)) = interior_pins.first_key_value() {
             return Err(RunError::DepOffsetOutOfRange(offset));
         }
         Ok(run)
-    }
-
-    fn with_first_op(
-        anchor: Id,
-        first_op: FirstOp,
-        first_extra_deps: BTreeSet<Id>,
-        first: char,
-    ) -> Self {
-        let first_node = HashNode {
-            pins: first_extra_deps.clone(),
-            op: match first_op {
-                FirstOp::After => Op::insert_after(anchor, first),
-                FirstOp::Before => Op::insert_before(anchor, first),
-            },
-        };
-        let first_id = first_node.id();
-        Self {
-            anchor,
-            first_op,
-            first_extra_deps,
-            interior_extra_deps: BTreeMap::new(),
-            run: first.to_string(),
-            elements: vec![first_id],
-        }
     }
 
     /// Get the number of characters in this run (O(1) using cached elements)
@@ -159,15 +124,15 @@ impl Run {
         nodes.push((self.elements[0], self.first_node_with_char(first)));
 
         for (i, ch) in chars.enumerate() {
-            let extra_dependencies = self
-                .interior_extra_deps
+            let pins = self
+                .interior_pins
                 .get(&(i + 1))
                 .cloned()
                 .unwrap_or_default();
             nodes.push((
                 self.elements[i + 1],
                 HashNode {
-                    pins: extra_dependencies,
+                    pins,
                     op: Op::insert_after(self.elements[i], ch),
                 },
             ));
@@ -178,11 +143,8 @@ impl Run {
 
     fn first_node_with_char(&self, first: char) -> HashNode {
         HashNode {
-            pins: self.first_extra_deps.clone(),
-            op: match self.first_op {
-                FirstOp::After => Op::insert_after(self.anchor, first),
-                FirstOp::Before => Op::insert_before(self.anchor, first),
-            },
+            pins: self.first_pins.clone(),
+            op: Op::insert(self.at, Payload::Char(first)),
         }
     }
 
@@ -199,12 +161,12 @@ impl Run {
     /// Extend this run by appending a character and return the new element's ID
     /// The new character will be InsertAfter(current_last_character, ch)
     pub fn extend(&mut self, ch: char) -> Id {
-        self.extend_with_deps(ch, BTreeSet::new())
+        self.extend_with_pins(ch, BTreeSet::new())
     }
 
-    /// Extend with extra dependencies on the new element (they participate in
+    /// Extend with pins on the new element (they participate in
     /// its id and are stored sparsely at its offset).
-    pub fn extend_with_deps(&mut self, ch: char, deps: BTreeSet<Id>) -> Id {
+    pub fn extend_with_pins(&mut self, ch: char, deps: BTreeSet<Id>) -> Id {
         let prev_id = *self.elements.last().unwrap();
         let new_node = HashNode {
             pins: deps,
@@ -212,7 +174,7 @@ impl Run {
         };
         let new_id = new_node.id();
         if !new_node.pins.is_empty() {
-            self.interior_extra_deps
+            self.interior_pins
                 .insert(self.elements.len(), new_node.pins);
         }
         self.extend_with_id(new_id, ch);
@@ -256,9 +218,9 @@ mod tests {
             }
 
             // Create the run with the first character
-            let mut run = Run::new(Id(insert_after), BTreeSet::new(), chars[0]);
+            let mut run = Run::new(Anchor::After(Id(insert_after)), BTreeSet::new(), chars[0]);
 
-            // Extend with remaining characters; sprinkle interior extra-deps
+            // Extend with remaining characters; sprinkle interior pins
             // (the burst-across-a-delete shape) on ~1 in 4 elements.
             for &ch in &chars[1..] {
                 if u8::arbitrary(g) % 4 == 0 {
@@ -266,7 +228,7 @@ mod tests {
                     for byte in &mut dep {
                         *byte = u8::arbitrary(g);
                     }
-                    run.extend_with_deps(ch, BTreeSet::from_iter([Id(dep)]));
+                    run.extend_with_pins(ch, BTreeSet::from_iter([Id(dep)]));
                 } else {
                     run.extend(ch);
                 }
@@ -280,9 +242,9 @@ mod tests {
     #[test]
     fn test_interior_deps_decompress() {
         let dep = test_id(7);
-        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
+        let mut run = Run::new(Anchor::After(test_id(0)), BTreeSet::new(), 'a');
         run.extend('b');
-        run.extend_with_deps('c', BTreeSet::from_iter([dep]));
+        run.extend_with_pins('c', BTreeSet::from_iter([dep]));
         run.extend('d');
 
         let nodes = run.decompress();
@@ -294,11 +256,10 @@ mod tests {
         }
         // and from_text with the same interior map reconstructs identically
         let rebuilt = Run::from_text(
-            run.anchor,
-            run.first_op,
-            run.first_extra_deps.clone(),
+            run.at,
+            run.first_pins.clone(),
             &run.run,
-            run.interior_extra_deps.clone(),
+            run.interior_pins.clone(),
         )
         .unwrap();
         assert_eq!(rebuilt, run);
@@ -308,20 +269,19 @@ mod tests {
     /// the split point become the right run's first deps.
     #[test]
     fn test_new_run() {
-        let anchor = test_id(0);
+        let anchor = Anchor::After(test_id(0));
         let mut run = Run::new(anchor, BTreeSet::new(), 'a');
         run.extend('b');
         run.extend('c');
 
         assert_eq!(run.len(), 3);
         assert_eq!(run.run, "abc");
-        assert_eq!(run.anchor, anchor);
-        assert_eq!(run.first_op, FirstOp::After);
+        assert_eq!(run.at, anchor);
     }
 
     #[test]
     fn test_decompress() {
-        let anchor = test_id(0);
+        let anchor = Anchor::After(test_id(0));
         let mut run = Run::new(anchor, BTreeSet::new(), 'a');
         run.extend('b');
 
@@ -331,7 +291,7 @@ mod tests {
         // Verify each node is correct
         let expected_node_a = HashNode {
             pins: BTreeSet::new(),
-            op: Op::insert_after(anchor, 'a'),
+            op: Op::insert(anchor, Payload::Char('a')),
         };
         assert_eq!(nodes[0], expected_node_a);
 
@@ -344,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_extend() {
-        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
+        let mut run = Run::new(Anchor::After(test_id(0)), BTreeSet::new(), 'a');
 
         run.extend('b');
 
@@ -354,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_first_and_last_id() {
-        let mut run = Run::new(test_id(0), BTreeSet::new(), 'a');
+        let mut run = Run::new(Anchor::After(test_id(0)), BTreeSet::new(), 'a');
         run.extend('b');
         run.extend('c');
         let nodes = run.decompress();

@@ -70,7 +70,7 @@ struct Structure {
     nodes: Vec<StructureNode>,
 }
 
-fn collect_deps(hex_deps: Vec<String>) -> Result<std::collections::BTreeSet<Id>, JsValue> {
+fn collect_pins(hex_deps: Vec<String>) -> Result<std::collections::BTreeSet<Id>, JsValue> {
     hex_deps.iter().map(|s| hex_to_id(s)).collect()
 }
 
@@ -123,14 +123,14 @@ impl WasmRun {
     #[wasm_bindgen(js_name = newAfter)]
     pub fn new_after(
         anchor_hex: &str,
-        extra_deps: Vec<String>,
+        pins_hex: Vec<String>,
         first: &str,
     ) -> Result<WasmRun, JsValue> {
-        let anchor = hex_to_id(anchor_hex)?;
-        let mut deps = collect_deps(extra_deps)?;
-        deps.remove(&anchor);
+        let anchor = Anchor::After(hex_to_id(anchor_hex)?);
+        let mut pins = collect_pins(pins_hex)?;
+        pins.remove(anchor.id());
         Ok(WasmRun {
-            inner: Run::new(anchor, deps, first_char(first)?),
+            inner: Run::new(anchor, pins, first_char(first)?),
         })
     }
 
@@ -140,14 +140,14 @@ impl WasmRun {
     #[wasm_bindgen(js_name = newBefore)]
     pub fn new_before(
         anchor_hex: &str,
-        extra_deps: Vec<String>,
+        pins_hex: Vec<String>,
         first: &str,
     ) -> Result<WasmRun, JsValue> {
-        let anchor = hex_to_id(anchor_hex)?;
-        let mut deps = collect_deps(extra_deps)?;
-        deps.remove(&anchor);
+        let anchor = Anchor::Before(hex_to_id(anchor_hex)?);
+        let mut pins = collect_pins(pins_hex)?;
+        pins.remove(anchor.id());
         Ok(WasmRun {
-            inner: Run::new_before(anchor, deps, first_char(first)?),
+            inner: Run::new(anchor, pins, first_char(first)?),
         })
     }
 
@@ -280,16 +280,17 @@ impl WasmHashSeq {
         for (head, run) in &s.runs {
             // Origin-anchored runs are the document's top level — emitted
             // with no anchor, like the old standalone root nodes.
-            let is_top_level = run.anchor == s.origin();
-            let (kind, rel) = match run.first_op {
+            let is_top_level = *run.at.id() == s.origin();
+
+            let (kind, rel) = match run.at {
                 _ if is_top_level => ("root", "after"),
-                crate::run::FirstOp::After => ("run", "after"),
-                crate::run::FirstOp::Before => ("before", "before"),
+                Anchor::After(_) => ("run", "after"),
+                Anchor::Before(_) => ("before", "before"),
             };
             let (parent, parent_offset) = if is_top_level {
                 (None, None)
             } else {
-                let (box_id, off) = resolve(&run.anchor);
+                let (box_id, off) = resolve(run.at.id());
                 (Some(id_to_hex(&box_id)), Some(off))
             };
             // Per-element tombstone state — one '0'/'1' per char, aligned
@@ -304,7 +305,7 @@ impl WasmHashSeq {
             }
             let mut seen = std::collections::BTreeSet::new();
             let deps = run
-                .first_extra_deps
+                .first_pins
                 .iter_ids(&s.ids)
                 .map(|id| resolve(&id))
                 .filter(|bo| seen.insert(*bo)) // dedup by (box, offset)
@@ -501,8 +502,8 @@ mod tests {
             WasmRun::new_after(&id_to_hex(&x), deps.clone(), "y").unwrap(),
             WasmRun::new_before(&id_to_hex(&x), deps.clone(), "y").unwrap(),
         ] {
-            assert_eq!(run.inner.first_extra_deps.len(), 1);
-            assert!(!run.inner.first_extra_deps.contains(&x));
+            assert_eq!(run.inner.first_pins.len(), 1);
+            assert!(!run.inner.first_pins.contains(&x));
             // The op round-trips through the wire codec (a pinned anchor
             // would be `RedundantPin` here).
             let bytes = run.encode_op();

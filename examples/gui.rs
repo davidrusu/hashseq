@@ -458,7 +458,7 @@ mod hashseq_viz {
                     let mut r: Vec<Id> = seq
                         .runs
                         .iter()
-                        .filter(|(_, run)| run.anchor == seq.origin())
+                        .filter(|(_, run)| *run.at.id() == seq.origin())
                         .map(|(head, _)| seq.id_of(*head))
                         .collect();
                     r.sort();
@@ -513,14 +513,14 @@ mod hashseq_viz {
                 for (head, before_run) in seq
                     .runs
                     .iter()
-                    .filter(|(_, r)| matches!(r.first_op, hashseq::FirstOp::Before))
+                    .filter(|(_, r)| r.at.is_before())
                 {
                     let id = &seq.id_of(*head);
                     let pos = *self.node_pos.entry(*id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let parent = &before_run.anchor;
+                    let parent = before_run.at.id();
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &self.node_pos) {
                         // Get all siblings (nodes before the same parent).
                         // befores() yields sorted order already.
@@ -593,7 +593,7 @@ mod hashseq_viz {
                 for (head, run) in seq
                     .runs
                     .iter()
-                    .filter(|(_, r)| matches!(r.first_op, hashseq::FirstOp::After))
+                    .filter(|(_, r)| r.at.is_after())
                 {
                     let run_id = &seq.id_of(*head);
                     let pos = *self.node_pos.entry(*run_id).or_insert_with(|| Point {
@@ -606,7 +606,7 @@ mod hashseq_viz {
                     // Determine target position based on run structure
                     let target_pos = {
                         // Has left dependencies
-                        let parent = run.anchor;
+                        let parent = *run.at.id();
                         if let Some(p) = get_node_right_edge(&parent, &self.node_pos) {
                             // Check how many siblings this run has (concurrent branches from same parent).
                             // afters() yields sorted order already.
