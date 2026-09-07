@@ -851,6 +851,11 @@ fn app_err(msg: &str) -> JsValue {
 #[derive(Default)]
 pub struct WasmHashWeb {
     inner: HashWeb,
+    /// The single upstream's clock (the relay everything goes through):
+    /// what it holds of each object, as far as this client knows. Deltas
+    /// are the diff against it; whatever arrives — delta, snapshot,
+    /// frontier — advances it.
+    upstream: crate::HashWebClock,
 }
 
 #[wasm_bindgen]
@@ -858,7 +863,7 @@ impl WasmHashWeb {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         let mut w = Self::default();
-        w.inner.enable_outbox(); // wasm consumers are delta-sync clients
+        w.inner.enable_delta_sync(); // wasm consumers are delta-sync clients
         w
     }
 
@@ -1410,27 +1415,54 @@ impl WasmHashWeb {
     pub fn decode(bytes: &[u8]) -> Result<WasmHashWeb, JsValue> {
         let mut inner =
             decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
-        inner.enable_outbox();
-        Ok(WasmHashWeb { inner })
+        inner.enable_delta_sync();
+        Ok(WasmHashWeb {
+            inner,
+            upstream: crate::HashWebClock::new(),
+        })
     }
 
-    /// Merge a peer snapshot: union of knowledge.
+    /// Merge a peer snapshot: union of knowledge. The snapshot is also
+    /// the sender's clock, so the upstream clock becomes it: the next
+    /// `takeDeltas` is exactly what we hold that the sender lacks.
     #[wasm_bindgen(js_name = mergeEncoded)]
     pub fn merge_encoded(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
         let other = decode_hashweb(bytes).map_err(|e| app_err(&format!("decode error: {e}")))?;
+        self.upstream = other.clock();
         self.inner.merge(other);
         Ok(())
     }
 
-    /// Drain the authored-ops delta as one 0xDE delta message; empty if
-    /// nothing was authored since the last take (APP_NOTES #8).
+    /// The delta for the upstream — everything we hold outside its
+    /// causal closure — as one 0xDE delta message; empty when there is
+    /// nothing (APP_NOTES #8). Our own clock then becomes the upstream's
+    /// ("last sent").
     #[wasm_bindgen(js_name = takeDeltas)]
     pub fn take_deltas(&mut self) -> Vec<u8> {
-        let groups = self.inner.take_deltas();
+        let groups = self.inner.deltas_for(&self.upstream);
+        self.upstream = self.inner.clock();
         if groups.is_empty() {
             return Vec::new();
         }
         crate::encoding::encode_delta(&groups)
+    }
+
+    /// Our frontier as one 0xC1 frame: per object the tips we hold. A
+    /// peer sets our clock from it and answers with a delta instead of a
+    /// snapshot (the hello / reconnect path).
+    #[wasm_bindgen(js_name = encodeFrontier)]
+    pub fn encode_frontier(&self) -> Vec<u8> {
+        crate::encoding::encode_frontier(&self.inner)
+    }
+
+    /// The upstream's 0xC1 frontier frame becomes its clock; the next
+    /// `takeDeltas` is then the exact catch-up delta. Returns the number
+    /// of objects named.
+    #[wasm_bindgen(js_name = applyFrontier)]
+    pub fn apply_frontier(&mut self, bytes: &[u8]) -> Result<usize, JsValue> {
+        self.upstream = crate::encoding::decode_frontier(bytes)
+            .map_err(|e| app_err(&format!("frontier decode error: {e}")))?;
+        Ok(self.upstream.objects().count())
     }
 
     /// Drain the ids (hex) of small value artifacts minted locally since
@@ -1447,9 +1479,11 @@ impl WasmHashWeb {
     }
 
     /// Apply a peer's 0xDE delta message. Idempotent; unknown objects are
-    /// opened from the frame's (kind, origin). Returns the number of nodes
-    /// NEWLY delivered — 0 for an echo of our own ops or a replay, so the
-    /// caller can skip re-rendering when nothing changed.
+    /// opened from the frame's (kind, origin). The upstream clock is not
+    /// touched: it changes only when the upstream states it (a frontier
+    /// frame, a snapshot) or when we send. Returns the number of nodes
+    /// NEWLY delivered — 0 for an echo of our own ops or a replay, so
+    /// the caller can skip re-rendering when nothing changed.
     #[wasm_bindgen(js_name = applyDelta)]
     pub fn apply_delta(&mut self, bytes: &[u8]) -> Result<usize, JsValue> {
         crate::encoding::apply_delta(&mut self.inner, bytes)

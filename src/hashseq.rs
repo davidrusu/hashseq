@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -531,14 +531,6 @@ pub struct HashSeq {
     /// The mark layer's own frontier: marks are downstream-only (content
     /// never references marks), so mark ops never enter the text tips.
     pub(crate) mark_tips: BTreeSet<Id>,
-    /// Provenance, one bit per handle: set for nodes this replica authored
-    /// (the [`Self::author`] seam and `insert_batch`), clear for everything
-    /// that arrived — merge, decode, delta, replay. Delta sync (APP_NOTES
-    /// #8) is derived from it: the arena is append-only in apply order, so
-    /// "authored since watermark `w`" is `ids[w..]` filtered by this bit
-    /// ([`Self::authored_since`]). Nothing is recorded at authoring time
-    /// and nothing received can echo.
-    pub(crate) authored: BitSet,
     /// Parked orphans + the gate (see `delivery::Delivery`). Gated here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
     /// (a map op in a seq), non-char insert payloads (the value column
@@ -616,7 +608,6 @@ impl HashSeq {
             placement: PlacementRegister::default(),
             tips: BTreeSet::new(),
             mark_tips: BTreeSet::new(),
-            authored: BitSet::default(),
             delivery: Delivery::default(),
             index: RunIndex::default(),
         };
@@ -646,55 +637,8 @@ impl HashSeq {
         self.ids.push(id);
         self.locs.push(loc.into());
         self.removed.push(false);
-        self.authored.push(false);
         self.id_to_idx.insert(id, idx);
         idx
-    }
-
-    /// The arena length — the delta-sync watermark. Interning is append-
-    /// only and in apply order (parked and gated nodes never intern), so
-    /// the length taken at one moment names exactly "everything applied
-    /// so far", and `authored_since(w)` later yields what this replica
-    /// wrote after that moment.
-    pub fn arena_len(&self) -> usize {
-        self.ids.len()
-    }
-
-    /// Flag the node just interned as locally authored. Every admitted
-    /// node interns exactly one handle, so after an admitted apply the
-    /// node sits at the arena tail.
-    #[inline]
-    fn mark_last_authored(&mut self, id: &Id) {
-        let last = self.ids.len() - 1;
-        debug_assert_eq!(self.ids[last], *id, "the authored node is the arena tail");
-        self.authored.set(last);
-    }
-
-    /// The local-authoring seam: apply a node this replica built (the
-    /// authoring helpers, or a `Cursor::first_node`/`payload_node` the
-    /// caller assembled) and flag it as authored so delta sync ships it.
-    /// `apply` is the remote path — merge, decode, delta, replay — and
-    /// never sets the flag, so received ops can never echo.
-    ///
-    /// `Err` hands the node back: the gate refused it (it sits in
-    /// quarantine, `contains_node` is false) and it is never shipped, so
-    /// peers are not sent an op this replica itself rejected. Local deps
-    /// are always applied, so a refusal is a gate verdict, never a parked
-    /// orphan. A node already present is returned `Ok` untouched: it was
-    /// either authored earlier (already flagged) or received (the peer
-    /// has it).
-    pub fn author(&mut self, node: HashNode) -> Result<HashNode, HashNode> {
-        let id = node.id();
-        if self.contains_node(&id) {
-            return Ok(node);
-        }
-        self.apply_with_id(id, node.clone());
-        if self.contains_node(&id) {
-            self.mark_last_authored(&id);
-            Ok(node)
-        } else {
-            Err(node)
-        }
     }
 
     pub fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
@@ -944,11 +888,9 @@ impl HashSeq {
         let first_node = cursor.first_node(first_ch);
 
         // Cursor-derived inserts anchor on applied elements/origin and are
-        // always admitted, so the hot path applies directly and flags the
-        // arena tail — no clone, no Result (`author` is for gate-able ops).
+        // always admitted, so the hot path applies directly — no clone.
         let mut prev_id = first_node.id();
         self.apply_with_id(prev_id, first_node);
-        self.mark_last_authored(&prev_id);
 
         // After the first apply, tips == {prev_id}, so the chained nodes carry no
         // extra deps.
@@ -959,7 +901,6 @@ impl HashSeq {
             };
             prev_id = node.id();
             self.apply_with_id(prev_id, node);
-            self.mark_last_authored(&prev_id);
         }
     }
 
@@ -976,8 +917,8 @@ impl HashSeq {
         let node = self
             .make_insert_value(idx, payload)
             .expect("cursor_at is total for clamped idx");
-        self.author(node)
-            .expect("cursor-derived inserts are always admitted")
+        self.apply_with_id(node.id(), node.clone());
+        node
     }
 
     pub fn remove(&mut self, idx: usize) {
@@ -991,10 +932,8 @@ impl HashSeq {
     /// `idx` is past the end (no characters were actually removed).
     pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
         let node = self.make_remove_batch(idx, amount)?;
-        Some(
-            self.author(node)
-                .expect("removes of applied elements are always admitted"),
-        )
+        self.apply_with_id(node.id(), node.clone());
+        Some(node)
     }
 
     /// Build (without applying) the removal of `amount` characters starting
@@ -1523,8 +1462,8 @@ impl HashSeq {
 
     /// Author a move of the element at `target` to the glued point `to`,
     /// superseding the heads this replica sees. Returns the applied node;
-    /// `Err` = the gate refused it (target not an element, anchor not a
-    /// glue point, or a self-move): nothing applied, nothing queued.
+    /// `Err` hands it back unapplied.
+    #[allow(clippy::result_large_err)]
     pub fn move_element(&mut self, target: Id, to: Anchor) -> Result<HashNode, HashNode> {
         let overwrites: BTreeSet<Id> = self.move_heads(&target).into_iter().collect();
         let mut named: BTreeSet<Id> = overwrites.clone();
@@ -1539,7 +1478,13 @@ impl HashSeq {
                 overwrites,
             },
         };
-        self.author(node)
+        let id = node.id();
+        self.apply_with_id(id, node.clone());
+        if self.contains_node(&id) {
+            Ok(node)
+        } else {
+            Err(node)
+        }
     }
 
     /// Resolve a mark anchor to a glue point `(node, after-side)`: an
@@ -1726,9 +1671,8 @@ impl HashSeq {
                 overwrites,
             },
         };
-        // Place is unconditionally admitted (the gate table), so this
-        // cannot fail; `author` still keeps the record-after-apply order.
-        self.author(node).expect("Place ops are always admitted")
+        self.apply_with_id(node.id(), node.clone());
+        node
     }
 
     // ---- mark reads (arbitration happens here, per Law II) ----
@@ -1957,11 +1901,8 @@ impl HashSeq {
     /// Author a mark of `kind`/`value` over `[start, end]`, superseding the
     /// same-kind marks intersecting the range that this replica sees.
     /// Anchor-side choice encodes edge-expansion behavior (MARKS.md).
-    /// `Err` = the gate refused it (an inverted span, e.g. anchors on
-    /// moved-in elements whose base slots cross, or an anchor that is not
-    /// a glue point — an unknown id, a remove/mark/place op id): nothing
-    /// applied, nothing parked, nothing queued for peers; the built node
-    /// is handed back.
+    /// Returns the applied node; `Err` hands it back unapplied.
+    #[allow(clippy::result_large_err)]
     pub fn mark_range(
         &mut self,
         start: Anchor,
@@ -1970,8 +1911,7 @@ impl HashSeq {
         value: Id,
     ) -> Result<HashNode, HashNode> {
         let (Some(s), Some(e)) = (self.glue_point(&start), self.glue_point(&end)) else {
-            // Refused before authoring: `author` would park a node whose
-            // anchor is unknown as an orphan of our own making.
+            // Both anchors must be glue points before anything applies.
             return Err(HashNode {
                 pins: BTreeSet::new(),
                 op: Op::Mark {
@@ -2015,13 +1955,19 @@ impl HashSeq {
                 overwrites,
             },
         };
-        self.author(node)
+        let id = node.id();
+        self.apply_with_id(id, node.clone());
+        if self.contains_node(&id) {
+            Ok(node)
+        } else {
+            Err(node)
+        }
     }
 
     /// Remove `kind` formatting over `[start, end]`: a mark whose value is
     /// the tombstone artifact (partial unmark is the same op over a
     /// sub-range — the overwritten mark keeps applying outside it).
-    /// `Err` as for `mark_range`.
+    #[allow(clippy::result_large_err)]
     pub fn unmark_range(
         &mut self,
         start: Anchor,
@@ -2212,9 +2158,9 @@ impl HashSeq {
     /// edge-table rows. `Err` hands the node back for quarantine.
     // The Err carries the node back by value — same move the parameters
     // make; boxing would buy an allocation per gated op for nothing.
-    #[allow(clippy::result_large_err)]
     /// `insert_anchor`: the resolved anchor handle when `node` is an
     /// Insert (see `park_or_dispatch`), `None` otherwise.
+    #[allow(clippy::result_large_err)]
     fn interpret(
         &mut self,
         id: Id,
@@ -2354,7 +2300,7 @@ impl HashSeq {
     /// per-handle twin of `all_nodes`, which walks the side tables in
     /// bulk). Ids come from the local table — no rehashing. The origin has
     /// no node.
-    fn node_at(&self, idx: NodeIdx) -> Option<HashNode> {
+    pub(crate) fn node_at(&self, idx: NodeIdx) -> Option<HashNode> {
         Some(match self.loc_of(idx) {
             Loc::Origin => return None,
             Loc::Run { run, pos } => {
@@ -2408,29 +2354,115 @@ impl HashSeq {
         })
     }
 
-    /// Every node applied since watermark `w` (an earlier `arena_len`), in
-    /// apply order — a causally safe order: each node's refs precede it.
-    /// Parked orphans and gated nodes are never interned, so they never
-    /// appear.
-    pub fn nodes_since(&self, w: usize) -> impl Iterator<Item = (Id, HashNode)> + '_ {
-        (w..self.ids.len()).filter_map(move |i| {
+    /// Every applied node in apply order — a causally safe order: each
+    /// node's refs precede it. Parked orphans and gated nodes are never
+    /// interned, so they never appear.
+    pub fn nodes_in_apply_order(&self) -> impl Iterator<Item = (Id, HashNode)> + '_ {
+        (0..self.ids.len()).filter_map(move |i| {
             let idx = NodeIdx(i as u32);
             self.node_at(idx).map(|n| (self.ids[i], n))
         })
     }
 
-    /// The delta since watermark `w`: nodes this replica authored
-    /// (`author`, the authoring helpers) at or after `w`, in apply order.
-    /// Received nodes are skipped before reconstruction, so a drain over a
-    /// remote-heavy stretch of the arena costs a bit test per handle.
-    pub fn authored_since(&self, w: usize) -> Vec<(Id, HashNode)> {
-        (w..self.ids.len())
-            .filter(|&i| self.authored.get(i))
-            .filter_map(|i| {
-                let idx = NodeIdx(i as u32);
-                self.node_at(idx).map(|n| (self.ids[i], n))
-            })
+    /// The whole frontier: the text tips and the mark layer's tips (marks
+    /// never enter the text tips, so neither set alone covers the DAG).
+    pub fn frontier(&self) -> BTreeSet<Id> {
+        self.tips.union(&self.mark_tips).copied().collect()
+    }
+
+    /// This replica's clock for the object: what a peer that has
+    /// everything we have holds. Sent as the hello, and kept as "last
+    /// sent" for a peer after a drain.
+    pub fn clock(&self) -> crate::Clock {
+        crate::Clock(self.frontier())
+    }
+
+    /// The delta for the peer behind `clock`: every applied node outside
+    /// the peer's causal closure, in apply order, reconstructed from the
+    /// stored forms. The clock is read, never written: keep `clock()`
+    /// after a drain as the peer's new clock, or take the peer's word for
+    /// it. Only applied nodes ship.
+    ///
+    /// One backward sweep in descending handle order (a max-heap over the
+    /// arena index), two colours: OURS spreads from our frontier, PEER
+    /// from the peer's tips we hold. Descending order means every node
+    /// pops after all its descendants, so a node under the peer's tips is
+    /// coloured PEER by the time it pops; a node that pops OURS-only is
+    /// new and ships. The sweep ends as soon as no OURS-only node is left
+    /// in the heap. Edges come from the same reconstruction that ships
+    /// (`node_at`), so the walk and the wire can never disagree about a
+    /// node's refs.
+    pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
+        const OURS: u8 = 1;
+        const PEER: u8 = 2;
+        let ours = self.frontier();
+        let mut heap: BinaryHeap<usize> = BinaryHeap::new();
+        let mut colour: FxHashMap<usize, u8> = FxHashMap::default();
+        let mut pending_ours = 0usize;
+        for i in ours.iter().filter_map(|t| self.walk_idx(t)) {
+            if colour.insert(i, OURS).is_none() {
+                heap.push(i);
+                pending_ours += 1;
+            }
+        }
+        for i in clock.0.iter().filter_map(|t| self.walk_idx(t)) {
+            match colour.insert(i, PEER) {
+                None => heap.push(i),
+                Some(OURS) => pending_ours -= 1,
+                Some(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        let mut deps = Vec::new();
+        while pending_ours > 0 {
+            let Some(i) = heap.pop() else { break };
+            deps.clear();
+            self.walk_deps(i, &mut deps);
+            if colour[&i] & PEER != 0 {
+                // Deps have lower handles, so they are still in the heap
+                // or unseen — never already popped.
+                for &d in &deps {
+                    match colour.insert(d, PEER) {
+                        None => heap.push(d),
+                        Some(OURS) => pending_ours -= 1,
+                        Some(_) => {}
+                    }
+                }
+            } else {
+                pending_ours -= 1;
+                out.push(i);
+                for &d in &deps {
+                    match colour.insert(d, OURS) {
+                        None => {
+                            heap.push(d);
+                            pending_ours += 1;
+                        }
+                        Some(prev) => {
+                            colour.insert(d, prev | OURS);
+                        }
+                    }
+                }
+            }
+        }
+        out.reverse();
+        out.into_iter()
+            .filter_map(|i| self.node_at(NodeIdx(i as u32)))
             .collect()
+    }
+
+    /// The walk's view of a handle: the origin is an axiom, not a node.
+    #[inline]
+    fn walk_idx(&self, id: &Id) -> Option<usize> {
+        self.idx_of(id)
+            .filter(|i| *i != ORIGIN_IDX)
+            .map(|i| i.0 as usize)
+    }
+
+    /// The handles a node references, from its reconstruction.
+    fn walk_deps(&self, i: usize, out: &mut Vec<usize>) {
+        if let Some(node) = self.node_at(NodeIdx(i as u32)) {
+            out.extend(node.iter_refs().filter_map(|r| self.walk_idx(r)));
+        }
     }
 
     /// Every applied node as `(id, HashNode)` — runs decompressed, remove
@@ -2645,6 +2677,7 @@ impl HashSeq {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::Clock;
     use quickcheck_macros::quickcheck;
 
     /// `PackedLoc` must round-trip every `Loc`, including handles and positions
@@ -4249,7 +4282,7 @@ mod test {
         assert_eq!(seq.iter().collect::<String>(), "bcda");
         seq.move_element(a, Anchor::Before(c)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "bacd");
-        assert!(seq.move_element(a, Anchor::After(a)).is_err()); // self-move gates
+        assert!(seq.move_element(a, Anchor::After(a)).is_err()); // self-move
         assert_eq!(seq.iter().collect::<String>(), "bacd");
         check_index_matches_iter(&seq);
     }
@@ -4875,8 +4908,10 @@ mod test {
         let d = seq.id_at(3).unwrap();
         seq.move_element(a, Anchor::After(d)).unwrap();
         assert_eq!(seq.iter().collect::<String>(), "bcda");
-        let queued = seq.authored_since(0).len();
+        let queued = seq.delta_for(&Clock::default()).len();
         assert_eq!(queued, 5);
+        let peer = seq.clock(); // last sent
+        let frontier = seq.frontier();
 
         // Anchors on the visible order, but `a`'s point sits at its base
         // slot (the front): an inverted span, which the gate refuses.
@@ -4885,71 +4920,188 @@ mod test {
             .unwrap_err();
         assert!(!seq.contains_node(&err.id()));
         assert_eq!(seq.delivery.gated.len(), 1);
-        assert_eq!(seq.authored_since(0).len(), queued, "nothing shipped");
+        assert!(seq.delta_for(&peer).is_empty(), "nothing shipped");
+        assert_eq!(
+            seq.frontier(),
+            frontier,
+            "a refused op never enters the frontier"
+        );
 
         // A self-move is refused the same way.
         let err = seq.move_element(c, Anchor::After(c)).unwrap_err();
         assert!(!seq.contains_node(&err.id()));
-        assert_eq!(seq.authored_since(0).len(), queued);
+        assert!(seq.delta_for(&peer).is_empty());
+        assert_eq!(seq.frontier(), frontier);
     }
 
-    /// The delta is derived, not recorded: `authored_since(w)` is the
-    /// arena tail filtered by provenance. Locally built nodes handed to
-    /// `author` ship (a cursor-built insert used to fall through `apply`
-    /// and never leave); received nodes never do, whichever path they
-    /// take in; a watermark taken after a merge excludes that history.
+    /// A delta is the DAG diff against the peer's clock: an empty clock
+    /// gets the whole history; against our own clock taken after a send
+    /// ("last sent"), only what we authored since; against the clock the
+    /// peer states, only what it lacks — whichever way local and remote
+    /// edits interleave.
     #[test]
-    fn delta_is_derived_from_the_arena_and_provenance() {
-        let mut seq = HashSeq::default();
-        seq.insert_batch(0, "ab".chars());
-        let w = seq.arena_len();
-        assert_eq!(seq.authored_since(0).len(), 2);
-        assert!(seq.authored_since(w).is_empty(), "drained");
+    fn delta_is_the_dag_diff_against_the_peers_clock() {
+        let mut a = HashSeq::default();
+        let mut b = HashSeq::default();
 
-        // A cursor-built node applied through the authoring seam ships.
-        let node = seq.cursor_at(2).unwrap().first_node('c');
-        let id = node.id();
-        seq.author(node).unwrap();
-        let delta = seq.authored_since(w);
-        assert_eq!(delta.len(), 1);
-        assert_eq!(delta[0].0, id);
-        assert_eq!(delta[0].1.id(), id, "reconstructed node hashes to its id");
-        let w = seq.arena_len();
-
-        // Received nodes (remote apply, merge) never ship, however they
-        // interleave with local ones.
-        let mut peer = HashSeq::default();
-        peer.insert_batch(0, "xyz".chars());
-        let remote: Vec<(Id, HashNode)> = peer.all_nodes();
-        seq.apply(remote[0].1.clone());
-        seq.insert(0, 'L');
-        let local = seq.id_at(0).unwrap();
-        seq.merge(peer.clone());
-        assert_eq!(seq.iter().count(), 3 + 1 + 3);
-        let delta = seq.authored_since(w);
-        assert_eq!(
-            delta.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            vec![local]
+        a.insert_batch(0, "ab".chars());
+        let d = a.delta_for(&Clock::default());
+        assert_eq!(d.len(), 2);
+        let b_clock = a.clock(); // last sent to B
+        assert!(a.delta_for(&b_clock).is_empty());
+        for n in &d {
+            b.apply_with_id(n.id(), n.clone());
+        }
+        assert_eq!(b.iter().collect::<String>(), "ab");
+        assert_eq!(b.clock(), b_clock, "B now holds exactly what we sent");
+        let a_clock = a.clock(); // what A told B it holds
+        assert!(
+            b.delta_for(&a_clock).is_empty(),
+            "received nodes never echo"
         );
 
-        // Re-authoring a known node is a no-op, not an echo.
-        let w = seq.arena_len();
-        let dup = seq.author(remote[0].1.clone()).unwrap();
-        assert_eq!(dup.id(), remote[0].0);
-        assert!(seq.authored_since(w).is_empty());
-
-        // The peer's own view: its watermark after merging us excludes
-        // what it merged, and its next edit is the whole delta.
-        let mut peer = peer;
-        peer.merge(seq.clone());
-        let pw = peer.arena_len();
-        peer.insert(0, 'P');
-        let d = peer.authored_since(pw);
+        // B authors on top; A receives it and B's clock is B's word.
+        b.insert_batch(2, "c".chars());
+        let d = b.delta_for(&a_clock);
         assert_eq!(d.len(), 1);
-        assert_eq!(peer.authored_since(0).len(), 4, "xyz + P");
+        a.apply_with_id(d[0].id(), d[0].clone());
+        let b_clock = b.clock();
+        assert!(a.delta_for(&b_clock).is_empty(), "no echo");
+        a.insert_batch(3, "d".chars());
+        let d = a.delta_for(&b_clock);
+        assert_eq!(
+            d.iter().map(|n| n.id()).collect::<Vec<_>>(),
+            vec![a.id_at(3).unwrap()]
+        );
+        let b_clock = a.clock(); // last sent
+
+        // A node whose refs are all old (deep under the peer's tips)
+        // ships alone: the sweep never re-sends the ancestors.
+        let a0 = a.id_at(0).unwrap();
+        let q = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(a0, 'Q'),
+        };
+        let q_id = q.id();
+        a.apply_with_id(q_id, q);
+        let d = a.delta_for(&b_clock);
+        assert_eq!(d.iter().map(|n| n.id()).collect::<Vec<_>>(), vec![q_id]);
+        let b_clock = a.clock();
+        assert!(a.delta_for(&b_clock).is_empty());
+
+        // Re-applying a known node changes nothing.
+        a.apply(d[0].clone());
+        assert!(a.delta_for(&b_clock).is_empty());
     }
 
-    /// `nodes_since(0)` reconstructs every stored form — run heads and
+    /// Out-of-order arrival: a node received from the peer parks, and
+    /// its dependency lands later — possibly authored locally as the
+    /// byte-identical node (content-derived ids). Against the peer's
+    /// stated clock neither ships back, and a local edit afterwards is
+    /// the whole delta.
+    #[test]
+    fn delta_never_echoes_woken_orphans() {
+        let mut a = HashSeq::default();
+        let mut b = HashSeq::default();
+        a.insert_batch(0, "x".chars());
+        b.merge(a.clone());
+
+        b.insert_batch(1, "yz".chars());
+        let b_clock = b.clock();
+        let nodes: Vec<(Id, HashNode)> = b.nodes_in_apply_order().collect();
+        let (n_id, n) = nodes[1].clone(); // y
+        let (m_id, m) = nodes[2].clone(); // z, anchored after y
+        // z arrives first and parks on y.
+        a.apply_with_id(m_id, m.clone());
+        assert_eq!(a.orphans().count(), 1);
+        // A's user types the identical y: interned, then z wakes behind it.
+        a.insert_batch(1, "y".chars());
+        assert_eq!(a.id_at(1).unwrap(), n_id);
+        assert_eq!(a.iter().collect::<String>(), "xyz");
+        assert!(
+            a.delta_for(&b_clock).is_empty(),
+            "y and z are under B's tips"
+        );
+        // The same with y arriving from the peer instead.
+        let mut a2 = HashSeq::default();
+        a2.insert_batch(0, "x".chars());
+        a2.apply_with_id(m_id, m.clone());
+        a2.apply_with_id(n_id, n.clone());
+        assert_eq!(a2.iter().collect::<String>(), "xyz");
+        assert!(a2.delta_for(&b_clock).is_empty());
+        a2.insert_batch(3, "w".chars());
+        let d = a2.delta_for(&b_clock);
+        assert_eq!(
+            d.iter().map(|n| n.id()).collect::<Vec<_>>(),
+            vec![a2.id_at(3).unwrap()]
+        );
+    }
+
+    /// A peer that states its frontier (a hello) gets exactly the rest of
+    /// the history, in an order it can replay with nothing parked — and a
+    /// peer stating a frontier from a state we have moved past (or an
+    /// empty one) gets the whole DAG.
+    #[test]
+    fn delta_against_a_declared_frontier_is_the_missing_suffix() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello wörld".chars());
+        seq.insert_batch(3, "XY".chars());
+        seq.remove_batch(6, 3).unwrap();
+        let snapshot = seq.clone();
+        seq.remove(0);
+        let a = seq.id_at(0).unwrap();
+        let z = seq.id_at(seq.len() - 1).unwrap();
+        seq.move_element(a, Anchor::After(z)).unwrap();
+        seq.mark_range(
+            Anchor::Before(seq.id_at(1).unwrap()),
+            Anchor::After(z),
+            bold(),
+            yes(),
+        )
+        .unwrap();
+        seq.place(Id([0x77; 32]));
+
+        // The peer holds `snapshot`; it says so.
+        let clock = snapshot.clock();
+        let d = seq.delta_for(&clock);
+        let mut peer = snapshot.clone();
+        for n in &d {
+            peer.apply_with_id(n.id(), n.clone());
+            assert_eq!(peer.orphans().count(), 0, "apply order is causal");
+        }
+        assert_eq!(
+            peer.iter().collect::<String>(),
+            seq.iter().collect::<String>()
+        );
+        assert_eq!(peer.frontier(), seq.frontier());
+        assert_eq!(peer.marked_spans(), seq.marked_spans());
+        assert_eq!(peer.clock(), seq.clock());
+        assert!(
+            seq.delta_for(&seq.clock()).is_empty(),
+            "last sent: nothing more"
+        );
+        let all = seq.nodes_in_apply_order().count();
+        assert!(
+            d.len() < all,
+            "only the suffix shipped ({} of {all})",
+            d.len()
+        );
+
+        // An empty frontier (a fresh peer): everything, once.
+        let fresh = Clock::default();
+        let whole = seq.delta_for(&fresh);
+        assert_eq!(whole.len(), all);
+        assert_eq!(
+            whole.iter().map(|n| n.id()).collect::<Vec<_>>(),
+            seq.nodes_in_apply_order()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            "apply order"
+        );
+        assert!(seq.delta_for(&seq.clock()).is_empty());
+    }
+
+    /// `nodes_in_apply_order` reconstructs every stored form — run heads and
     /// interior elements (after splits), atoms, remove chains, multi-target
     /// removes, moves, marks, places — to the exact node that was applied:
     /// each hashes to its stored id, and the set equals `all_nodes`.
@@ -4981,10 +5133,10 @@ mod test {
         .unwrap();
         seq.place(Id([0x77; 32]));
 
-        let since: Vec<(Id, HashNode)> = seq.nodes_since(0).collect();
+        let since: Vec<(Id, HashNode)> = seq.nodes_in_apply_order().collect();
         assert_eq!(
             since.len(),
-            seq.arena_len() - 1,
+            seq.ids.len() - 1,
             "every handle but the origin"
         );
         for (id, node) in &since {
@@ -4995,8 +5147,13 @@ mod test {
         all.sort_by_key(|(id, _)| *id);
         got.sort_by_key(|(id, _)| *id);
         assert_eq!(all, got);
-        // Everything here was authored, so the delta is the full history.
-        assert_eq!(seq.authored_since(0), since);
+        // A fresh peer's delta is the full history, in the same order.
+        let ids: Vec<Id> = seq
+            .delta_for(&Clock::default())
+            .iter()
+            .map(|n| n.id())
+            .collect();
+        assert_eq!(ids, since.iter().map(|(id, _)| *id).collect::<Vec<_>>());
         // Apply order is causally safe: a fresh replica replays it with
         // nothing parked.
         let mut fresh = HashSeq::default();
@@ -5078,31 +5235,25 @@ mod test {
         let rm = seq.remove_batch(1, 1).unwrap().id();
         let tips = seq.tips().clone();
         let mark_tips = seq.mark_tips().clone();
-        let w = seq.arena_len();
+        let peer = seq.clock();
 
         let unknown = Id([0xEE; 32]);
-        assert!(
-            seq.mark_range(Anchor::Before(a), Anchor::After(unknown), bold(), yes())
-                .is_err()
-        );
-        assert!(
-            seq.mark_range(Anchor::Before(unknown), Anchor::After(a), bold(), yes())
-                .is_err()
-        );
-        // A remove op id is not a glue point either.
-        assert!(
-            seq.mark_range(Anchor::Before(a), Anchor::After(rm), bold(), yes())
-                .is_err()
-        );
-        assert!(
-            seq.unmark_range(Anchor::Before(rm), Anchor::After(a), bold())
-                .is_err()
-        );
+        let refused = [
+            seq.mark_range(Anchor::Before(a), Anchor::After(unknown), bold(), yes()),
+            seq.mark_range(Anchor::Before(unknown), Anchor::After(a), bold(), yes()),
+            // A remove op id is not a glue point either.
+            seq.mark_range(Anchor::Before(a), Anchor::After(rm), bold(), yes()),
+            seq.unmark_range(Anchor::Before(rm), Anchor::After(a), bold()),
+        ];
+        for r in &refused {
+            let node = r.as_ref().unwrap_err();
+            assert!(!seq.contains_node(&node.id()), "never applied: {node:?}");
+        }
 
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.tips(), &tips);
         assert_eq!(seq.mark_tips(), &mark_tips);
-        assert!(seq.authored_since(w).is_empty());
+        assert!(seq.delta_for(&peer).is_empty());
         // Still authors normally.
         seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes())
             .unwrap();

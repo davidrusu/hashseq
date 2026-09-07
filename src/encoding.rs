@@ -7,6 +7,7 @@ use crate::hashseq::{CausalRemove, Loc};
 use crate::hashweb::HashWeb;
 use crate::run::RunError;
 use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
+use crate::{Clock, HashWebClock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -2274,7 +2275,7 @@ mod tests {
         }
     }
 
-    // ---- untrusted counts never size an allocation (see REVIEW_FINDINGS.md) ----
+    // ---- untrusted counts never size an allocation (2026-09-02 review) ----
     // Sizes here are chosen so a regression fails fast (capacity overflow
     // panics immediately); mid-range sizes would instead fill all memory.
 
@@ -3463,6 +3464,53 @@ pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError
     Ok(delivered)
 }
 
+// ---- frontier frames ------------------------------------------------------
+//
+//   0xC1 ‖ [ kind:u8 ‖ origin:32 ‖ n:varint ‖ n × id:32 ]*
+//
+// A replica's clock, object by object: the tips of each object it
+// holds. The receiver decodes it as the sender's clock
+// (`decode_frontier`) and answers with `deltas_for` — a hello that
+// costs the tips, not the history. An object absent from the frame is
+// one the sender does not hold, so the whole object ships.
+
+pub const FRONTIER_TAG: u8 = 0xC1;
+
+/// Encode `web`'s frontier (`HashWeb::frontier`) as one 0xC1 frame.
+pub fn encode_frontier(web: &HashWeb) -> Vec<u8> {
+    let mut buf = vec![FRONTIER_TAG];
+    for (kind, origin, tips) in web.frontier() {
+        buf.push(kind);
+        encode_id(&origin, &mut buf);
+        encode_id_set(&tips, &mut buf);
+    }
+    buf
+}
+
+/// A peer's 0xC1 frontier frame as its clock: the peer holds exactly
+/// the objects named, at exactly those tips.
+pub fn decode_frontier(bytes: &[u8]) -> Result<HashWebClock, DecodeError> {
+    if bytes.first() != Some(&FRONTIER_TAG) {
+        return Err(DecodeError::InvalidOpTag(
+            bytes.first().copied().unwrap_or(0),
+        ));
+    }
+    let mut c = Cursor { bytes, pos: 1 };
+    let mut clock = HashWebClock::new();
+    while c.pos < bytes.len() {
+        let kind = c.byte()?;
+        if kind != OBJ_SEQ && kind != OBJ_KV {
+            return Err(DecodeError::InvalidOpTag(kind));
+        }
+        let origin = c.step(decode_id)?;
+        let tips = c.step(decode_id_set)?;
+        clock
+            .objs
+            .insert(crate::object_id(kind, &origin), Clock(tips));
+    }
+    Ok(clock)
+}
+
 #[cfg(test)]
 mod delta_tests {
     use super::*;
@@ -3477,7 +3525,7 @@ mod delta_tests {
     #[test]
     fn delta_roundtrip_replay_and_convergence() {
         let mut a = HashWeb::new();
-        a.enable_outbox();
+        a.enable_delta_sync();
         let s = a.create_seq(oid(1));
         let k = a.create_kv(oid(2));
         a.seq_mut(&s).unwrap().insert_batch(0, "hello".chars());
@@ -3487,12 +3535,13 @@ mod delta_tests {
         let link = a.seq_mut(&s).unwrap().insert_value(5, oid(3));
         a.seq_mut(&s).unwrap().place(link.id());
 
-        let groups = a.take_deltas();
+        let groups = a.deltas_for(&HashWebClock::new()); // B holds nothing yet
         assert!(!groups.is_empty());
         let msg = encode_delta(&groups);
         assert_eq!(msg[0], DELTA_TAG);
-        // Drained: a second take is empty.
-        assert!(a.take_deltas().is_empty());
+        // Last sent: against our own clock a second take is empty.
+        let b_clock = a.clock();
+        assert!(a.deltas_for(&b_clock).is_empty());
 
         // B receives the delta cold — objects opened from (kind, origin).
         let mut b = HashWeb::new();
@@ -3507,12 +3556,64 @@ mod delta_tests {
         // and reports nothing new (clients skip the re-render on 0).
         assert_eq!(apply_delta(&mut b, &msg).expect("replay ok"), 0);
         assert_eq!(encode_hashweb(&a), encode_hashweb(&b));
-        // Received nodes carry no authored bit: neither B nor a receiver
-        // with delta sync enabled ever re-broadcasts received ops.
+        // A receiver that knows the sender's clock (its frontier frame,
+        // or its snapshot) never echoes: the delta's nodes are under it.
         let mut c2 = HashWeb::new();
-        c2.enable_outbox();
+        c2.enable_delta_sync();
         apply_delta(&mut c2, &msg).expect("applies");
-        assert!(c2.take_deltas().is_empty(), "remote ops never echo");
+        let a_clock = decode_frontier(&encode_frontier(&a)).unwrap();
+        assert!(c2.deltas_for(&a_clock).is_empty(), "remote ops never echo");
+        // Against an empty clock the receiver assumes nothing about the
+        // sender and ships everything.
+        assert_eq!(c2.deltas_for(&HashWebClock::new()).len(), 2);
+    }
+
+    /// The hello path: a peer states its frontier (0xC1); the reply is
+    /// the exact suffix it lacks, which replays into the same canonical
+    /// bytes. Objects the peer does not name ship whole; a frontier from
+    /// a peer that lost state resets what we assumed it held.
+    #[test]
+    fn frontier_frame_yields_the_catch_up_delta() {
+        let mut a = HashWeb::new();
+        let s = a.create_seq(oid(1));
+        let k = a.create_kv(oid(2));
+        a.seq_mut(&s).unwrap().insert_batch(0, "hello".chars());
+        let key = a.provide_value(&crate::value::Value::String("t".into()));
+        a.kv_mut(&k).unwrap().put_ids(key, oid(5));
+        let mut b = decode_hashweb(&encode_hashweb(&a)).unwrap();
+        // A moves on: more text, a new object.
+        a.seq_mut(&s).unwrap().insert_batch(5, " world".chars());
+        let s2 = a.create_seq(oid(7));
+        a.seq_mut(&s2).unwrap().insert_batch(0, "new".chars());
+
+        let hello = encode_frontier(&b);
+        assert_eq!(hello[0], FRONTIER_TAG);
+        let b_clock = decode_frontier(&hello).unwrap();
+        assert_eq!(b_clock.objects().count(), 2);
+        let groups = a.deltas_for(&b_clock);
+        let shipped: usize = groups.iter().map(|(_, _, n)| n.len()).sum();
+        assert_eq!(
+            shipped,
+            6 + 3,
+            "the suffix and the new object, nothing else"
+        );
+        let msg = encode_delta(&groups);
+        assert_eq!(apply_delta(&mut b, &msg).unwrap(), 9);
+        assert_eq!(encode_hashweb(&a), encode_hashweb(&b));
+        assert!(a.deltas_for(&a.clock()).is_empty(), "last sent");
+        assert!(a.deltas_for(&b.clock()).is_empty(), "B's word");
+
+        // The frontier round-trips through the frame exactly.
+        let c = decode_frontier(&encode_frontier(&a)).unwrap();
+        assert_eq!(c, a.clock());
+        assert!(a.deltas_for(&c).is_empty(), "equal frontiers, empty delta");
+
+        // B forgets everything and says so: A ships the whole store again.
+        let b_clock = decode_frontier(&encode_frontier(&HashWeb::new())).unwrap();
+        assert_eq!(b_clock.objects().count(), 0);
+        let groups = a.deltas_for(&b_clock);
+        let shipped: usize = groups.iter().map(|(_, _, n)| n.len()).sum();
+        assert_eq!(shipped, 5 + 6 + 1 + 3);
     }
 
     /// Small artifacts minted locally ride next to the delta (the title
@@ -3528,7 +3629,7 @@ mod delta_tests {
         a.provide_value(&Value::String("quiet".into()));
         assert!(a.take_new_artifacts().is_empty());
 
-        a.enable_outbox();
+        a.enable_delta_sync();
         let t = a.provide_value(&Value::String("Title".into()));
         let again = a.provide_value(&Value::String("Title".into()));
         assert_eq!(t, again);
@@ -3548,7 +3649,7 @@ mod delta_tests {
 
         // Bytes that ARRIVE (0xAF / lazy GET) are not re-pushed.
         let mut b = HashWeb::new();
-        b.enable_outbox();
+        b.enable_delta_sync();
         b.provide_artifact_bytes(Value::String("Title".into()).encoded());
         assert!(
             b.take_new_artifacts().is_empty(),

@@ -510,11 +510,7 @@ mod hashseq_viz {
                 }
 
                 // Process before-runs - stratify concurrent befores into lanes
-                for (head, before_run) in seq
-                    .runs
-                    .iter()
-                    .filter(|(_, r)| r.at.is_before())
-                {
+                for (head, before_run) in seq.runs.iter().filter(|(_, r)| r.at.is_before()) {
                     let id = &seq.id_of(*head);
                     let pos = *self.node_pos.entry(*id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
@@ -590,11 +586,7 @@ mod hashseq_viz {
 
                 // Process After-runs - position each run as a single entity.
                 // (Before-runs are positioned by the befores loop above.)
-                for (head, run) in seq
-                    .runs
-                    .iter()
-                    .filter(|(_, r)| r.at.is_after())
-                {
+                for (head, run) in seq.runs.iter().filter(|(_, r)| r.at.is_after()) {
                     let run_id = &seq.id_of(*head);
                     let pos = *self.node_pos.entry(*run_id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,

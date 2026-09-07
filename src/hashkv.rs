@@ -10,9 +10,10 @@
 //! (or op-node / origin ids — links). Artifact bytes ride a side store;
 //! an absent artifact is the `pending` state, never papered over.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, BinaryHeap};
 
-use crate::bitset::BitSet;
+use rustc_hash::FxHashMap;
+
 use crate::delivery::Delivery;
 use crate::hashseq::IdMap;
 use crate::placement::PlacementRegister;
@@ -61,15 +62,14 @@ pub struct HashKv {
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Applied node ids in apply order — the map's arena, append-only
-    /// (parked and gated nodes never enter). Its length is the delta-sync
-    /// watermark; see `HashSeq::authored`.
+    /// (parked and gated nodes never enter). Deps precede dependents, so
+    /// the position is the clock walk's order (`delta_for`).
     pub(crate) order: Vec<Id>,
-    /// Provenance parallel to `order`: set for nodes authored here
-    /// (`author`, `put_ids`, `place`), clear for received ones.
-    pub(crate) authored: BitSet,
-    /// Delta sync is on (`HashWeb::enable_outbox`): minted small artifacts
-    /// are tracked in `new_artifacts`. Deltas themselves are derived from
-    /// `order` + `authored` and need no switch.
+    /// Arena position by id (`order[slot[id]] == id`).
+    pub(crate) slot: IdMap<u32>,
+    /// Delta sync is on (`HashWeb::enable_delta_sync`): minted small
+    /// artifacts are tracked in `new_artifacts`. Deltas themselves are a
+    /// DAG diff against a peer clock and need no switch.
     pub(crate) delta_sync: bool,
     /// Small artifacts minted here since the last drain — the kv-level
     /// half of `HashWeb::new_artifacts`; recorded only while delta sync
@@ -104,7 +104,7 @@ impl HashKv {
             values: IdMap::default(),
             tips: BTreeSet::new(),
             order: Vec::new(),
-            authored: BitSet::default(),
+            slot: IdMap::default(),
             delta_sync: false,
             new_artifacts: Vec::new(),
             placement: PlacementRegister::default(),
@@ -206,27 +206,11 @@ impl HashKv {
         }
     }
 
-    /// The local-authoring seam (see `HashSeq::author`): apply a node this
-    /// replica built and flag it as authored so delta sync ships it.
-    /// `apply` is the remote path and never sets the flag. Map ops built
-    /// here are always admitted; a node already present is returned as is
-    /// (authored earlier, or received — never an echo).
-    pub fn author(&mut self, node: HashNode) -> HashNode {
-        let id = node.id();
-        if self.contains_node(&id) {
-            return node;
-        }
-        self.apply_with_id(id, node.clone());
-        if self.order.last() == Some(&id) {
-            self.authored.set(self.order.len() - 1);
-        }
-        node
-    }
-
     /// `put` by raw ids (links, already-provided artifacts, tombstone).
     pub fn put_ids(&mut self, key: Id, value: Id) -> HashNode {
         let node = self.make_put(key, value);
-        self.author(node)
+        self.apply_with_id(node.id(), node.clone());
+        node
     }
 
     /// Delete a key: a put of the tombstone artifact.
@@ -376,38 +360,102 @@ impl HashKv {
         Ok(())
     }
 
-    /// Store an admitted node: the register history plus the arena slot
-    /// (received provenance until `author` flags it).
+    /// Store an admitted node: the register history plus the arena slot.
     fn admit(&mut self, id: Id, node: HashNode) {
         self.nodes.insert(id, node);
+        self.slot.insert(id, self.order.len() as u32);
         self.order.push(id);
-        self.authored.push(false);
     }
 
-    /// The arena length — the delta-sync watermark (see
-    /// `HashSeq::arena_len`).
-    pub fn arena_len(&self) -> usize {
-        self.order.len()
+    /// Every applied node in apply order (causally safe: each node's refs
+    /// precede it).
+    pub fn nodes_in_apply_order(&self) -> impl Iterator<Item = (Id, HashNode)> + '_ {
+        self.order.iter().map(|id| (*id, self.nodes[id].clone()))
     }
 
-    /// Every node applied since watermark `w`, in apply order (causally
-    /// safe: each node's refs precede it).
-    pub fn nodes_since(&self, w: usize) -> impl Iterator<Item = (Id, HashNode)> + '_ {
-        self.order[w.min(self.order.len())..]
-            .iter()
-            .map(|id| (*id, self.nodes[id].clone()))
+    /// The frontier as the clock sees it (a map has one layer).
+    pub fn frontier(&self) -> BTreeSet<Id> {
+        self.tips.clone()
     }
 
-    /// The delta since watermark `w`: nodes authored here at or after `w`,
-    /// in apply order.
-    pub fn authored_since(&self, w: usize) -> Vec<(Id, HashNode)> {
-        (w..self.order.len())
-            .filter(|&i| self.authored.get(i))
-            .map(|i| {
-                let id = self.order[i];
-                (id, self.nodes[&id].clone())
-            })
+    /// This replica's clock for the object: what a peer that has
+    /// everything we have holds. Sent as the hello, and kept as "last
+    /// sent" for a peer after a drain.
+    pub fn clock(&self) -> crate::Clock {
+        crate::Clock(self.frontier())
+    }
+
+    /// The delta for the peer behind `clock`: every applied node outside
+    /// the peer's causal closure, in apply order (see `HashSeq::delta_for`).
+    /// Same sweep as `HashSeq::delta_for` over the map's arena (`order`,
+    /// apply order; `slot` for the reverse lookup). The origin has no
+    /// slot, so it is never walked or shipped.
+    pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
+        const OURS: u8 = 1;
+        const PEER: u8 = 2;
+        let ours = self.frontier();
+        let mut heap: BinaryHeap<usize> = BinaryHeap::new();
+        let mut colour: FxHashMap<usize, u8> = FxHashMap::default();
+        let mut pending_ours = 0usize;
+        for i in ours.iter().filter_map(|t| self.walk_idx(t)) {
+            if colour.insert(i, OURS).is_none() {
+                heap.push(i);
+                pending_ours += 1;
+            }
+        }
+        for i in clock.0.iter().filter_map(|t| self.walk_idx(t)) {
+            match colour.insert(i, PEER) {
+                None => heap.push(i),
+                Some(OURS) => pending_ours -= 1,
+                Some(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        let mut deps = Vec::new();
+        while pending_ours > 0 {
+            let Some(i) = heap.pop() else { break };
+            deps.clear();
+            self.walk_deps(i, &mut deps);
+            if colour[&i] & PEER != 0 {
+                // Deps have lower handles, so they are still in the heap
+                // or unseen — never already popped.
+                for &d in &deps {
+                    match colour.insert(d, PEER) {
+                        None => heap.push(d),
+                        Some(OURS) => pending_ours -= 1,
+                        Some(_) => {}
+                    }
+                }
+            } else {
+                pending_ours -= 1;
+                out.push(i);
+                for &d in &deps {
+                    match colour.insert(d, OURS) {
+                        None => {
+                            heap.push(d);
+                            pending_ours += 1;
+                        }
+                        Some(prev) => {
+                            colour.insert(d, prev | OURS);
+                        }
+                    }
+                }
+            }
+        }
+        out.reverse();
+        out.into_iter()
+            .filter_map(|i| Some(self.nodes[&self.order[i]].clone()))
             .collect()
+    }
+
+    #[inline]
+    fn walk_idx(&self, id: &Id) -> Option<usize> {
+        self.slot.get(id).map(|s| *s as usize)
+    }
+
+    fn walk_deps(&self, i: usize, out: &mut Vec<usize>) {
+        let node = &self.nodes[&self.order[i]];
+        out.extend(node.iter_refs().filter_map(|r| self.walk_idx(r)));
     }
 
     pub fn merge(&mut self, other: Self) {
@@ -446,7 +494,8 @@ impl HashKv {
                 overwrites,
             },
         };
-        self.author(node)
+        self.apply_with_id(node.id(), node.clone());
+        node
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {

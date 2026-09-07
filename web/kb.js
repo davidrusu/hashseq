@@ -457,13 +457,15 @@ let localCacheOff = false;
 
 // ---- delta sync (APP_NOTES #8/#19/#21 — the wall, fixed) ---------------------
 //
-// Steady state ships OPS, not snapshots: local edits drain the wasm
-// outbox into a 0xDE delta frame (bytes to KB, not MB) sent to the
-// server and the tab channel; images travel ONCE at upload as 0xAF
-// artifact frames. Full snapshots remain the hello / reconnect-resync
-// path only. The heavy full-state encode (localStorage cache + stats)
-// is debounced separately so neither typing nor remote deltas pay it
-// per keystroke.
+// Steady state ships OPS, not snapshots: local edits become a 0xDE
+// delta frame (bytes to KB, not MB) — the DAG diff against the
+// upstream's clock inside the wasm (the server's frontier from its
+// last snapshot, or our own frontier after our last send) — sent to
+// the server and the tab channel; images
+// travel ONCE at upload as 0xAF artifact frames. Full snapshots remain
+// the hello / reconnect-resync path only. The heavy full-state encode
+// (localStorage cache + stats) is debounced separately so neither
+// typing nor remote deltas pay it per keystroke.
 
 const TAG_DELTA = 0xde;
 const TAG_ARTIFACT = 0xaf;
@@ -639,8 +641,8 @@ function persistSoon() {
 }
 
 /// One dispatch for both transports (tab channel + WebSocket).
-/// `replySnap` sends our snapshot back on the quiesce path.
-function handleSyncMessage(raw, replySnap) {
+/// `reply` sends our catch-up delta back on the snapshot path.
+function handleSyncMessage(raw, reply) {
   const theirs = new Uint8Array(raw);
   if (theirs.length === 0) return;
   const savedEdit = captureEditState();
@@ -675,7 +677,11 @@ function handleSyncMessage(raw, replySnap) {
     remoteRender(savedEdit, id);
     return;
   }
-  // A snapshot: hello, reconnect resync, or a legacy peer.
+  // A snapshot: hello, reconnect resync, or a legacy peer. Merging it
+  // also sets the upstream clock to the sender's frontier, so the reply
+  // is a DELTA — exactly what we hold that they lack — not our whole
+  // snapshot; nothing to reply when the frontiers already agree. A
+  // frame we could not merge never converges — no reply, no ping-pong.
   let merged = true;
   try {
     web.mergeEncoded(theirs);
@@ -683,11 +689,11 @@ function handleSyncMessage(raw, replySnap) {
     console.warn('[kb] bad snapshot:', err);
     merged = false;
   }
-  const mine = persistLocal(); // whatever landed before a failure, kept
-  // Canonical bytes: equal op sets ⟺ identical snapshots. Re-send only
-  // while we know something they don't; equality ends the exchange. A
-  // frame we could not merge never converges — no reply, no ping-pong.
-  if (merged && !bytesEqual(mine, theirs)) replySnap(mine);
+  persistLocal(); // whatever landed before a failure, kept
+  if (merged) {
+    const delta = web.takeDeltas();
+    if (delta.length > 0) reply(delta);
+  }
   remoteRender(savedEdit);
 }
 
@@ -732,10 +738,6 @@ channel.onmessage = (e) => handleSyncMessage(e.data, (mine) => channel.postMessa
 let ws = null;
 let wsReady = false;
 let wsRetry = 1000;
-
-function bytesEqual(a, b) {
-  return a.length === b.length && a.every((x, i) => x === b[i]);
-}
 
 function setSyncStatus(live) {
   const dot = document.getElementById('sync-dot');

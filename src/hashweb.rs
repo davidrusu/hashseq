@@ -25,7 +25,32 @@ use rustc_hash::FxHashMap;
 use crate::hashkv::HashKv;
 use crate::hashseq::IdMap;
 use crate::value::{KIND_KV, KIND_SEQ, Value, object_id};
-use crate::{HashNode, HashSeq, Id};
+use crate::{Clock, HashNode, HashSeq, Id};
+
+/// What one peer holds of a store: a [`Clock`] per object. A value,
+/// never edited: what the peer told us (a 0xC1 frontier frame, a
+/// snapshot — `HashWeb::clock` of the decoded store) or what we last
+/// sent it (`HashWeb::clock` taken after a drain). Owned by the
+/// transport, one per peer; the store keeps no delta state of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HashWebClock {
+    pub(crate) objs: IdMap<Clock>,
+}
+
+impl HashWebClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn obj(&self, obj: &Id) -> Option<&Clock> {
+        self.objs.get(obj)
+    }
+
+    /// Objects with a frontier, in no particular order.
+    pub fn objects(&self) -> impl Iterator<Item = (&Id, &Clock)> {
+        self.objs.iter()
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct HashWeb {
@@ -42,18 +67,12 @@ pub struct HashWeb {
     pub(crate) parked: std::collections::HashMap<Id, Vec<(Id, HashNode)>>,
     /// Value-artifact side store shared across objects.
     pub(crate) values: IdMap<Vec<u8>>,
-    /// Delta sync is on (`enable_outbox`; APP_NOTES #8): minted small
-    /// artifacts are tracked for `take_new_artifacts`. Off by default —
-    /// servers and tests don't flush. The deltas themselves need no
-    /// switch: they are derived from each object's arena and provenance
-    /// bits (`HashSeq::authored_since`), so nothing is recorded per op.
+    /// Delta sync is on (`enable_delta_sync`; APP_NOTES #8): minted
+    /// small artifacts are tracked for `take_new_artifacts`. Off by
+    /// default — servers and tests don't flush. The deltas themselves
+    /// need no switch and no state here: a delta is the DAG diff against
+    /// a peer's [`HashWebClock`], which the transport owns (`deltas_for`).
     pub(crate) delta_sync: bool,
-    /// Delta-sync watermarks, per object id: the object's arena length at
-    /// the last `take_deltas`. Everything at or past it is what this
-    /// replica applied since — filtered to what it authored, that is the
-    /// next delta. One upstream (the single-peer case); a per-peer map
-    /// would be a map of these.
-    pub(crate) delta_marks: IdMap<usize>,
     /// Small value artifacts MINTED locally since the last drain (titles,
     /// mark kinds/values, code-block languages — the vocabulary a peer
     /// needs to read our ops). Deltas carry ops only and snapshots only
@@ -137,39 +156,67 @@ impl HashWeb {
 
     /// Turn on delta sync for this store: small artifacts minted from now
     /// on are tracked for `take_new_artifacts` (every current and future
-    /// object). Idempotent. `take_deltas` itself works either way — the
-    /// delta is derived, not recorded.
-    pub fn enable_outbox(&mut self) {
+    /// object). Idempotent. `deltas_for` itself works either way — the
+    /// delta is a diff, not a record.
+    pub fn enable_delta_sync(&mut self) {
         self.delta_sync = true;
         for kv in self.kvs.values_mut() {
             kv.delta_sync = true;
         }
     }
 
-    /// The delta since the last drain: `(kind, origin, nodes)` groups
-    /// sorted by object id — the openable wire address (an object id
-    /// cannot be opened; the frame must carry kind + origin). Each group is
-    /// what this replica AUTHORED in that object since its watermark, in
-    /// apply order; received nodes (merge, decode, delta, replay) are never
-    /// included, so nothing echoes. Advances every watermark.
-    pub fn take_deltas(&mut self) -> Vec<(u8, Id, Vec<HashNode>)> {
+    /// The delta for the peer behind `clock`: `(kind, origin, nodes)`
+    /// groups sorted by object id — the openable wire address (an object
+    /// id cannot be opened; the frame must carry kind + origin). Each
+    /// group is what this replica holds of that object outside the
+    /// peer's causal closure, in apply order. The clock is read, never
+    /// written: after sending, keep `self.clock()` as the peer's clock.
+    pub fn deltas_for(&self, clock: &HashWebClock) -> Vec<(u8, Id, Vec<HashNode>)> {
+        let empty = Clock::default();
         let mut out: Vec<(Id, (u8, Id, Vec<HashNode>))> = Vec::new();
         for (obj, seq) in &self.seqs {
-            let w = self.delta_marks.get(obj).copied().unwrap_or(0);
-            let nodes: Vec<HashNode> = seq.authored_since(w).into_iter().map(|(_, n)| n).collect();
-            self.delta_marks.insert(*obj, seq.arena_len());
+            let nodes = seq.delta_for(clock.obj(obj).unwrap_or(&empty));
             if !nodes.is_empty() {
                 out.push((*obj, (KIND_SEQ, seq.origin(), nodes)));
             }
         }
         for (obj, kv) in &self.kvs {
-            let w = self.delta_marks.get(obj).copied().unwrap_or(0);
-            let nodes: Vec<HashNode> = kv.authored_since(w).into_iter().map(|(_, n)| n).collect();
-            self.delta_marks.insert(*obj, kv.arena_len());
+            let nodes = kv.delta_for(clock.obj(obj).unwrap_or(&empty));
             if !nodes.is_empty() {
                 out.push((*obj, (KIND_KV, kv.origin(), nodes)));
             }
         }
+        out.sort_by_key(|(obj, _)| *obj);
+        out.into_iter().map(|(_, g)| g).collect()
+    }
+
+    /// This replica's clock: every object at its frontier. What a peer
+    /// that has everything we have holds — kept as "last sent" for a
+    /// peer after a drain, and what a peer learns from our snapshot.
+    pub fn clock(&self) -> HashWebClock {
+        let objs = self
+            .seqs
+            .iter()
+            .map(|(obj, s)| (*obj, s.clock()))
+            .chain(self.kvs.iter().map(|(obj, k)| (*obj, k.clock())))
+            .collect();
+        HashWebClock { objs }
+    }
+
+    /// This replica's frontier, object by object: `(kind, origin, tips)`
+    /// sorted by object id — what a peer needs to compute our delta (the
+    /// 0xC1 frontier frame, `encoding::encode_frontier`).
+    pub fn frontier(&self) -> Vec<(u8, Id, std::collections::BTreeSet<Id>)> {
+        let mut out: Vec<(Id, (u8, Id, std::collections::BTreeSet<Id>))> = self
+            .seqs
+            .iter()
+            .map(|(obj, s)| (*obj, (KIND_SEQ, s.origin(), s.frontier())))
+            .chain(
+                self.kvs
+                    .iter()
+                    .map(|(obj, k)| (*obj, (KIND_KV, k.origin(), k.frontier()))),
+            )
+            .collect();
         out.sort_by_key(|(obj, _)| *obj);
         out.into_iter().map(|(_, g)| g).collect()
     }
@@ -653,7 +700,7 @@ pub(crate) mod tests {
     fn kv_put_inside_web_ships_its_artifacts() {
         let mut web = HashWeb::new();
         let root = web.create_kv(oid(9));
-        web.enable_outbox();
+        web.enable_delta_sync();
         web.kv_mut(&root).unwrap().put(s("title"), s("Hello"));
         let mut minted = web.take_new_artifacts();
         minted.sort();

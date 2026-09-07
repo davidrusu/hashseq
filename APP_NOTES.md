@@ -853,17 +853,23 @@ now only hello, reconnect-resync, and legacy-client compat. Measured
 live on the family doc: a one-character edit is 107 bytes on the wire,
 where yesterday it was the full ~7MB snapshot both ways.
 
-- **The delta is authoring-side only, by construction.** Originally an
-  outbox that only the authoring helpers fed; since 2026-09-05 it is
-  derived instead: each object's arena is append-only in apply order
-  and carries one provenance bit per node (set by the `author` seam and
-  `insert_batch`, never by `apply`), so a delta is "arena since the
-  watermark, filtered to authored". Every remote path (merge, decode,
-  delta apply) leaves the bit clear, so echo is structurally impossible
-  — verified by test and by the relay loop (server relays raw client
-  frames to everyone including the sender; replay is idempotent). It
-  also means a node an app builds itself (a `Cursor::first_node`) ships
-  when handed to `author`, where the outbox silently dropped it.
+- **The delta is a DAG diff against the peer's clock.** Originally an
+  outbox that only the authoring helpers fed; then (briefly, 2026-09-05)
+  an arena watermark plus a per-node provenance bit. Both were replica-
+  local bookkeeping a peer could neither name nor verify, and the bit
+  misfired whenever an apply woke parked orphans. Now the store keeps
+  no delta state at all: the transport owns a `HashWebClock` per peer holding,
+  per object, the peer's TIPS as far as we know them — portable, so a
+  peer can state its own (the 0xC1 frontier frame) — and a delta is
+  every node we hold outside that frontier's causal closure, in apply
+  order (`HashWeb::deltas_for`). A clock is a value, never edited: it
+  is what the peer told us (a 0xC1 frontier frame, a snapshot) or what
+  we last sent it (`HashWeb::clock` taken after a drain). The diff is
+  one backward two-colour sweep per object per drain, recomputing the
+  peer's closure from the tips; steady-state typing ends after the new
+  nodes plus one step into shared history. A node an app builds itself
+  (a `Cursor::first_node`) ships once applied, whichever seam it came
+  through.
 - **Delta frames are addressed by (kind, origin), never object id** —
   the receiver must be able to OPEN objects it has never seen, and the
   id derivation is one-way. The #1 asymmetry became a wire-format

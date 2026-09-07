@@ -1,0 +1,341 @@
+# Queue
+
+Statuses: OPEN, DECISION (needs a call), DEFERRED (only alongside named work). Numbers are stable; remove an item when it is done.
+
+## Up next
+
+### 41. Drop refused ops instead of quarantining them — OPEN
+
+Where: `src/delivery.rs` `gated`, `gate`, `holds`, `held`, `into_held`; the `Err(node) => self.delivery.gate(..)` arm in `HashSeq::park_or_dispatch` and `HashKv::park_or_dispatch`; the trailing section in `src/encoding.rs` (~:1588, :1829, :1958); HASHWEB_SPEC.md "The edge table" (~:113) and "Tighten never, loosen carefully" (~:138); FRAMEWORK.md:264; HASHSEQ_SPEC.md:232,277.
+
+Problem: an op the apply gate refuses (self-move, non-element move target, non-glue-point anchor, inverted mark span, ill-typed op for the object kind) is kept forever in `delivery.gated`, re-encoded into every snapshot's trailing section, merged into every peer, and recorded as held in every clock. An attacker's junk becomes permanent state everywhere for the price of sending it once. The spec keeps it so a later loosening of a gate row can re-judge locally, but with tips-as-clock a refused op is outside our closure by construction, so one 0xC1 frontier exchange with an up-to-date peer re-delivers it after an upgrade. For moves none of the three rows is a plausible loosening candidate.
+
+Fix: the `Err` arm of `park_or_dispatch` drops the node; delete `Delivery::gated`, `gate`, the second clause of `holds`, and the gated halves of `held` / `into_held`; the trailing section carries parked orphans only. Spec: "gated" becomes "refused — dropped; anything referencing it parks until a peer that admits it supplies the chain"; "loosen carefully" becomes "loosening is recovered by re-sync, not re-judging". Tests: rewrite `gated_authoring_is_reported_and_never_queued_for_peers` and the decoder tests that round-trip gated nodes; add one that a refused op leaves no trace in state, snapshot, or clock, and one that a dependent of a refused op stays parked and applies once the chain arrives from a peer that admits it. Decide whether the same rule covers ill-typed ops from a newer peer (proposed: yes, the cost is one re-sync after upgrading).
+
+Do before item 40, which touches the same apply path.
+
+### 40. One frontier per object: fold `mark_tips` into the DAG's tips — OPEN
+
+Where: `src/hashseq.rs` `mark_tips` (~:533), `apply_mark` (~:1574), `mark_range` pins (~:1939), `frontier()`; MARKS.md "refs" (~:46) and "Apply" (~:135); LAYERING.md "Per-layer frontier" (~:99); HASHSEQ_SPEC.md:64.
+
+Problem: marks keep their own frontier and pin only it, so a mark op never enters the text tips and the next insert never pins a mark. The DAG is fundamental and every layer is built on top of it; the frontier is a property of the DAG, not of a layer, so all layers are bound by the same frontier. `HashSeq::frontier()` already unions the two sets for the clock walk and the 0xC1 frame.
+
+Fix: one `tips` set per object that every applied op enters and every authored op pins. Delete `mark_tips` and `mark_tips()`; `frontier()` becomes `tips.clone()`; `PartialEq` compares one set. Update MARKS.md (refs = named ∪ the object's frontier), replace the per-layer paragraph in LAYERING.md with a note that the parameter is settled at per-object, and HASHSEQ_SPEC.md:64. Measure dep bytes on the KB traces and the run-extension fast path (`insert_batch` chains carry no pins after the first node). Downstream-only stays a property of what marks reference.
+
+### 42. Don't return invalid nodes to callers, return semantic errors instead — OPEN
+
+Where: `HashSeq::move_element`, `mark_range`, `unmark_range` (`Result<HashNode, HashNode>`); the `admitted` bool and `mark_admissible` in `HashSeq::interpret`; the `map_err` sites in `src/wasm.rs` `seq_move`, `mark_range`, `mark_range_closed`, `unmark_range`.
+
+Problem: a refused op comes back as `Err(node)`, which says only "not applied". The gate knows why (target not an element, anchor not a glue point, self-move, inverted span) but folds it into a bool and drops it; the wasm error strings are inferred from context, not reported. No caller uses the returned node, and it is what trips `result_large_err` (four allows).
+
+Fix: `pub enum Refused { NotAnElement, NotAGluePoint, SelfMove, InvertedSpan }`; the helpers return `Result<HashNode, Refused>`; `interpret` produces the reason where it decides (keeping the node internally for quarantine until item 41 drops that); wasm maps each variant to its own message; delete the four `#[allow(clippy::result_large_err)]`. Tests assert the variant, not `!contains_node`.
+
+### 43. Rename the "gate" / "edge table" framing — OPEN
+
+Where: HASHWEB_SPEC.md "The edge table (the apply-time gate)" (~:103) is the source; the vocabulary spreads to ~170 mentions across `src/delivery.rs` (`gated`, `gate`), `src/hashseq.rs` and `src/hashkv.rs` (`interpret`'s `admitted` block, `mark_admissible`), `src/hash_node.rs`, `src/encoding.rs`, `src/hashweb.rs`, `src/wasm.rs`, and the specs FRAMEWORK.md:264, HASHSEQ_SPEC.md, HASHKV_SPEC.md, MARKS.md, MOVE.md, PLACEMENT_SPEC.md, GRAMMAR_SPEC.md, ENCODING_SPEC.md, HETEROGENEITY.md, OP_REFS.md, CYCLE_REVERT.md, BASECAMP_MODULE.md, APP_NOTES.md, SPEC_SCRATCH.md.
+
+Problem: the framing is wrong. What the table describes is which ops are well-formed for an object kind and its referents: a validity rule, decided once from hash-committed facts. "Gate" and "edge table" suggest a policy checkpoint and a routing structure, and they leak into names (`gated`, `gate`, `admitted`, "gate rows", "gate verdict") and into doc comments on the authoring helpers.
+
+Fix: pick one term for the rule (validity / admissibility / well-formedness) and one for the outcome (refused / invalid), rename the HASHWEB_SPEC section and its table heading, then sweep code identifiers and doc comments to match: `Delivery::gated` / `gate` (or gone, item 41), `interpret`'s `admitted`, `mark_admissible`, the `Refused` enum from item 42. Do alongside items 41 and 42, which touch the same code.
+
+## Core
+
+### 3. Delta drain is O(n²) for non-ASCII runs — OPEN
+
+Where: `src/hashseq.rs` `node_at`, `StoredRun::char_at`.
+
+Problem: `char_at(pos)` falls back to `text.chars().nth(pos)` whenever `text.len() != elements.len()`, and `node_at` calls it once per element. Delta emission and the clock walk's closure marking both go through `node_at`, so a drain or a hello over a non-ASCII run is quadratic. Release: 100k ASCII = 3.3 ms; "é" + 99,999 'a' = 376 ms. The wasm client drains every 200 ms and basecamp drains synchronously after every mutating call.
+
+Fix: give `StoredRun` an O(1) char accessor for the mixed case, or reconstruct per run with one `text.chars().zip(elements)` pass as `all_nodes` does.
+
+### 4. `deltas_for` and `frontier` have duplicated seq/kv loops — OPEN
+
+Where: `src/hashweb.rs` `deltas_for`, `frontier`.
+
+Problem: each has a seq loop and a kv loop differing only in `KIND_SEQ`/`KIND_KV`. `deltas_for` also runs a walk per object per drain, cheap but unconditional.
+
+Fix: share the loop body (hoist `encode_hashweb_with`'s `ObjRef { Map, Seq }`). If per-drain cost shows, a per-object dirty flag skips objects untouched since the clock last advanced.
+
+### 5. `node_at` duplicates `all_nodes` — OPEN
+
+Where: `src/hashseq.rs` `node_at`, `all_nodes`, `remove_run_nodes`.
+
+Problem: two full per-`Loc`-kind reconstructors. The RemoveChain arm is `remove_run_nodes`' body, the MultiRemove arm is `all_nodes`' literal, the Run arm re-derives the pin/anchor convention that `elem_pins`/`elem_anchor` (encoding.rs ~914-943) and `Run::decompress_with_ids` already encode. `merge` uses `all_nodes`, the clock uses `node_at`; only a test keeps them agreeing.
+
+Fix: extract `remove_run_node(rr, i)`; own the MultiRemove literal in one place; `all_nodes = nodes_in_apply_order().collect()`, batched per run so item 3's cost does not leak into merge.
+
+### 6. Stale doc comments from the FirstOp→Anchor rename — OPEN
+
+Where: `src/hashseq.rs:276` (broken rustdoc link `` [`Run::interior_extra_deps`] ``, `cargo doc` warns), `src/run.rs:19,23,58`, `src/hashseq.rs:155,488`.
+
+Fix: replace `first_op` / `FirstOp::Before` / `extra_deps` with `at` / `Anchor::Before` / `interior_pins` / `pins`.
+
+### 7. Dead guard in `IdIndex::insert` — OPEN
+
+Where: `src/hashseq.rs:52`.
+
+Problem: `if *e.get() != idx { spill }` cannot be false: the only caller `intern` always passes the arena tail, which no existing prefix entry can hold.
+
+Fix: `Occupied(_) => { self.spill.insert(id, idx); }` with a note that each id is interned once.
+
+### 8. Stray TODO in `cursor_at` — OPEN
+
+Where: `src/hashseq.rs` ~:2609.
+
+Problem: `// TODO: why not the visible right neighbor?` sits above the comment that answers it (Fugue rule; `region_first` guarantees no before-children).
+
+Fix: delete it or fold the question into the existing comment.
+
+### 9. Run-op anchor polarity is inverted relative to `Anchor::side_bit` — OPEN
+
+Where: `src/encoding.rs:296` and the `BLK_RUN_*` emit ~:1499.
+
+Problem: run frames encode After=0x00, Before=0x01; `Anchor::side_bit` in the node preimage is Before=0, After=1. The op-stream form is live on the wire, so flipping is not viable.
+
+Fix: one-line comment on the `RUN_OP_*` / `BLK_RUN_*` constants saying the polarity is deliberately opposite to `side_bit`.
+
+### 10. Value store: resolve by-id atoms through `HashWeb.values` — OPEN
+
+Where: `src/hashweb.rs`, the `src/hashseq.rs` apply path, `src/encoding.rs` `decode_payload`.
+
+Problem: the by-id payload form is never refused; the id is resolved on read when the replica knows the value. Today only the ASCII char table resolves (`Payload::resolved()`), so a non-ASCII char sent as `0x01 id` renders U+FFFC and has two strict-canonical forms. Also: the spec says inline `0x00 len bytes` is mandatory for any artifact ≤ 32 B, but the encoder inlines only `Payload::Char` and the decoder drops the bytes of an inline non-char artifact.
+
+Plan: keep the store on HashWeb; resolve at apply and re-resolve on artifact arrival; no signature change to `iter`/`char_at`; never use `CHAR_MEMO` (thread-local, history-dependent).
+
+1. `HashWeb::resolve_char(id) -> Option<char>` (ASCII table, else `values` → `Value::decode` → `Char`) and `resolve_node(node)` rewriting `Op::Insert{Payload::Id(v)}` on hit, id unchanged.
+2. Route seq deliveries in `apply_to_with_id` through `resolve_node`; parked nodes resolve on wake; `merge` already passes through it.
+3. `HashSeq::resolve_atoms(vid, c) -> usize`: for each `elem_payloads[e] == vid` set the single-element run's text to `c`, drop the entry. Run length unchanged so RunIndex is untouched. Strict round-trip test that a resolved 1-char run encodes identically to a typed one.
+4. Call `resolve_atoms` on every seq when new bytes decode to a non-ASCII `Value::Char`: `provide_artifact_bytes`, `provide_value`, `merge`, `decode_hashweb`.
+5. Thread a value sink through `decode_*_into(bytes, &mut Vec<Vec<u8>>)` so `decode_hashweb` / wasm ingestion capture inline non-char artifacts into `web.values`.
+6. Tests: by-id non-ASCII char applied before and after its artifact arrives renders as the char; ids equal; `payload_of` → None after resolution; strict web round-trip of resolved state.
+7. Docs: HASHSEQ_SPEC.md "Payload" (~:99) and the `ATOM_CHAR` doc: placeholder means "until resolved".
+
+Note: seq stream bytes change once an atom resolves (`0x01 id` → `0x00 len bytes`, mandatory per GRAMMAR_SPEC:241-244), so `decode_hashweb_strict` of an old snapshot holding a by-id atom plus its artifact reports `NotCanonical` after resolution. Correct per spec; a visible behaviour change.
+
+### 11. Bounded select/rank on large fragments — OPEN
+
+Where: `src/run_index.rs:112` `Frag::select` / `rank` on `Bits::Large`.
+
+Problem: linear word scan; `RunIndex::get` is called twice per `cursor_at`, so ~2.2k words scanned per keystroke at the tail of a 69k-element run. Constraint: `Bits::Small(u64)` stays exactly as is; nothing may cost the measured gains.
+
+Fix: inside `Bits::Large` only, a visible count per superblock of 8 words (512 elements). `select` skips whole blocks then scans ≤ 8 words; `rank` sums blocks below `k` then ≤ 8 words. `push_visible`/`set_bit`/`clear_bit` adjust one block count; `split_bits` rebuilds. Gate: `cargo run --release --example sequential_traces` vs `target/perf/review-after-e2.txt`, no regression on clownschool / friendsforever / json-crdt or it does not land. Also `debug_assert_eq!(frag.visible, popcount(bits))` at the six mutation sites.
+
+### 12. `IndexTarget` as (slot kind, before: bool) — DEFERRED
+
+Where: `src/run_index.rs:201` `IndexTarget`, `attach_at` (~672-726), `index_target` (hashseq.rs ~996-1030).
+
+Problem: six paired Before*/After* variants. Collapsing to (slot kind, before: bool) folds the four Moved/Splice arms of `attach_at`; the two Elem arms carry different split logic and stay.
+
+Fix: only alongside the next change that touches `attach_at`, and measure.
+
+### 13. Glue-point resolution is split across three re-derivations — OPEN
+
+Where: `src/hashseq.rs` ~:1006.
+
+Problem: the admission whitelist (interpret ~:2114/2137, `glue_point` ~:1479), the rendered-vs-splice-ghost predicate (`index_target` ~:1010, `ensure_op_fragment` ~:1421, `op_point_pos` ~:1509, `hashseq_iter.rs:87`), and the `ensure_op_fragment` pre-call at 5 sites.
+
+Fix: one `resolve_glue(anchor) -> Option<IndexTarget>`.
+
+### 14. Node representation grows by enumeration — OPEN
+
+Where: `src/hashseq.rs` ~:106 `PackedLoc` and the per-kind side tables.
+
+Problem: 3-bit kind with 7 of 8 used, `_ => Loc::MultiRemove` catch-all, no debug_assert on kind range in `pack`; every kind has its own side table plus a hand-written arm in interpret / `all_nodes` / `node_at` / merge / encoder depth walk / encoder trailing section. The next-but-one op kind silently corrupts the handle.
+
+Fix: at minimum a debug_assert on the kind range and a comment on the budget. Longer term, one reconstruction seam per kind that all walkers share.
+
+### 15. Sibling attachment implemented twice — OPEN
+
+Where: `src/hashseq.rs` ~:1369 `register_op_fragment` vs `insert_after` (~1061-1110).
+
+Problem: `register_op_fragment` mirrors `insert_after`; `after_sibling_target` vs `before_sibling_target` have different shapes.
+
+Fix: one `attach_sibling(anchor, side, id)`.
+
+### 16. Block encoder hardcodes two chain shapes — OPEN
+
+Where: `src/encoding.rs` ~:642.
+
+Problem: Move / Mark / Place / atom inserts all go to the trailing section as individually tagged nodes re-applied via `seq.apply` (full rehash). A KB workload (moves, marks, embeds) loses run compression.
+
+Fix: block forms for the op kinds the KB emits, or at least a batched re-apply that skips the rehash.
+
+### 17. Artifact inclusion in wire snapshots decided by byte size, not role — OPEN
+
+Where: `src/encoding.rs:2109` `WIRE_ARTIFACT_MAX = 1024`, `src/hashkv.rs:136`.
+
+Problem: a Put value > 1 KiB is stripped from the hello snapshot and never lazily fetched, so the register is missing forever on fresh peers. Overlaps item 34.
+
+Fix: decide by role (register values always ride; large blobs are fetched by id), or add a lazy fetch path on `Read::One(id)` misses.
+
+### 18. HASHSEQ_SPEC states the pre-Fugue anchor rule — OPEN
+
+Where: `HASHSEQ_SPEC.md:186-189`.
+
+Problem: the spec says "left causally-before right → `Before(right)`, else `After(left)`" while `cursor_at` implements the Fugue rule.
+
+Fix: rewrite the paragraph to describe the rule `cursor_at` implements, and say what "block non-interleaving" claim survives.
+
+### 19. `PackedLoc::pack` 29-bit position only debug-asserted — OPEN
+
+Where: `src/hashseq.rs:114`.
+
+Problem: needs 512 MB of run text to overflow, then silently corrupts the handle in release.
+
+Fix: split the run before the limit, or return an error from the insert path.
+
+### 20. Six private test-id constructors with two incompatible shapes — OPEN
+
+Where: `src/encoding.rs:2260` `test_id`, `:3470` `oid`, and siblings.
+
+Fix: one shared test helper module.
+
+## HashKv / HashWeb / value
+
+### 21. Locally minted value stays pending in the local kv view — OPEN
+
+Where: `src/hashkv.rs` `put_ids`, `src/hashweb.rs` `provide_value`.
+
+Problem: a `kv_mut().put_ids(k, vid)` whose value was minted only via `web.provide_value` stays pending in the authoring replica's own kv view: `web.resolve` sees it, every decoding/merging peer hydrates it, but the local `kv.get` does not. The wasm and test `or_else(web.resolve)` fallbacks exist only for this case.
+
+Fix: hydrate the kv view from `web.values` on `put_ids` (or give the kv a handle to the shared store), then delete the `or_else` fallbacks.
+
+### 22. Spurious kv conflicts between identical heads — DECISION
+
+Where: `src/hashkv.rs` `read_id` (~183-197).
+
+Problem: two concurrent `del(k)` → `Conflict([TOMBSTONE, TOMBSTONE])`, `get` None, `keys()` lists the key as live. Spec-conformant but useless to the app.
+
+Fix: dedup value ids in `read_id`. Needs a HASHKV_SPEC decision first.
+
+### 23. Store-parked dedup and `knows()` are O(N²) — OPEN
+
+Where: `src/hashweb.rs:269` `knows`, the store-parked dedup.
+
+Problem: both scan the parked Vec linearly, so N parked envelopes on one unopened object cost O(N²).
+
+Fix: key `parked` by node id, or keep a side set of ids per object.
+
+### 24. `HashKv::merge` panics on origin mismatch — OPEN
+
+Where: `src/hashkv.rs:413`.
+
+Problem: `assert_eq!` on origin. `HashSeq::merge` has the same assert but wasm guards it (`merge_encoded`); the kv path is Rust-API only.
+
+Fix: return an error, or document the precondition and keep the assert.
+
+### 25. `Value::decode` conflates unknown kind with pending — OPEN
+
+Where: `src/value.rs:123`.
+
+Problem: returns None for unknown kinds, so `resolve` cannot tell "unknown value kind" from "artifact not yet received".
+
+Fix: a distinct `Unknown(kind)` variant or a `Result`.
+
+### 26. Link payload doc/test drift — OPEN
+
+Where: `src/hashweb.rs:8` vs tests.
+
+Problem: disagreement on whether a link payload is the origin or the object id.
+
+Fix: pick one, fix the other.
+
+## wasm / web
+
+### 27. kb.js paths never run in a browser — OPEN
+
+Where: `web/kb.js`, `web/index.js`.
+
+Problem: unverified: `offsetOfPoint` / `locateOffset` DOM mapping after the code-point conversion layer, IME event ordering with the deferred render, sidebar drag resolving by origin at drop, the CodeMirror listener in `web/index.js`, and the title debounce capturing its page.
+
+Fix: drive the KB in a browser and check each path: astral chars ("😀a￼b" Backspace-merge, replacing 😀 with 😁), IME composition during a remote delta, drag during a remote render, title edit then page switch within 350 ms.
+
+### 28. wasm mark/unmark mint artifacts before validating the range — OPEN
+
+Where: `src/wasm.rs` ~1050-1140.
+
+Problem: an invalid call still pushes kind/value artifacts. Harmless.
+
+Fix: validate first.
+
+### 29. Full-snapshot upload on connect and reconnect — OPEN
+
+Where: `web/kb.js` `connectSync`, `sync-server/src/main.rs` `client_loop`.
+
+Problem: every connect uploads a full snapshot and the server answers every join with one.
+
+Fix: item 39.
+
+### 39. Hello by frontier: replace the snapshot handshake with 0xC1 frames — OPEN
+
+Where: `web/kb.js` `connectSync` / `handleSyncMessage`, `sync-server/src/main.rs` `client_loop`.
+
+Problem: the library has everything for a snapshot-free handshake (`encode_frontier` / `decode_frontier`, per-peer `HashWebClock`, `deltas_for`, `HashWeb::clock`) but the wire protocol still opens with full snapshots both ways: the server sends `fresh_bytes()` on join, the client sends `snapshotBytes()` on open, and the lagged path resends a snapshot. Clocks are values that change only when the peer states its clock or when we send, so a delta the client receives from the relay is not in the relay's clock and ships back on the next drain (the relay dedups, then re-broadcasts it): steady state needs the peer's clock to travel with its deltas, or the relay to answer each delta with its clock.
+
+Fix: on open the client sends its 0xC1 frontier; the server keeps a `HashWebClock` per connection from the frame, replies with `deltas_for` (a delta, or nothing) plus its own 0xC1 so the client can answer with its delta; each 0xDE frame carries the sender's frontier (or is followed by a 0xC1) so the receiver replaces the sender's clock on every delta; after sending, each side keeps its own `clock()` as the peer's; lagged clients get a fresh frontier exchange instead of a snapshot. Keep the snapshot path for legacy clients (first frame `HWB2`). The sync-server's `wire_stale` snapshot cache is then only needed for the compat path.
+
+## nool
+
+### 30. `nool status | head` panics on broken pipe — OPEN
+
+Where: `src/bin/nool/main.rs` `println!` sites.
+
+Fix: write through a locked `stdout` and ignore `ErrorKind::BrokenPipe`, or reset SIGPIPE at startup.
+
+### 31. Top-level USAGE omits `--force` — OPEN
+
+Where: `src/bin/nool/main.rs:28` `USAGE`.
+
+Problem: the per-command usage strings in `repo.rs:525,610` mention `--force` on `rm` and `merge`; the top-level text does not.
+
+Fix: add the flags to the top-level text.
+
+### 32. `init` ordering and stray `.nool` entry — OPEN
+
+Where: `src/bin/nool/repo.rs` `init`, `tracked_in_cwd`.
+
+Problem: `init` writes `store` before `root`; `tracked_in_cwd` turns a stray `.nool` entry into file name `""`. Unverified whether the atomic-save and `safe_key` changes covered these.
+
+Fix: check; fix or drop.
+
+## Basecamp
+
+### 33. Concurrent editing of one focused block corrupts positions — OPEN
+
+Where: `basecamp/ui/src/HashwebView.qml` ~1936-1952, `basecamp/rust-lib/src/cursor.rs`.
+
+Problem: the QML ignores authority while `localEdits > 0`, which never resets while a peer is also editing. "hello": A types at the end while B inserts "XYZ" at 0 → `text_insert(5,"!")` → "XYZhe!llo". `cursor.rs` exists for this and is unused.
+
+Fix: route typing through `cursor_insert` / `backspace` / `delete`, or apply authority with id-based caret restore.
+
+### 34. Artifact and snapshot delivery gaps — OPEN
+
+Where: `basecamp/rust-lib/src/module.rs` ~343-351, `bridge.rs` ~171-198, `space.rs` ~195-209.
+
+Problem: a lost mid-size artifact frame is never retransmitted; once a space's ops snapshot exceeds the 120 KB frame cap, anti-entropy stops and a fresh peer never bootstraps (visible in status, not fixed). Overlaps item 17.
+
+Fix: chunk snapshots; retransmit or lazily fetch artifacts on `Read::One(id)` misses.
+
+### 35. Persist worker holds the global lock across encode + disk I/O — OPEN
+
+Where: `basecamp/rust-lib/src/space.rs` ~148-154.
+
+Fix: encode under the lock, write outside it.
+
+### 36. hashseq pin is far behind HEAD — OPEN
+
+Where: `basecamp/rust-lib/Cargo.toml:25`.
+
+Problem: pinned to `5d3bf5b`. When the pin moves: `mark_range` / `move_element` / `unmark_range` return `Result<HashNode, HashNode>` (breaks `lib.rs:611,631,649,466`), `doc.rs:38-56` should use `anchor_id_at`, module-side artifact tracking should switch to `web.take_new_artifacts()`, and `enable_outbox` / `take_deltas` are gone: `SpaceState` must own a `hashseq::HashWebClock` for the topic: `deltas_for(&clock)` then `clock = web.clock()` in `drain_deltas`, `clock = other.clock()` before merging a snapshot in `merge_frame`; the `recent_sent` echo filter and the "outbox" comments in `space.rs` / `cursor.rs` go with it. The local `file://` git source must become the github URL once master is pushed (comment at `:22`).
+
+Fix: bump the pin in one change with those adaptations; rebuild via the lgx-portable variant and restart the app (factory dylib).
+
+## sync-server
+
+### 37. No auth on `/sync` and `/artifact` — DECISION
+
+Where: `sync-server/src/main.rs`.
+
+Problem: anyone reaching the port can write. Caps exist (4 MiB ws message, 2 MiB artifact, `HASHWEB_MAX_ARTIFACT_BYTES` 512 MiB, `HASHWEB_MAX_OBJECTS` 200k, 256 new objects per delta). Prod is on a public IP.
+
+Fix: shared token, origin allowlist, or accept open-write for the devnet.
