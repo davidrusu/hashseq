@@ -310,8 +310,8 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
         }
     }
     // Rebuild the seq inside a temp web so the delta rides the standard
-    // apply path (idempotent, parks out-of-order nodes), then clone it out.
-    // Previously parked orphans ride along too (all_nodes excludes them), so
+    // apply path (idempotent, orphans out-of-order nodes), then clone it out.
+    // Previously orphans ride along too (all_nodes excludes them), so
     // a delta that arrives ahead of its dependencies survives to be unparked.
     let mut web = HashWeb::new();
     let obj = web.create_seq(seq.origin());
@@ -336,13 +336,13 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
     store_seq(&sidecar, &merged)?;
     std::fs::write(file, realize(&merged)).map_err(|e| format!("writing {file}: {e}"))?;
     let applied = merged.all_nodes().len() - applied_before_len;
-    let parked = merged.orphans().count();
+    let orphaned = merged.orphans().count();
     let mut note = String::new();
     if applied > delivered {
-        note += &format!(" (incl. {} previously parked)", applied - delivered);
+        note += &format!(" (incl. {} previously orphaned)", applied - delivered);
     }
-    if parked > 0 {
-        note += &format!(", {parked} parked awaiting earlier ops");
+    if orphaned > 0 {
+        note += &format!(", {orphaned} orphaned awaiting earlier ops");
     }
     println!(
         "{file}: {delivered} new op(s): {applied} applied{note} ({} chars, {} tips)",

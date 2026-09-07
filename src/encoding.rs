@@ -1405,13 +1405,13 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     };
 
     // The trailing node section carries everything that is not a block:
-    // parked orphans, applied move ops (placement registers), and gated
-    // (quarantined) nodes — all as tagged nodes with ref-encoded ids,
-    // sorted by node id for deterministic bytes.
+    // orphans and applied move ops (placement registers) — all as
+    // tagged nodes with ref-encoded ids, sorted by node id for
+    // deterministic bytes.
     let orphans: Vec<HashNode> = {
         let mut nodes: Vec<(Id, HashNode)> = seq
             .delivery
-            .held()
+            .orphans()
             .map(|(id, node)| (*id, node.clone()))
             .collect();
         for (idx, mv) in &seq.move_nodes {
@@ -1585,7 +1585,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     }
 
-    // Orphans and gated nodes: the shared node layout with ref-encoded IDs.
+    // Orphans: the shared node layout with ref-encoded IDs.
     encode_varint(orphans.len(), &mut buf);
     for orphan in &orphans {
         encode_node_with(
@@ -1826,7 +1826,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
         }
     }
 
-    // Orphans and gated nodes: the shared node layout with ref-encoded IDs.
+    // Orphans: the shared node layout with ref-encoded IDs.
     let num_orphans = c.step(decode_varint)?;
     for _ in 0..num_orphans {
         let tag = c.byte()?;
@@ -1851,7 +1851,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
 // cycle machinery and a one-entry implicit dictionary (the origin). Refs
 // encode as `varint(0)` = origin, `varint(rank + 1)` = the rank-th put in
 // the stream. Keys and values are commitments — raw 32 B, never refs.
-// Trailing nodes (orphans + gated, id-sorted) carry full ids. The artifact
+// Trailing nodes (orphans, id-sorted) carry full ids. The artifact
 // section (id-sorted canonical value encodings) makes the snapshot
 // self-contained; it is a function of the replica's artifact store, so the
 // canonicality claim is scoped: equal op sets AND equal artifact stores
@@ -1955,8 +1955,8 @@ fn encode_hashkv_with_store(kv: &HashKv, include_store: bool) -> Vec<u8> {
         }
     }
 
-    // Trailing: parked + gated, id-sorted, full ids.
-    let mut held: Vec<(Id, &HashNode)> = kv.delivery.held().map(|(i, n)| (*i, n)).collect();
+    // Trailing: orphans, id-sorted, full ids.
+    let mut held: Vec<(Id, &HashNode)> = kv.delivery.orphans().map(|(i, n)| (*i, n)).collect();
     held.sort_by_key(|(id, _)| *id);
     encode_varint(held.len(), &mut buf);
     for (_, node) in &held {
@@ -2051,7 +2051,9 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
         let (op, used) = decode_op(&bytes[c.pos..])?;
         c.pos += used;
         match op {
-            EncodableOp::Node(node) => kv.apply(node),
+            EncodableOp::Node(node) => {
+                kv.apply(node);
+            }
             EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
         }
     }
@@ -2080,8 +2082,8 @@ pub fn decode_hashkv_strict(bytes: &[u8]) -> Result<HashKv, DecodeError> {
 // Format: [artifacts][objects][trailing]. The store has no identity — a
 // snapshot is a replica's knowledge: every object it holds, each nesting
 // its own canonical stream (`encode_hashseq` / `encode_hashkv`), sorted by
-// origin id, plus the store-level trailing section (store-wide orphans +
-// the routing gate's quarantine, full ids). Root objects' (origin, kind)
+// origin id, plus the store-level trailing section (store-wide orphaned
+// envelopes, full ids). Root objects' (origin, kind)
 // pairs travel as the object sections themselves. Nesting keeps every
 // object self-contained (holonic — any object is a replica root); the
 // spec's fully interleaved cross-object stream is a future refinement of
@@ -2174,16 +2176,16 @@ fn encode_hashweb_with(web: &HashWeb, include_all_artifacts: bool) -> Vec<u8> {
         buf.extend_from_slice(&inner);
     }
 
-    // Trailing section: store-parked envelopes, `obj_id ‖ node`, sorted by
+    // Trailing section: store-orphaned envelopes, `obj_id ‖ node`, sorted by
     // (object, node id) for canonicality.
-    let mut parked: Vec<(Id, Id, &HashNode)> = web
-        .parked
+    let mut orphaned: Vec<(Id, Id, &HashNode)> = web
+        .orphaned
         .iter()
         .flat_map(|(obj, envs)| envs.iter().map(move |(id, n)| (*obj, *id, n)))
         .collect();
-    parked.sort_by_key(|(obj, id, _)| (*obj, *id));
-    encode_varint(parked.len(), &mut buf);
-    for (obj, _, node) in &parked {
+    orphaned.sort_by_key(|(obj, id, _)| (*obj, *id));
+    encode_varint(orphaned.len(), &mut buf);
+    for (obj, _, node) in &orphaned {
         encode_id(obj, &mut buf);
         encode_hash_node(node, &mut buf);
     }
@@ -2231,13 +2233,15 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
         }
     }
 
-    let parked = c.step(decode_varint)?;
-    for _ in 0..parked {
+    let orphaned = c.step(decode_varint)?;
+    for _ in 0..orphaned {
         let obj = c.step(decode_id)?;
         let (op, used) = decode_op(&bytes[c.pos..])?;
         c.pos += used;
         match op {
-            EncodableOp::Node(node) => web.apply_to(obj, node),
+            EncodableOp::Node(node) => {
+                web.apply_to(obj, node);
+            }
             EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
         }
     }
@@ -2341,7 +2345,7 @@ mod tests {
         assert_eq!(decode_hashseq(&b).err(), Some(DecodeError::NoRefs));
         assert_eq!(decode_hashseq_strict(&b).err(), Some(DecodeError::NoRefs));
 
-        // Seq snapshot orphan section: a ref-less Remove parked there.
+        // Seq snapshot orphan section: a ref-less Remove orphaned there.
         let mut b = encode_hashseq(&HashSeq::new(test_id(1)));
         assert_eq!(b.pop(), Some(0));
         b.extend_from_slice(&[1, TAG_REMOVE, 0, 0]);
@@ -3127,23 +3131,27 @@ mod family_wire {
     }
 
     #[test]
-    fn kv_gated_and_conflicts_roundtrip() {
+    fn kv_refused_ops_vanish_and_conflicts_roundtrip() {
         let mut a = HashKv::default();
         let mut b = HashKv::default();
         a.put(s("k"), s("from-a"));
         b.put(s("k"), s("from-b"));
         a.merge(b);
-        // a seq op gates in a map — must survive the wire as quarantine
+        // a seq op is refused in a map — dropped, so the wire never sees it
+        let before = encode_hashkv(&a);
         let origin = a.origin();
-        a.apply(HashNode {
+        let bad = HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(origin, 'x'),
-        });
-        assert_eq!(a.delivery.gated.len(), 1);
+        };
+        let bad_id = bad.id();
+        a.apply(bad);
+        assert!(!a.contains_node(&bad_id));
+        assert_eq!(encode_hashkv(&a), before);
 
         let decoded = decode_hashkv_strict(&encode_hashkv(&a)).expect("strict");
         assert_eq!(decoded, a);
-        assert_eq!(decoded.delivery.gated.len(), 1);
+        assert_eq!(decoded.delivery.orphans().count(), 0);
         assert!(matches!(
             decoded.read(&s("k")),
             crate::hashkv::Read::Conflict(_)
@@ -3202,8 +3210,8 @@ mod family_wire {
     #[test]
     fn web_parked_orphans_roundtrip() {
         // An object's ops delivered before this replica knows the object
-        // park store-wide on its object id; the snapshot carries the
-        // envelopes and decode re-parks.
+        // orphan store-wide on its object id; the snapshot carries the
+        // envelopes and decode re-orphans.
         let mut a = HashWeb::new();
         let root = a.create_kv(Id([9; 32]));
         let p = put(&mut a, &root, s("t"), s("seq"));
@@ -3219,15 +3227,15 @@ mod family_wire {
 
         let decoded = decode_hashweb_strict(&encode_hashweb(&fresh)).expect("strict");
         assert_eq!(decoded.orphans().count(), 1);
-        // Opening the object wakes the re-parked envelope.
+        // Opening the object wakes the re-orphaned envelope.
         let mut decoded = decoded;
         assert_eq!(decoded.create_seq(p.id()), child);
         assert_eq!(decoded.orphans().count(), 0);
         assert_eq!(read_text(&decoded, &child), "x");
     }
 
-    /// A snapshot whose trailing section repeats a parked envelope decodes
-    /// to ONE parked envelope (store-wide parking dedups by node id); the
+    /// A snapshot whose trailing section repeats a orphaned envelope decodes
+    /// to ONE orphaned envelope (store-wide orphaning dedups by node id); the
     /// doubled bytes are then non-canonical and strict rejects them.
     #[test]
     fn web_duplicated_parked_envelope_decodes_once() {
@@ -3393,9 +3401,9 @@ mod legacy_compat {
 // where `node` is the standalone tagged form (`encode_hash_node`). Frames
 // are addressed by **(kind, origin)** — the openable address — never by
 // object id: the id derivation is one-way, so a receiver could not open
-// an unknown object addressed by id, and its ops would park forever.
+// an unknown object addressed by id, and its ops would orphan forever.
 // Apply is idempotent (dedup at the object layer), so echo and replay
-// are harmless; out-of-order arrival parks on refs per the ordinary
+// are harmless; out-of-order arrival orphans on refs per the ordinary
 // orphan machinery. Artifact bytes never ride deltas — they travel once,
 // in 0xAF frames (tag ‖ raw bytes), content-addressed at the receiver.
 
@@ -3422,8 +3430,8 @@ pub fn encode_delta(groups: &[(u8, Id, Vec<HashNode>)]) -> Vec<u8> {
 
 /// Apply a delta message to a store: open each addressed object
 /// (idempotent) and deliver its nodes through the normal apply path.
-/// Returns the number of nodes NEWLY delivered (already-known nodes —
-/// echoes, replays — count zero).
+/// Returns the number of nodes that were news — applied or newly
+/// orphaned; echoes and replays count zero.
 pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError> {
     if bytes.first() != Some(&DELTA_TAG) {
         return Err(DecodeError::InvalidOpTag(
@@ -3451,11 +3459,9 @@ pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError
             match op {
                 EncodableOp::Node(node) => {
                     let id = node.id();
-                    if web.knows(obj, &id) {
-                        continue; // echo / replay: nothing new
+                    if web.apply_to_with_id(obj, id, node) {
+                        delivered += 1;
                     }
-                    web.apply_to_with_id(obj, id, node);
-                    delivered += 1;
                 }
                 EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
             }

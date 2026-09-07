@@ -261,7 +261,7 @@ Two different things get rendered, with different mutability:
 
 The dividing rule for checks follows from this split:
 
-> A check may run **once, at apply time** (quarantining permanently on
+> A check may run **once, at apply time** (dropping the op on
 > failure) iff it is a function of hash-committed inputs and the immutable
 > base — an op's shape, its anchors' base order, an object's committed type.
 > Anything that depends on *which other ops are present* — head counts,

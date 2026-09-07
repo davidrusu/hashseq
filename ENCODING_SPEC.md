@@ -211,7 +211,7 @@ one-entry implicit dictionary (the origin) and rank refs; trailing
 `[artifacts][objects][trailing]`: each object nests its own canonical
 stream under its object id, objects sorted by id — holonic: any object
 section is a complete replica root; the object-id framing *is* the
-routing envelope, and the trailing section is store-parked envelopes
+routing envelope, and the trailing section is store-orphaned envelopes
 (`obj_id ‖ node`, sorted by object then node id). Inner maps carry **no** artifact
 store; the composition has one document-wide artifact section (the union
 of the web store and inner stores — inner stores are replica-local views

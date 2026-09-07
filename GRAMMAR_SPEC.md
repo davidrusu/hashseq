@@ -71,7 +71,7 @@ The envelope is the kind-independent parse (HETEROGENEITY.md): a replica
 that does not know `kind` still reads the refs (buffering and commitment)
 and skips `body_len` bytes. Placement is **body semantics** — where an op
 sits in its container is kind-level meaning, and not every kind has a place
-(a `Put` does not); an op anchoring on a node of unknown kind parks until
+(a `Put` does not); an op anchoring on a node of unknown kind orphans until
 the kind is known (Op kinds, below). The refs table doubles as the
 body's dictionary: role fields address it by index, and any entry no role
 addresses is a pure frontier pin — the named/pin split is positional, never
@@ -114,7 +114,7 @@ anchor := varint( (ref_idx << 1) | side )     -- side: 0 = Before, 1 = After
 
 Unknown kind tags are **not** malformed: the node is carried opaquely
 (envelope semantics only), per the extension path; ops that reference it in
-roles park until the kind is known.
+roles orphan until the kind is known.
 
 `Insert` carries a **single** anchor by decision — Fugue-style dual
 left/right origins were rejected: a committed interval hands every
@@ -136,8 +136,8 @@ ambiguity because the two streams never mix. The envelope needs no trust
 and no verdict: an op enveloped to the wrong object simply never applies
 there (its refs never arrive inside that object), the same fate as any
 garbage ref — bounded and attributable. Buffering is two-level: envelopes
-naming unknown object ids park store-wide until the object is opened or
-adopted; ops inside a live object park on their first missing ref in that
+naming unknown object ids orphan store-wide until the object is opened or
+adopted; ops inside a live object orphan on their first missing ref in that
 object's own buffer.
 
 ### Value fields: always by id in the preimage
@@ -189,7 +189,8 @@ a test vector, never magic bytes in id space.
 
 ### Grammar-level validation (all stable)
 
-Malformed — reject permanently, quarantine anything that refs it: non-
+Malformed — reject permanently and drop; anything that refs it orphans on
+the missing ref: non-
 minimal varint; unsorted/duplicated refs table or index list;
 `ref_count = 0`; `body_len` mismatch; ref index ≥ `ref_count`; trailing
 bytes. **Not**

@@ -531,7 +531,7 @@ pub struct HashSeq {
     /// The mark layer's own frontier: marks are downstream-only (content
     /// never references marks), so mark ops never enter the text tips.
     pub(crate) mark_tips: BTreeSet<Id>,
-    /// Parked orphans + the gate (see `delivery::Delivery`). Gated here
+    /// Orphans + the gate (see `delivery::Delivery`). Gated here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
     /// (a map op in a seq), non-char insert payloads (the value column
     /// generalization), inverted mark spans, and mark anchors on move-op
@@ -722,7 +722,7 @@ impl HashSeq {
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
-        self.delivery.orphans()
+        self.delivery.orphans().map(|(_, n)| n)
     }
 
     // ---- causal adjacency (handle space) ----
@@ -2093,9 +2093,9 @@ impl HashSeq {
         self.index.insert_span_at(t, idx);
     }
 
-    pub fn apply(&mut self, node: HashNode) {
+    pub fn apply(&mut self, node: HashNode) -> bool {
         let id = node.id();
-        self.apply_with_id(id, node);
+        self.apply_with_id(id, node)
     }
 
     /// Apply a node with a pre-computed ID (avoids double hashing). The id
@@ -2104,72 +2104,72 @@ impl HashSeq {
     /// the wire never supplies ids directly.
     ///
     /// Iterative worklist, no recursion: applying a node wakes exactly the
-    /// orphans parked on its id (which may re-park on their next missing
-    /// dep), so out-of-order delivery costs each node one park per missing
+    /// orphans waiting on its id (which may re-orphan on their next missing
+    /// dep), so out-of-order delivery costs each node one orphan per missing
     /// dep instead of a global retry per apply.
-    pub fn apply_with_id(&mut self, id: Id, node: HashNode) {
+    ///
+    /// Returns whether `node` was news: applied, or orphaned for the first
+    /// time. False for a replay of an applied or already-orphaned node,
+    /// and for a refused one (nothing changed).
+    pub fn apply_with_id(&mut self, id: Id, node: HashNode) -> bool {
         debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
-        if self.contains_node(&id) || self.delivery.holds(&id) {
-            return;
+        if self.contains_node(&id) {
+            return false;
         }
-        // `queue` only allocates when an apply actually wakes parked orphans;
-        // the common case (sequential typing, nothing parked) stays
+        // `queue` only allocates when an apply actually wakes orphans;
+        // the common case (sequential typing, nothing orphaned) stays
         // allocation-free and dispatches `node` directly.
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
-        self.park_or_dispatch(id, node, &mut queue);
+        let news = self.orphan_or_dispatch(id, node, &mut queue);
         while let Some((id, node)) = queue.pop() {
-            self.park_or_dispatch(id, node, &mut queue);
+            self.orphan_or_dispatch(id, node, &mut queue);
         }
+        news
     }
 
-    /// One step of the worklist: park `node` on its first missing dep, or
-    /// interpret it and wake its waiters. A gated node wakes nothing — its
-    /// dependents stay parked (the quarantine cascade).
-    fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
-        // An insert's anchor is resolved here once and handed down: the
-        // dependency check, the admission gate and the run-extension fast
-        // path all need the same handle, and on the typing hot path that
-        // lookup was paid three times.
-        let (insert_anchor, missing) = match &node.op {
-            Op::Insert { at, .. } => match self.idx_of(at.id()) {
-                None => (None, Some(*at.id())),
-                Some(a) => (
-                    Some(a),
-                    node.pins.iter().find(|d| !self.contains_node(d)).copied(),
-                ),
-            },
-            _ => (
-                None,
-                node.iter_refs().find(|d| !self.contains_node(d)).copied(),
-            ),
-        };
-        if let Some(missing) = missing {
-            self.delivery.park(missing, id, node);
-            return;
-        }
-        self.delivery.unpark(&id);
-        match self.interpret(id, node, insert_anchor) {
-            Ok(()) => self.delivery.wake(&id, queue),
-            Err(node) => self.delivery.gate(id, node),
-        }
+    /// The ref an orphan is keyed on: the first ref in `iter_refs` order
+    /// that is not applied here, or `None` when every ref is.
+    /// This is a hard requirement of the delivery module to ensure idempotency.
+    pub(crate) fn canonical_orphan_dependency(&self, node: &HashNode) -> Option<Id> {
+        node.iter_refs().find(|d| !self.contains_node(d)).copied()
     }
 
-    /// Interpret one node whose refs are all applied — this projection's
-    /// edge-table rows. `Err` hands the node back for quarantine.
-    // The Err carries the node back by value — same move the parameters
-    // make; boxing would buy an allocation per gated op for nothing.
-    /// `insert_anchor`: the resolved anchor handle when `node` is an
-    /// Insert (see `park_or_dispatch`), `None` otherwise.
-    #[allow(clippy::result_large_err)]
-    fn interpret(
+    /// One step of the worklist: orphan `node` on its canonical missing
+    /// dep (a re-delivered orphan lands in the bucket it is already in),
+    /// or interpret it and wake its waiters. A refused node wakes nothing
+    /// — its dependents stay orphaned (the refusal cascades).
+    fn orphan_or_dispatch(
         &mut self,
         id: Id,
         node: HashNode,
-        insert_anchor: Option<NodeIdx>,
-    ) -> Result<(), HashNode> {
+        queue: &mut Vec<(Id, HashNode)>,
+    ) -> bool {
+        if let Some(key) = self.canonical_orphan_dependency(&node) {
+            return self.delivery.orphan(key, id, node);
+        }
+        // A refused node (Err) is dropped; its dependents stay orphaned.
+        let applied = self.interpret(id, node).is_ok();
+        if applied {
+            self.delivery.wake(&id, queue);
+        }
+        applied
+    }
+
+    /// Interpret one node whose refs are all applied — this projection's
+    /// edge-table rows. `Err` hands the node back; the caller drops it.
+    // The Err carries the node back by value — same move the parameters
+    // make; boxing would buy an allocation per gated op for nothing.
+    /// `insert_anchor`: the resolved anchor handle when `node` is an
+    /// Insert (see `orphan_or_dispatch`), `None` otherwise.
+    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), ()> {
+        let insert_anchor = match &node.op {
+            Op::Insert { at, .. } => self.idx_of(at.id()),
+            _ => None,
+        };
+
         // The apply-time gate: ops this projection does not admit are
-        // quarantined before touching tips or the index. They never intern,
-        // so dependents stay parked (the correct edge-table semantics).
+        // dropped before touching tips or the index. They never intern,
+        // so dependents stay orphaned (the correct edge-table semantics).
         let admitted = match &node.op {
             // The Insert.at row: the anchor must be a glued point — an
             // element, a move op's splice point, or the origin. Anything
@@ -2218,7 +2218,7 @@ impl HashSeq {
             _ => false,
         };
         if !admitted {
-            return Err(node);
+            return Err(());
         }
 
         // Marks live in their own layer: they never enter the text tips
@@ -2226,7 +2226,7 @@ impl HashSeq {
         if let Op::Mark { start, end, .. } = &node.op {
             let (start, end) = (*start, *end);
             if !self.mark_admissible(&start, &end) {
-                return Err(node);
+                return Err(());
             }
             let Op::Mark {
                 kind_v,
@@ -2355,7 +2355,7 @@ impl HashSeq {
     }
 
     /// Every applied node in apply order — a causally safe order: each
-    /// node's refs precede it. Parked orphans and gated nodes are never
+    /// node's refs precede it. Orphans and gated nodes are never
     /// interned, so they never appear.
     pub fn nodes_in_apply_order(&self) -> impl Iterator<Item = (Id, HashNode)> + '_ {
         (0..self.ids.len()).filter_map(move |i| {
@@ -2467,7 +2467,7 @@ impl HashSeq {
 
     /// Every applied node as `(id, HashNode)` — runs decompressed, remove
     /// chains reconstructed, moves and multi-removes included. Ids come from
-    /// the local table (no rehashing). Parked orphans and gated nodes are
+    /// the local table (no rehashing). Orphans and gated nodes are
     /// NOT included; iterate `orphans()` / `gated` separately.
     pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
         let mut out: Vec<(Id, HashNode)> = Vec::new();
@@ -2524,10 +2524,9 @@ impl HashSeq {
             self.apply_with_id(id, node);
         }
 
-        // Apply parked orphans (ids were computed when they were parked)
-        // and re-present the other side's quarantined nodes: applying
-        // re-gates them here (deterministically), keeping merge lossless.
-        for (id, node) in other.delivery.into_held() {
+        // Apply the other side's orphans (ids were computed when
+        // they were orphaned); ours may hold what they were missing.
+        for (id, node) in other.delivery.into_orphans() {
             self.apply_with_id(id, node);
         }
     }
@@ -2664,7 +2663,9 @@ impl HashSeq {
     /// constituent `HashNode`s and applied one at a time.
     pub fn apply_op(&mut self, op: EncodableOp) {
         match op {
-            EncodableOp::Node(node) => self.apply(node),
+            EncodableOp::Node(node) => {
+                self.apply(node);
+            }
             EncodableOp::Run(run) => {
                 for node in run.decompress() {
                     self.apply(node);
@@ -3361,7 +3362,7 @@ mod test {
         assert_eq!(seq.len(), n);
     }
 
-    /// An orphan missing several deps re-parks on the next missing dep as
+    /// An orphan missing several deps re-orphans on the next missing dep as
     /// they arrive — in either arrival order.
     #[test]
     fn orphan_reparks_until_all_deps_arrive() {
@@ -4769,7 +4770,7 @@ mod test {
 
     /// The Insert.at gate row: anchors must be glued points (elements,
     /// move ops, the origin) — an insert anchored at a remove or mark op
-    /// quarantines instead of creating unrenderable content (or worse).
+    /// is refused instead of creating unrenderable content (or worse).
     #[test]
     fn insert_at_non_glued_anchor_gates() {
         let mut seq = HashSeq::default();
@@ -4785,20 +4786,21 @@ mod test {
             )
             .unwrap();
 
+        let before = crate::encoding::encode_hashseq(&seq);
         for anchor in [rm.id(), mk.id()] {
-            seq.apply(HashNode {
+            let node = HashNode {
                 pins: BTreeSet::new(),
                 op: Op::insert_after(anchor, 'X'),
-            });
+            };
+            let id = node.id();
+            seq.apply(node);
+            assert!(!seq.contains_node(&id), "refused, not applied");
         }
-        assert_eq!(seq.delivery.gated.len(), 2);
+        assert_eq!(seq.orphans().count(), 0, "refused, not orphaned");
         assert_eq!(seq.iter().collect::<String>(), "b");
         check_index_matches_iter(&seq);
-        // ...and the doc still roundtrips with the quarantined pair aboard.
-        let decoded =
-            crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(&seq))
-                .expect("strict");
-        assert_eq!(decoded.delivery.gated.len(), 2);
+        // ...and the refused pair left no trace in the snapshot.
+        assert_eq!(crate::encoding::encode_hashseq(&seq), before);
     }
 
     // ---- marks (the span-annotation projection, MARKS.md) ----
@@ -4900,7 +4902,7 @@ mod test {
     }
 
     #[test]
-    fn gated_authoring_is_reported_and_never_queued_for_peers() {
+    fn refused_authoring_is_reported_and_never_ships() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abcd".chars());
         let a = seq.id_at(0).unwrap();
@@ -4919,7 +4921,7 @@ mod test {
             .mark_range(Anchor::Before(c), Anchor::Before(a), bold(), yes())
             .unwrap_err();
         assert!(!seq.contains_node(&err.id()));
-        assert_eq!(seq.delivery.gated.len(), 1);
+        assert_eq!(seq.orphans().count(), 0);
         assert!(seq.delta_for(&peer).is_empty(), "nothing shipped");
         assert_eq!(
             seq.frontier(),
@@ -4994,7 +4996,7 @@ mod test {
         assert!(a.delta_for(&b_clock).is_empty());
     }
 
-    /// Out-of-order arrival: a node received from the peer parks, and
+    /// Out-of-order arrival: a node received from the peer orphans, and
     /// its dependency lands later — possibly authored locally as the
     /// byte-identical node (content-derived ids). Against the peer's
     /// stated clock neither ships back, and a local edit afterwards is
@@ -5011,7 +5013,7 @@ mod test {
         let nodes: Vec<(Id, HashNode)> = b.nodes_in_apply_order().collect();
         let (n_id, n) = nodes[1].clone(); // y
         let (m_id, m) = nodes[2].clone(); // z, anchored after y
-        // z arrives first and parks on y.
+        // z arrives first and orphans on y.
         a.apply_with_id(m_id, m.clone());
         assert_eq!(a.orphans().count(), 1);
         // A's user types the identical y: interned, then z wakes behind it.
@@ -5038,7 +5040,7 @@ mod test {
     }
 
     /// A peer that states its frontier (a hello) gets exactly the rest of
-    /// the history, in an order it can replay with nothing parked — and a
+    /// the history, in an order it can replay with nothing orphaned — and a
     /// peer stating a frontier from a state we have moved past (or an
     /// empty one) gets the whole DAG.
     #[test]
@@ -5155,7 +5157,7 @@ mod test {
             .collect();
         assert_eq!(ids, since.iter().map(|(id, _)| *id).collect::<Vec<_>>());
         // Apply order is causally safe: a fresh replica replays it with
-        // nothing parked.
+        // nothing orphaned.
         let mut fresh = HashSeq::default();
         for (id, node) in &since {
             fresh.apply_with_id(*id, node.clone());
@@ -5409,7 +5411,7 @@ mod test {
                 overwrites: BTreeSet::new(),
             },
         });
-        assert_eq!(seq.delivery.gated.len(), 1);
+        assert_eq!(seq.orphans().count(), 0);
         assert!(seq.mark_nodes.is_empty());
         assert!(seq.mark_tips().is_empty());
     }
@@ -5532,7 +5534,7 @@ mod test {
         );
         check_index_matches_iter(&seq);
 
-        // Roundtrip carries op-anchored marks (they park until the op
+        // Roundtrip carries op-anchored marks (they orphan until the op
         // applies, then re-anchor identically).
         let decoded =
             crate::encoding::decode_hashseq_strict(&crate::encoding::encode_hashseq(&seq))
@@ -5561,7 +5563,7 @@ mod test {
                 overwrites: BTreeSet::new(),
             },
         });
-        assert_eq!(seq.delivery.gated.len(), 1);
+        assert_eq!(seq.orphans().count(), 0);
         assert!(seq.mark_tips().is_empty());
     }
 
@@ -5625,7 +5627,7 @@ mod test {
         assert_eq!(decoded.iter().collect::<String>(), "abx");
     }
 
-    /// A mark delivered before its text parks and applies on arrival.
+    /// A mark delivered before its text orphans and applies on arrival.
     #[test]
     fn mark_before_its_text_parks() {
         let mut source = HashSeq::default();
@@ -5721,8 +5723,10 @@ mod test {
                 overwrites: BTreeSet::new(),
             },
         };
+        let id = node.id();
         seq.apply(node);
-        assert_eq!(seq.delivery.gated.len(), 1);
+        assert!(!seq.contains_node(&id));
+        assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.placement_of(&a), None);
     }
 
@@ -5743,9 +5747,92 @@ mod test {
                 overwrites: BTreeSet::new(),
             },
         };
+        let id = node.id();
         seq.apply(node);
-        assert_eq!(seq.delivery.gated.len(), 1);
+        assert!(!seq.contains_node(&id));
+        assert_eq!(seq.orphans().count(), 0);
         let _ = b;
+    }
+
+    /// A refused op is dropped: no state, no snapshot bytes, no clock or
+    /// delta trace, and re-delivery is refused again rather than deduped.
+    #[test]
+    fn refused_op_leaves_no_trace() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+        let before = crate::encoding::encode_hashseq(&seq);
+        let frontier = seq.frontier();
+        let history = seq.delta_for(&Clock::default()).len();
+
+        let self_move = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Move {
+                target: a,
+                to: Anchor::After(a),
+                overwrites: BTreeSet::new(),
+            },
+        };
+        let id = self_move.id();
+        assert!(!seq.apply(self_move.clone()), "refused: nothing changed");
+        assert!(!seq.apply(self_move), "re-delivery: refused again");
+        assert!(!seq.contains_node(&id));
+        assert_eq!(seq.orphans().count(), 0);
+        assert_eq!(seq.frontier(), frontier);
+        assert_eq!(crate::encoding::encode_hashseq(&seq), before);
+        assert_eq!(seq.delta_for(&Clock::default()).len(), history);
+        // Merging a replica that saw the refused op carries nothing over.
+        let mut other = HashSeq::default();
+        other.merge(seq.clone());
+        assert_eq!(other, seq);
+        assert_eq!(other.orphans().count(), 0);
+    }
+
+    /// A dependent of a refused op orphans on it like any missing ref, and
+    /// stays orphaned: the refused op is never supplied by this replica,
+    /// and a merge carries the orphaned dependent, not the refused op.
+    #[test]
+    fn dependent_of_a_refused_op_stays_parked() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "ab".chars());
+        let a = seq.id_at(0).unwrap();
+        let self_move = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::Move {
+                target: a,
+                to: Anchor::After(a),
+                overwrites: BTreeSet::new(),
+            },
+        };
+        let m = self_move.id();
+        let dependent = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_after(m, 'X'),
+        };
+        let x = dependent.id();
+        // Either arrival order ends the same way.
+        assert!(seq.apply(dependent.clone()), "orphaned: news");
+        assert!(
+            !seq.apply(dependent.clone()),
+            "re-delivered orphan: not news"
+        );
+        assert!(!seq.apply(self_move.clone()));
+        assert!(!seq.contains_node(&m));
+        assert!(!seq.contains_node(&x));
+        assert_eq!(seq.orphans().count(), 1);
+        assert!(seq.orphans().any(|n| n.id() == x));
+        assert_eq!(seq.iter().collect::<String>(), "ab");
+
+        let mut other = HashSeq::default();
+        other.merge(seq.clone());
+        assert_eq!(other.orphans().count(), 1, "the orphaned dependent travels");
+        assert!(!other.contains_node(&m), "the refused op does not");
+        other.apply(self_move);
+        assert_eq!(
+            other.orphans().count(),
+            1,
+            "refused there too; X stays orphaned"
+        );
     }
 
     fn raw_move(target: Id, to: Anchor, overwrites: &[Id]) -> HashNode {
@@ -5818,7 +5905,7 @@ mod test {
 
     #[test]
     fn moves_merge_through_orphan_buffering() {
-        // Deliver the move before its target exists: it parks, then applies.
+        // Deliver the move before its target exists: it orphans, then applies.
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "abc".chars());
         let a = seq.id_at(0).unwrap();
@@ -5827,7 +5914,7 @@ mod test {
         let mv = other.move_element(a, Anchor::After(c)).unwrap();
 
         let mut fresh = HashSeq::default();
-        fresh.apply(mv); // parks: target unknown
+        fresh.apply(mv); // orphans: target unknown
         assert_eq!(fresh.orphans().count(), 1);
         fresh.merge(seq);
         assert_eq!(fresh.placement_of(&a), Some(Anchor::After(c)));

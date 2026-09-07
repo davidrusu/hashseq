@@ -228,8 +228,8 @@ placement:
 
 ### Self-move
 
-`to` naming `target` itself is contentless and stable → apply-time
-quarantine (same gate class as inverted spans, MARKS.md). Destinations on
+`to` naming `target` itself is contentless and stable → refused at apply
+and dropped (same gate class as inverted spans, MARKS.md). Destinations on
 move ops — including ops of `target`'s own chain — are well-defined and
 admitted: excision precedes placement and an op's rank is permanent, so
 "move x to where that op placed it" renders at the op's splice point.
@@ -274,7 +274,7 @@ FRAMEWORK Law II it is a cache pinned equal to the definitional iterator
 ## Validation
 
 - A `Remove` naming a non-insert node is inert, not rejected (no leak).
-- Self-moves → permanent quarantine (stable check).
+- Self-moves → refused at apply and dropped (stable check).
 - A `Move`'s anchor must resolve to a valid glued point **in `target`'s own
   object** (an element, the origin, or a move op's own splice point for
   `After(move_op)`); a cross-container destination fails the apply-time gate

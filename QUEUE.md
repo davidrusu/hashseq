@@ -4,16 +4,6 @@ Statuses: OPEN, DECISION (needs a call), DEFERRED (only alongside named work). N
 
 ## Up next
 
-### 41. Drop refused ops instead of quarantining them — OPEN
-
-Where: `src/delivery.rs` `gated`, `gate`, `holds`, `held`, `into_held`; the `Err(node) => self.delivery.gate(..)` arm in `HashSeq::park_or_dispatch` and `HashKv::park_or_dispatch`; the trailing section in `src/encoding.rs` (~:1588, :1829, :1958); HASHWEB_SPEC.md "The edge table" (~:113) and "Tighten never, loosen carefully" (~:138); FRAMEWORK.md:264; HASHSEQ_SPEC.md:232,277.
-
-Problem: an op the apply gate refuses (self-move, non-element move target, non-glue-point anchor, inverted mark span, ill-typed op for the object kind) is kept forever in `delivery.gated`, re-encoded into every snapshot's trailing section, merged into every peer, and recorded as held in every clock. An attacker's junk becomes permanent state everywhere for the price of sending it once. The spec keeps it so a later loosening of a gate row can re-judge locally, but with tips-as-clock a refused op is outside our closure by construction, so one 0xC1 frontier exchange with an up-to-date peer re-delivers it after an upgrade. For moves none of the three rows is a plausible loosening candidate.
-
-Fix: the `Err` arm of `park_or_dispatch` drops the node; delete `Delivery::gated`, `gate`, the second clause of `holds`, and the gated halves of `held` / `into_held`; the trailing section carries parked orphans only. Spec: "gated" becomes "refused — dropped; anything referencing it parks until a peer that admits it supplies the chain"; "loosen carefully" becomes "loosening is recovered by re-sync, not re-judging". Tests: rewrite `gated_authoring_is_reported_and_never_queued_for_peers` and the decoder tests that round-trip gated nodes; add one that a refused op leaves no trace in state, snapshot, or clock, and one that a dependent of a refused op stays parked and applies once the chain arrives from a peer that admits it. Decide whether the same rule covers ill-typed ops from a newer peer (proposed: yes, the cost is one re-sync after upgrading).
-
-Do before item 40, which touches the same apply path.
-
 ### 40. One frontier per object: fold `mark_tips` into the DAG's tips — OPEN
 
 Where: `src/hashseq.rs` `mark_tips` (~:533), `apply_mark` (~:1574), `mark_range` pins (~:1939), `frontier()`; MARKS.md "refs" (~:46) and "Apply" (~:135); LAYERING.md "Per-layer frontier" (~:99); HASHSEQ_SPEC.md:64.
@@ -28,7 +18,7 @@ Where: `HashSeq::move_element`, `mark_range`, `unmark_range` (`Result<HashNode, 
 
 Problem: a refused op comes back as `Err(node)`, which says only "not applied". The gate knows why (target not an element, anchor not a glue point, self-move, inverted span) but folds it into a bool and drops it; the wasm error strings are inferred from context, not reported. No caller uses the returned node, and it is what trips `result_large_err` (four allows).
 
-Fix: `pub enum Refused { NotAnElement, NotAGluePoint, SelfMove, InvertedSpan }`; the helpers return `Result<HashNode, Refused>`; `interpret` produces the reason where it decides (keeping the node internally for quarantine until item 41 drops that); wasm maps each variant to its own message; delete the four `#[allow(clippy::result_large_err)]`. Tests assert the variant, not `!contains_node`.
+Fix: `pub enum Refused { NotAnElement, NotAGluePoint, SelfMove, InvertedSpan }`; the helpers return `Result<HashNode, Refused>`; `interpret` produces the reason where it decides; wasm maps each variant to its own message; delete the four `#[allow(clippy::result_large_err)]`. Tests assert the variant, not `!contains_node`.
 
 ### 43. Rename the "gate" / "edge table" framing — OPEN
 
@@ -103,7 +93,7 @@ Problem: the by-id payload form is never refused; the id is resolved on read whe
 Plan: keep the store on HashWeb; resolve at apply and re-resolve on artifact arrival; no signature change to `iter`/`char_at`; never use `CHAR_MEMO` (thread-local, history-dependent).
 
 1. `HashWeb::resolve_char(id) -> Option<char>` (ASCII table, else `values` → `Value::decode` → `Char`) and `resolve_node(node)` rewriting `Op::Insert{Payload::Id(v)}` on hit, id unchanged.
-2. Route seq deliveries in `apply_to_with_id` through `resolve_node`; parked nodes resolve on wake; `merge` already passes through it.
+2. Route seq deliveries in `apply_to_with_id` through `resolve_node`; orphaned nodes resolve on wake; `merge` already passes through it.
 3. `HashSeq::resolve_atoms(vid, c) -> usize`: for each `elem_payloads[e] == vid` set the single-element run's text to `c`, drop the entry. Run length unchanged so RunIndex is untouched. Strict round-trip test that a resolved 1-char run encodes identically to a typed one.
 4. Call `resolve_atoms` on every seq when new bytes decode to a non-ASCII `Value::Char`: `provide_artifact_bytes`, `provide_value`, `merge`, `decode_hashweb`.
 5. Thread a value sink through `decode_*_into(bytes, &mut Vec<Vec<u8>>)` so `decode_hashweb` / wasm ingestion capture inline non-char artifacts into `web.values`.
@@ -208,13 +198,13 @@ Problem: two concurrent `del(k)` → `Conflict([TOMBSTONE, TOMBSTONE])`, `get` N
 
 Fix: dedup value ids in `read_id`. Needs a HASHKV_SPEC decision first.
 
-### 23. Store-parked dedup and `knows()` are O(N²) — OPEN
+### 23. Store-orphaned dedup and `knows()` are O(N²) — OPEN
 
-Where: `src/hashweb.rs:269` `knows`, the store-parked dedup.
+Where: `src/hashweb.rs:269` `knows`, the store-orphaned dedup.
 
-Problem: both scan the parked Vec linearly, so N parked envelopes on one unopened object cost O(N²).
+Problem: both scan the orphaned Vec linearly, so N orphaned envelopes on one unopened object cost O(N²).
 
-Fix: key `parked` by node id, or keep a side set of ids per object.
+Fix: key `orphaned` by node id, or keep a side set of ids per object.
 
 ### 24. `HashKv::merge` panics on origin mismatch — OPEN
 

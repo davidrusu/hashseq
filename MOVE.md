@@ -190,7 +190,7 @@ tombstone. Cursor logic chooses: `After(move_op)` = relative to x's new
 home; `After(u)`/`Before(v)` (destination neighbors) = relative to the gap.
 
 Self-moves (`to` resolving into `target`'s own move chain) are syntactically
-checkable and stable → apply-time quarantine (the shared gate class).
+checkable and stable → refused at apply and dropped (the shared gate class).
 
 ## Amplification audit
 
@@ -205,7 +205,7 @@ honest replicas?
 | dominating-op vandalism (move honest block to garbage) | one relocation | the permissionless-write baseline (same class as Remove); attributable, revertible |
 | mass element moves | singleton fragments in the treap | linear in attacker ops; treap stays O(log F) |
 | move-churn ghost spam | none beyond live placements | splice ghosts are lazy — only anchored-to splice points persist |
-| cross-container relocation games | n/a — not an op | the gate quarantines cross-container destinations; re-link duplication is flagged, per-op bounded, resolved by one delete |
+| cross-container relocation games | n/a — not an op | the gate refuses cross-container destinations; re-link duplication is flagged, per-op bounded, resolved by one delete |
 
 No reshuffle row exists because none is reachable: relocation of honest
 content requires a dominating op per block (linear, attributable), frozen

@@ -457,7 +457,7 @@ mod tests {
             let want: String = model.iter().collect();
             assert_eq!(web.text(&list).unwrap(), want, "after move({from},{to})");
         }
-        // Dropping onto itself (either side) is a no-op, not a gated op.
+        // Dropping onto itself (either side) is a no-op, not a refused op.
         let before = web.text(&list).unwrap();
         web.seq_move(&list, 1, 1).unwrap();
         web.seq_move(&list, 1, 2).unwrap();
@@ -526,7 +526,7 @@ mod tests {
         web.text_insert(&doc, 0, "abcd").unwrap();
         web.seq_move(&doc, 0, 4).unwrap();
         assert_eq!(web.text(&doc).unwrap(), "bcda");
-        // "cd" then the moved-in "a": both used to be gated or cover nothing.
+        // "cd" then the moved-in "a": both used to be refused or cover nothing.
         web.mark_range(&doc, 1, 3, "bold", "on").unwrap();
         web.mark_range_closed(&doc, 3, 4, "bold", "on").unwrap();
         let spans = web.marked_spans(&doc).unwrap();
@@ -910,7 +910,7 @@ impl WasmHashWeb {
         self.inner.object_count()
     }
 
-    /// Envelopes parked on unknown object ids (waiting for an open).
+    /// Envelopes orphaned on unknown object ids (waiting for an open).
     #[wasm_bindgen(js_name = orphanCount)]
     pub fn orphan_count(&self) -> usize {
         self.inner.orphans().count()
@@ -1389,7 +1389,9 @@ impl WasmHashWeb {
         let obj = hex_to_id(obj_hex)?;
         let (op, _) = decode_op(op_bytes).map_err(|e| app_err(&format!("decode op: {e}")))?;
         match op {
-            EncodableOp::Node(node) => self.inner.apply_to(obj, node),
+            EncodableOp::Node(node) => {
+                self.inner.apply_to(obj, node);
+            }
             EncodableOp::Run(run) => {
                 for (id, node) in run.decompress_with_ids() {
                     self.inner.apply_to_with_id(obj, id, node);

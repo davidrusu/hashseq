@@ -249,7 +249,7 @@ replica sees. Observations:
   replica — derive block origins from the content ids instead of random!)
   or version-gated conventions. This deserves ledger status: "how do
   app conventions version?" is the app-layer twin of the system's
-  cross-version parking story.
+  cross-version orphaning story.
 
 **Feedback**: Move via drag needed one wasm method and ~40 lines of DOM.
 The deterministic-migration idea (derive new origins from existing op ids,
@@ -857,7 +857,7 @@ where yesterday it was the full ~7MB snapshot both ways.
   outbox that only the authoring helpers fed; then (briefly, 2026-09-05)
   an arena watermark plus a per-node provenance bit. Both were replica-
   local bookkeeping a peer could neither name nor verify, and the bit
-  misfired whenever an apply woke parked orphans. Now the store keeps
+  misfired whenever an apply woke orphans. Now the store keeps
   no delta state at all: the transport owns a `HashWebClock` per peer holding,
   per object, the peer's TIPS as far as we know them — portable, so a
   peer can state its own (the 0xC1 frontier frame) — and a delta is
@@ -889,7 +889,7 @@ where yesterday it was the full ~7MB snapshot both ways.
   strand a joiner between the snapshot and the deltas it missed.
 
 **Feedback**: the op DAG's refs made the transport almost trivial —
-out-of-order frames park and wake with zero new protocol state, and
+out-of-order frames orphan and wake with zero new protocol state, and
 idempotent apply made relay/echo/replay a non-problem. The remaining
 sync gap from #21 is now only artifact laziness (hello still hauls all
 image bytes once per fresh browser; have/want negotiation or

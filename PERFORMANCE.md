@@ -137,7 +137,7 @@ chained node hash (fewer hasher updates, no ASCII tag strings), raising the
 hash-only ceiling to ~9.5M ops/s on this machine. Snapshot
 `after-id-preimage.txt`.
 
-**Orphan buffering** (2026-06-11): orphans now park on their first missing
+**Orphan buffering** (2026-06-11): orphans now wait on their first missing
 dep (`HashMap<Id, Vec<(Id, HashNode)>>`, SipHash — keys are adversary-chosen
 bytes) with an `orphan_ids` dedup set; applying an op wakes only its waiters
 via an iterative worklist. Replaces the retry-everything drain that was
@@ -374,7 +374,7 @@ Subsumes `RemoveSpan` + `Single`. Modest (~1–2% of the encoding, concentrated 
 scatter-delete traces) and fiddlier than #2 (chain order must be preserved,
 ranges need a direction bit, decode reconstructs across runs). Below #1b.
 
-### 3c. Range-compress the in-memory remove structures (parked)
+### 3c. Range-compress the in-memory remove structures (orphaned)
 
 Measured handle-contiguity of the `Vec<NodeIdx>` payloads in `RemoveRun` /
 `CausalRemove`:
@@ -393,7 +393,7 @@ Measured handle-contiguity of the `Vec<NodeIdx>` payloads in `RemoveRun` /
   `(run_head, start_pos, count)` instead of handles — but `split_run_at`
   relocates/fragments a span's positions, so it needs a reverse index (run →
   removes targeting it) updated on every split. Real overhead and bug surface;
-  parked alongside #4. (automerge's `targets` are genuinely scattered — 18%
+  orphaned alongside #4. (automerge's `targets` are genuinely scattered — 18%
   contiguous, which is exactly why they're wire singles — so not compressible in
   either space.)
 

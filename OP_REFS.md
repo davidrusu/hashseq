@@ -251,7 +251,7 @@ fundamental, and C-with-ropes subsumes B's honest-case compactness.
 - **Malformed refs** (position out of range, path step into a node with
   fewer deps, far-pointer id not present): all total functions of
   hash-committed inputs and the immutable DAG — **stable**, per FRAMEWORK's
-  dividing rule → apply-time gate, permanent quarantine, convergent
+  dividing rule → apply-time gate, refused and dropped, convergent
   verdicts. One new row in each spec's Validation table, same gate as
   inverted spans and ill-typed children.
 - **Far-pointer containment**: a far pointer must be an ancestor of the tips

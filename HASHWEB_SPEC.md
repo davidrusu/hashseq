@@ -96,9 +96,9 @@ Each object keeps **its own tips**. The run/write-run fast path needs
 thread every concurrent edit anywhere in the document through this object's
 deps — the frontier-granularity trade is LAYERING.md's subject. First op of
 an object refs its origin. Buffering is **two-level**: envelopes naming
-an object id the store does not know park store-wide (opening or adoption
+an object id the store does not know orphan store-wide (opening or adoption
 wakes them — the store's only delivery state); ops inside a live object
-park on their first missing ref in that object's own buffer.
+orphan on their first missing ref in that object's own buffer.
 
 ## The edge table (the apply-time gate)
 
@@ -110,14 +110,14 @@ verdicts that are total, convergent, and stable:
 
 - **meaningful** — apply proceeds;
 - **inert** — tolerated, no effect;
-- **gated** — permanent quarantine; no honest op ever depends on a gated op;
-- a referent of **unknown kind** yields no verdict: the op parks until the
+- **refused** — dropped: never applied, never stored, never re-presented by merge or snapshot. Anything referencing it orphans on that missing ref, so a refusal cascades without the refused op being kept; no honest op ever depends on one;
+- a referent of **unknown kind** yields no verdict: the op orphans until the
   kind is known (HETEROGENEITY.md — unknown-ness can never gate).
 
 | op . role | admits | otherwise |
 |---|---|---|
 | `Insert . at` | insert, move op (its splice point), or the object's origin — in one `Seq` | gate |
-| `Remove . target` | insert, in the op's own `Seq` | inert (non-insert); a ref living in another object never arrives here — parks forever, no verdict |
+| `Remove . target` | insert, in the op's own `Seq` | inert (non-insert); a ref living in another object never arrives here — orphans forever, no verdict |
 | `Move . target` | insert, in the object `to` resolves in (same-container rule) | gate |
 | `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the object's origin — in `target`'s object; not `target` itself (self-move) | gate |
 | `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the object's origin, in one `Seq`; inverted spans gate (MARKS.md) | gate |
@@ -137,13 +137,14 @@ filters identically.
 
 **Tighten never, loosen carefully.** Gate verdicts are permanent and must
 be computed identically by every replica, so this table is versioned
-semantics. *Tightening* a row after launch would quarantine ops already
+semantics. *Tightening* a row after launch would refuse ops already
 applied inside honest documents — a true fork, forbidden. *Loosening* a row
-(e.g. someday admitting move-op splice points as mark anchors) is an
-upgrade-with-re-evaluation: quarantined ops are re-judged under the new
-rules, and the cross-version divergence is the same park-until-upgrade
-class as unknown kinds. Rule of thumb: **when in doubt, gate** —
-strictness is recoverable, laxness is forever.
+(e.g. someday admitting a new anchor kind) is recovered by re-sync, not by
+re-judging: a refused op was dropped, and after the upgrade one frontier
+exchange with a peer that holds it re-delivers it — it lies outside the
+upgraded replica's closure by construction. The cross-version divergence
+is the same orphan-until-upgrade class as unknown kinds. Rule of thumb:
+**when in doubt, refuse** — strictness is recoverable, laxness is forever.
 
 ## The value side store
 

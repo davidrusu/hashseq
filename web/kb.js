@@ -810,7 +810,7 @@ const toolsEl = document.getElementById('page-tools');
 const noPageEl = document.getElementById('no-page');
 const statObjects = document.getElementById('stat-objects');
 const statBytes = document.getElementById('stat-bytes');
-const statParked = document.getElementById('stat-parked');
+const statParked = document.getElementById('stat-orphaned');
 
 let current = null; // pageObj hex
 let currentBody = null; // body seq obj id

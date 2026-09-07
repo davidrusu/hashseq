@@ -27,19 +27,19 @@ defined answers:
   proceeds;
 - **inert** — the edge is tolerated but has no effect (a remove naming a
   non-insert sets a dead bit on nothing);
-- **gated** — the edge is declared ill-typed; the op quarantines permanently
+- **gated** — the edge is declared ill-typed; the op is refused and dropped
   (kinds are immutable, so the verdict is stable — FRAMEWORK's apply-time
   gate criterion).
 
 What the property is *not*: static typing. An author cannot prove a
 referent's kind inside their own artifact — the verdict lands at the gate,
-when both artifacts are present (an unknown referent parks the op as a
+when both artifacts are present (an unknown referent orphans the op as a
 normal orphan first). It is dynamic typing with unforgeable tags.
 
 ## The generative turn
 
 The current specs use kind-commitment *defensively*: inert removes
-(HASHSEQ_SPEC), anchor-kind checks (MARKS.md), ill-typed child quarantine
+(HASHSEQ_SPEC), anchor-kind checks (MARKS.md), ill-typed child refusal
 (HASHWEB_SPEC). The stronger position is to use it *generatively*:
 
 > **One object's DAG may mix op kinds freely.** Safety is not object
@@ -141,7 +141,7 @@ A shared namespace of kind-committed artifacts is how the system grows
 without migrations — and the framework itself dictates *how*. "I do not
 recognize this kind" is a fact about the replica's software, not about
 hash-committed inputs, so by the stability criterion it can never be a gate
-verdict: a replica that quarantined unknown kinds would diverge, on the
+verdict: a replica that refused unknown kinds would diverge, on the
 permanent record, from upgraded peers. Extension is therefore handled by
 semantics, not rejection.
 
@@ -166,13 +166,13 @@ and each op's semantics split accordingly:
   surfaced as present-but-uninterpretable — the same honest state as a
   pending blob.
 
-### Unknown referents park
+### Unknown referents orphan
 
 Because placement lives in the body, an op that anchors on a node whose
 kind a replica cannot interpret has no resolvable place there — so it
-**parks as an orphan** until the kind is known. Parking is not a verdict:
+**orphans as an orphan** until the kind is known. Orphaning is not a verdict:
 nothing permanent is decided, which is exactly what the stability criterion
-demands of unknown-ness (it can never gate). On upgrade, parked ops apply
+demands of unknown-ness (it can never gate). On upgrade, orphaned ops apply
 as ordinary late deliveries, and late arrival never reorders existing
 content — the replay trap stays closed across versions through the same
 property that closes it across delivery orders. The accepted trade: an old
@@ -189,10 +189,10 @@ gates permanently. Unknown kinds neither pass nor fail — they wait.
 - the **op set** converges universally — sync, ids, and buffering are
   envelope concerns;
 - the **base order** agrees on everything all parties can interpret; ops
-  referencing unknown kinds park and arrive on upgrade as late deliveries —
+  referencing unknown kinds orphan and arrive on upgrade as late deliveries —
   insertion, never reordering;
 - **render is version-parameterized**: `render_v(S)` differs across
-  versions by exactly the unknown kinds' body effects (and their parked
+  versions by exactly the unknown kinds' body effects (and their orphaned
   dependents); same-version replicas converge as always.
 
 Version-skewed *interaction* is already covered by existing machinery, from
@@ -243,7 +243,7 @@ different one.
 1. **Retrofit audit.** Verify every gate verdict is a function of
    hash-committed facts computable by any replica that knows the relevant
    kinds — never of availability or version — and that every
-   unknown-referent path parks rather than verdicts. (Reading a *known*
+   unknown-referent path orphans rather than verdicts. (Reading a *known*
    referent's body — e.g. a move op's `to` for its splice point — is fine;
    placement is body semantics.) Run it against the normative edge table
    (HASHWEB_SPEC.md) and the envelope grammar (GRAMMAR_SPEC.md).

@@ -128,7 +128,7 @@ analog of a typing run (ENCODING_SPEC.md block kinds).
 - `overwrites` naming a non-Put or a put on another key: ignored by the
   definitional head-set filter — no gate needed, verdicts never depend on
   it.
-- No apply-time quarantine is needed for well-formed Puts: any key/value id
+- No apply-time refusal is needed for well-formed Puts: any key/value id
   is authorable; conflict is the surfaced symptom. (Payload-kind policy —
   e.g. an app rejecting object links in certain slots — is schema, not
   convergence: the decided Text/List-unification stance, HASHWEB_SPEC.md

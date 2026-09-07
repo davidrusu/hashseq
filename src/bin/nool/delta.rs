@@ -14,35 +14,18 @@
 use std::collections::BTreeSet;
 
 use hashseq::encoding::{decode_id, decode_varint, encode_delta, encode_varint};
-use hashseq::value::{KIND_KV, KIND_SEQ};
 use hashseq::{HashNode, HashWeb, Id, Op};
 
 pub const MAGIC: &[u8] = b"nooldelta1\n";
 
-/// Ops present in `have` that `base` does not know, grouped per object,
-/// plus the value artifacts those ops commit to (resolved from `have`).
+/// Ops present in `have` outside `base`'s causal closure (the DAG diff
+/// against `base`'s clock), grouped per object, plus the value artifacts
+/// those ops commit to (resolved from `have`).
 pub fn diff(base: &HashWeb, have: &HashWeb) -> (Vec<(u8, Id, Vec<HashNode>)>, Vec<Vec<u8>>) {
-    let mut groups = Vec::new();
+    let groups = have.deltas_for(&base.clock());
     let mut artifact_ids: BTreeSet<Id> = BTreeSet::new();
-    let mut objs: Vec<Id> = have.objects().copied().collect();
-    objs.sort();
-    for obj in objs {
-        let (kind, origin, nodes) = if let Some(seq) = have.seq(&obj) {
-            (KIND_SEQ, seq.origin(), seq.all_nodes())
-        } else if let Some(kv) = have.kv(&obj) {
-            (KIND_KV, kv.origin(), kv.all_nodes())
-        } else {
-            continue;
-        };
-        let missing: Vec<HashNode> = nodes
-            .into_iter()
-            .filter(|(id, _)| !base.knows(obj, id))
-            .map(|(_, node)| node)
-            .collect();
-        if missing.is_empty() {
-            continue;
-        }
-        for node in &missing {
+    for (_, _, nodes) in &groups {
+        for node in nodes {
             // nool authors text (chars, not value payloads), puts, and
             // places — only puts commit to artifacts a receiver may lack.
             if let Op::Put { key, value, .. } = &node.op {
@@ -50,7 +33,6 @@ pub fn diff(base: &HashWeb, have: &HashWeb) -> (Vec<(u8, Id, Vec<HashNode>)>, Ve
                 artifact_ids.insert(*value);
             }
         }
-        groups.push((kind, origin, missing));
     }
     let artifacts = artifact_ids
         .iter()
@@ -147,7 +129,7 @@ mod tests {
     use super::*;
     use hashseq::HashSeq;
     use hashseq::encoding::apply_delta;
-    use hashseq::value::object_id;
+    use hashseq::value::{KIND_SEQ, object_id};
 
     #[test]
     fn delta_file_roundtrips_and_applies_idempotently() {

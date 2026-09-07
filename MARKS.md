@@ -47,7 +47,7 @@ The pinned frontier is the mark layer's own: marks are **downstream-only**
 (marks reference content; content never references marks), so mark ops never
 enter the text object's tips or touch its runs — the frontier-granularity
 choice per LAYERING.md. Anchor ids are refs, so a mark arriving before its
-text parks as a normal orphan. `kind` and `value` are value commitments —
+text orphans as a normal orphan. `kind` and `value` are value commitments —
 never buffered on, `pending` when unresolvable.
 
 ## Anchors and expansion
@@ -175,8 +175,8 @@ painter" session chain can run-compress later if profiles say so.
 - `kind` and `value` are ids (BLAKE3 outputs), so in-memory keying by kind
   id is fast-hash-safe — no SipHash needed (the HASHKV_SPEC.md key rule;
   adversarial kind bytes cost their author indirection, never a table).
-- **Amplification**: one O(log F) comparison plus one quarantine entry per
-  malicious op — linear in attacker effort. Mark spam over huge ranges
+- **Amplification**: one O(log F) comparison per malicious op and nothing
+  stored (refused ops are dropped) — linear in attacker effort. Mark spam over huge ranges
   costs the renderer O(anchor events), not O(range); MVR set growth is the
   application-surfaced symptom. Note the gate does not shrink the spam
   surface (valid empty spans are always authorable); its goals are bounded

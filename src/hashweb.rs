@@ -3,7 +3,7 @@
 //! The store has **no identity and no semantics of its own** — it is not a
 //! datastructure, and it defines no composition. What it does is
 //! mechanics: open objects, deliver enveloped ops (`obj_id ‖ node` —
-//! transport metadata, never hashed), park envelopes for unknown objects,
+//! transport metadata, never hashed), orphan envelopes for unknown objects,
 //! and merge as a union of knowledge. Composition is the *user's*
 //! convention: a link is an object id carried as a value; ownership-style
 //! nesting is recreated by opening a child at one of your own op ids
@@ -52,6 +52,12 @@ impl HashWebClock {
     }
 }
 
+/// One object's share of a delta: `(kind, origin, nodes)` — the openable
+/// wire address plus the nodes, in apply order.
+pub type DeltaGroup = (u8, Id, Vec<HashNode>);
+/// One object's share of a frontier: `(kind, origin, tips)`.
+pub type FrontierGroup = (u8, Id, std::collections::BTreeSet<Id>);
+
 #[derive(Debug, Clone, Default)]
 pub struct HashWeb {
     /// Every seq object this replica knows, keyed by derived object id
@@ -59,12 +65,12 @@ pub struct HashWeb {
     pub(crate) seqs: FxHashMap<Id, HashSeq>,
     /// Every map object, likewise.
     pub(crate) kvs: FxHashMap<Id, HashKv>,
-    /// Envelopes parked on object ids this store does not know yet;
-    /// opening or adopting the object wakes them. Node-level parking
+    /// Envelopes orphaned on object ids this store does not know yet;
+    /// opening or adopting the object wakes them. Node-level orphaning
     /// lives inside each object's own delivery — the store keeps no
     /// per-node state at all. Keyed by attacker-chosen object ids, so
-    /// std's SipHash, not Fx (the same reasoning as `Delivery::parked`).
-    pub(crate) parked: std::collections::HashMap<Id, Vec<(Id, HashNode)>>,
+    /// std's SipHash, not Fx (the same reasoning as `Delivery::orphaned`).
+    pub(crate) orphaned: std::collections::HashMap<Id, Vec<(Id, HashNode)>>,
     /// Value-artifact side store shared across objects.
     pub(crate) values: IdMap<Vec<u8>>,
     /// Delta sync is on (`enable_delta_sync`; APP_NOTES #8): minted
@@ -171,9 +177,9 @@ impl HashWeb {
     /// group is what this replica holds of that object outside the
     /// peer's causal closure, in apply order. The clock is read, never
     /// written: after sending, keep `self.clock()` as the peer's clock.
-    pub fn deltas_for(&self, clock: &HashWebClock) -> Vec<(u8, Id, Vec<HashNode>)> {
+    pub fn deltas_for(&self, clock: &HashWebClock) -> Vec<DeltaGroup> {
         let empty = Clock::default();
-        let mut out: Vec<(Id, (u8, Id, Vec<HashNode>))> = Vec::new();
+        let mut out: Vec<(Id, DeltaGroup)> = Vec::new();
         for (obj, seq) in &self.seqs {
             let nodes = seq.delta_for(clock.obj(obj).unwrap_or(&empty));
             if !nodes.is_empty() {
@@ -206,8 +212,8 @@ impl HashWeb {
     /// This replica's frontier, object by object: `(kind, origin, tips)`
     /// sorted by object id — what a peer needs to compute our delta (the
     /// 0xC1 frontier frame, `encoding::encode_frontier`).
-    pub fn frontier(&self) -> Vec<(u8, Id, std::collections::BTreeSet<Id>)> {
-        let mut out: Vec<(Id, (u8, Id, std::collections::BTreeSet<Id>))> = self
+    pub fn frontier(&self) -> Vec<FrontierGroup> {
+        let mut out: Vec<(Id, FrontierGroup)> = self
             .seqs
             .iter()
             .map(|(obj, s)| (*obj, (KIND_SEQ, s.origin(), s.frontier())))
@@ -286,48 +292,39 @@ impl HashWeb {
     /// enveloped to the wrong object simply never applies there (its refs
     /// never arrive in that object), the same fate as any garbage ref —
     /// bounded, attributable, and correct by construction. Envelopes for
-    /// unknown object ids park store-wide and wake when the object is
+    /// unknown object ids orphan store-wide and wake when the object is
     /// opened or adopted.
-    pub fn apply_to(&mut self, obj: Id, node: HashNode) {
+    pub fn apply_to(&mut self, obj: Id, node: HashNode) -> bool {
         let id = node.id();
-        self.apply_to_with_id(obj, id, node);
+        self.apply_to_with_id(obj, id, node)
     }
 
-    pub fn apply_to_with_id(&mut self, obj: Id, id: Id, node: HashNode) {
+    /// Returns whether the envelope was news: applied, or orphaned for
+    /// the first time (in the object, or store-wide on an unknown
+    /// object). False for echoes and replays.
+    pub fn apply_to_with_id(&mut self, obj: Id, id: Id, node: HashNode) -> bool {
         debug_assert_eq!(id, node.id(), "apply_to_with_id called with a wrong id");
         if let Some(seq) = self.seqs.get_mut(&obj) {
-            seq.apply_with_id(id, node);
+            seq.apply_with_id(id, node)
         } else if let Some(kv) = self.kvs.get_mut(&obj) {
             kv.hydrate(&node, &self.values);
-            kv.apply_with_id(id, node);
+            kv.apply_with_id(id, node)
         } else {
-            // Store-wide parking dedups by node id like the objects do:
+            // Store-wide orphaning dedups by node id like the objects do:
             // echoes, replays, and self-merges must not grow the list.
-            let envelopes = self.parked.entry(obj).or_default();
-            if !envelopes.iter().any(|(pid, _)| *pid == id) {
+            let envelopes = self.orphaned.entry(obj).or_default();
+            if envelopes.iter().any(|(pid, _)| *pid == id) {
+                false
+            } else {
                 envelopes.push((id, node));
+                true
             }
         }
     }
 
-    /// Has this replica already seen node `id` enveloped to `obj` — applied,
-    /// parked as an orphan inside the object, or parked store-wide on an
-    /// unopened object? The re-delivery dedup for echoes and replays.
-    pub fn knows(&self, obj: Id, id: &Id) -> bool {
-        if let Some(seq) = self.seqs.get(&obj) {
-            seq.contains_node(id) || seq.delivery.holds(id)
-        } else if let Some(kv) = self.kvs.get(&obj) {
-            kv.contains_node(id) || kv.delivery.holds(id)
-        } else {
-            self.parked
-                .get(&obj)
-                .is_some_and(|v| v.iter().any(|(pid, _)| pid == id))
-        }
-    }
-
-    /// Deliver envelopes parked on a newly opened object.
+    /// Deliver envelopes orphaned on a newly opened object.
     fn wake(&mut self, obj: Id) {
-        let Some(envelopes) = self.parked.remove(&obj) else {
+        let Some(envelopes) = self.orphaned.remove(&obj) else {
             return;
         };
         for (id, node) in envelopes {
@@ -364,7 +361,7 @@ impl HashWeb {
             for (id, node) in seq.all_nodes() {
                 self.apply_to_with_id(*origin, id, node);
             }
-            for (id, node) in seq.delivery.held() {
+            for (id, node) in seq.delivery.orphans() {
                 self.apply_to_with_id(*origin, *id, node.clone());
             }
         }
@@ -383,20 +380,20 @@ impl HashWeb {
             for (id, node) in m.all_nodes() {
                 self.apply_to_with_id(*origin, id, node);
             }
-            for (id, node) in m.delivery.held() {
+            for (id, node) in m.delivery.orphans() {
                 self.apply_to_with_id(*origin, *id, node.clone());
             }
         }
-        for (obj, envelopes) in other.parked {
+        for (obj, envelopes) in other.orphaned {
             for (id, node) in envelopes {
                 self.apply_to_with_id(obj, id, node);
             }
         }
     }
 
-    /// Envelopes parked on unknown object ids.
+    /// Envelopes orphaned on unknown object ids.
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
-        self.parked.values().flatten().map(|(_, node)| node)
+        self.orphaned.values().flatten().map(|(_, node)| node)
     }
 }
 
@@ -446,9 +443,9 @@ pub(crate) mod tests {
     }
 
     /// The store is knowledge, not an object: merge is an unconditional
-    /// union — unknown origins are adopted (waking anything parked on
+    /// union — unknown origins are adopted (waking anything orphaned on
     /// them), shared objects merge pairwise, and a kind mis-agreement on
-    /// an out-of-band origin degrades to per-op quarantine, never a panic.
+    /// an out-of-band origin degrades to per-op refusal, never a panic.
     #[test]
     fn store_merge_is_union_of_knowledge() {
         // Two stores with unrelated roots merge unconditionally.
@@ -474,7 +471,7 @@ pub(crate) mod tests {
         assert_eq!(read_text(&a, &s1), "hi");
         assert_eq!(get(&a, &k2, &s("k")), Some(s("v")));
 
-        // Ops arriving before their root is known park; adopting the root
+        // Ops arriving before their root is known orphan; adopting the root
         // wakes them.
         let nodes = a.seq(&s1).unwrap().all_nodes();
         let mut fresh = HashWeb::new();
@@ -484,7 +481,7 @@ pub(crate) mod tests {
         assert_eq!(
             fresh.orphans().count(),
             2,
-            "both envelopes park on the unknown object id"
+            "both envelopes orphan on the unknown object id"
         );
         fresh.create_seq(oid(1));
         assert_eq!(fresh.orphans().count(), 0, "adoption wakes transitively");
@@ -492,14 +489,14 @@ pub(crate) mod tests {
 
         // Kind "mis-agreement" is unrepresentable: the same seed opened as
         // a Kv derives a different object id — the two coexist, nothing
-        // quarantines.
+        // is refused.
         let mut confused = HashWeb::new();
         let k1 = confused.create_kv(oid(1));
         assert_ne!(k1, s1);
         confused.merge(a.clone());
         assert_eq!(confused.object_count(), 3);
         assert_eq!(read_text(&confused, &s1), "hi");
-        assert!(confused.kv(&k1).unwrap().delivery.gated.is_empty());
+        assert_eq!(confused.kv(&k1).unwrap().tips().len(), 1, "untouched");
 
         // Roundtrip of a multi-root store.
         let decoded = crate::encoding::decode_hashweb_strict(&crate::encoding::encode_hashweb(&a))
@@ -596,7 +593,7 @@ pub(crate) mod tests {
     }
 
     /// Delivery-order independence: Place ops arriving before their
-    /// overwritten predecessors park on refs and converge identically.
+    /// overwritten predecessors orphan on refs and converge identically.
     #[test]
     fn place_ops_converge_under_any_delivery_order() {
         let mut a = HashWeb::new();
@@ -610,7 +607,7 @@ pub(crate) mod tests {
         let expected = a.seq(&child).unwrap().placement().chain();
         assert_eq!(expected, vec![l2.id(), l1.id()]);
 
-        // Reverse delivery: the superseder first — it parks on its
+        // Reverse delivery: the superseder first — it orphans on its
         // overwritten ref, then wakes when the predecessor lands.
         let mut fresh = HashWeb::new();
         fresh.create_seq(child_origin);
@@ -680,7 +677,7 @@ pub(crate) mod tests {
         assert_eq!(kv.get(&s("color")), Some(s("blue")));
         assert_eq!(kv.get(&s("shade")), Some(s("green")));
 
-        // Delivery order: the op first, parked on an unknown object, the
+        // Delivery order: the op first, orphaned on an unknown object, the
         // object opened later — hydration happens at delivery.
         let nodes = doc.kv(&root).unwrap().all_nodes();
         let mut late = HashWeb::new();
@@ -768,7 +765,7 @@ pub(crate) mod tests {
     #[test]
     fn envelopes_park_until_object_is_opened() {
         // Deliver an object's ops before this replica knows the object:
-        // the envelopes park store-wide; opening the object wakes them.
+        // the envelopes orphan store-wide; opening the object wakes them.
         let mut a = HashWeb::new();
         let root = a.create_kv(oid(9));
         let p = put(&mut a, &root, s("t"), s("seq"));
@@ -783,14 +780,14 @@ pub(crate) mod tests {
         assert_eq!(fresh.orphans().count(), 1);
         assert!(fresh.seq(&child).is_none());
         // The app learns the convention's input (the parent op's id) and
-        // opens the child: parked envelopes deliver.
+        // opens the child: orphaned envelopes deliver.
         assert_eq!(fresh.create_seq(p.id()), child);
         assert_eq!(fresh.orphans().count(), 0);
         assert_eq!(read_text(&fresh, &child), "x");
     }
 
-    /// Store-parked envelopes dedup by node id: a re-delivery, an echo, or
-    /// a self-merge leaves the parked list (and the canonical bytes)
+    /// Store-orphaned envelopes dedup by node id: a re-delivery, an echo, or
+    /// a self-merge leaves the orphaned list (and the canonical bytes)
     /// unchanged — merge is idempotent for never-opened objects too.
     #[test]
     fn store_parked_envelopes_dedup_on_redelivery() {
@@ -809,7 +806,10 @@ pub(crate) mod tests {
             fresh.apply_to_with_id(child, *id, node.clone());
         }
         assert_eq!(fresh.orphans().count(), n, "re-delivery is a no-op");
-        assert!(fresh.knows(child, &child_nodes[0].0));
+        assert!(
+            !fresh.apply_to(child, child_nodes[0].1.clone()),
+            "re-delivery is not news"
+        );
 
         let bytes = crate::encoding::encode_hashweb(&fresh);
         fresh.merge(fresh.clone());
@@ -832,7 +832,7 @@ pub(crate) mod tests {
         let b0 = doc.seq(&b).unwrap().id_at(0).unwrap();
 
         // A remove naming elements of two objects, enveloped to `a`: the
-        // foreign ref never arrives inside `a`, so the op parks there
+        // foreign ref never arrives inside `a`, so the op orphans there
         // forever — the same fate as any garbage ref, no verdict needed.
         let node = HashNode {
             pins: Default::default(),

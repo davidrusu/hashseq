@@ -62,7 +62,7 @@ pub struct HashKv {
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Applied node ids in apply order — the map's arena, append-only
-    /// (parked and gated nodes never enter). Deps precede dependents, so
+    /// (orphaned and gated nodes never enter). Deps precede dependents, so
     /// the position is the clock walk's order (`delta_for`).
     pub(crate) order: Vec<Id>,
     /// Arena position by id (`order[slot[id]] == id`).
@@ -78,7 +78,7 @@ pub struct HashKv {
     /// The containment register — where does this object live
     /// (PLACEMENT_SPEC.md). `Place` is valid in any object kind.
     pub(crate) placement: PlacementRegister,
-    /// Parked orphans + the gate (non-map ops quarantine — the edge table).
+    /// Orphans (non-map ops are refused and dropped — the edge table).
     pub(crate) delivery: Delivery,
 }
 
@@ -158,13 +158,13 @@ impl HashKv {
         }
     }
 
-    /// `hydrate` over every node this object holds (applied and parked).
+    /// `hydrate` over every node this object holds (applied and orphaned).
     pub(crate) fn hydrate_all(&mut self, store: &IdMap<Vec<u8>>) {
         let nodes: Vec<HashNode> = self
             .nodes
             .values()
             .cloned()
-            .chain(self.delivery.held().map(|(_, n)| n.clone()))
+            .chain(self.delivery.orphans().map(|(_, n)| n.clone()))
             .collect();
         for node in &nodes {
             self.hydrate(node, store);
@@ -273,44 +273,58 @@ impl HashKv {
 
     // ---- apply ----
 
-    pub fn apply(&mut self, node: HashNode) {
+    pub fn apply(&mut self, node: HashNode) -> bool {
         let id = node.id();
-        self.apply_with_id(id, node);
+        self.apply_with_id(id, node)
     }
 
     /// Apply with a pre-computed id (`id` must be the node's true hash).
-    /// Iterative worklist: applying a node wakes exactly the orphans parked
+    /// Iterative worklist: applying a node wakes exactly the orphans waiting
     /// on its id.
-    pub fn apply_with_id(&mut self, id: Id, node: HashNode) {
+    /// Returns whether `node` was news (see `HashSeq::apply_with_id`).
+    pub fn apply_with_id(&mut self, id: Id, node: HashNode) -> bool {
         debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
-        if self.contains_node(&id) || self.delivery.holds(&id) {
-            return;
+        if self.contains_node(&id) {
+            return false;
         }
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
-        self.park_or_dispatch(id, node, &mut queue);
+        let news = self.orphan_or_dispatch(id, node, &mut queue);
         while let Some((id, node)) = queue.pop() {
-            self.park_or_dispatch(id, node, &mut queue);
+            self.orphan_or_dispatch(id, node, &mut queue);
         }
+        news
     }
 
-    /// One step of the worklist: park `node` on its first missing ref, or
-    /// interpret it and wake its waiters. A gated node wakes nothing — its
-    /// dependents stay parked (the quarantine cascade).
-    fn park_or_dispatch(&mut self, id: Id, node: HashNode, queue: &mut Vec<(Id, HashNode)>) {
-        let missing = node.iter_refs().find(|d| !self.contains_node(d)).copied();
-        if let Some(missing) = missing {
-            self.delivery.park(missing, id, node);
-            return;
+    /// The ref an orphan is keyed on: the first ref in `iter_refs` order
+    /// that is not applied here (see `HashSeq::canonical_orphan_dependency`
+    /// for why that key is stable while the node stays orphaned).
+    pub(crate) fn canonical_orphan_dependency(&self, node: &HashNode) -> Option<Id> {
+        node.iter_refs().find(|d| !self.contains_node(d)).copied()
+    }
+
+    /// One step of the worklist: orphan `node` on its canonical missing
+    /// ref (a re-delivered orphan lands in the bucket it is already in),
+    /// or interpret it and wake its waiters. A refused node wakes nothing
+    /// — its dependents stay orphaned (the refusal cascades).
+    fn orphan_or_dispatch(
+        &mut self,
+        id: Id,
+        node: HashNode,
+        queue: &mut Vec<(Id, HashNode)>,
+    ) -> bool {
+        if let Some(key) = self.canonical_orphan_dependency(&node) {
+            return self.delivery.orphan(key, id, node);
         }
-        self.delivery.unpark(&id);
-        match self.interpret(id, node) {
-            Ok(()) => self.delivery.wake(&id, queue),
-            Err(node) => self.delivery.gate(id, node),
+        // A refused node (Err) is dropped; its dependents stay orphaned.
+        let applied = self.interpret(id, node).is_ok();
+        if applied {
+            self.delivery.wake(&id, queue);
         }
+        applied
     }
 
     /// Interpret one node whose refs are all applied — this projection's
-    /// edge-table rows. `Err` hands the node back for quarantine.
+    /// edge-table rows. `Err` hands the node back; the caller drops it.
     #[allow(clippy::result_large_err)]
     fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), HashNode> {
         // Place is admitted in any object kind (PLACEMENT_SPEC.md): the
@@ -472,7 +486,7 @@ impl HashKv {
         for (id, node) in other.nodes {
             self.apply_with_id(id, node);
         }
-        for (id, node) in other.delivery.into_held() {
+        for (id, node) in other.delivery.into_orphans() {
             self.apply_with_id(id, node);
         }
     }
@@ -499,10 +513,10 @@ impl HashKv {
     }
 
     pub fn orphans(&self) -> impl Iterator<Item = &HashNode> {
-        self.delivery.orphans()
+        self.delivery.orphans().map(|(_, n)| n)
     }
 
-    /// Every applied node as `(id, HashNode)` (parked/gated not included).
+    /// Every applied node as `(id, HashNode)` (orphaned/gated not included).
     pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
         self.nodes.iter().map(|(id, n)| (*id, n.clone())).collect()
     }
@@ -622,15 +636,18 @@ mod tests {
     }
 
     #[test]
-    fn non_map_ops_gate() {
+    fn non_map_ops_are_refused() {
         let mut kv = HashKv::default();
         let origin = kv.origin();
-        kv.apply(HashNode {
+        let node = HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(origin, 'x'),
-        });
-        assert_eq!(kv.delivery.gated.len(), 1);
-        assert!(kv.tips().len() == 1, "gated ops never enter tips");
+        };
+        let id = node.id();
+        kv.apply(node);
+        assert!(!kv.contains_node(&id));
+        assert_eq!(kv.delivery.orphans().count(), 0, "dropped, not orphaned");
+        assert!(kv.tips().len() == 1, "refused ops never enter tips");
     }
 
     #[test]

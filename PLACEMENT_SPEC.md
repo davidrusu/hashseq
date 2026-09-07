@@ -36,7 +36,7 @@ Place {
 payload discipline (HASHSEQ_SPEC.md "Payload"): it is not in `refs(u)`,
 buffering never waits on it, and nothing about the referent is gated. The
 supersession DAG (`overwrites`) stays entirely within the placed object's
-own history: verification, frontiers, sync, and parking remain strictly
+own history: verification, frontiers, sync, and orphaning remain strictly
 per-object. There is deliberately **no `parent` field**: the parent is
 `home(placed_at)` — the object whose DAG contains the named insert —
 derivable at read time via the store's id interning. An explicit copy
@@ -175,14 +175,14 @@ apply.
 | op kind vs object kind | `Place` admitted in **both** `Seq` and `Kv` (the register concerns the object's placement, not its content projection) | — |
 
 No new gate rows: every malformed relationship is inert at read time
-rather than quarantined, because nothing about `placed_at` is verifiable
+rather than refused, because nothing about `placed_at` is verifiable
 at apply time without foreign state — and the gate must never depend on
 what a replica happens to hold.
 
 **Extension path.** `Place` is a new tag in the shared node grammar
 (GRAMMAR_SPEC.md "Op kinds", tag 5). Replicas that predate it carry the
 nodes opaquely (envelope semantics — unknown kinds are not malformed) and
-park ops that reference them in roles; they render by the legacy rule
+orphan ops that reference them in roles; they render by the legacy rule
 until upgraded, which degrades to today's behavior (presence membership,
 duplicates healed deterministically) and corrupts nothing.
 
@@ -209,7 +209,7 @@ duplicates healed deterministically) and corrupts nothing.
 | cycle bomb (K registers forming loops) | SCC recompute over the affected component; members detach, flagged; no placement conferred anywhere | O(component) per op; **the component is attacker-growable**, so per-op honest cost is linear in the attacker's own prior spend — same shape CYCLE_REVERT.md accepted for D1's iteration depth; incremental SCC maintenance is the open engineering item |
 | placement of honest content to garbage | one dominating `Place` — relocation | the permissionless-write baseline; attributable, revertible |
 | `placed_at` garbage / mismatch spam | none — inert at read, no gate verdicts to grind | membership simply never matches |
-| stale-replica games | old replicas render legacy membership (duplicates, healed) | park-until-upgrade class; no divergence in op state |
+| stale-replica games | old replicas render legacy membership (duplicates, healed) | orphan-until-upgrade class; no divergence in op state |
 
 ## Open threads
 
