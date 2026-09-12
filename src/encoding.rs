@@ -2917,7 +2917,7 @@ mod tests {
         assert_eq!(encode_hashseq(&b), bytes, "equal sets, equal bytes");
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "bedb884305a836b82a0164b96c8b37a61f59313a7c55e94ca00d33242af8acaf",
+            "10b5ca85664c02dcff34ec400fb225469ab331e604180867aabf2ab7ab0eedde",
             "canonical snapshot bytes moved — bump knowingly"
         );
     }

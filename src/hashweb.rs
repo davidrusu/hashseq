@@ -216,11 +216,11 @@ impl HashWeb {
         let mut out: Vec<(Id, FrontierGroup)> = self
             .seqs
             .iter()
-            .map(|(obj, s)| (*obj, (KIND_SEQ, s.origin(), s.frontier())))
+            .map(|(obj, s)| (*obj, (KIND_SEQ, s.origin(), s.tips().clone())))
             .chain(
                 self.kvs
                     .iter()
-                    .map(|(obj, k)| (*obj, (KIND_KV, k.origin(), k.frontier()))),
+                    .map(|(obj, k)| (*obj, (KIND_KV, k.origin(), k.tips().clone()))),
             )
             .collect();
         out.sort_by_key(|(obj, _)| *obj);

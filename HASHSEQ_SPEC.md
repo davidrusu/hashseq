@@ -59,11 +59,11 @@ frontier rule). Anchors are "attach-to"; targets and overwrites are
 frontier, one id. The encoding stores each id of `refs(u)` once (the sorted
 refs table, GRAMMAR_SPEC.md); indices are an encoding concern.
 
-Which frontier a `Move` pins — the object's own, or a separate
-downstream-only move frontier that never enters the object's tips — is the
-LAYERING.md granularity parameter; nothing below depends on the choice. If
-moves keep a separate frontier, a move may additionally pin its container's
-observed frontier (the commitment vector), making move-vs-remove concurrency
+A `Move` pins the object's one frontier, like every op: the LAYERING.md
+granularity parameter is settled at per-object (no per-layer frontiers).
+Nothing below depends on that beyond the pins themselves. A move may
+additionally pin its container's observed frontier (the commitment vector),
+making move-vs-remove concurrency
 decidable; nothing requires it and v1 does not. Orphan buffering covers
 moves arriving before `target` or `to`.
 

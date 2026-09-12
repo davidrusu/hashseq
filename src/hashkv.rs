@@ -387,16 +387,11 @@ impl HashKv {
         self.order.iter().map(|id| (*id, self.nodes[id].clone()))
     }
 
-    /// The frontier as the clock sees it (a map has one layer).
-    pub fn frontier(&self) -> BTreeSet<Id> {
-        self.tips.clone()
-    }
-
     /// This replica's clock for the object: what a peer that has
     /// everything we have holds. Sent as the hello, and kept as "last
     /// sent" for a peer after a drain.
     pub fn clock(&self) -> crate::Clock {
-        crate::Clock(self.frontier())
+        crate::Clock(self.tips().clone())
     }
 
     /// The delta for the peer behind `clock`: every applied node outside
@@ -407,7 +402,7 @@ impl HashKv {
     pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
         const OURS: u8 = 1;
         const PEER: u8 = 2;
-        let ours = self.frontier();
+        let ours = self.tips();
         let mut heap: BinaryHeap<usize> = BinaryHeap::new();
         let mut colour: FxHashMap<usize, u8> = FxHashMap::default();
         let mut pending_ours = 0usize;

@@ -4,14 +4,6 @@ Statuses: OPEN, DECISION (needs a call), DEFERRED (only alongside named work). N
 
 ## Up next
 
-### 40. One frontier per object: fold `mark_tips` into the DAG's tips — OPEN
-
-Where: `src/hashseq.rs` `mark_tips` (~:533), `apply_mark` (~:1574), `mark_range` pins (~:1939), `frontier()`; MARKS.md "refs" (~:46) and "Apply" (~:135); LAYERING.md "Per-layer frontier" (~:99); HASHSEQ_SPEC.md:64.
-
-Problem: marks keep their own frontier and pin only it, so a mark op never enters the text tips and the next insert never pins a mark. The DAG is fundamental and every layer is built on top of it; the frontier is a property of the DAG, not of a layer, so all layers are bound by the same frontier. `HashSeq::frontier()` already unions the two sets for the clock walk and the 0xC1 frame.
-
-Fix: one `tips` set per object that every applied op enters and every authored op pins. Delete `mark_tips` and `mark_tips()`; `frontier()` becomes `tips.clone()`; `PartialEq` compares one set. Update MARKS.md (refs = named ∪ the object's frontier), replace the per-layer paragraph in LAYERING.md with a note that the parameter is settled at per-object, and HASHSEQ_SPEC.md:64. Measure dep bytes on the KB traces and the run-extension fast path (`insert_batch` chains carry no pins after the first node). Downstream-only stays a property of what marks reference.
-
 ### 42. Don't return invalid nodes to callers, return semantic errors instead — OPEN
 
 Where: `HashSeq::move_element`, `mark_range`, `unmark_range` (`Result<HashNode, HashNode>`); the `admitted` bool and `mark_admissible` in `HashSeq::interpret`; the `map_err` sites in `src/wasm.rs` `seq_move`, `mark_range`, `mark_range_closed`, `unmark_range`.

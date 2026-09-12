@@ -237,7 +237,7 @@ pub struct StoredMark {
     pub value: Id,
     /// Superseded mark ops (range- and kind-scoped at read), in Id order.
     pub overwrites: SortedIdVec,
-    /// Frontier pins (the mark layer's own frontier), in Id order.
+    /// Frontier pins, in Id order.
     pub pins: SortedIdVec,
 }
 
@@ -527,10 +527,8 @@ pub struct HashSeq {
     /// The containment register: live heads + the last-agreed walk.
     pub(crate) placement: PlacementRegister,
 
+    /// Latest concurrent nodes
     pub(crate) tips: BTreeSet<Id>,
-    /// The mark layer's own frontier: marks are downstream-only (content
-    /// never references marks), so mark ops never enter the text tips.
-    pub(crate) mark_tips: BTreeSet<Id>,
     /// Orphans + the gate (see `delivery::Delivery`). Gated here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
     /// (a map op in a seq), non-char insert payloads (the value column
@@ -567,7 +565,7 @@ pub struct StoredPlace {
 
 impl PartialEq for HashSeq {
     fn eq(&self, other: &Self) -> bool {
-        self.tips == other.tips && self.mark_tips == other.mark_tips
+        self.tips == other.tips
     }
 }
 
@@ -607,7 +605,6 @@ impl HashSeq {
             place_nodes: FxHashMap::default(),
             placement: PlacementRegister::default(),
             tips: BTreeSet::new(),
-            mark_tips: BTreeSet::new(),
             delivery: Delivery::default(),
             index: RunIndex::default(),
         };
@@ -1556,9 +1553,10 @@ impl HashSeq {
         self.index.cmp_sweep(pa, pb)
     }
 
-    /// Apply a mark: O(1) bookkeeping (MARKS.md "Apply") — intern, attach
-    /// the two anchor events, update the mark layer's tips. Suppression is
-    /// computed at read, never at apply.
+    /// Apply a mark: O(1) bookkeeping (MARKS.md "Apply") — intern and
+    /// attach the two anchor events; the frontier was updated by the
+    /// caller like for every op. Suppression is computed at read, never
+    /// at apply.
     #[allow(clippy::too_many_arguments)] // one parameter per op field
     fn apply_mark(
         &mut self,
@@ -1573,11 +1571,6 @@ impl HashSeq {
         let idx = self.intern(id, Loc::MarkOp);
         let (start_anchor, start_after) = self.glue_point(&start).expect("gated above");
         let (end_anchor, end_after) = self.glue_point(&end).expect("gated above");
-
-        for r in overwrites.iter().chain(pins.iter()) {
-            self.mark_tips.remove(r);
-        }
-        self.mark_tips.insert(id);
 
         self.mark_events
             .entry(start_anchor)
@@ -1944,7 +1937,7 @@ impl HashSeq {
         let mut named: BTreeSet<Id> = overwrites.clone();
         named.insert(*start.id());
         named.insert(*end.id());
-        let pins: BTreeSet<Id> = self.mark_tips.difference(&named).cloned().collect();
+        let pins: BTreeSet<Id> = self.tips.difference(&named).cloned().collect();
         let node = HashNode {
             pins,
             op: Op::Mark {
@@ -1975,11 +1968,6 @@ impl HashSeq {
         kind: Id,
     ) -> Result<HashNode, HashNode> {
         self.mark_range(start, end, kind, *crate::value::TOMBSTONE)
-    }
-
-    /// The mark layer's frontier (mark ops not superseded or pinned-over).
-    pub fn mark_tips(&self) -> &BTreeSet<Id> {
-        &self.mark_tips
     }
 
     fn apply_remove(&mut self, id: Id, extra_deps: BTreeSet<Id>, target_ids: BTreeSet<Id>) {
@@ -2221,31 +2209,30 @@ impl HashSeq {
             return Err(());
         }
 
-        // Marks live in their own layer: they never enter the text tips
-        // (downstream-only — content never references marks; LAYERING.md).
-        if let Op::Mark { start, end, .. } = &node.op {
-            let (start, end) = (*start, *end);
-            if !self.mark_admissible(&start, &end) {
-                return Err(());
-            }
-            let Op::Mark {
-                kind_v,
-                value,
-                overwrites,
-                ..
-            } = node.op
-            else {
-                unreachable!("matched above")
-            };
-            self.apply_mark(id, node.pins, start, end, kind_v, value, overwrites);
-            return Ok(());
+        // The mark rows need the sweep (fragment materialization takes
+        // &mut), so they are checked here rather than in the table above.
+        if let Op::Mark { start, end, .. } = &node.op
+            && !self.mark_admissible(&start.clone(), &end.clone())
+        {
+            return Err(());
         }
 
-        // Update tips before consuming node (insert ops don't depend on tips)
         for tip in node.iter_refs() {
             self.tips.remove(tip);
         }
         self.tips.insert(id);
+
+        if let Op::Mark {
+            start,
+            end,
+            kind_v,
+            value,
+            overwrites,
+        } = node.op
+        {
+            self.apply_mark(id, node.pins, start, end, kind_v, value, overwrites);
+            return Ok(());
+        }
 
         match node.op {
             Op::Insert { at, payload } => {
@@ -2364,17 +2351,11 @@ impl HashSeq {
         })
     }
 
-    /// The whole frontier: the text tips and the mark layer's tips (marks
-    /// never enter the text tips, so neither set alone covers the DAG).
-    pub fn frontier(&self) -> BTreeSet<Id> {
-        self.tips.union(&self.mark_tips).copied().collect()
-    }
-
     /// This replica's clock for the object: what a peer that has
     /// everything we have holds. Sent as the hello, and kept as "last
     /// sent" for a peer after a drain.
     pub fn clock(&self) -> crate::Clock {
-        crate::Clock(self.frontier())
+        crate::Clock(self.tips().clone())
     }
 
     /// The delta for the peer behind `clock`: every applied node outside
@@ -2395,7 +2376,7 @@ impl HashSeq {
     pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
         const OURS: u8 = 1;
         const PEER: u8 = 2;
-        let ours = self.frontier();
+        let ours = self.tips();
         let mut heap: BinaryHeap<usize> = BinaryHeap::new();
         let mut colour: FxHashMap<usize, u8> = FxHashMap::default();
         let mut pending_ours = 0usize;
@@ -4913,7 +4894,7 @@ mod test {
         let queued = seq.delta_for(&Clock::default()).len();
         assert_eq!(queued, 5);
         let peer = seq.clock(); // last sent
-        let frontier = seq.frontier();
+        let frontier = seq.tips().clone();
 
         // Anchors on the visible order, but `a`'s point sits at its base
         // slot (the front): an inverted span, which the gate refuses.
@@ -4924,8 +4905,8 @@ mod test {
         assert_eq!(seq.orphans().count(), 0);
         assert!(seq.delta_for(&peer).is_empty(), "nothing shipped");
         assert_eq!(
-            seq.frontier(),
-            frontier,
+            seq.tips(),
+            &frontier,
             "a refused op never enters the frontier"
         );
 
@@ -4933,7 +4914,7 @@ mod test {
         let err = seq.move_element(c, Anchor::After(c)).unwrap_err();
         assert!(!seq.contains_node(&err.id()));
         assert!(seq.delta_for(&peer).is_empty());
-        assert_eq!(seq.frontier(), frontier);
+        assert_eq!(seq.tips(), &frontier);
     }
 
     /// A delta is the DAG diff against the peer's clock: an empty clock
@@ -5075,7 +5056,7 @@ mod test {
             peer.iter().collect::<String>(),
             seq.iter().collect::<String>()
         );
-        assert_eq!(peer.frontier(), seq.frontier());
+        assert_eq!(peer.tips(), seq.tips());
         assert_eq!(peer.marked_spans(), seq.marked_spans());
         assert_eq!(peer.clock(), seq.clock());
         assert!(
@@ -5236,7 +5217,6 @@ mod test {
         let b = seq.id_at(1).unwrap();
         let rm = seq.remove_batch(1, 1).unwrap().id();
         let tips = seq.tips().clone();
-        let mark_tips = seq.mark_tips().clone();
         let peer = seq.clock();
 
         let unknown = Id([0xEE; 32]);
@@ -5254,7 +5234,6 @@ mod test {
 
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.tips(), &tips);
-        assert_eq!(seq.mark_tips(), &mark_tips);
         assert!(seq.delta_for(&peer).is_empty());
         // Still authors normally.
         seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes())
@@ -5413,7 +5392,6 @@ mod test {
         });
         assert_eq!(seq.orphans().count(), 0);
         assert!(seq.mark_nodes.is_empty());
-        assert!(seq.mark_tips().is_empty());
     }
 
     /// Regional semantics: a mark's points are fixed at their anchors'
@@ -5564,7 +5542,7 @@ mod test {
             },
         });
         assert_eq!(seq.orphans().count(), 0);
-        assert!(seq.mark_tips().is_empty());
+        assert!(seq.mark_nodes.is_empty());
     }
 
     /// Move destinations on splice points: y lands adjacent to wherever the
@@ -5671,7 +5649,7 @@ mod test {
             .expect("roundtrip");
         assert_eq!(decoded, seq);
         assert_eq!(decoded.marked_spans(), seq.marked_spans());
-        assert_eq!(decoded.mark_tips(), seq.mark_tips());
+        assert_eq!(decoded.tips(), seq.tips());
     }
 
     #[test]
@@ -5762,7 +5740,7 @@ mod test {
         seq.insert_batch(0, "ab".chars());
         let a = seq.id_at(0).unwrap();
         let before = crate::encoding::encode_hashseq(&seq);
-        let frontier = seq.frontier();
+        let frontier = seq.tips().clone();
         let history = seq.delta_for(&Clock::default()).len();
 
         let self_move = HashNode {
@@ -5778,7 +5756,7 @@ mod test {
         assert!(!seq.apply(self_move), "re-delivery: refused again");
         assert!(!seq.contains_node(&id));
         assert_eq!(seq.orphans().count(), 0);
-        assert_eq!(seq.frontier(), frontier);
+        assert_eq!(seq.tips(), &frontier);
         assert_eq!(crate::encoding::encode_hashseq(&seq), before);
         assert_eq!(seq.delta_for(&Clock::default()).len(), history);
         // Merging a replica that saw the refused op carries nothing over.

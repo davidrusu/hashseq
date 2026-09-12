@@ -98,7 +98,16 @@ Costs:
 
 ### Per-layer frontier (marks/moves split from their host object)
 
-Everything per-object buys, plus:
+**Rejected (2026-09-12): the parameter is settled at per-object.** The DAG
+is fundamental and every layer is built on top of it; the frontier is a
+property of the DAG, not of a layer, so all layers are bound by the same
+frontier. Marks were the one layer that kept its own tips; that set is
+folded into the object's `tips`, and a mark now enters the frontier and is
+pinned by whatever is authored next, like a move or a place. Downstream-only
+remains a fact about what marks *reference*, which is all the closure
+argument below ever needed.
+
+What the split would have bought, for the record:
 
 - content closures exclude annotations entirely — a replica can sync and
   render text without ever fetching marks or moves; annotations layer on
@@ -107,8 +116,11 @@ Everything per-object buys, plus:
 - annotation bursts (indent/outdent, format painting) never thread through
   content runs.
 
-Additional cost: more frontier bookkeeping, and the downstream-only
-discipline must be stated and preserved per layer.
+And its cost: more frontier bookkeeping, a second tip set per object to
+carry on the wire and in every clock, and a downstream-only discipline
+stated and preserved per layer. Interior pins already let runs extend
+through deps, so the pins a mark adds to the next insert cost bytes, not
+run structure.
 
 ## Where the ideas factor nicely
 

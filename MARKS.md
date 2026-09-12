@@ -43,12 +43,15 @@ named(u) = { anchor_id(start), anchor_id(end) } ∪ overwrites
 refs(u)  = named(u) ∪ frontier pins   // kind and value are values, not references
 ```
 
-The pinned frontier is the mark layer's own: marks are **downstream-only**
-(marks reference content; content never references marks), so mark ops never
-enter the text object's tips or touch its runs — the frontier-granularity
-choice per LAYERING.md. Anchor ids are refs, so a mark arriving before its
-text orphans as a normal orphan. `kind` and `value` are value commitments —
-never buffered on, `pending` when unresolvable.
+The pinned frontier is the object's one frontier: a mark enters the tips
+like every other op and retires the refs it names, and the next authored op
+of any kind pins it. Marks are still **downstream-only** in what they
+reference (marks reference content; content never references marks), but
+that is a property of their refs, not of a separate frontier — the
+frontier-granularity parameter of LAYERING.md is settled at per-object.
+Anchor ids are refs, so a mark arriving before its text orphans as a normal
+orphan. `kind` and `value` are value commitments — never buffered on,
+`pending` when unresolvable.
 
 ## Anchors and expansion
 
@@ -132,8 +135,8 @@ The classic hard cases, as they converge here:
 ## Apply
 
 O(1) bookkeeping: intern; attach start/end events to the anchor elements
-(`anchor_events: element → mark events`); update mark-layer tips.
-Suppression is computed at read, never at apply.
+(`anchor_events: element → mark events`); the object's tips update as for
+any op. Suppression is computed at read, never at apply.
 
 ## Rendering
 
@@ -160,7 +163,7 @@ painter" session chain can run-compress later if profiles say so.
   3. a failed check is permanent (base order is immutable) and convergent
      (all replicas agree on every verdict);
   4. no honest op ever depends on one: honest replicas gate before apply,
-     so inverted marks never enter honest mark-layer tips.
+     so inverted marks never enter honest tips.
   Defense in depth: the sweep stays activation-guarded — an end event for a
   never-started mark is inert rather than perturbing the active set — so a
   future relaxation of the gate cannot reintroduce the
