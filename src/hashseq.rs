@@ -529,7 +529,7 @@ pub struct HashSeq {
 
     /// Latest concurrent nodes
     pub(crate) tips: BTreeSet<Id>,
-    /// Orphans + the gate (see `delivery::Delivery`). Gated here
+    /// Orphans (see `delivery::Delivery`). Refused here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
     /// (a map op in a seq), non-char insert payloads (the value column
     /// generalization), inverted mark spans, and mark anchors on move-op
@@ -1489,12 +1489,12 @@ impl HashSeq {
         }
     }
 
-    /// Mark admissibility (the Mark gate rows): both anchors resolve to
+    /// Mark admissibility (the Mark admission rows): both anchors resolve to
     /// glue points, and the span is not inverted. Op-anchored points need a
     /// physical fragment to compare — materialized here even when the
-    /// verdict is "gate": a zero-width splice slot for an already-applied
+    /// verdict is "refused": a zero-width splice slot for an already-applied
     /// move op is derived, convergence-neutral index state, not a trace of
-    /// the gated mark.
+    /// the refused mark.
     fn mark_admissible(&mut self, start: &Anchor, end: &Anchor) -> Result<(), Refused> {
         let (Some(s), Some(e)) = (self.glue_point(start), self.glue_point(end)) else {
             return Err(Refused::NotAGluePoint);
@@ -1567,8 +1567,8 @@ impl HashSeq {
         overwrites: BTreeSet<Id>,
     ) {
         let idx = self.intern(id, Loc::MarkOp);
-        let (start_anchor, start_after) = self.glue_point(&start).expect("gated above");
-        let (end_anchor, end_after) = self.glue_point(&end).expect("gated above");
+        let (start_anchor, start_after) = self.glue_point(&start).expect("admitted above");
+        let (end_anchor, end_after) = self.glue_point(&end).expect("admitted above");
 
         self.mark_events
             .entry(start_anchor)
@@ -2109,9 +2109,9 @@ impl HashSeq {
     }
 
     /// Interpret one node whose refs are all applied — this projection's
-    /// edge-table rows. `Err` hands the node back; the caller drops it.
+    /// admission rows. `Err` hands the node back; the caller drops it.
     // The Err carries the node back by value — same move the parameters
-    // make; boxing would buy an allocation per gated op for nothing.
+    // make; boxing would buy an allocation per refused op for nothing.
     /// `insert_anchor`: the resolved anchor handle when `node` is an
     /// Insert (see `orphan_or_dispatch`), `None` otherwise.
     fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), Refused> {
@@ -2198,7 +2198,7 @@ impl HashSeq {
                 placed_at,
                 overwrites,
             } => self.apply_place(id, node.pins, placed_at, overwrites),
-            _ => unreachable!("gated above"),
+            _ => unreachable!("refused above"),
         }
         Ok(())
     }
@@ -2278,7 +2278,7 @@ impl HashSeq {
     }
 
     /// Every applied node in apply order — a causally safe order: each
-    /// node's refs precede it. Orphans and gated nodes are never
+    /// node's refs precede it. Orphans are never
     /// interned, so they never appear.
     pub fn nodes_in_apply_order(&self) -> impl Iterator<Item = (Id, HashNode)> + '_ {
         (0..self.ids.len()).filter_map(move |i| {
@@ -2384,8 +2384,8 @@ impl HashSeq {
 
     /// Every applied node as `(id, HashNode)` — runs decompressed, remove
     /// chains reconstructed, moves and multi-removes included. Ids come from
-    /// the local table (no rehashing). Orphans and gated nodes are
-    /// NOT included; iterate `orphans()` / `gated` separately.
+    /// the local table (no rehashing). Orphans are NOT
+    /// included; iterate `orphans()` separately.
     pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
         let mut out: Vec<(Id, HashNode)> = Vec::new();
         for run in self.runs.values() {
@@ -4343,7 +4343,7 @@ mod test {
                         seq.id_at(y as usize % seq.len()).unwrap()
                     };
                     // Sometimes aim at a splice point instead (self-splice
-                    // combinations gate harmlessly).
+                    // combinations are refused harmlessly).
                     if y & 4 != 0
                         && let Some(m) = seq.move_heads(&anchor).first().copied()
                     {
@@ -4354,7 +4354,7 @@ mod test {
                     } else {
                         Anchor::Before(anchor)
                     };
-                    let _ = seq.move_element(target, to); // self-moves gate
+                    let _ = seq.move_element(target, to); // self-moves are refused
                 }
                 4 => {
                     // Insert anchored at a move op's splice point (any head
@@ -4386,7 +4386,7 @@ mod test {
                     seq.insert_value(at, v);
                 }
                 _ => {
-                    // Mark or unmark a range (possibly inverted — gates
+                    // Mark or unmark a range (possibly inverted — refused
                     // harmlessly; possibly over tombstones — spec-valid).
                     if seq.is_empty() {
                         continue;
@@ -4685,11 +4685,11 @@ mod test {
         );
     }
 
-    /// The Insert.at gate row: anchors must be glued points (elements,
+    /// The Insert.at admission row: anchors must be glued points (elements,
     /// move ops, the origin) — an insert anchored at a remove or mark op
     /// is refused instead of creating unrenderable content (or worse).
     #[test]
-    fn insert_at_non_glued_anchor_gates() {
+    fn insert_at_non_glued_anchor_is_refused() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ab".chars());
         let rm = seq.remove_batch(0, 1).unwrap();
@@ -4833,7 +4833,7 @@ mod test {
         let frontier = seq.tips().clone();
 
         // Anchors on the visible order, but `a`'s point sits at its base
-        // slot (the front): an inverted span, which the gate refuses.
+        // slot (the front): an inverted span, which admission refuses.
         let err = seq
             .mark_range(Anchor::Before(c), Anchor::Before(a), bold(), yes())
             .unwrap_err();
@@ -5307,9 +5307,9 @@ mod test {
     }
 
     /// Peritext case 4: an inverted span (end before start in base order)
-    /// gates permanently.
+    /// is refused permanently.
     #[test]
-    fn inverted_mark_span_gates() {
+    fn inverted_mark_span_is_refused() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ab".chars());
         let a = seq.id_at(0).unwrap();
@@ -5456,10 +5456,10 @@ mod test {
         assert_eq!(decoded.marked_spans(), seq.marked_spans());
     }
 
-    /// Inverted spans gate for op points too (permanent: op ranks never
+    /// Inverted spans are refused for op points too (permanent: op ranks never
     /// move).
     #[test]
-    fn inverted_splice_point_span_gates() {
+    fn inverted_splice_point_span_is_refused() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ma".chars());
         let m = seq.id_at(0).unwrap();
@@ -5623,7 +5623,7 @@ mod test {
     }
 
     #[test]
-    fn self_move_gates() {
+    fn self_move_is_refused() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ab".chars());
         let a = seq.id_at(0).unwrap();
@@ -5644,13 +5644,13 @@ mod test {
     }
 
     #[test]
-    fn move_of_non_element_gates() {
+    fn move_of_non_element_is_refused() {
         let mut seq = HashSeq::default();
         seq.insert_batch(0, "ab".chars());
         let a = seq.id_at(0).unwrap();
         let b = seq.id_at(1).unwrap();
         // Remove b, then craft a move whose target is the REMOVE op (not an
-        // element) — an edge-table violation.
+        // element) — refused by the admission table.
         let remove = seq.remove_batch(1, 1).unwrap();
         let node = HashNode {
             pins: BTreeSet::new(),

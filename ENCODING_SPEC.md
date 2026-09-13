@@ -207,7 +207,7 @@ A **kv snapshot** is `[origin][puts][trailing][artifacts]` — applied kv
 nodes are all puts with causal refs, so the stream is a plain topological
 order (smallest id first among ready nodes; no cycle machinery) with a
 one-entry implicit dictionary (the origin) and rank refs; trailing
-(orphans + gated, id-sorted) carries full ids. A **web snapshot** is
+(orphans, id-sorted) carries full ids. A **web snapshot** is
 `[artifacts][objects][trailing]`: each object nests its own canonical
 stream under its object id, objects sorted by id — holonic: any object
 section is a complete replica root; the object-id framing *is* the

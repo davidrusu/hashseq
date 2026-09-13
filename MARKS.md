@@ -102,7 +102,7 @@ The live set at `(x, k)` is every `k`-mark covering `x` not named in the
 **range-scoped**: an overwrite erases its targets only where the
 superseding op's span overlaps them — and **kind-scoped**: cross-kind
 entries in `overwrites` are ignored by the definitional filter (mirroring
-HashKv's same-key rule; never gated — HASHWEB_SPEC.md "Gate vs filter"). A conflict is a multi-head live set — non-supersession, per
+HashKv's same-key rule; never refused — HASHWEB_SPEC.md "Admission vs filter"). A conflict is a multi-head live set — non-supersession, per
 FRAMEWORK; the honest-author lemma connects it to concurrency exactly as
 everywhere else.
 
@@ -130,7 +130,7 @@ The classic hard cases, as they converge here:
 3. *Span text deleted, new text inserted between the tombstones*: between
    the points → inherits the mark (documented, slightly surprising,
    correct).
-4. *Adversarial inverted span*: gated at apply — Validation below.
+4. *Adversarial inverted span*: refused at apply — Validation below.
 
 ## Apply
 
@@ -154,7 +154,7 @@ painter" session chain can run-compress later if profiles say so.
 
 ## Validation
 
-- **Inverted span** (end point before start point) — an apply-time gate:
+- **Inverted span** (end point before start point) — an apply-time admission rule:
   1. the check can always run at apply: anchor ids are refs, so both
      elements are present when the op leaves the orphan buffer;
   2. it is one `cmp_order` comparison over the **base order** — O(log F),
@@ -162,14 +162,14 @@ painter" session chain can run-compress later if profiles say so.
      later `Move` can never flip a verdict;
   3. a failed check is permanent (base order is immutable) and convergent
      (all replicas agree on every verdict);
-  4. no honest op ever depends on one: honest replicas gate before apply,
+  4. no honest op ever depends on one: honest replicas refuse before apply,
      so inverted marks never enter honest tips.
   Defense in depth: the sweep stays activation-guarded — an end event for a
   never-started mark is inert rather than perturbing the active set — so a
-  future relaxation of the gate cannot reintroduce the
+  future relaxation of the rule cannot reintroduce the
   formatting-leaks-to-end-of-document failure.
 - **Anchor kind**: anchors must name elements, the origin, or a move op's
-  splice point, in one `Seq` — a row of the edge table (HASHWEB_SPEC.md).
+  splice point, in one `Seq` — a row of the admission table (HASHWEB_SPEC.md).
   An op-anchored endpoint brackets *wherever the op's target renders* (the
   regional exception that expresses "cover that moved-in word"); its
   position is the op's id-rank in its anchor's fork order — permanent, so
@@ -181,7 +181,7 @@ painter" session chain can run-compress later if profiles say so.
 - **Amplification**: one O(log F) comparison per malicious op and nothing
   stored (refused ops are dropped) — linear in attacker effort. Mark spam over huge ranges
   costs the renderer O(anchor events), not O(range); MVR set growth is the
-  application-surfaced symptom. Note the gate does not shrink the spam
+  application-surfaced symptom. Note refusal does not shrink the spam
   surface (valid empty spans are always authorable); its goals are bounded
   cost and no rendering leak.
 

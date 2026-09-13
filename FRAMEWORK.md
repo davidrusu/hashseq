@@ -52,7 +52,7 @@ way to reference an op without committing to it, so "a reference outside the
 commitment" is unrepresentable.
 
 Delivery follows the same set: **an op is buffered until every id in
-`refs(u)` has applied.** There is no other gating.
+`refs(u)` has applied.** Nothing else holds delivery back.
 
 The typing fast path is `refs = {anchor}` — the anchor *is* the frontier,
 one id total. The **canonical encoding** (the id preimage, and the wire
@@ -74,8 +74,8 @@ resolving it means holding its preimage, and the preimage carries its kind
 referent is discovered, unforgeably, at the moment of dereference — so
 misinterpreting one kind as another is not an error to check for but a thing
 that cannot be expressed. Cross-kind references are therefore always
-well-defined queries; the edge table (HASHWEB_SPEC.md) states which
-reference edges are meaningful and gates the rest. HETEROGENEITY.md
+well-defined queries; the admission table (HASHWEB_SPEC.md) states which
+reference edges are meaningful and refuses the rest. HETEROGENEITY.md
 explores the object designs this licenses.
 
 ## The honest frontier rule
@@ -84,7 +84,7 @@ explores the object designs this licenses.
 > frontier of the op's layer — honest construction:
 > `refs = frontier ∪ named`, nothing less.
 
-The rule is a convention defining honest behavior, **not a validation gate**.
+The rule is a convention defining honest behavior, **not an admission rule**.
 Seeing cannot be proven, so omission is unenforceable; an author who omits
 frontier ops they saw is exercising the *withholding* lever (below), which is
 answered at resolution time, never at apply.
@@ -269,7 +269,7 @@ The dividing rule for checks follows from this split:
 > time**, where re-evaluation is the normal case.
 
 Inverted spans (MARKS.md) and ill-typed ops (HASHWEB_SPEC.md) pass the
-test → apply-time gates, verdicts permanent and convergent. Head counts and
+test → apply-time admission rules, verdicts permanent and convergent. Head counts and
 rendered placement fail it → read-time arbitration. Getting this wrong in
 either direction reintroduces replay: an apply-time verdict about an
 unstable fact must be revised on arrival — the trap MOVE.md documents in

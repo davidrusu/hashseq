@@ -27,12 +27,12 @@ defined answers:
   proceeds;
 - **inert** — the edge is tolerated but has no effect (a remove naming a
   non-insert sets a dead bit on nothing);
-- **gated** — the edge is declared ill-typed; the op is refused and dropped
+- **refused** — the edge is declared ill-typed; the op is refused and dropped
   (kinds are immutable, so the verdict is stable — FRAMEWORK's apply-time
-  gate criterion).
+  admission criterion).
 
 What the property is *not*: static typing. An author cannot prove a
-referent's kind inside their own artifact — the verdict lands at the gate,
+referent's kind inside their own artifact — the verdict lands at admission,
 when both artifacts are present (an unknown referent orphans the op as a
 normal orphan first). It is dynamic typing with unforgeable tags.
 
@@ -44,33 +44,33 @@ The current specs use kind-commitment *defensively*: inert removes
 
 > **One object's DAG may mix op kinds freely.** Safety is not object
 > homogeneity; it is edge typing — each op kind declares, per role, the
-> kinds it may reference, and one shared gate checks every edge.
+> kinds it may reference, and one shared admission table checks every edge.
 
-### The typed-edge table
+### The typed admission table
 
 The whole discipline compresses into a table that is itself the validation
 spec:
 
 | op . role | may reference | otherwise |
 |---|---|---|
-| `Insert . at` (anchor) | insert, move op (its splice point), the object's origin id | gate |
+| `Insert . at` (anchor) | insert, move op (its splice point), the object's origin id | refused |
 | `Remove . target` | insert | inert |
-| `Mark . anchor` | insert (char), the object's origin id | gate |
-| `Mark . overwrites` | mark | gate |
+| `Mark . anchor` | insert (char), the object's origin id | refused |
+| `Mark . overwrites` | mark | refused |
 | `Put . overwrites` | put on the same key | ignored (definitional filter) |
-| `Move . target` | insert, in the object `to` resolves in (same-container rule) | gate |
-| `Move . to` | glued point (insert, move op) in `target`'s object | gate |
+| `Move . target` | insert, in the object `to` resolves in (same-container rule) | refused |
+| `Move . to` | glued point (insert, move op) in `target`'s object | refused |
 | unroled refs (pins) | anything | always meaningful — pure frontier pins |
 
-(The normative version now lives in HASHWEB_SPEC.md "The edge table"; this
+(The normative version now lives in HASHWEB_SPEC.md "Admission"; this
 sketch is the design rationale.) Every existing per-layer check is a row of
-this table — the shared validate-before-apply gate the specs had been
+this table — the shared validate-before-apply rule the specs had been
 reaching for piecemeal, now folded. Extending the
 family = adding rows, not adding mechanisms. Note the table has two kinds of
-constraint: **kind checks** (stable, gate-enforceable) and **value-dependent
+constraint: **kind checks** (stable, enforceable at admission) and **value-dependent
 filters** (same-key for `Put.overwrites` — enforced definitionally in the
-head-set computation, not at the gate); keeping that distinction explicit is
-what keeps every gate verdict permanent.
+head-set computation, not at admission); keeping that distinction explicit is
+what keeps every admission verdict permanent.
 
 ### Consequence: one derive_key context
 
@@ -140,8 +140,8 @@ The gallery — each exists because references cross kinds safely:
 A shared namespace of kind-committed artifacts is how the system grows
 without migrations — and the framework itself dictates *how*. "I do not
 recognize this kind" is a fact about the replica's software, not about
-hash-committed inputs, so by the stability criterion it can never be a gate
-verdict: a replica that refused unknown kinds would diverge, on the
+hash-committed inputs, so by the stability criterion it can never be an
+admission verdict: a replica that refused unknown kinds would diverge, on the
 permanent record, from upgraded peers. Extension is therefore handled by
 semantics, not rejection.
 
@@ -172,7 +172,7 @@ Because placement lives in the body, an op that anchors on a node whose
 kind a replica cannot interpret has no resolvable place there — so it
 **orphans as an orphan** until the kind is known. Orphaning is not a verdict:
 nothing permanent is decided, which is exactly what the stability criterion
-demands of unknown-ness (it can never gate). On upgrade, orphaned ops apply
+demands of unknown-ness (it can never refuse). On upgrade, orphaned ops apply
 as ordinary late deliveries, and late arrival never reorders existing
 content — the replay trap stays closed across versions through the same
 property that closes it across delivery orders. The accepted trade: an old
@@ -180,9 +180,9 @@ replica renders unknown-kind content and everything anchored on it as
 *absent*, not as a placed placeholder.
 
 Anchorability remains a stable, kind-committed fact for **known** kinds:
-the edge table says which kinds bear glued points (`Insert . at` admits
+the admission table says which kinds bear glued points (`Insert . at` admits
 inserts, move ops, the object's origin id), and a known-kind violation
-gates permanently. Unknown kinds neither pass nor fail — they wait.
+is refused permanently. Unknown kinds neither pass nor fail — they wait.
 
 ### The convergence contract across versions
 
@@ -226,7 +226,7 @@ different one.
 
 ## Costs and cautions
 
-- **The edge table is load-bearing spec surface.** It must be total (every
+- **The admission table is load-bearing spec surface.** It must be total (every
   op-role × kind has a verdict), convergent (verdicts from hash-committed
   inputs only), and versioned with the encoding. A missing row is a
   divergence bug, not an oversight.
@@ -240,12 +240,12 @@ different one.
 
 ## Open problems
 
-1. **Retrofit audit.** Verify every gate verdict is a function of
+1. **Retrofit audit.** Verify every admission verdict is a function of
    hash-committed facts computable by any replica that knows the relevant
    kinds — never of availability or version — and that every
    unknown-referent path orphans rather than verdicts. (Reading a *known*
    referent's body — e.g. a move op's `to` for its splice point — is fine;
-   placement is body semantics.) Run it against the normative edge table
+   placement is body semantics.) Run it against the normative admission table
    (HASHWEB_SPEC.md) and the envelope grammar (GRAMMAR_SPEC.md).
 2. **Transclusion semantics.** Render cycles are solved: an embedding
    renderer embeds each object at most once per root-to-leaf path and

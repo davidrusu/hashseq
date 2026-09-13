@@ -33,7 +33,7 @@ a stable end point inserts its own terminal element and anchors `Before` it.
 Sentinels are user-space objects, not protocol.
 
 `Move` is **same-container only**: the destination anchor must resolve
-within `target`'s own object — a stable gate, both sides hash-committed.
+within `target`'s own object — a stable admission rule, both sides hash-committed.
 Element placement registers therefore never change parent edges, and
 *intra-object* placement cycles stay unrepresentable. Cross-container
 relocation is not a seq op: it is `Insert` of the object's link in the
@@ -83,7 +83,7 @@ rank fragment for life), and Move destinations (drag-next-to-moved-content
 lands at the rendered position) — including self-splice: moving an
 element to one of its own ops' splice points is well-defined ("put x
 where that op placed it" — excision precedes placement and op ranks are
-permanent), so no extra gate row exists for it. Move's rendered index relocation is wired per "Apply" below:
+permanent), so no extra admission row exists for it. Move's rendered index relocation is wired per "Apply" below:
 origin ghosts (base slots live forever), one relocation per rendered-
 placement change, the deciding move op an ordinary insert sibling in its
 anchor's fork order; `prop_index_matches_iterator_with_moves` pins the
@@ -93,7 +93,7 @@ render adjacent to the moved element; cursors anchor moved-in neighbors at
 their deciding op, so typing next to moved content lands where the user
 sees it. A superseded op that content anchored to keeps a zero-width
 splice slot at its rank (its destination fragment demotes in place, and
-promotes back if the register re-agrees on it). Still gated: a Move whose
+promotes back if the register re-agrees on it). Still refused: a Move whose
 *destination* is another op's splice point.
 
 ## Payload
@@ -193,7 +193,7 @@ committed interval hands every malicious peer an inverted `(right, left)`
 pair — and crossing intervals from several peers form constraint sets with
 no consistent order at all — forcing per-insert interval validation and a
 fresh arbitration surface onto the system's hottest op (marks pay their
-inverted-span gate only at mark volume), on top of a second ref in every
+inverted-span rule only at mark volume), on top of a second ref in every
 insert preimage and an absent-right sentinel. The single anchor has no
 interval to invert — structurally valid by form — and an adversary's
 anchor games order only their own content (locality invariant). Accepted
@@ -229,7 +229,7 @@ placement:
 ### Self-move
 
 `to` naming `target` itself is contentless and stable → refused at apply
-and dropped (same gate class as inverted spans, MARKS.md). Destinations on
+and dropped (same admission class as inverted spans, MARKS.md). Destinations on
 move ops — including ops of `target`'s own chain — are well-defined and
 admitted: excision precedes placement and an op's rank is permanent, so
 "move x to where that op placed it" renders at the op's splice point.
@@ -277,9 +277,9 @@ FRAMEWORK Law II it is a cache pinned equal to the definitional iterator
 - Self-moves → refused at apply and dropped (stable check).
 - A `Move`'s anchor must resolve to a valid glued point **in `target`'s own
   object** (an element, the origin, or a move op's own splice point for
-  `After(move_op)`); a cross-container destination fails the apply-time gate
+  `After(move_op)`); a cross-container destination fails the apply-time admission rule
   like a malformed anchor — the check is stable, both objects
-  hash-committed (HASHWEB_SPEC.md edge table).
+  hash-committed (HASHWEB_SPEC.md admission table).
 - **Stability requirement (realized).** Two already-emitted elements never
   reorder in the **base order** — new inserts only subdivide gaps,
   tombstones keep their run/fragment slot — so `cmp_order(a, b)` over
@@ -288,11 +288,11 @@ FRAMEWORK Law II it is a cache pinned equal to the definitional iterator
   a moved element's base slot stays in the index for life, and rendered
   relocation must never change a base-order verdict. (Reading the rendered
   slot here is a convergence bug — replicas that have and haven't seen a
-  move would disagree on permanent gate verdicts.) Anchor points
+  move would disagree on permanent admission verdicts.) Anchor points
   (`Before(c)` / `After(c)`, MARKS.md) are glued and stable for life.
   **Rendered placement is not base order**: a move relocates where an
   element renders, never the base order that anchors, mark *points*, and
-  gate verdicts depend on (FRAMEWORK "Stability"; mark *membership*
+  admission verdicts depend on (FRAMEWORK "Stability"; mark *membership*
   samples the rendered crossing against those base-fixed points —
   MARKS.md "regional"). Every higher layer (marks' permanent inverted-span check,
   the move splice-point anchor) borrows the base order's immutability.

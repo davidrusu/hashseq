@@ -126,7 +126,7 @@ not schedule-independent (two legal revert schedules reach different
 fixpoints) — closing that gap costs either a confluence proof with
 stage-faithful incremental maintenance, or a detach-the-SCC rule. The
 same-container restriction removes the problem's input instead: parent
-edges never change, containment stays the creation forest, and the gate
+edges never change, containment stays the creation forest, and admission
 ("destination resolves in `target`'s object") is stable and convergent.
 
 Cross-container relocation is **remove + insert of the object's link**.
@@ -155,7 +155,7 @@ discipline that keeps that sound (HASHSEQ_SPEC.md Apply/Validation):
 - a moved element keeps its **origin ghost** — the base slot is never
   removed; `cmp_order` and every permanent verdict resolve through ghosts
   only (reading the rendered slot is a convergence bug: replicas that
-  have/haven't seen a move would disagree on permanent gate verdicts);
+  have/haven't seen a move would disagree on permanent admission verdicts);
 - the rendered copy is a singleton fragment placed by **insert-sibling
   semantics**: the deciding move op joins its anchor's fork order like an
   insert child, keyed by its own id — later inserts, run continuations,
@@ -190,7 +190,7 @@ tombstone. Cursor logic chooses: `After(move_op)` = relative to x's new
 home; `After(u)`/`Before(v)` (destination neighbors) = relative to the gap.
 
 Self-moves (`to` resolving into `target`'s own move chain) are syntactically
-checkable and stable → refused at apply and dropped (the shared gate class).
+checkable and stable → refused at apply and dropped (the shared admission class).
 
 ## Amplification audit
 
@@ -205,7 +205,7 @@ honest replicas?
 | dominating-op vandalism (move honest block to garbage) | one relocation | the permissionless-write baseline (same class as Remove); attributable, revertible |
 | mass element moves | singleton fragments in the treap | linear in attacker ops; treap stays O(log F) |
 | move-churn ghost spam | none beyond live placements | splice ghosts are lazy — only anchored-to splice points persist |
-| cross-container relocation games | n/a — not an op | the gate refuses cross-container destinations; re-link duplication is flagged, per-op bounded, resolved by one delete |
+| cross-container relocation games | n/a — not an op | admission refuses cross-container destinations; re-link duplication is flagged, per-op bounded, resolved by one delete |
 
 No reshuffle row exists because none is reachable: relocation of honest
 content requires a dominating op per block (linear, attributable), frozen

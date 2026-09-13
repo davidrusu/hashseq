@@ -53,7 +53,7 @@ object id, derived from
 **kind ‖ origin**, is the store-level address (routing envelope + index)
 and **never appears in any preimage**. The kind is inside the address, so
 the same origin opened as a Seq and as a Kv is two different objects, and
-kind mis-agreement is unrepresentable rather than gated. Kinds are tags
+kind mis-agreement is unrepresentable rather than refused. Kinds are tags
 inside the encodings. Bump a context string ⟺ identity hard fork; there
 is no other versioning at this layer.
 
@@ -195,8 +195,8 @@ minimal varint; unsorted/duplicated refs table or index list;
 `ref_count = 0`; `body_len` mismatch; ref index ≥ `ref_count`; trailing
 bytes. **Not**
 malformed: unknown op kinds, unknown artifact kinds (carried), and any
-semantic property of referents (those verdicts belong to the edge-table
-gate, which runs when referents are present).
+semantic property of referents (those verdicts belong to the admission
+table, which runs when referents are present).
 
 ## Part B: snapshot stream grammar
 

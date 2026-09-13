@@ -13,7 +13,7 @@ property-harness items).
 ## Resolution history: first dissolved, then decided
 
 *2026-07-01:* `Move` restricted to same-container destinations
-(HASHSEQ_SPEC.md — a stable gate): parent edges never change, containment
+(HASHSEQ_SPEC.md — a stable admission rule): parent edges never change, containment
 stays the creation forest, and placement cycles are unrepresentable. The
 problem below has no input. Cross-container relocation is remove + insert
 of the object's link; its concurrent-relocation residue is detectable

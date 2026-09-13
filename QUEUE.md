@@ -2,16 +2,6 @@
 
 Statuses: OPEN, DECISION (needs a call), DEFERRED (only alongside named work). Numbers are stable; remove an item when it is done.
 
-## Up next
-
-### 43. Rename the "gate" / "edge table" framing — OPEN
-
-Where: HASHWEB_SPEC.md "The edge table (the apply-time gate)" (~:103) is the source; the vocabulary spreads to ~170 mentions across `src/delivery.rs` (`gated`, `gate`), `src/hashseq.rs` and `src/hashkv.rs` (`interpret`'s `admitted` block, `mark_admissible`), `src/hash_node.rs`, `src/encoding.rs`, `src/hashweb.rs`, `src/wasm.rs`, and the specs FRAMEWORK.md:264, HASHSEQ_SPEC.md, HASHKV_SPEC.md, MARKS.md, MOVE.md, PLACEMENT_SPEC.md, GRAMMAR_SPEC.md, ENCODING_SPEC.md, HETEROGENEITY.md, OP_REFS.md, CYCLE_REVERT.md, BASECAMP_MODULE.md, APP_NOTES.md, SPEC_SCRATCH.md.
-
-Problem: the framing is wrong. What the table describes is which ops are well-formed for an object kind and its referents: a validity rule, decided once from hash-committed facts. "Gate" and "edge table" suggest a policy checkpoint and a routing structure, and they leak into names (`gated`, `gate`, `admitted`, "gate rows", "gate verdict") and into doc comments on the authoring helpers.
-
-Fix: pick one term for the rule (validity / admissibility / well-formedness) and one for the outcome (`Refused` is already the outcome type), rename the HASHWEB_SPEC section and its table heading, then sweep code identifiers and doc comments to match: `mark_admissible`, the `verdict` binding and "gate rows" comments in `interpret`, the `HashSeq` field doc that still lists what is "gated here today", and the spec prose.
-
 ## Core
 
 ### 44. An interned `HashNode`: refs resolved to `NodeIdx` — OPEN

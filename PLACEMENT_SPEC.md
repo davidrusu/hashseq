@@ -34,7 +34,7 @@ Place {
 
 `placed_at` is a **value commitment in a foreign DAG** — the standing
 payload discipline (HASHSEQ_SPEC.md "Payload"): it is not in `refs(u)`,
-buffering never waits on it, and nothing about the referent is gated. The
+buffering never waits on it, and nothing about the referent is refused. The
 supersession DAG (`overwrites`) stays entirely within the placed object's
 own history: verification, frontiers, sync, and orphaning remain strictly
 per-object. There is deliberately **no `parent` field**: the parent is
@@ -156,7 +156,7 @@ next `Place` re-places it. The naive revert-downward rule remains
 rejected (non-confluent — the counterexample stands).
 
 An SCC of one — `placed_at` resolving inside X's own subtree — needs no
-gate: it is just the smallest cycle, detached and flagged like any other.
+admission rule: it is just the smallest cycle, detached and flagged like any other.
 
 ## Apply
 
@@ -166,17 +166,17 @@ projection (the container's own rendered order is untouched by
 membership). Late or adversarial delivery costs the same as on-time
 apply.
 
-## Validation (edge table deltas — HASHWEB_SPEC.md)
+## Validation (admission-table deltas — HASHWEB_SPEC.md)
 
 | op . role | admits | otherwise |
 |---|---|---|
 | `Place . placed_at` | any id | never edge-checked: a value commitment, payload class. A `placed_at` that names a non-insert, an atom whose payload is not this object's origin, or garbage simply never matches any atom during a container walk — inert by the membership rule, no verdict needed |
-| `Place . overwrites` | — | never gated: entries that are not `Place` ops in the same object are ignored by the definitional head-set filter (same class as `Put . overwrites`) |
+| `Place . overwrites` | — | never refused: entries that are not `Place` ops in the same object are ignored by the definitional head-set filter (same class as `Put . overwrites`) |
 | op kind vs object kind | `Place` admitted in **both** `Seq` and `Kv` (the register concerns the object's placement, not its content projection) | — |
 
-No new gate rows: every malformed relationship is inert at read time
+No new admission rows: every malformed relationship is inert at read time
 rather than refused, because nothing about `placed_at` is verifiable
-at apply time without foreign state — and the gate must never depend on
+at apply time without foreign state — and admission must never depend on
 what a replica happens to hold.
 
 **Extension path.** `Place` is a new tag in the shared node grammar
@@ -208,7 +208,7 @@ duplicates healed deterministically) and corrupts nothing.
 | fork-spam on one object's containment register | head-set growth; object pins at last-agreed, flagged | linear in attacker ops; a fresh destination is never attacker-chosen (inherited) |
 | cycle bomb (K registers forming loops) | SCC recompute over the affected component; members detach, flagged; no placement conferred anywhere | O(component) per op; **the component is attacker-growable**, so per-op honest cost is linear in the attacker's own prior spend — same shape CYCLE_REVERT.md accepted for D1's iteration depth; incremental SCC maintenance is the open engineering item |
 | placement of honest content to garbage | one dominating `Place` — relocation | the permissionless-write baseline; attributable, revertible |
-| `placed_at` garbage / mismatch spam | none — inert at read, no gate verdicts to grind | membership simply never matches |
+| `placed_at` garbage / mismatch spam | none — inert at read, no admission verdicts to grind | membership simply never matches |
 | stale-replica games | old replicas render legacy membership (duplicates, healed) | orphan-until-upgrade class; no divergence in op state |
 
 ## Open threads

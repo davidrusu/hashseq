@@ -32,7 +32,7 @@ honest frontier rule ("`refs(u)` contains the author's observed frontier
 | Law I / Law II, orphan buffering (waits on refs, already global)   | no                                                  |
 | conflict = non-supersession; heads/`overwrites` machinery          | no — registers name ids explicitly, never frontiers |
 | locality dividing line, freeze rule, MVR                           | no                                                  |
-| stability split (base order vs placement), apply-time gates        | no                                                  |
+| stability split (base order vs placement), apply-time admission        | no                                                  |
 | canonical encoding (blocks, order, refs — one stream spans layers) | no                                                  |
 | honest frontier rule                                               | **yes — this is the injection point**               |
 | "no rule may rely on cross-layer causal order" obligation          | only exists when granularity is finer than global   |

@@ -62,7 +62,7 @@ pub struct HashKv {
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Applied node ids in apply order — the map's arena, append-only
-    /// (orphaned and gated nodes never enter). Deps precede dependents, so
+    /// (orphans never enter). Deps precede dependents, so
     /// the position is the clock walk's order (`delta_for`).
     pub(crate) order: Vec<Id>,
     /// Arena position by id (`order[slot[id]] == id`).
@@ -78,7 +78,7 @@ pub struct HashKv {
     /// The containment register — where does this object live
     /// (PLACEMENT_SPEC.md). `Place` is valid in any object kind.
     pub(crate) placement: PlacementRegister,
-    /// Orphans (non-map ops are refused and dropped — the edge table).
+    /// Orphans (non-map ops are refused and dropped — the admission table).
     pub(crate) delivery: Delivery,
 }
 
@@ -314,11 +314,11 @@ impl HashKv {
     }
 
     /// Interpret one node whose refs are all applied — this projection's
-    /// edge-table rows. `Err` says why it was refused; the caller drops it.
+    /// admission rows. `Err` says why it was refused; the caller drops it.
     fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), Refused> {
         // Place is admitted in any object kind (PLACEMENT_SPEC.md): the
         // containment register concerns the object's placement, not its
-        // content projection. placed_at is a commitment — nothing to gate.
+        // content projection. placed_at is a commitment — nothing to refuse.
         if let Op::Place {
             placed_at,
             overwrites,
@@ -333,7 +333,7 @@ impl HashKv {
             return Ok(());
         }
 
-        // Edge-table gate: only map ops are admitted here (a seq op in a
+        // Admission: only map ops are admitted here (a seq op in a
         // Map is ill-typed — stable, permanent).
         let Op::Put {
             key, overwrites, ..
@@ -500,7 +500,7 @@ impl HashKv {
         self.delivery.orphans().map(|(_, n)| n)
     }
 
-    /// Every applied node as `(id, HashNode)` (orphaned/gated not included).
+    /// Every applied node as `(id, HashNode)` (orphans not included).
     pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
         self.nodes.iter().map(|(id, n)| (*id, n.clone())).collect()
     }

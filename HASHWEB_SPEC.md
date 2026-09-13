@@ -100,11 +100,11 @@ an object id the store does not know orphan store-wide (opening or adoption
 wakes them — the store's only delivery state); ops inside a live object
 orphan on their first missing ref in that object's own buffer.
 
-## The edge table (the apply-time gate)
+## Admission (the apply-time rules)
 
 Two facts are hash-committed and version-independent: an object's **kind**
 (inside its derived object id — replicas can never disagree, and object
-links need no type annotation) and every referent's **kind**. So reference validation is one shared gate, run when
+links need no type annotation) and every referent's **kind**. So reference validation is one shared admission table, run when
 an op leaves the orphan buffer (all refs present), issuing per-edge
 verdicts that are total, convergent, and stable:
 
@@ -112,30 +112,30 @@ verdicts that are total, convergent, and stable:
 - **inert** — tolerated, no effect;
 - **refused** — dropped: never applied, never stored, never re-presented by merge or snapshot. Anything referencing it orphans on that missing ref, so a refusal cascades without the refused op being kept; no honest op ever depends on one;
 - a referent of **unknown kind** yields no verdict: the op orphans until the
-  kind is known (HETEROGENEITY.md — unknown-ness can never gate).
+  kind is known (HETEROGENEITY.md — unknown-ness can never refuse).
 
 | op . role | admits | otherwise |
 |---|---|---|
-| `Insert . at` | insert, move op (its splice point), or the object's origin — in one `Seq` | gate |
+| `Insert . at` | insert, move op (its splice point), or the object's origin — in one `Seq` | refused |
 | `Remove . target` | insert, in the op's own `Seq` | inert (non-insert); a ref living in another object never arrives here — orphans forever, no verdict |
-| `Move . target` | insert, in the object `to` resolves in (same-container rule) | gate |
-| `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the object's origin — in `target`'s object; not `target` itself (self-move) | gate |
-| `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the object's origin, in one `Seq`; inverted spans gate (MARKS.md) | gate |
-| `Mark . overwrites` | — | never gated: entries that are not covering same-kind marks are ignored by the definitional suppression filter (same class as `Put . overwrites` — kind- and coverage-scoping live in the read, not the gate) |
-| `Put . overwrites` | — | never gated: entries that are not puts on the same key are ignored by the definitional head-set filter |
+| `Move . target` | insert, in the object `to` resolves in (same-container rule) | refused |
+| `Move . to` | insert, move op (any — including ops of `target`'s own chain: excision precedes placement and op ranks are permanent, so "put x where that op placed it" is well-defined), or the object's origin — in `target`'s object; not `target` itself (self-move) | refused |
+| `Mark . anchor` (start, end) | insert, move op (its splice point — brackets wherever the op's target renders; anchored ops retain their rank fragment for life), or the object's origin, in one `Seq`; inverted spans are refused (MARKS.md) | refused |
+| `Mark . overwrites` | — | never refused: entries that are not covering same-kind marks are ignored by the definitional suppression filter (same class as `Put . overwrites` — kind- and coverage-scoping live in the read, not at admission) |
+| `Put . overwrites` | — | never refused: entries that are not puts on the same key are ignored by the definitional head-set filter |
 | `Place . placed_at` | any id | never edge-checked: a value commitment (payload class); a non-matching or garbage id is inert under the membership read rule (PLACEMENT_SPEC.md) |
-| `Place . overwrites` | — | never gated: entries that are not `Place` ops in the same object are ignored by the definitional head-set filter |
-| op kind vs object kind | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv`; `Place` in **either** (the containment register concerns the object's placement, not its content projection — PLACEMENT_SPEC.md) | gate (reachable only by enveloping ops at a wrong-kind or colliding out-of-band seed — the kind is inside the derived object id, so honest kind mis-agreement is unrepresentable) |
+| `Place . overwrites` | — | never refused: entries that are not `Place` ops in the same object are ignored by the definitional head-set filter |
+| op kind vs object kind | seq ops (`Insert`/`Remove`/`Move`/`Mark`) in a `Seq`; `Put` in a `Kv`; `Place` in **either** (the containment register concerns the object's placement, not its content projection — PLACEMENT_SPEC.md) | refused (reachable only by enveloping ops at a wrong-kind or colliding out-of-band seed — the kind is inside the derived object id, so honest kind mis-agreement is unrepresentable) |
 | pins (unroled refs) | anything | always meaningful — pure frontier pins |
 | payloads / keys / values | any id | never edge-checked: values are not references, and payload kinds are not schema-gated (Objects, above) — schema is the renderer's concern |
 
-**Gate vs filter.** Two constraint classes, deliberately distinct: **kind
-checks** (the "gate" rows) are stable apply-time verdicts; **value-dependent
+**Admission vs filter.** Two constraint classes, deliberately distinct: **kind
+checks** (the "refused" rows) are stable apply-time verdicts; **value-dependent
 constraints** (same key, same `kind_v`) live in the definitional read —
 free at apply, no verdict to get wrong, and the incremental head-set update
 filters identically.
 
-**Tighten never, loosen carefully.** Gate verdicts are permanent and must
+**Tighten never, loosen carefully.** Admission verdicts are permanent and must
 be computed identically by every replica, so this table is versioned
 semantics. *Tightening* a row after launch would refuse ops already
 applied inside honest documents — a true fork, forbidden. *Loosening* a row

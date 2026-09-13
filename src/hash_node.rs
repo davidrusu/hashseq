@@ -109,7 +109,7 @@ pub enum Op {
     /// Claim liveness: tombstone every target (idempotent union).
     Remove(BTreeSet<Id>),
     /// Claim placement: relocate `target` within its own container
-    /// (same-container only — a stable gate) superseding `overwrites`.
+    /// (same-container only — a stable admission rule) superseding `overwrites`.
     Move {
         target: Id,
         to: Anchor,
@@ -253,7 +253,7 @@ pub(crate) fn varint_len(mut value: usize) -> usize {
 
 impl HashNode {
     /// Every id this node references: `refs(u) = pins ∪ named(u)`.
-    /// Delivery buffers on exactly this set; there is no other gating.
+    /// Delivery buffers on exactly this set; nothing else holds delivery back.
     pub fn iter_refs(&self) -> impl Iterator<Item = &Id> {
         self.pins
             .iter()
