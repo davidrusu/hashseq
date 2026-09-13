@@ -318,10 +318,10 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
     let applied_before = seq.all_nodes();
     let applied_before_len = applied_before.len();
     for (id, node) in applied_before {
-        web.apply_to_with_id(obj, id, node);
+        let _ = web.apply_to_with_id(obj, id, node);
     }
     for node in seq.orphans() {
-        web.apply_to(obj, node.clone());
+        let _ = web.apply_to(obj, node.clone());
     }
     for artifact in artifacts {
         web.provide_artifact_bytes(artifact);

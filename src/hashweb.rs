@@ -25,7 +25,7 @@ use rustc_hash::FxHashMap;
 use crate::hashkv::HashKv;
 use crate::hashseq::IdMap;
 use crate::value::{KIND_KV, KIND_SEQ, Value, object_id};
-use crate::{Clock, HashNode, HashSeq, Id};
+use crate::{Clock, HashNode, HashSeq, Id, Outcome, Refused};
 
 /// What one peer holds of a store: a [`Clock`] per object. A value,
 /// never edited: what the peer told us (a 0xC1 frontier frame, a
@@ -294,15 +294,20 @@ impl HashWeb {
     /// bounded, attributable, and correct by construction. Envelopes for
     /// unknown object ids orphan store-wide and wake when the object is
     /// opened or adopted.
-    pub fn apply_to(&mut self, obj: Id, node: HashNode) -> bool {
+    pub fn apply_to(&mut self, obj: Id, node: HashNode) -> Result<Outcome, Refused> {
         let id = node.id();
         self.apply_to_with_id(obj, id, node)
     }
 
-    /// Returns whether the envelope was news: applied, or orphaned for
-    /// the first time (in the object, or store-wide on an unknown
-    /// object). False for echoes and replays.
-    pub fn apply_to_with_id(&mut self, obj: Id, id: Id, node: HashNode) -> bool {
+    /// The `Outcome` for the envelope: the object's own verdict, or
+    /// `Orphaned` / `Known` for a store-wide orphan on an object not yet
+    /// opened.
+    pub fn apply_to_with_id(
+        &mut self,
+        obj: Id,
+        id: Id,
+        node: HashNode,
+    ) -> Result<Outcome, Refused> {
         debug_assert_eq!(id, node.id(), "apply_to_with_id called with a wrong id");
         if let Some(seq) = self.seqs.get_mut(&obj) {
             seq.apply_with_id(id, node)
@@ -313,12 +318,12 @@ impl HashWeb {
             // Store-wide orphaning dedups by node id like the objects do:
             // echoes, replays, and self-merges must not grow the list.
             let envelopes = self.orphaned.entry(obj).or_default();
-            if envelopes.iter().any(|(pid, _)| *pid == id) {
-                false
+            Ok(if envelopes.iter().any(|(pid, _)| *pid == id) {
+                Outcome::Known
             } else {
                 envelopes.push((id, node));
-                true
-            }
+                Outcome::Orphaned
+            })
         }
     }
 
@@ -328,7 +333,7 @@ impl HashWeb {
             return;
         };
         for (id, node) in envelopes {
-            self.apply_to_with_id(obj, id, node);
+            let _ = self.apply_to_with_id(obj, id, node);
         }
     }
 
@@ -359,10 +364,10 @@ impl HashWeb {
         }
         for (origin, seq) in &other.seqs {
             for (id, node) in seq.all_nodes() {
-                self.apply_to_with_id(*origin, id, node);
+                let _ = self.apply_to_with_id(*origin, id, node);
             }
             for (id, node) in seq.delivery.orphans() {
-                self.apply_to_with_id(*origin, *id, node.clone());
+                let _ = self.apply_to_with_id(*origin, *id, node.clone());
             }
         }
         for (origin, m) in &other.kvs {
@@ -378,15 +383,15 @@ impl HashWeb {
                 }
             }
             for (id, node) in m.all_nodes() {
-                self.apply_to_with_id(*origin, id, node);
+                let _ = self.apply_to_with_id(*origin, id, node);
             }
             for (id, node) in m.delivery.orphans() {
-                self.apply_to_with_id(*origin, *id, node.clone());
+                let _ = self.apply_to_with_id(*origin, *id, node.clone());
             }
         }
         for (obj, envelopes) in other.orphaned {
             for (id, node) in envelopes {
-                self.apply_to_with_id(obj, id, node);
+                let _ = self.apply_to_with_id(obj, id, node);
             }
         }
     }
@@ -476,7 +481,7 @@ pub(crate) mod tests {
         let nodes = a.seq(&s1).unwrap().all_nodes();
         let mut fresh = HashWeb::new();
         for (id, node) in nodes {
-            fresh.apply_to_with_id(s1, id, node);
+            let _ = fresh.apply_to_with_id(s1, id, node);
         }
         assert_eq!(
             fresh.orphans().count(),
@@ -612,9 +617,9 @@ pub(crate) mod tests {
         let mut fresh = HashWeb::new();
         fresh.create_seq(child_origin);
         let child2 = object_id(KIND_SEQ, &child_origin);
-        fresh.apply_to_with_id(child2, pl2.id(), pl2.clone());
+        let _ = fresh.apply_to_with_id(child2, pl2.id(), pl2.clone());
         assert_eq!(fresh.seq(&child2).unwrap().placement().heads().len(), 0);
-        fresh.apply_to_with_id(child2, pl1.id(), pl1.clone());
+        let _ = fresh.apply_to_with_id(child2, pl1.id(), pl1.clone());
         assert_eq!(
             fresh.seq(&child2).unwrap().placement().chain(),
             expected,
@@ -685,7 +690,7 @@ pub(crate) mod tests {
             late.values.insert(*vid, b.clone());
         }
         for (id, node) in &nodes {
-            late.apply_to_with_id(root, *id, node.clone());
+            let _ = late.apply_to_with_id(root, *id, node.clone());
         }
         late.create_kv(oid(9));
         assert_eq!(late.kv(&root).unwrap().get(&s("color")), Some(s("blue")));
@@ -775,7 +780,7 @@ pub(crate) mod tests {
 
         let mut fresh = HashWeb::new();
         for (id, node) in &child_nodes {
-            fresh.apply_to_with_id(child, *id, node.clone());
+            let _ = fresh.apply_to_with_id(child, *id, node.clone());
         }
         assert_eq!(fresh.orphans().count(), 1);
         assert!(fresh.seq(&child).is_none());
@@ -798,16 +803,17 @@ pub(crate) mod tests {
 
         let mut fresh = HashWeb::new();
         for (id, node) in &child_nodes {
-            fresh.apply_to_with_id(child, *id, node.clone());
+            let _ = fresh.apply_to_with_id(child, *id, node.clone());
         }
         let n = child_nodes.len();
         assert_eq!(fresh.orphans().count(), n);
         for (id, node) in &child_nodes {
-            fresh.apply_to_with_id(child, *id, node.clone());
+            let _ = fresh.apply_to_with_id(child, *id, node.clone());
         }
         assert_eq!(fresh.orphans().count(), n, "re-delivery is a no-op");
-        assert!(
-            !fresh.apply_to(child, child_nodes[0].1.clone()),
+        assert_eq!(
+            fresh.apply_to(child, child_nodes[0].1.clone()),
+            Ok(Outcome::Known),
             "re-delivery is not news"
         );
 
@@ -838,7 +844,7 @@ pub(crate) mod tests {
             pins: Default::default(),
             op: Op::Remove([a0, b0].into_iter().collect()),
         };
-        doc.apply_to(a, node);
+        let _ = doc.apply_to(a, node);
         assert_eq!(doc.seq(&a).unwrap().delivery.orphans().count(), 1);
         assert_eq!(read_text(&doc, &a), "a"); // untouched
         assert_eq!(read_text(&doc, &b), "b");
@@ -890,7 +896,7 @@ pub(crate) mod tests {
             let seq = doc.seq(&a).unwrap();
             seq.make_insert_value(6, b).unwrap()
         };
-        doc.apply_to(a, node.clone());
+        let _ = doc.apply_to(a, node.clone());
         let seq = doc.seq(&a).unwrap();
         let atom = seq.id_at(6).unwrap();
         assert_eq!(

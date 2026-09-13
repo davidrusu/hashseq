@@ -4,23 +4,23 @@ Statuses: OPEN, DECISION (needs a call), DEFERRED (only alongside named work). N
 
 ## Up next
 
-### 42. Don't return invalid nodes to callers, return semantic errors instead — OPEN
-
-Where: `HashSeq::move_element`, `mark_range`, `unmark_range` (`Result<HashNode, HashNode>`); the `admitted` bool and `mark_admissible` in `HashSeq::interpret`; the `map_err` sites in `src/wasm.rs` `seq_move`, `mark_range`, `mark_range_closed`, `unmark_range`.
-
-Problem: a refused op comes back as `Err(node)`, which says only "not applied". The gate knows why (target not an element, anchor not a glue point, self-move, inverted span) but folds it into a bool and drops it; the wasm error strings are inferred from context, not reported. No caller uses the returned node, and it is what trips `result_large_err` (four allows).
-
-Fix: `pub enum Refused { NotAnElement, NotAGluePoint, SelfMove, InvertedSpan }`; the helpers return `Result<HashNode, Refused>`; `interpret` produces the reason where it decides; wasm maps each variant to its own message; delete the four `#[allow(clippy::result_large_err)]`. Tests assert the variant, not `!contains_node`.
-
 ### 43. Rename the "gate" / "edge table" framing — OPEN
 
 Where: HASHWEB_SPEC.md "The edge table (the apply-time gate)" (~:103) is the source; the vocabulary spreads to ~170 mentions across `src/delivery.rs` (`gated`, `gate`), `src/hashseq.rs` and `src/hashkv.rs` (`interpret`'s `admitted` block, `mark_admissible`), `src/hash_node.rs`, `src/encoding.rs`, `src/hashweb.rs`, `src/wasm.rs`, and the specs FRAMEWORK.md:264, HASHSEQ_SPEC.md, HASHKV_SPEC.md, MARKS.md, MOVE.md, PLACEMENT_SPEC.md, GRAMMAR_SPEC.md, ENCODING_SPEC.md, HETEROGENEITY.md, OP_REFS.md, CYCLE_REVERT.md, BASECAMP_MODULE.md, APP_NOTES.md, SPEC_SCRATCH.md.
 
 Problem: the framing is wrong. What the table describes is which ops are well-formed for an object kind and its referents: a validity rule, decided once from hash-committed facts. "Gate" and "edge table" suggest a policy checkpoint and a routing structure, and they leak into names (`gated`, `gate`, `admitted`, "gate rows", "gate verdict") and into doc comments on the authoring helpers.
 
-Fix: pick one term for the rule (validity / admissibility / well-formedness) and one for the outcome (refused / invalid), rename the HASHWEB_SPEC section and its table heading, then sweep code identifiers and doc comments to match: `Delivery::gated` / `gate` (or gone, item 41), `interpret`'s `admitted`, `mark_admissible`, the `Refused` enum from item 42. Do alongside items 41 and 42, which touch the same code.
+Fix: pick one term for the rule (validity / admissibility / well-formedness) and one for the outcome (`Refused` is already the outcome type), rename the HASHWEB_SPEC section and its table heading, then sweep code identifiers and doc comments to match: `mark_admissible`, the `verdict` binding and "gate rows" comments in `interpret`, the `HashSeq` field doc that still lists what is "gated here today", and the spec prose.
 
 ## Core
+
+### 44. An interned `HashNode`: refs resolved to `NodeIdx` — OPEN
+
+Where: `src/hash_node.rs` (`HashNode`, `Op`, `Anchor`, `Payload`); the per-kind stored forms in `src/hashseq.rs` (`StoredRun` pins, `CausalRemove`, `RemoveRun`, `StoredMove`, `StoredMark`, `StoredPlace`) and `HashKv::nodes`; `node_at`, `all_nodes`, the `walk_deps` edge function, `interpret`, and the encoder's ref-index emission in `src/encoding.rs`.
+
+Problem: a `HashNode` names its refs by `Id` (32 bytes each), so every consumer that works in handle space re-resolves them: `interpret` probes `idx_of` per ref, the clock walk maps `iter_refs()` through `idx_of` per edge, the encoder maps ids to ref indices, and each stored form keeps its own handle-typed copy of the same layout (`SortedIdVec` pins, `NodeIdx` anchors and targets) with a hand-written reconstruction back to ids in `node_at` / `all_nodes` / `*_node`. `HashKv` stores whole `HashNode`s, ids and all.
+
+Fix: one interned node shape — the `HashNode` / `Op` structure with every ref a `NodeIdx` (pins as `SortedIdVec`, anchors as `(NodeIdx, side)`, targets and overwrites as handle sets; payloads, kinds and values stay `Id` since they are commitments, not refs). Resolve once at the apply seam (after the orphan check, when every ref is known to be present) and hand the interned form to `interpret`; make it the thing the stored forms carry or are built from; `node_at` becomes "map handles back through `ids`" in one place; the clock walk takes edges straight from it with no probes; the encoder emits ref indices from handles. Keep `HashNode` as the wire and hashing form only. Also retires the `insert_at` pre-resolution at the top of `HashSeq::interpret` and its `NodeIdx(u32::MAX)` sentinel for non-insert ops: the anchor becomes a field of the interned `Insert`. Subsumes the reconstruction half of item 5 and the per-kind-arm sprawl of item 14. Perf-gate on the sequential traces: the resolve-once must not cost more than the three probes `interpret` pays today.
 
 ### 3. Delta drain is O(n²) for non-ASCII runs — OPEN
 

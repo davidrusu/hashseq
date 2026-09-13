@@ -18,7 +18,7 @@ use crate::delivery::Delivery;
 use crate::hashseq::IdMap;
 use crate::placement::PlacementRegister;
 use crate::value::{TOMBSTONE, Value};
-use crate::{HashNode, Id, Op};
+use crate::{HashNode, Id, Op, Outcome, Refused};
 
 /// A key's register state: the live put heads, in id order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -209,7 +209,7 @@ impl HashKv {
     /// `put` by raw ids (links, already-provided artifacts, tombstone).
     pub fn put_ids(&mut self, key: Id, value: Id) -> HashNode {
         let node = self.make_put(key, value);
-        self.apply_with_id(node.id(), node.clone());
+        let _ = self.apply_with_id(node.id(), node.clone());
         node
     }
 
@@ -262,8 +262,6 @@ impl HashKv {
         }
     }
 
-    /// Iterate live keys (key value ids) — id order is the only total order
-    /// (key bytes can be pending); display ordering is a render concern.
     pub fn keys(&self) -> impl Iterator<Item = &Id> {
         self.keys
             .iter()
@@ -271,28 +269,22 @@ impl HashKv {
             .map(|(k, _)| k)
     }
 
-    // ---- apply ----
-
-    pub fn apply(&mut self, node: HashNode) -> bool {
+    pub fn apply(&mut self, node: HashNode) -> Result<Outcome, Refused> {
         let id = node.id();
         self.apply_with_id(id, node)
     }
 
-    /// Apply with a pre-computed id (`id` must be the node's true hash).
-    /// Iterative worklist: applying a node wakes exactly the orphans waiting
-    /// on its id.
-    /// Returns whether `node` was news (see `HashSeq::apply_with_id`).
-    pub fn apply_with_id(&mut self, id: Id, node: HashNode) -> bool {
+    pub fn apply_with_id(&mut self, id: Id, node: HashNode) -> Result<Outcome, Refused> {
         debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
         if self.contains_node(&id) {
-            return false;
+            return Ok(Outcome::Known);
         }
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
-        let news = self.orphan_or_dispatch(id, node, &mut queue);
+        let outcome = self.orphan_or_dispatch(id, node, &mut queue);
         while let Some((id, node)) = queue.pop() {
-            self.orphan_or_dispatch(id, node, &mut queue);
+            let _ = self.orphan_or_dispatch(id, node, &mut queue);
         }
-        news
+        outcome
     }
 
     /// The ref an orphan is keyed on: the first ref in `iter_refs` order
@@ -302,31 +294,28 @@ impl HashKv {
         node.iter_refs().find(|d| !self.contains_node(d)).copied()
     }
 
-    /// One step of the worklist: orphan `node` on its canonical missing
-    /// ref (a re-delivered orphan lands in the bucket it is already in),
-    /// or interpret it and wake its waiters. A refused node wakes nothing
-    /// — its dependents stay orphaned (the refusal cascades).
     fn orphan_or_dispatch(
         &mut self,
         id: Id,
         node: HashNode,
         queue: &mut Vec<(Id, HashNode)>,
-    ) -> bool {
+    ) -> Result<Outcome, Refused> {
         if let Some(key) = self.canonical_orphan_dependency(&node) {
-            return self.delivery.orphan(key, id, node);
+            return Ok(if self.delivery.orphan(key, id, node) {
+                Outcome::Orphaned
+            } else {
+                Outcome::Known
+            });
         }
-        // A refused node (Err) is dropped; its dependents stay orphaned.
-        let applied = self.interpret(id, node).is_ok();
-        if applied {
-            self.delivery.wake(&id, queue);
-        }
-        applied
+        // A refused node is dropped; its dependents stay orphaned.
+        self.interpret(id, node)?;
+        self.delivery.wake(&id, queue);
+        Ok(Outcome::Applied)
     }
 
     /// Interpret one node whose refs are all applied — this projection's
-    /// edge-table rows. `Err` hands the node back; the caller drops it.
-    #[allow(clippy::result_large_err)]
-    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), HashNode> {
+    /// edge-table rows. `Err` says why it was refused; the caller drops it.
+    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), Refused> {
         // Place is admitted in any object kind (PLACEMENT_SPEC.md): the
         // containment register concerns the object's placement, not its
         // content projection. placed_at is a commitment — nothing to gate.
@@ -350,7 +339,7 @@ impl HashKv {
             key, overwrites, ..
         } = &node.op
         else {
-            return Err(node);
+            return Err(Refused::WrongObjectKind);
         };
         let key = *key;
 
@@ -479,10 +468,10 @@ impl HashKv {
         // Apply in causal-safe order via the orphan machinery: node ids were
         // computed on the other side, reuse them.
         for (id, node) in other.nodes {
-            self.apply_with_id(id, node);
+            let _ = self.apply_with_id(id, node);
         }
         for (id, node) in other.delivery.into_orphans() {
-            self.apply_with_id(id, node);
+            let _ = self.apply_with_id(id, node);
         }
     }
 
@@ -503,7 +492,7 @@ impl HashKv {
                 overwrites,
             },
         };
-        self.apply_with_id(node.id(), node.clone());
+        let _ = self.apply_with_id(node.id(), node.clone());
         node
     }
 
@@ -596,7 +585,7 @@ mod tests {
                 overwrites: BTreeSet::new(),
             },
         };
-        kv.apply(node);
+        let _ = kv.apply(node);
         assert!(matches!(kv.read(&s("k")), Read::Conflict(_)));
     }
 
@@ -624,7 +613,7 @@ mod tests {
                 overwrites: BTreeSet::from_iter([a_head]),
             },
         };
-        kv.apply(node);
+        let _ = kv.apply(node);
         // A's register is untouched.
         assert_eq!(kv.get(&s("a")), Some(s("va")));
         assert_eq!(kv.get(&s("b")), Some(s("vb")));
@@ -639,7 +628,7 @@ mod tests {
             op: Op::insert_after(origin, 'x'),
         };
         let id = node.id();
-        kv.apply(node);
+        let _ = kv.apply(node);
         assert!(!kv.contains_node(&id));
         assert_eq!(kv.delivery.orphans().count(), 0, "dropped, not orphaned");
         assert!(kv.tips().len() == 1, "refused ops never enter tips");

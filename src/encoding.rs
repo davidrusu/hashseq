@@ -7,7 +7,7 @@ use crate::hashseq::{CausalRemove, Loc};
 use crate::hashweb::HashWeb;
 use crate::run::RunError;
 use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
-use crate::{Clock, HashWebClock};
+use crate::{Clock, HashWebClock, Outcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -1715,7 +1715,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 // `from_text` computed the element ids from the wire content —
                 // the authoritative derivation, so apply without rehashing.
                 for (id, node) in run.decompress_with_ids() {
-                    seq.apply_with_id(id, node);
+                    let _ = seq.apply_with_id(id, node);
                 }
                 ranks.runs.push(run.elements);
             }
@@ -1764,7 +1764,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                     let id = node.id();
                     prev_remove_id = Some(id);
                     exposed.push(id);
-                    seq.apply_with_id(id, node);
+                    let _ = seq.apply_with_id(id, node);
                 }
                 ranks.removes.push(exposed);
             }
@@ -1778,7 +1778,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 validate_node(&node)?;
                 let id = node.id();
                 ranks.removes.push(vec![id]);
-                seq.apply_with_id(id, node);
+                let _ = seq.apply_with_id(id, node);
             }
             BLK_REMOVE_OTHER => {
                 let pins = decode_ref_set(&mut c, &id_list, &ranks)?;
@@ -1820,7 +1820,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
                 validate_node(&node)?;
                 let id = node.id();
                 ranks.removes.push(vec![id]);
-                seq.apply_with_id(id, node);
+                let _ = seq.apply_with_id(id, node);
             }
             other => return Err(DecodeError::InvalidOpTag(other)),
         }
@@ -1836,7 +1836,7 @@ pub fn decode_hashseq(bytes: &[u8]) -> Result<HashSeq, DecodeError> {
             &mut |c| decode_ref(c, &id_list, &ranks),
             &mut |c| decode_ref_set(c, &id_list, &ranks),
         )?;
-        seq.apply(node);
+        let _ = seq.apply(node);
     }
 
     Ok(seq)
@@ -2043,7 +2043,7 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
         // Recomputed ids are the authoritative derivation.
         let id = node.id();
         emitted.push(id);
-        kv.apply_with_id(id, node);
+        let _ = kv.apply_with_id(id, node);
     }
 
     let held = c.step(decode_varint)?;
@@ -2052,7 +2052,7 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
         c.pos += used;
         match op {
             EncodableOp::Node(node) => {
-                kv.apply(node);
+                let _ = kv.apply(node);
             }
             EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
         }
@@ -2240,7 +2240,7 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
         c.pos += used;
         match op {
             EncodableOp::Node(node) => {
-                web.apply_to(obj, node);
+                let _ = web.apply_to(obj, node);
             }
             EncodableOp::Run(_) => return Err(DecodeError::InvalidOpTag(TAG_RUN)),
         }
@@ -2898,7 +2898,7 @@ mod tests {
         let e0 = a.id_at(0).unwrap();
         let last = a.id_at(a.len() - 1).unwrap();
         let mv = a.move_element(e0, crate::Anchor::After(last)).unwrap();
-        a.apply(HashNode {
+        let _ = a.apply(HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(mv.id(), 'x'),
         });
@@ -2977,13 +2977,13 @@ mod tests {
         let mut r2 = HashSeq::default();
         // Replica 2 sees the fork before the run continuation.
         for (id, node) in r1.all_nodes().into_iter().take(1) {
-            r2.apply_with_id(id, node); // 'a'
+            let _ = r2.apply_with_id(id, node); // 'a'
         }
-        r2.apply(fork.clone());
+        let _ = r2.apply(fork.clone());
         for (id, node) in r1.all_nodes() {
-            r2.apply_with_id(id, node); // 'b' (and 'a' dedup)
+            let _ = r2.apply_with_id(id, node); // 'b' (and 'a' dedup)
         }
-        r1.apply(fork);
+        let _ = r1.apply(fork);
 
         assert_eq!(r1, r2);
         assert_eq!(encode_hashseq(&r1), encode_hashseq(&r2));
@@ -3145,7 +3145,7 @@ mod family_wire {
             op: Op::insert_after(origin, 'x'),
         };
         let bad_id = bad.id();
-        a.apply(bad);
+        let _ = a.apply(bad);
         assert!(!a.contains_node(&bad_id));
         assert_eq!(encode_hashkv(&a), before);
 
@@ -3221,7 +3221,7 @@ mod family_wire {
 
         let mut fresh = HashWeb::new();
         for (id, node) in child_nodes {
-            fresh.apply_to_with_id(child, id, node);
+            let _ = fresh.apply_to_with_id(child, id, node);
         }
         assert_eq!(fresh.orphans().count(), 1);
 
@@ -3245,7 +3245,7 @@ mod family_wire {
         let child_nodes = a.seq(&child).unwrap().all_nodes();
         let mut fresh = HashWeb::new();
         for (id, node) in &child_nodes {
-            fresh.apply_to_with_id(child, *id, node.clone());
+            let _ = fresh.apply_to_with_id(child, *id, node.clone());
         }
         let bytes = encode_hashweb(&fresh);
 
@@ -3459,7 +3459,10 @@ pub fn apply_delta(web: &mut HashWeb, bytes: &[u8]) -> Result<usize, DecodeError
             match op {
                 EncodableOp::Node(node) => {
                     let id = node.id();
-                    if web.apply_to_with_id(obj, id, node) {
+                    if web
+                        .apply_to_with_id(obj, id, node)
+                        .is_ok_and(Outcome::is_news)
+                    {
                         delivered += 1;
                     }
                 }

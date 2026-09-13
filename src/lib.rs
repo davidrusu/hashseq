@@ -47,3 +47,56 @@ impl std::fmt::Debug for Id {
 /// simply not walked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Clock(pub std::collections::BTreeSet<Id>);
+
+/// Why the apply-time rules refused an op (HASHWEB_SPEC.md "The edge
+/// table"). Every verdict is a function of hash-committed facts, so it is
+/// the same on every replica and never changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// A move's target is not an element of this object.
+    NotAnElement,
+    /// An insert, move or mark anchor is not a glue point: an element, the
+    /// origin, or a move op's splice point.
+    NotAGluePoint,
+    /// A move whose destination is its own target.
+    SelfMove,
+    /// A mark whose start point sorts after its end point.
+    InvertedSpan,
+    /// An op kind this object's projection does not carry: a seq op in a
+    /// map, a map op in a seq.
+    WrongObjectKind,
+}
+
+/// What delivering a node did (`HashSeq::apply`, `HashKv::apply`,
+/// `HashWeb::apply_to`) when the rules did not refuse it; a refusal is
+/// the `Err(Refused)` of those calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Interned and interpreted; its waiters were woken.
+    Applied,
+    /// Seen for the first time but waiting on a missing ref (or, at the
+    /// store level, on an object not yet opened).
+    Orphaned,
+    /// Already applied or already orphaned: nothing changed.
+    Known,
+}
+
+impl Outcome {
+    /// Did this delivery change anything — apply or first-time orphan?
+    /// The signal a client uses to re-render and a relay uses to forward.
+    pub fn is_news(self) -> bool {
+        matches!(self, Outcome::Applied | Outcome::Orphaned)
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Refused::NotAnElement => "target is not an element",
+            Refused::NotAGluePoint => "anchor is not a glue point",
+            Refused::SelfMove => "an element cannot be moved next to itself",
+            Refused::InvertedSpan => "the span is inverted",
+            Refused::WrongObjectKind => "op kind does not belong in this object",
+        })
+    }
+}

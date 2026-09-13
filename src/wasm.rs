@@ -1108,7 +1108,7 @@ impl WasmHashWeb {
             Anchor::Before(seq.anchor_id_at(to_slot).expect("to_slot < len"))
         };
         seq.move_element(target, to)
-            .map_err(|_| app_err("move not admissible"))?;
+            .map_err(|r| app_err(&format!("move refused: {r}")))?;
         Ok(())
     }
 
@@ -1160,7 +1160,7 @@ impl WasmHashWeb {
         let (s, e) = anchor_range(seq, start, end)?;
         let node = seq
             .mark_range(s, e, kind_id, value_id)
-            .map_err(|_| app_err("mark not admissible: anchors do not bracket a span"))?;
+            .map_err(|r| app_err(&format!("mark refused: {r}")))?;
         Ok(id_to_hex(&node.id()))
     }
 
@@ -1193,7 +1193,7 @@ impl WasmHashWeb {
         let e = Anchor::After(seq.anchor_id_at(end - 1).expect("end-1 < len"));
         let node = seq
             .mark_range(s, e, kind_id, value_id)
-            .map_err(|_| app_err("mark not admissible: anchors do not bracket a span"))?;
+            .map_err(|r| app_err(&format!("mark refused: {r}")))?;
         Ok(id_to_hex(&node.id()))
     }
 
@@ -1217,7 +1217,7 @@ impl WasmHashWeb {
         let (s, e) = anchor_range(seq, start, end)?;
         let node = seq
             .unmark_range(s, e, kind_id)
-            .map_err(|_| app_err("unmark not admissible: anchors do not bracket a span"))?;
+            .map_err(|r| app_err(&format!("unmark refused: {r}")))?;
         Ok(id_to_hex(&node.id()))
     }
 
@@ -1390,11 +1390,11 @@ impl WasmHashWeb {
         let (op, _) = decode_op(op_bytes).map_err(|e| app_err(&format!("decode op: {e}")))?;
         match op {
             EncodableOp::Node(node) => {
-                self.inner.apply_to(obj, node);
+                let _ = self.inner.apply_to(obj, node);
             }
             EncodableOp::Run(run) => {
                 for (id, node) in run.decompress_with_ids() {
-                    self.inner.apply_to_with_id(obj, id, node);
+                    let _ = self.inner.apply_to_with_id(obj, id, node);
                 }
             }
         }

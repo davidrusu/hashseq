@@ -158,7 +158,7 @@ mod tests {
         let obj = web.create_seq(origin);
         assert_eq!(obj, object_id(KIND_SEQ, &origin));
         for (id, node) in a.all_nodes() {
-            web.apply_to_with_id(obj, id, node);
+            let _ = web.apply_to_with_id(obj, id, node);
         }
         let delivered = apply_delta(&mut web, msg).unwrap();
         assert_eq!(delivered, 5);

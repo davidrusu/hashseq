@@ -6,7 +6,7 @@ use crate::bitset::BitSet;
 use crate::delivery::Delivery;
 use crate::placement::PlacementRegister;
 use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepFrag, SweepPos};
-use crate::{Anchor, EncodableOp, HashNode, Id, Op, Payload, Run};
+use crate::{Anchor, EncodableOp, HashNode, Id, Op, Outcome, Payload, Refused, Run};
 
 /// HashMap keyed by `Id`. Uses FxHash instead of SipHash: safe because `Id` is
 /// already a BLAKE3 hash, so adversaries cannot craft colliding keys without
@@ -887,7 +887,7 @@ impl HashSeq {
         // Cursor-derived inserts anchor on applied elements/origin and are
         // always admitted, so the hot path applies directly — no clone.
         let mut prev_id = first_node.id();
-        self.apply_with_id(prev_id, first_node);
+        let _ = self.apply_with_id(prev_id, first_node);
 
         // After the first apply, tips == {prev_id}, so the chained nodes carry no
         // extra deps.
@@ -897,7 +897,7 @@ impl HashSeq {
                 op: Op::insert_after(prev_id, ch),
             };
             prev_id = node.id();
-            self.apply_with_id(prev_id, node);
+            let _ = self.apply_with_id(prev_id, node);
         }
     }
 
@@ -914,7 +914,7 @@ impl HashSeq {
         let node = self
             .make_insert_value(idx, payload)
             .expect("cursor_at is total for clamped idx");
-        self.apply_with_id(node.id(), node.clone());
+        let _ = self.apply_with_id(node.id(), node.clone());
         node
     }
 
@@ -929,7 +929,7 @@ impl HashSeq {
     /// `idx` is past the end (no characters were actually removed).
     pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
         let node = self.make_remove_batch(idx, amount)?;
-        self.apply_with_id(node.id(), node.clone());
+        let _ = self.apply_with_id(node.id(), node.clone());
         Some(node)
     }
 
@@ -1458,10 +1458,9 @@ impl HashSeq {
     }
 
     /// Author a move of the element at `target` to the glued point `to`,
-    /// superseding the heads this replica sees. Returns the applied node;
-    /// `Err` hands it back unapplied.
-    #[allow(clippy::result_large_err)]
-    pub fn move_element(&mut self, target: Id, to: Anchor) -> Result<HashNode, HashNode> {
+    /// superseding the heads this replica sees. Returns the applied node,
+    /// or why the rules refused it.
+    pub fn move_element(&mut self, target: Id, to: Anchor) -> Result<HashNode, Refused> {
         let overwrites: BTreeSet<Id> = self.move_heads(&target).into_iter().collect();
         let mut named: BTreeSet<Id> = overwrites.clone();
         named.insert(target);
@@ -1475,13 +1474,8 @@ impl HashSeq {
                 overwrites,
             },
         };
-        let id = node.id();
-        self.apply_with_id(id, node.clone());
-        if self.contains_node(&id) {
-            Ok(node)
-        } else {
-            Err(node)
-        }
+        self.apply(node.clone())?;
+        Ok(node)
     }
 
     /// Resolve a mark anchor to a glue point `(node, after-side)`: an
@@ -1501,16 +1495,20 @@ impl HashSeq {
     /// verdict is "gate": a zero-width splice slot for an already-applied
     /// move op is derived, convergence-neutral index state, not a trace of
     /// the gated mark.
-    fn mark_admissible(&mut self, start: &Anchor, end: &Anchor) -> bool {
+    fn mark_admissible(&mut self, start: &Anchor, end: &Anchor) -> Result<(), Refused> {
         let (Some(s), Some(e)) = (self.glue_point(start), self.glue_point(end)) else {
-            return false;
+            return Err(Refused::NotAGluePoint);
         };
         for (n, _) in [s, e] {
             if let Loc::MoveOp = self.loc_of(n) {
                 self.ensure_op_fragment(n);
             }
         }
-        self.cmp_points(s, e) != std::cmp::Ordering::Greater
+        if self.cmp_points(s, e) == std::cmp::Ordering::Greater {
+            Err(Refused::InvertedSpan)
+        } else {
+            Ok(())
+        }
     }
 
     /// Sweep position of a move op's fragment point (fragment must exist —
@@ -1664,7 +1662,7 @@ impl HashSeq {
                 overwrites,
             },
         };
-        self.apply_with_id(node.id(), node.clone());
+        let _ = self.apply_with_id(node.id(), node.clone());
         node
     }
 
@@ -1894,27 +1892,17 @@ impl HashSeq {
     /// Author a mark of `kind`/`value` over `[start, end]`, superseding the
     /// same-kind marks intersecting the range that this replica sees.
     /// Anchor-side choice encodes edge-expansion behavior (MARKS.md).
-    /// Returns the applied node; `Err` hands it back unapplied.
-    #[allow(clippy::result_large_err)]
+    /// Returns the applied node, or why it was refused.
     pub fn mark_range(
         &mut self,
         start: Anchor,
         end: Anchor,
         kind: Id,
         value: Id,
-    ) -> Result<HashNode, HashNode> {
+    ) -> Result<HashNode, Refused> {
         let (Some(s), Some(e)) = (self.glue_point(&start), self.glue_point(&end)) else {
             // Both anchors must be glue points before anything applies.
-            return Err(HashNode {
-                pins: BTreeSet::new(),
-                op: Op::Mark {
-                    start,
-                    end,
-                    kind_v: kind,
-                    value,
-                    overwrites: BTreeSet::new(),
-                },
-            });
+            return Err(Refused::NotAGluePoint);
         };
         // Overwrites hygiene (open problem 1, simple form): name every
         // same-kind mark whose span intersects the new range.
@@ -1948,25 +1936,19 @@ impl HashSeq {
                 overwrites,
             },
         };
-        let id = node.id();
-        self.apply_with_id(id, node.clone());
-        if self.contains_node(&id) {
-            Ok(node)
-        } else {
-            Err(node)
-        }
+        self.apply(node.clone())?;
+        Ok(node)
     }
 
     /// Remove `kind` formatting over `[start, end]`: a mark whose value is
     /// the tombstone artifact (partial unmark is the same op over a
     /// sub-range — the overwritten mark keeps applying outside it).
-    #[allow(clippy::result_large_err)]
     pub fn unmark_range(
         &mut self,
         start: Anchor,
         end: Anchor,
         kind: Id,
-    ) -> Result<HashNode, HashNode> {
+    ) -> Result<HashNode, Refused> {
         self.mark_range(start, end, kind, *crate::value::TOMBSTONE)
     }
 
@@ -2081,38 +2063,23 @@ impl HashSeq {
         self.index.insert_span_at(t, idx);
     }
 
-    pub fn apply(&mut self, node: HashNode) -> bool {
+    pub fn apply(&mut self, node: HashNode) -> Result<Outcome, Refused> {
         let id = node.id();
         self.apply_with_id(id, node)
     }
 
-    /// Apply a node with a pre-computed ID (avoids double hashing). The id
-    /// must be the node's true hash — callers either just computed it
-    /// (`apply`) or copied it from a locally-computed cache (`merge`, decode);
-    /// the wire never supplies ids directly.
-    ///
-    /// Iterative worklist, no recursion: applying a node wakes exactly the
-    /// orphans waiting on its id (which may re-orphan on their next missing
-    /// dep), so out-of-order delivery costs each node one orphan per missing
-    /// dep instead of a global retry per apply.
-    ///
-    /// Returns whether `node` was news: applied, or orphaned for the first
-    /// time. False for a replay of an applied or already-orphaned node,
-    /// and for a refused one (nothing changed).
-    pub fn apply_with_id(&mut self, id: Id, node: HashNode) -> bool {
+    /// Apply a node with a pre-computed ID (avoids double hashing).
+    pub fn apply_with_id(&mut self, id: Id, node: HashNode) -> Result<Outcome, Refused> {
         debug_assert_eq!(id, node.id(), "apply_with_id called with a wrong id");
         if self.contains_node(&id) {
-            return false;
+            return Ok(Outcome::Known);
         }
-        // `queue` only allocates when an apply actually wakes orphans;
-        // the common case (sequential typing, nothing orphaned) stays
-        // allocation-free and dispatches `node` directly.
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
-        let news = self.orphan_or_dispatch(id, node, &mut queue);
+        let outcome = self.orphan_or_dispatch(id, node, &mut queue);
         while let Some((id, node)) = queue.pop() {
-            self.orphan_or_dispatch(id, node, &mut queue);
+            let _ = self.orphan_or_dispatch(id, node, &mut queue);
         }
-        news
+        outcome
     }
 
     /// The ref an orphan is keyed on: the first ref in `iter_refs` order
@@ -2122,25 +2089,23 @@ impl HashSeq {
         node.iter_refs().find(|d| !self.contains_node(d)).copied()
     }
 
-    /// One step of the worklist: orphan `node` on its canonical missing
-    /// dep (a re-delivered orphan lands in the bucket it is already in),
-    /// or interpret it and wake its waiters. A refused node wakes nothing
-    /// — its dependents stay orphaned (the refusal cascades).
     fn orphan_or_dispatch(
         &mut self,
         id: Id,
         node: HashNode,
         queue: &mut Vec<(Id, HashNode)>,
-    ) -> bool {
+    ) -> Result<Outcome, Refused> {
         if let Some(key) = self.canonical_orphan_dependency(&node) {
-            return self.delivery.orphan(key, id, node);
+            return Ok(if self.delivery.orphan(key, id, node) {
+                Outcome::Orphaned
+            } else {
+                Outcome::Known
+            });
         }
-        // A refused node (Err) is dropped; its dependents stay orphaned.
-        let applied = self.interpret(id, node).is_ok();
-        if applied {
-            self.delivery.wake(&id, queue);
-        }
-        applied
+        // A refused node is dropped; its dependents stay orphaned.
+        self.interpret(id, node)?;
+        self.delivery.wake(&id, queue);
+        Ok(Outcome::Applied)
     }
 
     /// Interpret one node whose refs are all applied — this projection's
@@ -2149,73 +2114,45 @@ impl HashSeq {
     // make; boxing would buy an allocation per gated op for nothing.
     /// `insert_anchor`: the resolved anchor handle when `node` is an
     /// Insert (see `orphan_or_dispatch`), `None` otherwise.
-    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), ()> {
-        let insert_anchor = match &node.op {
-            Op::Insert { at, .. } => self.idx_of(at.id()),
-            _ => None,
+    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), Refused> {
+        // dereference insert anchor once for multiple use sites.
+        // only meaningful in Insert op contexts
+        let insert_at = match &node.op {
+            Op::Insert { at, .. } => self.idx_of_known(at.id()),
+            _ => NodeIdx(u32::MAX), // sentinel value
         };
 
-        // The apply-time gate: ops this projection does not admit are
-        // dropped before touching tips or the index. They never intern,
-        // so dependents stay orphaned (the correct edge-table semantics).
-        let admitted = match &node.op {
-            // The Insert.at row: the anchor must be a glued point — an
-            // element, a move op's splice point, or the origin. Anything
-            // else (a remove op, a mark op) gates: there is no gap to claim
-            // at a node that never renders. Payloads are never checked
-            // (opaque commitments — HASHSEQ_SPEC "Payload").
-            Op::Insert { .. } => insert_anchor.is_some_and(|a| {
-                matches!(self.loc_of(a), Loc::Run { .. } | Loc::Origin | Loc::MoveOp)
-            }),
-            // Removes admit unconditionally: a target that is not an insert
-            // is inert (its tombstone bit references nothing rendered),
-            // never an error.
-            Op::Remove(_) => true,
-            // The Move rows of the edge table (all stable — every input is a
-            // hash-committed fact about already-applied referents):
-            // target must be an element of THIS seq; the destination must be
-            // an element or the origin (a Move whose destination is another
-            // move op's splice point is not yet admitted — insert anchors on
-            // splice points ARE live); self-moves gate.
-            Op::Move { target, to, .. } => {
-                let t = self.idx_of(target);
-                let target_ok = t.is_some_and(|t| matches!(self.loc_of(t), Loc::Run { .. }));
-                // Destination: an element, the origin, or another move op's
-                // splice point — including an op that moves this same
-                // target ("put x where that op placed it"): the excision of
-                // the old rendering precedes placement, and a superseded
-                // op's rank is permanent, so the case is well-defined, not
-                // special.
-                let anchor_ok = self.idx_of(to.id()).is_some_and(|a| {
-                    matches!(self.loc_of(a), Loc::Run { .. } | Loc::Origin | Loc::MoveOp)
-                });
-                target_ok && anchor_ok && to.id() != target
+        match &node.op {
+            Op::Insert { .. } => {
+                if !matches!(
+                    self.loc_of(insert_at),
+                    Loc::Run { .. } | Loc::Origin | Loc::MoveOp
+                ) {
+                    return Err(Refused::NotAGluePoint);
+                }
             }
-            // The Mark rows (MARKS.md "Validation", all stable): anchors
-            // must resolve to glue points — elements, the origin, or move
-            // ops (splice-point span endpoints) — and the span must not be
-            // inverted: one comparison over permanent positions (base slots
-            // and op ranks), so no later op can flip the verdict. Checked in
-            // the Mark dispatch below (fragment materialization needs &mut).
-            Op::Mark { .. } => true,
-            // Place admits unconditionally (PLACEMENT_SPEC.md): placed_at
-            // is a value commitment nothing can verify at apply time, and
-            // every malformed relationship is inert at read time. No new
-            // gate rows.
-            Op::Place { .. } => true,
-            _ => false,
-        };
-        if !admitted {
-            return Err(());
-        }
+            Op::Move { target, to, .. } => {
+                let target_idx = self.idx_of_known(target);
 
-        // The mark rows need the sweep (fragment materialization takes
-        // &mut), so they are checked here rather than in the table above.
-        if let Op::Mark { start, end, .. } = &node.op
-            && !self.mark_admissible(&start.clone(), &end.clone())
-        {
-            return Err(());
-        }
+                // Move target must be a sequence element
+                if !matches!(self.loc_of(target_idx), Loc::Run { .. }) {
+                    return Err(Refused::NotAnElement);
+                }
+
+                let to_idx = self.idx_of_known(to.id());
+                let to_loc = self.loc_of(to_idx);
+                if !matches!(to_loc, Loc::Run { .. } | Loc::Origin | Loc::MoveOp) {
+                    return Err(Refused::NotAGluePoint);
+                }
+
+                if to_idx == target_idx {
+                    return Err(Refused::SelfMove);
+                }
+            }
+            Op::Mark { start, end, .. } => self.mark_admissible(start, end)?,
+            Op::Remove(_) | Op::Place { .. } => (),
+            _ => return Err(Refused::WrongObjectKind),
+        };
 
         for tip in node.iter_refs() {
             self.tips.remove(tip);
@@ -2246,10 +2183,9 @@ impl HashSeq {
                     ch,
                     payload,
                 };
-                let a = insert_anchor.expect("admitted above");
                 match at {
-                    Anchor::After(anchor) => self.insert_after(id, a, ci(anchor)),
-                    Anchor::Before(anchor) => self.insert_before(id, a, ci(anchor)),
+                    Anchor::After(anchor) => self.insert_after(id, insert_at, ci(anchor)),
+                    Anchor::Before(anchor) => self.insert_before(id, insert_at, ci(anchor)),
                 }
             }
             Op::Remove(nodes) => self.apply_remove(id, node.pins, nodes),
@@ -2502,13 +2438,13 @@ impl HashSeq {
         // reference elements not yet applied are ordered by the orphan
         // machinery, so the emission order does not matter.
         for (id, node) in other.all_nodes() {
-            self.apply_with_id(id, node);
+            let _ = self.apply_with_id(id, node);
         }
 
         // Apply the other side's orphans (ids were computed when
         // they were orphaned); ours may hold what they were missing.
         for (id, node) in other.delivery.into_orphans() {
-            self.apply_with_id(id, node);
+            let _ = self.apply_with_id(id, node);
         }
     }
 
@@ -2645,11 +2581,11 @@ impl HashSeq {
     pub fn apply_op(&mut self, op: EncodableOp) {
         match op {
             EncodableOp::Node(node) => {
-                self.apply(node);
+                let _ = self.apply(node);
             }
             EncodableOp::Run(run) => {
                 for node in run.decompress() {
-                    self.apply(node);
+                    let _ = self.apply(node);
                 }
             }
         }
@@ -2659,7 +2595,7 @@ impl HashSeq {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::Clock;
+    use crate::{Clock, Outcome, Refused};
     use quickcheck_macros::quickcheck;
 
     /// `PackedLoc` must round-trip every `Loc`, including handles and positions
@@ -2740,8 +2676,8 @@ mod test {
                 op: Op::Remove(BTreeSet::from_iter([r])),
                 pins: BTreeSet::new(),
             };
-            seq_a.apply(node.clone());
-            seq_b.apply(node);
+            let _ = seq_a.apply(node.clone());
+            let _ = seq_b.apply(node);
         }
 
         let mut iter_a = seq_a.iter_ids();
@@ -3146,7 +3082,7 @@ mod test {
             pins: BTreeSet::default(),
         };
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             op: Op::insert_after(insert.id(), 'a'),
             pins: BTreeSet::default(),
         });
@@ -3154,7 +3090,7 @@ mod test {
         assert_eq!(seq.orphans().count(), 1);
         assert_eq!(seq.len(), 0);
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             op: Op::insert_before(insert.id(), 'a'),
             pins: BTreeSet::default(),
         });
@@ -3162,7 +3098,7 @@ mod test {
         assert_eq!(seq.orphans().count(), 2);
         assert_eq!(seq.len(), 0);
 
-        seq.apply(insert);
+        let _ = seq.apply(insert);
 
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.len(), 3);
@@ -3183,13 +3119,13 @@ mod test {
             pins: BTreeSet::new(),
         };
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             op: Op::Remove(BTreeSet::from_iter([insert.id()])),
             pins: BTreeSet::new(),
         });
 
         assert_eq!(seq.orphans().count(), 1);
-        seq.apply(insert);
+        let _ = seq.apply(insert);
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(&String::from_iter(seq.iter()), "");
     }
@@ -3337,7 +3273,7 @@ mod test {
 
         let mut seq = HashSeq::default();
         for node in nodes.into_iter().rev() {
-            seq.apply(node);
+            let _ = seq.apply(node);
         }
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.len(), n);
@@ -3363,11 +3299,11 @@ mod test {
 
         for (first, second) in [(a.clone(), b.clone()), (b, a)] {
             let mut seq = HashSeq::default();
-            seq.apply(c.clone());
+            let _ = seq.apply(c.clone());
             assert_eq!(seq.orphans().count(), 1);
-            seq.apply(first);
+            let _ = seq.apply(first);
             assert_eq!(seq.orphans().count(), 1, "still missing one dep");
-            seq.apply(second);
+            let _ = seq.apply(second);
             assert_eq!(seq.orphans().count(), 0);
             assert_eq!(seq.len(), 3);
             assert!(seq.iter().collect::<String>().contains('c'));
@@ -3399,9 +3335,9 @@ mod test {
                 (n2, n1)
             };
             let mut seq = HashSeq::default();
-            seq.apply(root.clone());
-            seq.apply(small);
-            seq.apply(big);
+            let _ = seq.apply(root.clone());
+            let _ = seq.apply(small);
+            let _ = seq.apply(big);
             check_index_matches_iter(&seq);
         }
     }
@@ -3639,7 +3575,7 @@ mod test {
         let removed = seq.iter_ids().nth(1).copied().unwrap();
         seq.remove(1);
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             op: Op::Remove(BTreeSet::from_iter([removed])),
             pins: BTreeSet::new(),
         });
@@ -3932,7 +3868,7 @@ mod test {
             op: Op::insert_after(seq_a.id_at(0).unwrap(), 'y'),
         };
 
-        seq_a.apply(node.clone());
+        let _ = seq_a.apply(node.clone());
         seq_b.apply_op(EncodableOp::Node(node));
 
         assert_eq!(
@@ -3954,7 +3890,7 @@ mod test {
         run.extend('c');
 
         for node in run.decompress() {
-            seq_a.apply(node);
+            let _ = seq_a.apply(node);
         }
         seq_b.apply_op(EncodableOp::Run(run));
 
@@ -4224,7 +4160,7 @@ mod test {
         let expect: String = std::iter::once('b')
             .chain(sibs.iter().map(|s| s.1))
             .collect();
-        seq.apply(x);
+        let _ = seq.apply(x);
         assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
     }
@@ -4247,7 +4183,7 @@ mod test {
             op: Op::insert_after(b, 'c'),
         };
         let expect = if m.id() < cnode.id() { "bac" } else { "bca" };
-        seq.apply(cnode);
+        let _ = seq.apply(cnode);
         assert_eq!(seq.iter().collect::<String>(), expect);
         check_index_matches_iter(&seq);
     }
@@ -4433,7 +4369,7 @@ mod test {
                         } else {
                             Op::insert_before(m, 's')
                         };
-                        seq.apply(HashNode {
+                        let _ = seq.apply(HashNode {
                             pins: BTreeSet::new(),
                             op,
                         });
@@ -4487,7 +4423,7 @@ mod test {
                     let mut named: BTreeSet<Id> = BTreeSet::new();
                     named.insert(*start.id());
                     named.insert(*end.id());
-                    seq.apply(HashNode {
+                    let _ = seq.apply(HashNode {
                         pins: BTreeSet::new(),
                         op: Op::Mark {
                             start,
@@ -4774,7 +4710,7 @@ mod test {
                 op: Op::insert_after(anchor, 'X'),
             };
             let id = node.id();
-            seq.apply(node);
+            let _ = seq.apply(node);
             assert!(!seq.contains_node(&id), "refused, not applied");
         }
         assert_eq!(seq.orphans().count(), 0, "refused, not orphaned");
@@ -4901,7 +4837,7 @@ mod test {
         let err = seq
             .mark_range(Anchor::Before(c), Anchor::Before(a), bold(), yes())
             .unwrap_err();
-        assert!(!seq.contains_node(&err.id()));
+        assert_eq!(err, Refused::InvertedSpan);
         assert_eq!(seq.orphans().count(), 0);
         assert!(seq.delta_for(&peer).is_empty(), "nothing shipped");
         assert_eq!(
@@ -4912,7 +4848,7 @@ mod test {
 
         // A self-move is refused the same way.
         let err = seq.move_element(c, Anchor::After(c)).unwrap_err();
-        assert!(!seq.contains_node(&err.id()));
+        assert_eq!(err, Refused::SelfMove);
         assert!(seq.delta_for(&peer).is_empty());
         assert_eq!(seq.tips(), &frontier);
     }
@@ -4933,7 +4869,7 @@ mod test {
         let b_clock = a.clock(); // last sent to B
         assert!(a.delta_for(&b_clock).is_empty());
         for n in &d {
-            b.apply_with_id(n.id(), n.clone());
+            let _ = b.apply_with_id(n.id(), n.clone());
         }
         assert_eq!(b.iter().collect::<String>(), "ab");
         assert_eq!(b.clock(), b_clock, "B now holds exactly what we sent");
@@ -4947,7 +4883,7 @@ mod test {
         b.insert_batch(2, "c".chars());
         let d = b.delta_for(&a_clock);
         assert_eq!(d.len(), 1);
-        a.apply_with_id(d[0].id(), d[0].clone());
+        let _ = a.apply_with_id(d[0].id(), d[0].clone());
         let b_clock = b.clock();
         assert!(a.delta_for(&b_clock).is_empty(), "no echo");
         a.insert_batch(3, "d".chars());
@@ -4966,14 +4902,14 @@ mod test {
             op: Op::insert_after(a0, 'Q'),
         };
         let q_id = q.id();
-        a.apply_with_id(q_id, q);
+        let _ = a.apply_with_id(q_id, q);
         let d = a.delta_for(&b_clock);
         assert_eq!(d.iter().map(|n| n.id()).collect::<Vec<_>>(), vec![q_id]);
         let b_clock = a.clock();
         assert!(a.delta_for(&b_clock).is_empty());
 
         // Re-applying a known node changes nothing.
-        a.apply(d[0].clone());
+        let _ = a.apply(d[0].clone());
         assert!(a.delta_for(&b_clock).is_empty());
     }
 
@@ -4995,7 +4931,7 @@ mod test {
         let (n_id, n) = nodes[1].clone(); // y
         let (m_id, m) = nodes[2].clone(); // z, anchored after y
         // z arrives first and orphans on y.
-        a.apply_with_id(m_id, m.clone());
+        let _ = a.apply_with_id(m_id, m.clone());
         assert_eq!(a.orphans().count(), 1);
         // A's user types the identical y: interned, then z wakes behind it.
         a.insert_batch(1, "y".chars());
@@ -5008,8 +4944,8 @@ mod test {
         // The same with y arriving from the peer instead.
         let mut a2 = HashSeq::default();
         a2.insert_batch(0, "x".chars());
-        a2.apply_with_id(m_id, m.clone());
-        a2.apply_with_id(n_id, n.clone());
+        let _ = a2.apply_with_id(m_id, m.clone());
+        let _ = a2.apply_with_id(n_id, n.clone());
         assert_eq!(a2.iter().collect::<String>(), "xyz");
         assert!(a2.delta_for(&b_clock).is_empty());
         a2.insert_batch(3, "w".chars());
@@ -5049,7 +4985,7 @@ mod test {
         let d = seq.delta_for(&clock);
         let mut peer = snapshot.clone();
         for n in &d {
-            peer.apply_with_id(n.id(), n.clone());
+            let _ = peer.apply_with_id(n.id(), n.clone());
             assert_eq!(peer.orphans().count(), 0, "apply order is causal");
         }
         assert_eq!(
@@ -5141,7 +5077,7 @@ mod test {
         // nothing orphaned.
         let mut fresh = HashSeq::default();
         for (id, node) in &since {
-            fresh.apply_with_id(*id, node.clone());
+            let _ = fresh.apply_with_id(*id, node.clone());
             assert_eq!(fresh.orphans().count(), 0);
         }
         assert_eq!(
@@ -5228,8 +5164,7 @@ mod test {
             seq.unmark_range(Anchor::Before(rm), Anchor::After(a), bold()),
         ];
         for r in &refused {
-            let node = r.as_ref().unwrap_err();
-            assert!(!seq.contains_node(&node.id()), "never applied: {node:?}");
+            assert_eq!(*r.as_ref().unwrap_err(), Refused::NotAGluePoint);
         }
 
         assert_eq!(seq.orphans().count(), 0);
@@ -5262,7 +5197,7 @@ mod test {
 
         // Type between a and b (a before-child of b: inside Before(b),
         // outside After(a)).
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_before(b, 'x'),
         });
@@ -5344,7 +5279,7 @@ mod test {
         seq.unmark_range(Anchor::Before(ids[1]), Anchor::After(ids[2]), bold())
             .unwrap();
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(ids[1], 'x'),
         });
@@ -5363,7 +5298,7 @@ mod test {
             .unwrap();
         seq.remove_batch(1, 2); // tombstone b, c
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(ids[1], 'x'),
         });
@@ -5380,7 +5315,7 @@ mod test {
         let a = seq.id_at(0).unwrap();
         let b = seq.id_at(1).unwrap();
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             pins: BTreeSet::new(),
             op: Op::Mark {
                 start: Anchor::Before(b),
@@ -5531,7 +5466,7 @@ mod test {
         let a = seq.id_at(1).unwrap();
         let op = seq.move_element(m, Anchor::After(a)).unwrap(); // renders after a
 
-        seq.apply(HashNode {
+        let _ = seq.apply(HashNode {
             pins: BTreeSet::new(),
             op: Op::Mark {
                 start: Anchor::After(op.id()),
@@ -5617,12 +5552,12 @@ mod test {
             .unwrap();
 
         let mut fresh = HashSeq::default();
-        fresh.apply(mark);
+        let _ = fresh.apply(mark);
         assert_eq!(fresh.orphans().count(), 1);
         assert!(fresh.mark_nodes.is_empty());
         for (id, node) in source.all_nodes() {
             if matches!(node.op, Op::Insert { .. }) {
-                fresh.apply_with_id(id, node);
+                let _ = fresh.apply_with_id(id, node);
             }
         }
         assert_eq!(fresh.orphans().count(), 0);
@@ -5682,7 +5617,7 @@ mod test {
             },
         };
         assert_eq!(by_id.id(), node.id());
-        other.apply(by_id);
+        let _ = other.apply(by_id);
         assert_eq!(other.iter().collect::<String>(), "azb");
         assert_eq!(other.payload_of(&z), None);
     }
@@ -5702,7 +5637,7 @@ mod test {
             },
         };
         let id = node.id();
-        seq.apply(node);
+        let _ = seq.apply(node);
         assert!(!seq.contains_node(&id));
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.placement_of(&a), None);
@@ -5726,7 +5661,7 @@ mod test {
             },
         };
         let id = node.id();
-        seq.apply(node);
+        let _ = seq.apply(node);
         assert!(!seq.contains_node(&id));
         assert_eq!(seq.orphans().count(), 0);
         let _ = b;
@@ -5752,8 +5687,12 @@ mod test {
             },
         };
         let id = self_move.id();
-        assert!(!seq.apply(self_move.clone()), "refused: nothing changed");
-        assert!(!seq.apply(self_move), "re-delivery: refused again");
+        assert_eq!(seq.apply(self_move.clone()), Err(Refused::SelfMove));
+        assert_eq!(
+            seq.apply(self_move),
+            Err(Refused::SelfMove),
+            "re-delivery: refused again"
+        );
         assert!(!seq.contains_node(&id));
         assert_eq!(seq.orphans().count(), 0);
         assert_eq!(seq.tips(), &frontier);
@@ -5789,12 +5728,13 @@ mod test {
         };
         let x = dependent.id();
         // Either arrival order ends the same way.
-        assert!(seq.apply(dependent.clone()), "orphaned: news");
-        assert!(
-            !seq.apply(dependent.clone()),
-            "re-delivered orphan: not news"
+        assert_eq!(seq.apply(dependent.clone()), Ok(Outcome::Orphaned));
+        assert_eq!(
+            seq.apply(dependent.clone()),
+            Ok(Outcome::Known),
+            "re-delivered orphan"
         );
-        assert!(!seq.apply(self_move.clone()));
+        assert_eq!(seq.apply(self_move.clone()), Err(Refused::SelfMove));
         assert!(!seq.contains_node(&m));
         assert!(!seq.contains_node(&x));
         assert_eq!(seq.orphans().count(), 1);
@@ -5805,7 +5745,7 @@ mod test {
         other.merge(seq.clone());
         assert_eq!(other.orphans().count(), 1, "the orphaned dependent travels");
         assert!(!other.contains_node(&m), "the refused op does not");
-        other.apply(self_move);
+        let _ = other.apply(self_move);
         assert_eq!(
             other.orphans().count(),
             1,
@@ -5836,8 +5776,8 @@ mod test {
         let b = seq.id_at(1).unwrap();
         let c = seq.id_at(2).unwrap();
 
-        seq.apply(raw_move(a, Anchor::After(c), &[b]));
-        seq.apply(raw_move(a, Anchor::Before(b), &[b]));
+        let _ = seq.apply(raw_move(a, Anchor::After(c), &[b]));
+        let _ = seq.apply(raw_move(a, Anchor::Before(b), &[b]));
         assert!(seq.placement_conflicted(&a));
         // No genuine common ancestor: bottoms out at creation.
         assert_eq!(seq.placement_of(&a), None);
@@ -5859,8 +5799,8 @@ mod test {
         let q = seq.move_element(b, Anchor::After(c)).unwrap().id();
         assert_eq!(seq.iter().collect::<String>(), "acb");
 
-        seq.apply(raw_move(a, Anchor::After(c), &[q]));
-        seq.apply(raw_move(a, Anchor::Before(c), &[q]));
+        let _ = seq.apply(raw_move(a, Anchor::After(c), &[q]));
+        let _ = seq.apply(raw_move(a, Anchor::Before(c), &[q]));
         assert!(seq.placement_conflicted(&a));
         assert_eq!(seq.placement_of(&a), None);
         assert_eq!(seq.placement_of(&b), Some(Anchor::After(c)));
@@ -5892,7 +5832,7 @@ mod test {
         let mv = other.move_element(a, Anchor::After(c)).unwrap();
 
         let mut fresh = HashSeq::default();
-        fresh.apply(mv); // orphans: target unknown
+        let _ = fresh.apply(mv); // orphans: target unknown
         assert_eq!(fresh.orphans().count(), 1);
         fresh.merge(seq);
         assert_eq!(fresh.placement_of(&a), Some(Anchor::After(c)));
