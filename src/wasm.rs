@@ -280,9 +280,10 @@ impl WasmHashSeq {
         for (head, run) in &s.runs {
             // Origin-anchored runs are the document's top level — emitted
             // with no anchor, like the old standalone root nodes.
-            let is_top_level = *run.at.id() == s.origin();
+            let at = run.at.to_anchor(&s.ids);
+            let is_top_level = *at.id() == s.origin();
 
-            let (kind, rel) = match run.at {
+            let (kind, rel) = match at {
                 _ if is_top_level => ("root", "after"),
                 Anchor::After(_) => ("run", "after"),
                 Anchor::Before(_) => ("before", "before"),
@@ -290,7 +291,7 @@ impl WasmHashSeq {
             let (parent, parent_offset) = if is_top_level {
                 (None, None)
             } else {
-                let (box_id, off) = resolve(run.at.id());
+                let (box_id, off) = resolve(at.id());
                 (Some(id_to_hex(&box_id)), Some(off))
             };
             // Per-element tombstone state — one '0'/'1' per char, aligned

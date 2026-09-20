@@ -15,7 +15,8 @@ use std::collections::{BTreeSet, BinaryHeap};
 use rustc_hash::FxHashMap;
 
 use crate::delivery::Delivery;
-use crate::hashseq::IdMap;
+use crate::hashseq::{IdMap, NodeIdx};
+use crate::interned_hash_node::{InternedHashNode, InternedOp};
 use crate::placement::PlacementRegister;
 use crate::value::{TOMBSTONE, Value};
 use crate::{HashNode, Id, Op, Outcome, Refused};
@@ -41,14 +42,19 @@ pub enum Read {
     Conflict(Vec<Id>),
 }
 
+/// The origin's arena slot — always the first.
+const ORIGIN_SLOT: NodeIdx = NodeIdx(0);
+
 #[derive(Debug, Clone)]
 pub struct HashKv {
     /// The origin anchor: the arbitrary 32-byte value this object's
     /// creator chose (often another op's id — the composition convention).
     origin: Id,
-    /// Applied puts by node id (the register history — retention: keep all;
-    /// the supersession spine is what the read rules walk).
-    pub(crate) nodes: IdMap<HashNode>,
+    /// Applied nodes (the register history — retention: keep all; the
+    /// supersession spine is what the read rules walk), interned against
+    /// `order` and parallel to it: the node at arena slot `s` is
+    /// `nodes[s - 1]` — slot 0 is the origin, which has no node.
+    pub(crate) nodes: Vec<InternedHashNode>,
     /// key value-id -> register. Keyed by the key's id — already a BLAKE3
     /// output, so FxHash is safe (the HASHKV_SPEC key rule: adversarial key
     /// bytes cost their author derivation, never a table).
@@ -62,8 +68,10 @@ pub struct HashKv {
     pub(crate) values: IdMap<Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Applied node ids in apply order — the map's arena, append-only
-    /// (orphans never enter). Deps precede dependents, so
-    /// the position is the clock walk's order (`delta_for`).
+    /// (orphans never enter), and the id table the interned nodes' handles
+    /// index. Slot 0 is the origin: an axiom, present so refs to it resolve
+    /// like any other. Deps precede dependents, so the position is the
+    /// clock walk's order (`delta_for`).
     pub(crate) order: Vec<Id>,
     /// Arena position by id (`order[slot[id]] == id`).
     pub(crate) slot: IdMap<u32>,
@@ -99,7 +107,7 @@ impl HashKv {
     pub fn new(origin: Id) -> Self {
         let mut kv = Self {
             origin,
-            nodes: IdMap::default(),
+            nodes: Vec::new(),
             keys: IdMap::default(),
             values: IdMap::default(),
             tips: BTreeSet::new(),
@@ -112,6 +120,8 @@ impl HashKv {
         };
         // The origin is axiomatically present: the map's frontier begins at
         // it, so a fresh map's first put pins {origin}.
+        kv.slot.insert(origin, ORIGIN_SLOT.0);
+        kv.order.push(origin);
         kv.tips.insert(origin);
         kv
     }
@@ -125,7 +135,16 @@ impl HashKv {
     }
 
     pub(crate) fn contains_node(&self, id: &Id) -> bool {
-        *id == self.origin || self.nodes.contains_key(id)
+        self.slot.contains_key(id)
+    }
+
+    fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
+        self.slot.get(id).map(|s| NodeIdx(*s))
+    }
+
+    /// The applied node at arena slot `idx` (not the origin's).
+    fn node(&self, idx: NodeIdx) -> &InternedHashNode {
+        &self.nodes[idx.0 as usize - 1]
     }
 
     /// Store a value artifact's bytes (resolves `pending` reads of its id).
@@ -146,28 +165,34 @@ impl HashKv {
     /// keeps `get`/`resolve` on an object inside a `HashWeb` from missing
     /// values the web holds. Bounded by what the node references.
     pub(crate) fn hydrate(&mut self, node: &HashNode, store: &IdMap<Vec<u8>>) {
-        let Op::Put { key, value, .. } = &node.op else {
-            return;
-        };
-        for id in [key, value] {
-            if !self.values.contains_key(id)
-                && let Some(bytes) = store.get(id)
+        if let Op::Put { key, value, .. } = &node.op {
+            self.hydrate_ids([*key, *value], store);
+        }
+    }
+
+    fn hydrate_ids(&mut self, ids: [Id; 2], store: &IdMap<Vec<u8>>) {
+        for id in ids {
+            if !self.values.contains_key(&id)
+                && let Some(bytes) = store.get(&id)
             {
-                self.values.insert(*id, bytes.clone());
+                self.values.insert(id, bytes.clone());
             }
         }
     }
 
     /// `hydrate` over every node this object holds (applied and orphaned).
     pub(crate) fn hydrate_all(&mut self, store: &IdMap<Vec<u8>>) {
-        let nodes: Vec<HashNode> = self
-            .nodes
-            .values()
-            .cloned()
-            .chain(self.delivery.orphans().map(|(_, n)| n.clone()))
-            .collect();
-        for node in &nodes {
-            self.hydrate(node, store);
+        let applied = self.nodes.iter().map(|n| match &n.op {
+            InternedOp::Put { key, value, .. } => Some([*key, *value]),
+            _ => None,
+        });
+        let orphaned = self.delivery.orphans().map(|(_, n)| match &n.op {
+            Op::Put { key, value, .. } => Some([*key, *value]),
+            _ => None,
+        });
+        let named: Vec<[Id; 2]> = applied.chain(orphaned).flatten().collect();
+        for ids in named {
+            self.hydrate_ids(ids, store);
         }
     }
 
@@ -234,8 +259,8 @@ impl HashKv {
         let heads = self.heads(key);
         let live: Vec<Id> = heads
             .iter()
-            .filter_map(|h| match &self.nodes[h].op {
-                Op::Put { value, .. } => Some(*value),
+            .map(|h| match &self.node(NodeIdx(self.slot[h])).op {
+                InternedOp::Put { value, .. } => *value,
                 _ => unreachable!("heads hold puts"),
             })
             .collect();
@@ -287,67 +312,65 @@ impl HashKv {
         outcome
     }
 
-    /// The ref an orphan is keyed on: the first ref in `iter_refs` order
-    /// that is not applied here (see `HashSeq::canonical_orphan_dependency`
-    /// for why that key is stable while the node stays orphaned).
-    pub(crate) fn canonical_orphan_dependency(&self, node: &HashNode) -> Option<Id> {
-        node.iter_refs().find(|d| !self.contains_node(d)).copied()
-    }
-
+    /// Resolve the node's refs to arena slots — once — or orphan it on the
+    /// first ref (in `iter_refs` order) that is not applied here (see
+    /// `HashSeq::orphan_or_dispatch` for why that key matters).
     fn orphan_or_dispatch(
         &mut self,
         id: Id,
         node: HashNode,
         queue: &mut Vec<(Id, HashNode)>,
     ) -> Result<Outcome, Refused> {
-        if let Some(key) = self.canonical_orphan_dependency(&node) {
-            return Ok(if self.delivery.orphan(key, id, node) {
-                Outcome::Orphaned
-            } else {
-                Outcome::Known
-            });
-        }
+        let interned = match InternedHashNode::resolve(&node, |r| self.idx_of(r)) {
+            Ok(interned) => interned,
+            Err(missing) => {
+                return Ok(if self.delivery.orphan(missing, id, node) {
+                    Outcome::Orphaned
+                } else {
+                    Outcome::Known
+                });
+            }
+        };
         // A refused node is dropped; its dependents stay orphaned.
-        self.interpret(id, node)?;
+        self.interpret(id, interned)?;
         self.delivery.wake(&id, queue);
         Ok(Outcome::Applied)
     }
 
-    /// Interpret one node whose refs are all applied — this projection's
-    /// admission rows. `Err` says why it was refused; the caller drops it.
-    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), Refused> {
-        // Place is admitted in any object kind (PLACEMENT_SPEC.md): the
-        // containment register concerns the object's placement, not its
-        // content projection. placed_at is a commitment — nothing to refuse.
-        if let Op::Place {
-            placed_at,
-            overwrites,
-        } = &node.op
-        {
-            for r in node.iter_refs() {
-                self.tips.remove(r);
-            }
-            self.tips.insert(id);
-            self.placement.apply(id, *placed_at, overwrites.clone());
-            self.admit(id, node);
-            return Ok(());
-        }
-
-        // Admission: only map ops are admitted here (a seq op in a
-        // Map is ill-typed — stable, permanent).
-        let Op::Put {
-            key, overwrites, ..
-        } = &node.op
-        else {
+    /// Interpret one node whose refs are all applied (so it arrives
+    /// interned) — this projection's admission rows. `Err` says why it was
+    /// refused; the caller drops it.
+    fn interpret(&mut self, id: Id, node: InternedHashNode) -> Result<(), Refused> {
+        // Admission: Place is admitted in any object kind
+        // (PLACEMENT_SPEC.md) — the containment register concerns the
+        // object's placement, not its content projection, and placed_at is
+        // a commitment: nothing to refuse. Otherwise only map ops are
+        // admitted here (a seq op in a Map is ill-typed — stable, permanent).
+        if !matches!(node.op, InternedOp::Put { .. } | InternedOp::Place { .. }) {
             return Err(Refused::WrongObjectKind);
-        };
-        let key = *key;
+        }
 
         // tips update: everything referenced leaves the frontier.
-        for r in node.iter_refs() {
-            self.tips.remove(r);
+        for r in node.refs() {
+            self.tips.remove(&self.order[r.0 as usize]);
         }
         self.tips.insert(id);
+
+        let (key, overwrites) = match &node.op {
+            InternedOp::Place {
+                placed_at,
+                overwrites,
+            } => {
+                self.placement
+                    .apply(id, *placed_at, overwrites.to_id_set(&self.order));
+                self.admit(id, node);
+                return Ok(());
+            }
+            InternedOp::Put {
+                key, overwrites, ..
+            } => (*key, overwrites),
+            _ => unreachable!("refused above"),
+        };
 
         // heads(k) = heads(k) − overwrites(u) ∪ {u}, with the definitional
         // same-key filter: we only touch THIS key's head list, so an
@@ -355,7 +378,7 @@ impl HashKv {
         // here — ignored, never an error (it cannot corrupt another
         // register).
         let ks = self.keys.entry(key).or_default();
-        ks.heads.retain(|h| !overwrites.contains(h));
+        ks.heads.retain(|h| !overwrites.contains(h, &self.order));
         let pos = ks.heads.binary_search(&id).unwrap_or_else(|p| p);
         ks.heads.insert(pos, id);
 
@@ -364,16 +387,18 @@ impl HashKv {
     }
 
     /// Store an admitted node: the register history plus the arena slot.
-    fn admit(&mut self, id: Id, node: HashNode) {
-        self.nodes.insert(id, node);
+    fn admit(&mut self, id: Id, node: InternedHashNode) {
         self.slot.insert(id, self.order.len() as u32);
         self.order.push(id);
+        self.nodes.push(node);
     }
 
     /// Every applied node in apply order (causally safe: each node's refs
     /// precede it).
     pub fn nodes_in_apply_order(&self) -> impl Iterator<Item = (Id, HashNode)> + '_ {
-        self.order.iter().map(|id| (*id, self.nodes[id].clone()))
+        let ids = self.order.iter().skip(1); // slot 0 is the origin
+        ids.zip(&self.nodes)
+            .map(|(id, node)| (*id, node.to_node(&self.order)))
     }
 
     /// This replica's clock for the object: what a peer that has
@@ -386,8 +411,8 @@ impl HashKv {
     /// The delta for the peer behind `clock`: every applied node outside
     /// the peer's causal closure, in apply order (see `HashSeq::delta_for`).
     /// Same sweep as `HashSeq::delta_for` over the map's arena (`order`,
-    /// apply order; `slot` for the reverse lookup). The origin has no
-    /// slot, so it is never walked or shipped.
+    /// apply order; `slot` for the reverse lookup). The origin is an
+    /// axiom, not a node, so it is never walked or shipped.
     pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
         const OURS: u8 = 1;
         const PEER: u8 = 2;
@@ -442,18 +467,21 @@ impl HashKv {
         }
         out.reverse();
         out.into_iter()
-            .filter_map(|i| Some(self.nodes[&self.order[i]].clone()))
+            .map(|i| self.node(NodeIdx(i as u32)).to_node(&self.order))
             .collect()
     }
 
+    /// The walk's view of a slot: the origin is an axiom, not a node.
     #[inline]
     fn walk_idx(&self, id: &Id) -> Option<usize> {
-        self.slot.get(id).map(|s| *s as usize)
+        self.idx_of(id)
+            .filter(|i| *i != ORIGIN_SLOT)
+            .map(|i| i.0 as usize)
     }
 
     fn walk_deps(&self, i: usize, out: &mut Vec<usize>) {
-        let node = &self.nodes[&self.order[i]];
-        out.extend(node.iter_refs().filter_map(|r| self.walk_idx(r)));
+        let refs = self.node(NodeIdx(i as u32)).refs();
+        out.extend(refs.filter(|r| *r != ORIGIN_SLOT).map(|r| r.0 as usize));
     }
 
     pub fn merge(&mut self, other: Self) {
@@ -461,13 +489,14 @@ impl HashKv {
             self.origin, other.origin,
             "cannot merge maps with different origins"
         );
+        // Apply order is causally safe; node ids were computed on the other
+        // side, reuse them.
+        let nodes = other.all_nodes();
         // Value artifacts merge by union (content-addressed — no conflicts).
         for (vid, bytes) in other.values {
             self.values.entry(vid).or_insert(bytes);
         }
-        // Apply in causal-safe order via the orphan machinery: node ids were
-        // computed on the other side, reuse them.
-        for (id, node) in other.nodes {
+        for (id, node) in nodes {
             let _ = self.apply_with_id(id, node);
         }
         for (id, node) in other.delivery.into_orphans() {
@@ -502,7 +531,7 @@ impl HashKv {
 
     /// Every applied node as `(id, HashNode)` (orphans not included).
     pub fn all_nodes(&self) -> Vec<(Id, HashNode)> {
-        self.nodes.iter().map(|(id, n)| (*id, n.clone())).collect()
+        self.nodes_in_apply_order().collect()
     }
 
     /// Value artifacts this replica holds bytes for.

@@ -1,0 +1,367 @@
+//! The interned node: a `HashNode` with every ref resolved to a `NodeIdx`.
+//!
+//! `HashNode` is the wire and hashing form: it names its refs by `Id`.
+//! Everything past the apply seam works in handle space, so a node is
+//! resolved once — when every ref is known to be present — and the interned
+//! form is what `interpret` consumes, what the stored forms are built from,
+//! and what `node_at` maps back through the id table.
+//!
+//! Only refs are interned. Payloads, keys, mark kinds and values stay `Id`:
+//! they are commitments, not refs, and need not be in the object's id table.
+//!
+//! Handles are replica-local (see `NodeIdx`), so nothing here may be hashed,
+//! compared across replicas, or put on the wire; set-valued roles are
+//! `SortedIdVec`s, which keep `Id` order.
+
+use crate::hashseq::{NodeIdx, SortedIdVec};
+use crate::{Anchor, HashNode, Id, Op, Payload};
+
+/// The glued point in handle space: `Anchor` with its id resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternedAnchor {
+    Before(NodeIdx),
+    After(NodeIdx),
+}
+
+impl InternedAnchor {
+    #[inline]
+    pub fn idx(&self) -> NodeIdx {
+        match self {
+            InternedAnchor::Before(i) | InternedAnchor::After(i) => *i,
+        }
+    }
+
+    #[inline]
+    pub fn is_after(&self) -> bool {
+        matches!(self, InternedAnchor::After(_))
+    }
+
+    #[inline]
+    pub fn is_before(&self) -> bool {
+        matches!(self, InternedAnchor::Before(_))
+    }
+
+    /// The point as `(node, after-side)` — the shape the glue-point
+    /// comparisons take.
+    #[inline]
+    pub fn point(&self) -> (NodeIdx, bool) {
+        (self.idx(), self.is_after())
+    }
+
+    /// Map the handle back through the id table (`ids[h.0]` is `h`'s id).
+    #[inline]
+    pub fn to_anchor(&self, ids: &[Id]) -> Anchor {
+        match self {
+            InternedAnchor::Before(i) => Anchor::Before(ids[i.0 as usize]),
+            InternedAnchor::After(i) => Anchor::After(ids[i.0 as usize]),
+        }
+    }
+
+    #[inline]
+    fn resolve(a: &Anchor, to_handle: &mut impl FnMut(&Id) -> Option<NodeIdx>) -> Result<Self, Id> {
+        let idx = to_handle(a.id()).ok_or(*a.id())?;
+        Ok(match a {
+            Anchor::Before(_) => InternedAnchor::Before(idx),
+            Anchor::After(_) => InternedAnchor::After(idx),
+        })
+    }
+}
+
+/// `Op` in handle space: named refs (anchors, targets, overwrites) are
+/// handles; value commitments stay ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InternedOp {
+    Insert {
+        at: InternedAnchor,
+        payload: Payload,
+    },
+    /// Targets in `Id` order.
+    Remove(SortedIdVec),
+    Move {
+        target: NodeIdx,
+        to: InternedAnchor,
+        overwrites: SortedIdVec,
+    },
+    Put {
+        key: Id,
+        value: Id,
+        overwrites: SortedIdVec,
+    },
+    Mark {
+        start: InternedAnchor,
+        end: InternedAnchor,
+        kind_v: Id,
+        value: Id,
+        overwrites: SortedIdVec,
+    },
+    Place {
+        placed_at: Id,
+        overwrites: SortedIdVec,
+    },
+}
+
+/// `HashNode` in handle space: `refs(u) = pins ∪ named(u)`, every member a
+/// handle into the owning object's id table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternedHashNode {
+    pub pins: SortedIdVec,
+    pub op: InternedOp,
+}
+
+impl InternedHashNode {
+    /// Resolve every ref of `node` through `to_handle`, once. `Err` is the
+    /// first ref in `HashNode::iter_refs` order that is not present — the
+    /// key the node orphans on, so the walk order here must stay that order.
+    pub fn resolve(
+        node: &HashNode,
+        mut to_handle: impl FnMut(&Id) -> Option<NodeIdx>,
+    ) -> Result<Self, Id> {
+        let h = &mut to_handle;
+        let pins = SortedIdVec::try_from_id_set(&node.pins, &mut *h)?;
+        let op = match &node.op {
+            Op::Insert { at, payload } => InternedOp::Insert {
+                at: InternedAnchor::resolve(at, h)?,
+                payload: *payload,
+            },
+            Op::Remove(targets) => InternedOp::Remove(SortedIdVec::try_from_id_set(targets, h)?),
+            Op::Move {
+                target,
+                to,
+                overwrites,
+            } => InternedOp::Move {
+                target: h(target).ok_or(*target)?,
+                to: InternedAnchor::resolve(to, h)?,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+            },
+            Op::Put {
+                key,
+                value,
+                overwrites,
+            } => InternedOp::Put {
+                key: *key,
+                value: *value,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+            },
+            Op::Mark {
+                start,
+                end,
+                kind_v,
+                value,
+                overwrites,
+            } => InternedOp::Mark {
+                start: InternedAnchor::resolve(start, h)?,
+                end: InternedAnchor::resolve(end, h)?,
+                kind_v: *kind_v,
+                value: *value,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+            },
+            Op::Place {
+                placed_at,
+                overwrites,
+            } => InternedOp::Place {
+                placed_at: *placed_at,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+            },
+        };
+        Ok(InternedHashNode { pins, op })
+    }
+
+    /// Every handle this node references, in `HashNode::iter_refs` order.
+    pub fn refs(&self) -> impl Iterator<Item = NodeIdx> + '_ {
+        let (primary, secondary, set) = match &self.op {
+            InternedOp::Insert { at, .. } => (Some(at.idx()), None, None),
+            InternedOp::Remove(targets) => (None, None, Some(targets)),
+            InternedOp::Move {
+                target,
+                to,
+                overwrites,
+            } => (Some(*target), Some(to.idx()), Some(overwrites)),
+            InternedOp::Mark {
+                start,
+                end,
+                overwrites,
+                ..
+            } => (Some(start.idx()), Some(end.idx()), Some(overwrites)),
+            InternedOp::Put { overwrites, .. } | InternedOp::Place { overwrites, .. } => {
+                (None, None, Some(overwrites))
+            }
+        };
+        self.pins
+            .iter()
+            .chain(primary)
+            .chain(secondary)
+            .chain(set.into_iter().flatten())
+    }
+
+    /// The wire form: every handle mapped back through the id table
+    /// (`ids[h.0]` is `h`'s id). No rehashing — the node's own id is
+    /// `ids[its handle]`.
+    pub fn to_node(&self, ids: &[Id]) -> HashNode {
+        let op = match &self.op {
+            InternedOp::Insert { at, payload } => Op::Insert {
+                at: at.to_anchor(ids),
+                payload: *payload,
+            },
+            InternedOp::Remove(targets) => Op::Remove(targets.to_id_set(ids)),
+            InternedOp::Move {
+                target,
+                to,
+                overwrites,
+            } => Op::Move {
+                target: ids[target.0 as usize],
+                to: to.to_anchor(ids),
+                overwrites: overwrites.to_id_set(ids),
+            },
+            InternedOp::Put {
+                key,
+                value,
+                overwrites,
+            } => Op::Put {
+                key: *key,
+                value: *value,
+                overwrites: overwrites.to_id_set(ids),
+            },
+            InternedOp::Mark {
+                start,
+                end,
+                kind_v,
+                value,
+                overwrites,
+            } => Op::Mark {
+                start: start.to_anchor(ids),
+                end: end.to_anchor(ids),
+                kind_v: *kind_v,
+                value: *value,
+                overwrites: overwrites.to_id_set(ids),
+            },
+            InternedOp::Place {
+                placed_at,
+                overwrites,
+            } => Op::Place {
+                placed_at: *placed_at,
+                overwrites: overwrites.to_id_set(ids),
+            },
+        };
+        HashNode {
+            pins: self.pins.to_id_set(ids),
+            op,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn tid(n: u8) -> Id {
+        Id([n; 32])
+    }
+
+    fn sample_nodes() -> Vec<HashNode> {
+        let pins = BTreeSet::from_iter([tid(7), tid(9)]);
+        vec![
+            HashNode {
+                pins: BTreeSet::new(),
+                op: Op::insert_after(tid(1), 'x'),
+            },
+            HashNode {
+                pins: pins.clone(),
+                op: Op::Insert {
+                    at: Anchor::Before(tid(2)),
+                    payload: Payload::Id(tid(0x33)),
+                },
+            },
+            HashNode {
+                pins: pins.clone(),
+                op: Op::Remove(BTreeSet::from_iter([tid(1), tid(2)])),
+            },
+            HashNode {
+                pins: pins.clone(),
+                op: Op::Move {
+                    target: tid(1),
+                    to: Anchor::Before(tid(2)),
+                    overwrites: BTreeSet::from_iter([tid(3)]),
+                },
+            },
+            HashNode {
+                pins: pins.clone(),
+                op: Op::Put {
+                    key: tid(0x11),
+                    value: tid(0x22),
+                    overwrites: BTreeSet::from_iter([tid(3), tid(4)]),
+                },
+            },
+            HashNode {
+                pins: pins.clone(),
+                op: Op::Mark {
+                    start: Anchor::Before(tid(1)),
+                    end: Anchor::After(tid(2)),
+                    kind_v: tid(0x30),
+                    value: tid(0x31),
+                    overwrites: BTreeSet::from_iter([tid(3)]),
+                },
+            },
+            HashNode {
+                pins,
+                op: Op::Place {
+                    placed_at: tid(0x44),
+                    overwrites: BTreeSet::from_iter([tid(3), tid(4)]),
+                },
+            },
+        ]
+    }
+
+    /// An id table holding `tid(0)..tid(15)` at handle `n`: sorted by id, so
+    /// handle order and id order coincide.
+    fn table() -> Vec<Id> {
+        (0..16).map(tid).collect()
+    }
+
+    fn lookup(ids: &[Id]) -> impl FnMut(&Id) -> Option<NodeIdx> + '_ {
+        |id| ids.iter().position(|i| i == id).map(|p| NodeIdx(p as u32))
+    }
+
+    #[test]
+    fn resolve_then_to_node_is_identity() {
+        let ids = table();
+        for node in sample_nodes() {
+            let interned = InternedHashNode::resolve(&node, lookup(&ids)).expect("all refs known");
+            assert_eq!(interned.to_node(&ids), node);
+        }
+    }
+
+    #[test]
+    fn refs_follow_iter_refs_order() {
+        let ids = table();
+        for node in sample_nodes() {
+            let interned = InternedHashNode::resolve(&node, lookup(&ids)).expect("all refs known");
+            let via_handles: Vec<Id> = interned.refs().map(|h| ids[h.0 as usize]).collect();
+            let via_ids: Vec<Id> = node.iter_refs().copied().collect();
+            assert_eq!(via_handles, via_ids);
+        }
+    }
+
+    /// The orphan key: the first ref in `iter_refs` order that is missing.
+    #[test]
+    fn resolve_reports_first_missing_ref_in_iter_refs_order() {
+        let ids = table();
+        for node in sample_nodes() {
+            let refs: Vec<Id> = node.iter_refs().copied().collect();
+            for missing_from in 0..refs.len() {
+                // Everything from `missing_from` on is unknown.
+                let unknown: BTreeSet<Id> = refs[missing_from..].iter().copied().collect();
+                let got = InternedHashNode::resolve(&node, |id| {
+                    if unknown.contains(id) {
+                        None
+                    } else {
+                        lookup(&ids)(id)
+                    }
+                });
+                let want = refs.iter().find(|r| unknown.contains(r)).copied();
+                assert_eq!(got.err(), want);
+            }
+        }
+    }
+}

@@ -1,16 +1,20 @@
 # Queue
 
-Statuses: OPEN, DECISION (needs a call), DEFERRED (only alongside named work). Numbers are stable; remove an item when it is done.
+- can we consolidate insert_before and insert_after functions now?
+- rename NodeIdx to InternedId
+- Loc::ensure_glue_point/::ensure_element that return result to simplify validation logic
 
 ## Core
 
-### 44. An interned `HashNode`: refs resolved to `NodeIdx` — OPEN
+### 44. Encoder block layer in handle space — OPEN
 
-Where: `src/hash_node.rs` (`HashNode`, `Op`, `Anchor`, `Payload`); the per-kind stored forms in `src/hashseq.rs` (`StoredRun` pins, `CausalRemove`, `RemoveRun`, `StoredMove`, `StoredMark`, `StoredPlace`) and `HashKv::nodes`; `node_at`, `all_nodes`, the `walk_deps` edge function, `interpret`, and the encoder's ref-index emission in `src/encoding.rs`.
+Where: `src/encoding.rs` block derivation and emit (`CanonRun`, `Block`, `Payload`, `visit_refs`, `producer`, `resolve` / `encode_ref`); `encode_hashkv_with_store`.
 
-Problem: a `HashNode` names its refs by `Id` (32 bytes each), so every consumer that works in handle space re-resolves them: `interpret` probes `idx_of` per ref, the clock walk maps `iter_refs()` through `idx_of` per edge, the encoder maps ids to ref indices, and each stored form keeps its own handle-typed copy of the same layout (`SortedIdVec` pins, `NodeIdx` anchors and targets) with a hand-written reconstruction back to ids in `node_at` / `all_nodes` / `*_node`. `HashKv` stores whole `HashNode`s, ids and all.
+Done so far: `InternedHashNode` (`src/interned_hash_node.rs`) is the `HashNode` / `Op` shape with every ref a `NodeIdx`. Both projections resolve a node once at the apply seam (`orphan_or_dispatch`; the `Err` is the orphan key) and `interpret` takes the interned form; the stored forms are built from it by move (`StoredRun.at`, `StoredMove.to`, `StoredMark.start/end` are `InternedAnchor`s); `HashSeq::interned_at` is the one stored-form → node seam and `node_at` is `interned_at(..).to_node(&ids)`; the clock walk and the encoder's depth pass take edges from `HashSeq::for_each_ref` with no probes; `HashKv::nodes` is a `Vec<InternedHashNode>` parallel to `order` (origin at slot 0). The encoder no longer calls `idx_of`. Perf-gated: `target/perf/item44-baseline-d203db5.txt` vs `item44-after.txt`, encoded bytes unchanged.
 
-Fix: one interned node shape — the `HashNode` / `Op` structure with every ref a `NodeIdx` (pins as `SortedIdVec`, anchors as `(NodeIdx, side)`, targets and overwrites as handle sets; payloads, kinds and values stay `Id` since they are commitments, not refs). Resolve once at the apply seam (after the orphan check, when every ref is known to be present) and hand the interned form to `interpret`; make it the thing the stored forms carry or are built from; `node_at` becomes "map handles back through `ids`" in one place; the clock walk takes edges straight from it with no probes; the encoder emits ref indices from handles. Keep `HashNode` as the wire and hashing form only. Also retires the `insert_at` pre-resolution at the top of `HashSeq::interpret` and its `NodeIdx(u32::MAX)` sentinel for non-insert ops: the anchor becomes a field of the interned `Insert`. Subsumes the reconstruction half of item 5 and the per-kind-arm sprawl of item 14. Perf-gate on the sequential traces: the resolve-once must not cost more than the three probes `interpret` pays today.
+Problem: the block layer still works in id space. `CanonRun.first_pins` / `interior`, `Payload::*::extra_deps` / `targets` and `Block.exposed` are rebuilt as `BTreeSet<Id>` / `Vec<Id>` from handles, `producer` is an `FxHashMap<Id, _>` over every exposed id, and `encode_ref` hashes a 32-byte id per ref to find its block. The kv encoder likewise sorts `all_nodes()` and ranks through an `index_of: FxHashMap<Id, usize>`.
+
+Fix: keep block bodies as handles (`SortedIdVec` pins, `NodeIdx` targets), make `producer` a `Vec<(u32, u32)>` indexed by handle, and go to ids only for the dictionary and for orphans (whose refs may be unknown). Byte-identical output is the gate: the strict round-trip and determinism tests, plus the size tables of `sequential_traces`.
 
 ### 3. Delta drain is O(n²) for non-ASCII runs — OPEN
 
@@ -28,13 +32,13 @@ Problem: each has a seq loop and a kv loop differing only in `KIND_SEQ`/`KIND_KV
 
 Fix: share the loop body (hoist `encode_hashweb_with`'s `ObjRef { Map, Seq }`). If per-drain cost shows, a per-object dirty flag skips objects untouched since the clock last advanced.
 
-### 5. `node_at` duplicates `all_nodes` — OPEN
+### 5. The run pin/anchor convention is derived in three places — OPEN
 
-Where: `src/hashseq.rs` `node_at`, `all_nodes`, `remove_run_nodes`.
+Where: `src/hashseq.rs` `interned_at` / `for_each_ref` (Run arm), `src/encoding.rs` `elem_pins` / `elem_anchor`, `src/run.rs` `Run::decompress_with_ids`.
 
-Problem: two full per-`Loc`-kind reconstructors. The RemoveChain arm is `remove_run_nodes`' body, the MultiRemove arm is `all_nodes`' literal, the Run arm re-derives the pin/anchor convention that `elem_pins`/`elem_anchor` (encoding.rs ~914-943) and `Run::decompress_with_ids` already encode. `merge` uses `all_nodes`, the clock uses `node_at`; only a test keeps them agreeing.
+Problem: "element 0 carries `at` + `first_pins`, element `i > 0` is `After(elements[i-1])` + `interior_pins[i]`" is written out in each. (The per-kind reconstructors are gone: `node_at` is `interned_at(..).to_node(&ids)`, and `all_nodes` uses it for everything but char runs, which stay batched per run so item 3's cost does not leak into merge.)
 
-Fix: extract `remove_run_node(rr, i)`; own the MultiRemove literal in one place; `all_nodes = nodes_in_apply_order().collect()`, batched per run so item 3's cost does not leak into merge.
+Fix: one `StoredRun::elem(pos) -> (InternedAnchor, Option<&SortedIdVec>)` that the three share.
 
 ### 6. Stale doc comments from the FirstOp→Anchor rename — OPEN
 
@@ -104,7 +108,7 @@ Fix: only alongside the next change that touches `attach_at`, and measure.
 
 Where: `src/hashseq.rs` ~:1006.
 
-Problem: the admission whitelist (interpret ~:2114/2137, `glue_point` ~:1479), the rendered-vs-splice-ghost predicate (`index_target` ~:1010, `ensure_op_fragment` ~:1421, `op_point_pos` ~:1509, `hashseq_iter.rs:87`), and the `ensure_op_fragment` pre-call at 5 sites.
+Problem: the admission whitelist (now one predicate, `is_glue_point`), the rendered-vs-splice-ghost predicate (`index_target` ~:1010, `ensure_op_fragment` ~:1421, `op_point_pos` ~:1509, `hashseq_iter.rs:87`), and the `ensure_op_fragment` pre-call at 5 sites.
 
 Fix: one `resolve_glue(anchor) -> Option<IndexTarget>`.
 
@@ -112,9 +116,9 @@ Fix: one `resolve_glue(anchor) -> Option<IndexTarget>`.
 
 Where: `src/hashseq.rs` ~:106 `PackedLoc` and the per-kind side tables.
 
-Problem: 3-bit kind with 7 of 8 used, `_ => Loc::MultiRemove` catch-all, no debug_assert on kind range in `pack`; every kind has its own side table plus a hand-written arm in interpret / `all_nodes` / `node_at` / merge / encoder depth walk / encoder trailing section. The next-but-one op kind silently corrupts the handle.
+Problem: 3-bit kind with 7 of 8 used, `_ => Loc::MultiRemove` catch-all, no debug_assert on kind range in `pack`. The next-but-one op kind silently corrupts the handle. Every kind still has its own side table, but the hand-written arms are down to three: `interpret`, `interned_at` (the reconstruction seam every walker shares) and `for_each_ref` (its allocation-free edge twin, kept equal by `check_for_each_ref_matches_interned_refs`).
 
-Fix: at minimum a debug_assert on the kind range and a comment on the budget. Longer term, one reconstruction seam per kind that all walkers share.
+Fix: a debug_assert on the kind range and a comment on the budget.
 
 ### 15. Sibling attachment implemented twice — OPEN
 

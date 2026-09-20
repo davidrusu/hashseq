@@ -458,7 +458,7 @@ mod hashseq_viz {
                     let mut r: Vec<Id> = seq
                         .runs
                         .iter()
-                        .filter(|(_, run)| *run.at.id() == seq.origin())
+                        .filter(|(_, run)| seq.id_of(run.at.idx()) == seq.origin())
                         .map(|(head, _)| seq.id_of(*head))
                         .collect();
                     r.sort();
@@ -516,7 +516,7 @@ mod hashseq_viz {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let parent = before_run.at.id();
+                    let parent = &seq.id_of(before_run.at.idx());
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &self.node_pos) {
                         // Get all siblings (nodes before the same parent).
                         // befores() yields sorted order already.
@@ -555,8 +555,7 @@ mod hashseq_viz {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let targets: Vec<Id> =
-                        remove_node.nodes.iter().map(|t| seq.id_of(*t)).collect();
+                    let targets: Vec<Id> = remove_node.nodes.iter_ids(&seq.ids).collect();
                     let target_pos = if !targets.is_empty() {
                         let p: Vector = targets
                             .iter()
@@ -598,7 +597,7 @@ mod hashseq_viz {
                     // Determine target position based on run structure
                     let target_pos = {
                         // Has left dependencies
-                        let parent = *run.at.id();
+                        let parent = seq.id_of(run.at.idx());
                         if let Some(p) = get_node_right_edge(&parent, &self.node_pos) {
                             // Check how many siblings this run has (concurrent branches from same parent).
                             // afters() yields sorted order already.

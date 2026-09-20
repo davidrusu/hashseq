@@ -298,7 +298,7 @@ pub fn encode_run(run: &Run, buf: &mut Vec<u8>) {
         Anchor::After(_) => RUN_OP_AFTER,
         Anchor::Before(_) => RUN_OP_BEFORE,
     });
-    encode_id(&run.at.id(), buf);
+    encode_id(run.at.id(), buf);
     encode_id_set(&run.first_pins, buf);
     encode_string(&run.run, buf);
     // Interior extra-deps: varint count + (varint offset, id_set) entries,
@@ -770,6 +770,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         },
     }
     struct Block {
+        head: NodeIdx,
         head_id: Id,
         exposed: Vec<Id>,
         payload: Payload,
@@ -807,85 +808,10 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // spills; ENCODING_SPEC.md open problem 5).
     let mut depth: Vec<u64> = vec![0; seq.ids.len()];
     for i in 0..seq.ids.len() {
-        let idx = NodeIdx(i as u32);
+        // Refs only: a Place's `placed_at` is a foreign commitment — not in
+        // this object's id table, so it cannot affect depth.
         let mut d = 0u64;
-        {
-            let mut bump = |r: NodeIdx| d = d.max(depth[r.0 as usize] + 1);
-            match seq.loc_of(idx) {
-                Loc::Origin => {}
-                Loc::Run { run, pos } => {
-                    let r = &seq.runs[&run];
-                    if pos > 0 {
-                        bump(r.elements[pos as usize - 1]);
-                        if let Some(p) = r.interior_pins.get(&(pos as usize)) {
-                            for h in p.iter() {
-                                bump(h);
-                            }
-                        }
-                    } else {
-                        if let Some(a) = seq.idx_of(&r.at.id()) {
-                            bump(a);
-                        }
-                        for h in r.first_pins.iter() {
-                            bump(h);
-                        }
-                    }
-                }
-                Loc::RemoveChain { chain, pos } => {
-                    let c = &seq.remove_runs[&chain];
-                    bump(c.targets[pos as usize]);
-                    if pos > 0 {
-                        bump(c.links[pos as usize - 1]);
-                    } else {
-                        for h in c.first_extra_deps.iter() {
-                            bump(h);
-                        }
-                    }
-                }
-                Loc::MultiRemove => {
-                    let m = &seq.remove_nodes[&idx];
-                    for h in m.pins.iter() {
-                        bump(h);
-                    }
-                    for &t in m.nodes.iter() {
-                        bump(t);
-                    }
-                }
-                Loc::MoveOp => {
-                    let mv = &seq.move_nodes[&idx];
-                    bump(mv.target);
-                    bump(mv.to_anchor);
-                    for h in mv.overwrites.iter() {
-                        bump(h);
-                    }
-                    for h in mv.pins.iter() {
-                        bump(h);
-                    }
-                }
-                Loc::PlaceOp => {
-                    let sp = &seq.place_nodes[&idx];
-                    // placed_at is a foreign commitment — not in this
-                    // object's id table, so it cannot affect depth.
-                    for h in sp.overwrites.iter() {
-                        bump(h);
-                    }
-                    for h in sp.pins.iter() {
-                        bump(h);
-                    }
-                }
-                Loc::MarkOp => {
-                    let mk = &seq.mark_nodes[&idx];
-                    bump(mk.start_anchor);
-                    bump(mk.end_anchor);
-                    for h in mk.overwrites.iter() {
-                        bump(h);
-                    }
-                    for h in mk.pins.iter() {
-                        bump(h);
-                    }
-                }
-            }
-        }
+        seq.for_each_ref(NodeIdx(i as u32), |r| d = d.max(depth[r.0 as usize] + 1));
         depth[i] = d;
     }
 
@@ -936,10 +862,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             (Anchor::After(seq.id_of(p)), Some(p))
         } else {
             let r = &seq.runs[&run];
-            let anchor_elem = seq
-                .idx_of(&r.at.id())
-                .filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }));
-            (r.at, anchor_elem)
+            let anchor_elem =
+                Some(r.at.idx()).filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }));
+            (r.at.to_anchor(&seq.ids), anchor_elem)
         }
     };
 
@@ -1008,6 +933,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     for (ci, cr) in canon_runs.iter().enumerate() {
         let exposed: Vec<Id> = cr.elements.iter().map(|e| seq.id_of(*e)).collect();
         blocks.push(Block {
+            head: cr.elements[0],
             head_id: exposed[0],
             exposed,
             payload: Payload::Run(ci),
@@ -1030,9 +956,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // link r -> stored-chain heads whose first deps are exactly {id(r)}.
     let mut heads_pinning: FxHashMap<NodeIdx, Vec<NodeIdx>> = FxHashMap::default();
     for chain in seq.remove_runs.values() {
-        let deps: Vec<Id> = chain.first_extra_deps.iter_ids(&seq.ids).collect();
-        if let [d] = deps[..]
-            && let Some(di) = seq.idx_of(&d)
+        if let [di] = *chain.first_extra_deps.as_slice()
             && link_pos.contains_key(&di)
         {
             heads_pinning.entry(di).or_default().push(chain.links[0]);
@@ -1054,12 +978,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         let parent = if i > 0 {
             Some(seq.remove_runs[&key].links[i - 1])
         } else {
-            let deps: Vec<Id> = seq.remove_runs[&key]
-                .first_extra_deps
-                .iter_ids(&seq.ids)
-                .collect();
-            match deps[..] {
-                [d] => seq.idx_of(&d).filter(|di| link_pos.contains_key(di)),
+            match *seq.remove_runs[&key].first_extra_deps.as_slice() {
+                [di] => Some(di).filter(|di| link_pos.contains_key(di)),
                 _ => None,
             }
         };
@@ -1140,6 +1060,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     let exposed: Vec<Id> = links[i..j].iter().map(|l| seq.id_of(*l)).collect();
                     if j - i > 1 {
                         blocks.push(Block {
+                            head: links[i],
                             head_id: exposed[0],
                             exposed,
                             payload: Payload::RemoveSpan {
@@ -1152,6 +1073,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                         });
                     } else {
                         blocks.push(Block {
+                            head: links[i],
                             head_id: exposed[0],
                             exposed,
                             payload: Payload::Single {
@@ -1165,6 +1087,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 None => {
                     let id = seq.id_of(links[i]);
                     blocks.push(Block {
+                        head: links[i],
                         head_id: id,
                         exposed: vec![id],
                         payload: Payload::Other {
@@ -1185,8 +1108,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     multi_removes.sort_by_key(|(idx, _)| seq.id_of(*idx));
     for (idx, remove) in &multi_removes {
         let id = seq.id_of(*idx);
-        let targets = remove.nodes.iter().map(|t| seq.id_of(*t)).collect();
+        let targets = remove.nodes.iter_ids(&seq.ids).collect();
         blocks.push(Block {
+            head: *idx,
             head_id: id,
             exposed: vec![id],
             payload: Payload::Other {
@@ -1243,7 +1167,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     let visit_refs = |block: &Block, f: &mut dyn FnMut(&Id, bool)| match &block.payload {
         Payload::Run(ci) => {
             let cr = &canon_runs[*ci];
-            f(&cr.at.id(), false);
+            f(cr.at.id(), false);
             for id in &cr.first_pins {
                 f(id, false);
             }
@@ -1323,13 +1247,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // late deps spill to the dictionary — an id-order pick would instead
     // force-emit an essentially random cycle member, spilling anchor after
     // anchor until the old chain happens to be chosen.
-    let block_depth: Vec<u64> = blocks
-        .iter()
-        .map(|b| {
-            let idx = seq.idx_of(&b.head_id).expect("block heads are applied");
-            depth[idx.0 as usize]
-        })
-        .collect();
+    let block_depth: Vec<u64> = blocks.iter().map(|b| depth[b.head.0 as usize]).collect();
 
     let mut emit_pos = vec![usize::MAX; nb]; // block index -> emit position
     let mut order: Vec<usize> = Vec::with_capacity(nb);
@@ -1414,17 +1332,13 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             .orphans()
             .map(|(id, node)| (*id, node.clone()))
             .collect();
-        for (idx, mv) in &seq.move_nodes {
-            nodes.push((seq.id_of(*idx), seq.move_node(*idx, mv)));
-        }
-        for (idx, mk) in &seq.mark_nodes {
-            nodes.push((seq.id_of(*idx), seq.mark_node(mk)));
-        }
-        for (idx, sp) in &seq.place_nodes {
-            nodes.push((seq.id_of(*idx), seq.place_node(sp)));
-        }
-        for &e in seq.elem_payloads.keys() {
-            nodes.push((seq.id_of(e), seq.atom_node(e)));
+        let applied = (seq.move_nodes.keys())
+            .chain(seq.mark_nodes.keys())
+            .chain(seq.place_nodes.keys())
+            .chain(seq.elem_payloads.keys());
+        for &idx in applied {
+            let node = seq.node_at(idx).expect("op and atom handles hold nodes");
+            nodes.push((seq.id_of(idx), node));
         }
         nodes.sort_by_key(|(id, _)| *id);
         nodes.into_iter().map(|(_, node)| node).collect()
@@ -1501,7 +1415,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                     Anchor::After(_) => BLK_RUN_AFTER,
                     Anchor::Before(_) => BLK_RUN_BEFORE,
                 });
-                encode_ref(&cr.at.id(), pe, &mut buf);
+                encode_ref(cr.at.id(), pe, &mut buf);
                 encode_ref_set(&cr.first_pins, pe, &mut buf);
                 encode_string(&cr.text, &mut buf);
                 encode_varint(cr.interior.len(), &mut buf);
@@ -1867,7 +1781,7 @@ pub fn encode_hashkv(kv: &HashKv) -> Vec<u8> {
 /// byte canonicality across merge orders).
 fn encode_hashkv_with_store(kv: &HashKv, include_store: bool) -> Vec<u8> {
     let origin = kv.origin();
-    let mut nodes: Vec<(Id, &HashNode)> = kv.nodes.iter().map(|(i, n)| (*i, n)).collect();
+    let mut nodes: Vec<(Id, HashNode)> = kv.all_nodes();
     nodes.sort_by_key(|(id, _)| *id);
     let index_of: FxHashMap<Id, usize> = nodes
         .iter()
@@ -1913,7 +1827,7 @@ fn encode_hashkv_with_store(kv: &HashKv, include_store: bool) -> Vec<u8> {
     };
     encode_varint(n, &mut buf);
     for &i in &order {
-        let (_, node) = nodes[i];
+        let (_, node) = &nodes[i];
         // Per-node kind tag (snapshot v2): 0 = Put, 1 = Place. The kv
         // section predating Place was tagless (every node a Put); the
         // legacy decode path still reads that form.

@@ -4,6 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bitset::BitSet;
 use crate::delivery::Delivery;
+use crate::interned_hash_node::{InternedAnchor, InternedHashNode, InternedOp};
 use crate::placement::PlacementRegister;
 use crate::run_index::{ElemRef, IndexTarget, RunIndex, SweepFrag, SweepPos};
 use crate::{Anchor, EncodableOp, HashNode, Id, Op, Outcome, Payload, Refused, Run};
@@ -16,11 +17,10 @@ pub type IdMap<V> = FxHashMap<Id, V>;
 pub type IdSet = FxHashSet<Id>;
 
 /// The `Id -> NodeIdx` intern map, keyed by the id's u64 prefix instead of the
-/// full 32 bytes. `Id` is BLAKE3 output, so the prefix is effectively a
-/// perfect hash; a prefix hit is verified against `ids[idx]`, which makes
-/// lookups exact — a true prefix collision just fails verification and falls
+/// full 32 bytes. A prefix hit is verified against `ids[idx]`, which makes
+/// lookups exact, a true prefix collision just fails verification and falls
 /// through to the `spill` map of full-key entries (expected to stay empty:
-/// ~N²/2⁶⁴ chance per pair, and harmless when it does fire).
+/// ~N^2 / 2^64 chance per pair, and harmless when it does fire).
 #[derive(Debug, Default, Clone)]
 struct IdIndex {
     prefix: FxHashMap<u64, NodeIdx>,
@@ -90,6 +90,12 @@ pub enum Loc {
     /// A containment-register place op (stored in `place_nodes`;
     /// PLACEMENT_SPEC.md).
     PlaceOp,
+}
+
+impl Loc {
+    fn is_glue_point(&self) -> bool {
+        matches!(&self, Loc::Run { .. } | Loc::Origin | Loc::MoveOp)
+    }
 }
 
 /// `Loc` packed into 8 bytes for the per-node `locs` Vec (the enum is 12).
@@ -188,8 +194,8 @@ impl Cursor {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalInsert {
-    pub pins: BTreeSet<Id>,
-    pub anchor: Id,
+    pub anchor: NodeIdx,
+    pub pins: SortedIdVec,
     pub ch: char,
     /// `Some(value id)` for an atom (a non-char payload): `ch` is then the
     /// U+FFFC placeholder and the commitment id lives in the value column.
@@ -207,37 +213,24 @@ pub const ATOM_CHAR: char = '\u{FFFC}';
 pub struct CausalRemove {
     pub pins: SortedIdVec,
     /// Removed element handles, in Id order.
-    pub nodes: Box<[NodeIdx]>,
+    pub nodes: SortedIdVec,
 }
 
-/// Storage form of an applied move op (the placement projection,
-/// HASHSEQ_SPEC.md `Move`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMove {
     pub target: NodeIdx,
-    /// Destination glued point: side + anchor handle.
-    pub to_before: bool,
-    pub to_anchor: NodeIdx,
-    /// Superseded move ops (the register's overwrites edges), in Id order.
+    pub to: InternedAnchor,
     pub overwrites: SortedIdVec,
-    /// Frontier pins, in Id order.
     pub pins: SortedIdVec,
 }
 
-/// Storage form of an applied mark op (the span-annotation projection,
-/// MARKS.md). Anchors are glue points on elements (or the origin); `kind`
-/// and `value` are value commitments, not references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMark {
-    pub start_after: bool,
-    pub start_anchor: NodeIdx,
-    pub end_after: bool,
-    pub end_anchor: NodeIdx,
+    pub start: InternedAnchor,
+    pub end: InternedAnchor,
     pub kind: Id,
     pub value: Id,
-    /// Superseded mark ops (range- and kind-scoped at read), in Id order.
     pub overwrites: SortedIdVec,
-    /// Frontier pins, in Id order.
     pub pins: SortedIdVec,
 }
 
@@ -265,12 +258,9 @@ impl RemoveRun {
     }
 }
 
-/// Storage form of an insert run. Mirrors the wire-level [`Run`] but holds
-/// element handles instead of full ids: the id of element `i` is
-/// `seq.id_of(elements[i])`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRun {
-    pub at: Anchor,
+    pub at: InternedAnchor,
     pub first_pins: SortedIdVec,
     /// Extra deps of interior elements (offset >= 1), sparse — see
     /// [`Run::interior_extra_deps`]. Lets a typing burst extend its run
@@ -315,8 +305,8 @@ impl StoredRun {
     }
 
     /// Split at element index `at` (0 < at < len), returning the right portion.
-    /// `right_anchor` is the id of the left portion's last element.
-    fn split_at(&mut self, at: usize, right_anchor: Id) -> StoredRun {
+    /// `right_anchor` is the left portion's last element.
+    fn split_at(&mut self, at: usize, right_anchor: NodeIdx) -> StoredRun {
         assert!(at > 0 && at < self.len(), "Invalid split position");
         let right_elements = self.elements.split_off(at);
         let byte_pos = self.text.char_indices().nth(at).unwrap().0;
@@ -330,7 +320,7 @@ impl StoredRun {
             .map(|(k, v)| (k - at, v))
             .collect();
         StoredRun {
-            at: Anchor::After(right_anchor),
+            at: InternedAnchor::After(right_anchor),
             first_pins: right_first_pins,
             interior_pins: right_interior,
             text: right_text,
@@ -342,7 +332,7 @@ impl StoredRun {
     /// id table (`ids[elements[i]]`) — no rehashing.
     pub fn to_run(&self, ids: &[Id]) -> Run {
         Run {
-            at: self.at,
+            at: self.at.to_anchor(ids),
             first_pins: self.first_pins.to_id_set(ids),
             interior_pins: self
                 .interior_pins
@@ -357,17 +347,8 @@ impl StoredRun {
 
 /// A set of node handles kept sorted by their `Id`, stored as `Vec<NodeIdx>`
 /// (4 bytes/entry) instead of `BTreeSet<Id>` (32 bytes/entry plus a ~400 B
-/// B-tree node each). Used for the `afters` / `befores_by_anchor` sibling
-/// sets, and as the set-once storage for applied deps/pins/overwrites
-/// (built with `from_id_set`, rebuilt as `BTreeSet<Id>` for the wire /
-/// hashing at encode and decompress time).
-///
-/// The order is by `Id` — never by handle — because sibling order is a
-/// convergence concern and handles are replica-local (see the interning
-/// invariant). The handle is only the compact payload; every Id comparison
-/// dereferences through the caller-supplied `ids` table, so methods that need
-/// ordering take `ids: &[Id]` (where `ids[h.0]` is `h`'s id).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// B-tree node each).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SortedIdVec(Vec<NodeIdx>);
 
 impl SortedIdVec {
@@ -380,8 +361,20 @@ impl SortedIdVec {
 
     /// Build from an already-`Id`-sorted set, mapping each id to its handle
     /// (`BTreeSet` iterates in `Id` order, so the handles land sorted).
-    pub(crate) fn from_id_set(set: &BTreeSet<Id>, to_handle: impl FnMut(&Id) -> NodeIdx) -> Self {
-        SortedIdVec(set.iter().map(to_handle).collect())
+    /// `Err` is the first member (in `Id` order) with no handle.
+    pub(crate) fn try_from_id_set(
+        set: &BTreeSet<Id>,
+        mut to_handle: impl FnMut(&Id) -> Option<NodeIdx>,
+    ) -> Result<Self, Id> {
+        set.iter()
+            .map(|id| to_handle(id).ok_or(*id))
+            .collect::<Result<Vec<NodeIdx>, Id>>()
+            .map(SortedIdVec)
+    }
+
+    /// The one-member set.
+    pub(crate) fn single(handle: NodeIdx) -> Self {
+        SortedIdVec(vec![handle])
     }
 
     /// Rebuild the `Id` set (for the wire format / hashing).
@@ -401,6 +394,11 @@ impl SortedIdVec {
         if let Err(pos) = self.search(&id, ids) {
             self.0.insert(pos, handle);
         }
+    }
+
+    /// Is a handle whose id equals `id` a member?
+    pub fn contains(&self, id: &Id, ids: &[Id]) -> bool {
+        self.search(id, ids).is_ok()
     }
 
     /// Remove the handle whose id equals `id`, if present.
@@ -433,6 +431,12 @@ impl SortedIdVec {
     #[inline]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
         self.0.iter().copied()
+    }
+
+    /// The handles, in `Id` order.
+    #[inline]
+    pub fn as_slice(&self) -> &[NodeIdx] {
+        &self.0
     }
 
     #[inline]
@@ -642,11 +646,6 @@ impl HashSeq {
         self.id_to_idx.get(id, &self.ids)
     }
 
-    /// `idx_of` for ids that are known to be interned.
-    fn idx_of_known(&self, id: &Id) -> NodeIdx {
-        self.idx_of(id).expect("id was interned")
-    }
-
     pub fn id_of(&self, idx: NodeIdx) -> Id {
         self.ids[idx.0 as usize]
     }
@@ -679,23 +678,6 @@ impl HashSeq {
     pub fn payload_of(&self, id: &Id) -> Option<Id> {
         let e = self.idx_of(id)?;
         self.elem_payloads.get(&e).copied()
-    }
-
-    /// Reconstruct an atom's `HashNode` (for merge / re-broadcast / wire).
-    pub(crate) fn atom_node(&self, e: NodeIdx) -> HashNode {
-        let Loc::Run { run, .. } = self.loc_of(e) else {
-            unreachable!("atoms are single-element runs")
-        };
-        let r = &self.runs[&run];
-        debug_assert_eq!(r.elements.len(), 1, "atoms never chain");
-
-        HashNode {
-            pins: r.first_pins.to_id_set(&self.ids),
-            op: Op::Insert {
-                at: r.at,
-                payload: Payload::Id(self.elem_payloads[&e]),
-            },
-        }
     }
 
     pub(crate) fn char_at(&self, idx: NodeIdx) -> char {
@@ -1001,12 +983,12 @@ impl HashSeq {
         }
     }
 
-    /// `anchor` is `after.anchor` resolved (a checked dependency, so interned).
-    fn insert_after(&mut self, id: Id, anchor: NodeIdx, after: CausalInsert) {
+    /// `anchor` is the insert's resolved `After` anchor.
+    fn insert_after(&mut self, id: Id, after: CausalInsert) {
         // A move-op anchor: content anchoring at the splice point — make
         // sure the op holds a physical rank first.
-        if let Loc::MoveOp = self.loc_of(anchor) {
-            self.ensure_op_fragment(anchor);
+        if let Loc::MoveOp = self.loc_of(after.anchor) {
+            self.ensure_op_fragment(after.anchor);
         }
 
         // Fast path: extend the run whose tail is the anchor. Extra deps on
@@ -1014,43 +996,47 @@ impl HashSeq {
         // delete) don't block extension — they're stored sparsely at the
         // element's offset and participate in its id, so the chain still
         // reconstructs exactly.
-        if let Loc::Run { run, pos } = self.loc_of(anchor) {
+        if let Loc::Run { run, pos } = self.loc_of(after.anchor) {
             // Check for explicit forks first (cheap u32-keyed lookup)
-            let has_explicit_afters = self.afters.get(&anchor).is_some_and(|ns| !ns.is_empty());
+            let has_explicit_afters = self
+                .afters
+                .get(&after.anchor)
+                .is_some_and(|ns| !ns.is_empty());
 
-            let atomic = after.payload.is_some() || self.is_atom(anchor);
+            let atomic = after.payload.is_some() || self.is_atom(after.anchor);
             if !has_explicit_afters && !atomic && pos as usize + 1 == self.runs[&run].len() {
                 // Run extension - most common case for sequential typing
                 let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
-                let deps = SortedIdVec::from_id_set(&after.pins, |d| self.idx_of_known(d));
-                self.runs.get_mut(&run).unwrap().extend(idx, after.ch, deps);
+                self.runs
+                    .get_mut(&run)
+                    .unwrap()
+                    .extend(idx, after.ch, after.pins);
                 self.index.extend_run(run, pos + 1);
                 return;
             }
         }
 
         // Slow path: this insert forks.
-        let target = self.after_sibling_target(anchor, &id);
+        let target = self.after_sibling_target(after.anchor, &id);
 
         // We are inserting after a node inside a run (the extension case was
         // handled by the fast path above, so this is a fork). If the anchor isn't
         // the run's tail, split off everything after it first.
-        if let Loc::Run { run, pos } = self.loc_of(anchor)
+        if let Loc::Run { run, pos } = self.loc_of(after.anchor)
             && (pos as usize) + 1 < self.runs[&run].len()
         {
             self.split_run_at(run, pos as usize + 1);
-            debug_assert_eq!(self.runs[&run].last(), anchor);
+            debug_assert_eq!(self.runs[&run].last(), after.anchor);
         }
 
         // Start a new run anchored at the anchor node.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
-        let first_extra_deps = SortedIdVec::from_id_set(&after.pins, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
-                at: Anchor::After(after.anchor),
-                first_pins: first_extra_deps,
+                at: InternedAnchor::After(after.anchor),
+                first_pins: after.pins,
                 interior_pins: BTreeMap::new(),
                 text: after.ch.to_string(),
                 elements: vec![idx],
@@ -1063,7 +1049,7 @@ impl HashSeq {
 
         // run extension is handled in the fast path above, fork/split updates the afters set
         self.afters
-            .entry(anchor)
+            .entry(after.anchor)
             .or_default()
             .insert(idx, &self.ids);
 
@@ -1080,8 +1066,7 @@ impl HashSeq {
     fn split_run_at(&mut self, run: NodeIdx, at: usize) -> NodeIdx {
         let r = self.runs.get_mut(&run).unwrap();
         let left_last = r.elements[at - 1];
-        let right_anchor = self.ids[left_last.0 as usize];
-        let right_run = r.split_at(at, right_anchor);
+        let right_run = r.split_at(at, left_last);
         let right_head = right_run.head();
 
         // re-locate the right run's elements
@@ -1110,19 +1095,13 @@ impl HashSeq {
     fn apply_move(
         &mut self,
         id: Id,
-        pins: BTreeSet<Id>,
-        target: Id,
-        to: Anchor,
-        overwrites: BTreeSet<Id>,
+        pins: SortedIdVec,
+        target_idx: NodeIdx,
+        to: InternedAnchor,
+        overwrites: SortedIdVec,
     ) {
-        let target_idx = self.idx_of_known(&target);
         let old_decider = self.decider_of(target_idx);
         let idx = self.intern(id, Loc::MoveOp);
-        let (to_before, to_id) = match to {
-            Anchor::Before(a) => (true, a),
-            Anchor::After(a) => (false, a),
-        };
-        let to_anchor = self.idx_of_known(&to_id);
 
         // heads(x) = heads(x) − overwrites ∪ {u}. The same-register filter is
         // structural: we only remove ids present in THIS target's head list,
@@ -1130,20 +1109,15 @@ impl HashSeq {
         // ignored, never errors.
         let reg = self.moves.entry(target_idx).or_default();
         for o in &overwrites {
-            reg.heads.remove(o, &self.ids);
+            reg.heads.remove(&self.ids[o.0 as usize], &self.ids);
         }
         reg.heads.insert(idx, &self.ids);
 
         let stored = StoredMove {
             target: target_idx,
-            to_before,
-            to_anchor,
-            overwrites: SortedIdVec::from_id_set(&overwrites, |d| {
-                self.id_to_idx.get(d, &self.ids).expect("ref was interned")
-            }),
-            pins: SortedIdVec::from_id_set(&pins, |d| {
-                self.id_to_idx.get(d, &self.ids).expect("ref was interned")
-            }),
+            to,
+            overwrites,
+            pins,
         };
         self.move_nodes.insert(idx, stored);
 
@@ -1159,28 +1133,8 @@ impl HashSeq {
 
         // Remove beats move: a tombstoned element renders nowhere, so a
         // register change must not touch the index.
-        if !self.is_removed(target_idx) {
-            if old_decider != new_decider {
-                self.rerender(target_idx, old_decider, new_decider);
-            }
-        }
-    }
-
-    /// Reconstruct a move op's `HashNode` (for merge / re-broadcast).
-    pub fn move_node(&self, idx: NodeIdx, mv: &StoredMove) -> HashNode {
-        let _ = idx;
-        let to_id = self.id_of(mv.to_anchor);
-        HashNode {
-            pins: mv.pins.to_id_set(&self.ids),
-            op: Op::Move {
-                target: self.id_of(mv.target),
-                to: if mv.to_before {
-                    Anchor::Before(to_id)
-                } else {
-                    Anchor::After(to_id)
-                },
-                overwrites: mv.overwrites.to_id_set(&self.ids),
-            },
+        if !self.is_removed(target_idx) && old_decider != new_decider {
+            self.rerender(target_idx, old_decider, new_decider);
         }
     }
 
@@ -1226,13 +1180,7 @@ impl HashSeq {
     }
 
     fn move_anchor(&self, m: NodeIdx) -> Anchor {
-        let mv = &self.move_nodes[&m];
-        let a = self.id_of(mv.to_anchor);
-        if mv.to_before {
-            Anchor::Before(a)
-        } else {
-            Anchor::After(a)
-        }
+        self.move_nodes[&m].to.to_anchor(&self.ids)
     }
 
     /// Transitive overwrites of `m` within the register history (same-target
@@ -1377,7 +1325,7 @@ impl HashSeq {
     fn register_op_fragment(&mut self, op: NodeIdx, render: bool) {
         let op_id = self.id_of(op);
         let mv = &self.move_nodes[&op];
-        let (anchor, to_before, target) = (mv.to_anchor, mv.to_before, mv.target);
+        let (anchor, to_before, target) = (mv.to.idx(), mv.to.is_before(), mv.target);
         // A destination on another op's splice point: that op needs a
         // physical rank first (terminates — anchors are causal refs, so
         // the recursion strictly descends the DAG).
@@ -1436,7 +1384,7 @@ impl HashSeq {
     /// continuation.
     fn unregister_sibling(&mut self, op: NodeIdx) {
         let mv = &self.move_nodes[&op];
-        let (anchor, to_before) = (mv.to_anchor, mv.to_before);
+        let (anchor, to_before) = (mv.to.idx(), mv.to.is_before());
         let op_id = self.id_of(op);
         let map = if to_before {
             &mut self.befores_by_anchor
@@ -1483,10 +1431,7 @@ impl HashSeq {
     /// around wherever its target renders). `None` for anything else.
     fn glue_point(&self, a: &Anchor) -> Option<(NodeIdx, bool)> {
         let i = self.idx_of(a.id())?;
-        match self.loc_of(i) {
-            Loc::Run { .. } | Loc::Origin | Loc::MoveOp => Some((i, matches!(a, Anchor::After(_)))),
-            _ => None,
-        }
+        self.loc_of(i).is_glue_point().then_some((i, a.is_after()))
     }
 
     /// Mark admissibility (the Mark admission rows): both anchors resolve to
@@ -1495,10 +1440,15 @@ impl HashSeq {
     /// verdict is "refused": a zero-width splice slot for an already-applied
     /// move op is derived, convergence-neutral index state, not a trace of
     /// the refused mark.
-    fn mark_admissible(&mut self, start: &Anchor, end: &Anchor) -> Result<(), Refused> {
-        let (Some(s), Some(e)) = (self.glue_point(start), self.glue_point(end)) else {
+    fn mark_admissible(
+        &mut self,
+        start: InternedAnchor,
+        end: InternedAnchor,
+    ) -> Result<(), Refused> {
+        if !self.loc_of(start.idx()).is_glue_point() || !self.loc_of(end.idx()).is_glue_point() {
             return Err(Refused::NotAGluePoint);
-        };
+        }
+        let (s, e) = (start.point(), end.point());
         for (n, _) in [s, e] {
             if let Loc::MoveOp = self.loc_of(n) {
                 self.ensure_op_fragment(n);
@@ -1559,16 +1509,16 @@ impl HashSeq {
     fn apply_mark(
         &mut self,
         id: Id,
-        pins: BTreeSet<Id>,
-        start: Anchor,
-        end: Anchor,
+        pins: SortedIdVec,
+        start: InternedAnchor,
+        end: InternedAnchor,
         kind: Id,
         value: Id,
-        overwrites: BTreeSet<Id>,
+        overwrites: SortedIdVec,
     ) {
         let idx = self.intern(id, Loc::MarkOp);
-        let (start_anchor, start_after) = self.glue_point(&start).expect("admitted above");
-        let (end_anchor, end_after) = self.glue_point(&end).expect("admitted above");
+        let (start_anchor, start_after) = start.point();
+        let (end_anchor, end_after) = end.point();
 
         self.mark_events
             .entry(start_anchor)
@@ -1588,60 +1538,27 @@ impl HashSeq {
             });
 
         let stored = StoredMark {
-            start_after,
-            start_anchor,
-            end_after,
-            end_anchor,
+            start,
+            end,
             kind,
             value,
-            overwrites: SortedIdVec::from_id_set(&overwrites, |d| self.idx_of_known(d)),
-            pins: SortedIdVec::from_id_set(&pins, |d| self.idx_of_known(d)),
+            overwrites,
+            pins,
         };
         self.mark_nodes.insert(idx, stored);
     }
 
-    /// Reconstruct a mark op's `HashNode` (for merge / re-broadcast).
-    pub fn mark_node(&self, mk: &StoredMark) -> HashNode {
-        let anchor = |after: bool, n: NodeIdx| {
-            let id = self.id_of(n);
-            if after {
-                Anchor::After(id)
-            } else {
-                Anchor::Before(id)
-            }
-        };
-        HashNode {
-            pins: mk.pins.to_id_set(&self.ids),
-            op: Op::Mark {
-                start: anchor(mk.start_after, mk.start_anchor),
-                end: anchor(mk.end_after, mk.end_anchor),
-                kind_v: mk.kind,
-                value: mk.value,
-                overwrites: mk.overwrites.to_id_set(&self.ids),
-            },
-        }
-    }
-
-    fn apply_place(&mut self, id: Id, pins: BTreeSet<Id>, placed_at: Id, overwrites: BTreeSet<Id>) {
+    fn apply_place(&mut self, id: Id, pins: SortedIdVec, placed_at: Id, overwrites: SortedIdVec) {
         let idx = self.intern(id, Loc::PlaceOp);
+        // The register is shared with `HashKv` and works in id space.
+        self.placement
+            .apply(id, placed_at, overwrites.to_id_set(&self.ids));
         let stored = StoredPlace {
             placed_at,
-            overwrites: SortedIdVec::from_id_set(&overwrites, |d| self.idx_of_known(d)),
-            pins: SortedIdVec::from_id_set(&pins, |d| self.idx_of_known(d)),
+            overwrites,
+            pins,
         };
         self.place_nodes.insert(idx, stored);
-        self.placement.apply(id, placed_at, overwrites);
-    }
-
-    /// Reconstruct a place op's `HashNode` (for merge / re-broadcast).
-    pub fn place_node(&self, sp: &StoredPlace) -> HashNode {
-        HashNode {
-            pins: sp.pins.to_id_set(&self.ids),
-            op: Op::Place {
-                placed_at: sp.placed_at,
-                overwrites: sp.overwrites.to_id_set(&self.ids),
-            },
-        }
     }
 
     /// The containment register — where does this object live
@@ -1689,11 +1606,11 @@ impl HashSeq {
     fn mark_covers(&self, mk: &StoredMark, x: NodeIdx) -> bool {
         use std::cmp::Ordering;
         let xp = self.index.rendered_pos(self.elem_ref(x));
-        let after_start = match self.point_pos(mk.start_anchor, mk.start_after) {
+        let after_start = match self.point_pos(mk.start.idx(), mk.start.is_after()) {
             None => true, // origin point: below everything
             Some(s) => self.index.cmp_sweep(s, xp) == Ordering::Less,
         };
-        let before_end = match self.point_pos(mk.end_anchor, mk.end_after) {
+        let before_end = match self.point_pos(mk.end.idx(), mk.end.is_after()) {
             None => false, // an origin end point precedes every element
             Some(e) => self.index.cmp_sweep(xp, e) == Ordering::Less,
         };
@@ -1917,8 +1834,8 @@ impl HashSeq {
             .filter(|(_, mk)| {
                 use std::cmp::Ordering;
                 mk.kind == kind
-                    && self.cmp_points((mk.end_anchor, mk.end_after), s) == Ordering::Greater
-                    && self.cmp_points(e, (mk.start_anchor, mk.start_after)) == Ordering::Greater
+                    && self.cmp_points(mk.end.point(), s) == Ordering::Greater
+                    && self.cmp_points(e, mk.start.point()) == Ordering::Greater
             })
             .map(|(&i, _)| self.id_of(i))
             .collect();
@@ -1952,19 +1869,17 @@ impl HashSeq {
         self.mark_range(start, end, kind, *crate::value::TOMBSTONE)
     }
 
-    fn apply_remove(&mut self, id: Id, extra_deps: BTreeSet<Id>, target_ids: BTreeSet<Id>) {
-        // Targets are checked dependencies of the remove, so they are interned.
+    fn apply_remove(&mut self, id: Id, extra_deps: SortedIdVec, targets: SortedIdVec) {
         // (A remove targeting a non-insert node is harmless: it's not in the
         // position index, and its tombstone bit is inert.)
-        let targets: Vec<NodeIdx> = target_ids.iter().map(|t| self.idx_of_known(t)).collect();
         for t in &targets {
             // Removes targeting non-inserts have no index entry and are inert.
             // Base-rendered elements just clear their bit; a moved element's
             // destination fragment retires with its deciding op — demoting
             // to a splice ghost when content anchored at the op.
-            if let Loc::Run { run, pos } = self.loc_of(*t)
+            if let Loc::Run { run, pos } = self.loc_of(t)
                 && !self.index.remove_element((run, pos))
-                && let Some(op) = self.decider_of(*t)
+                && let Some(op) = self.decider_of(t)
             {
                 if self.op_has_children(op) {
                     self.index.demote_to_splice((run, pos), op);
@@ -1978,34 +1893,30 @@ impl HashSeq {
         // Single-target removes coalesce into RemoveRuns, the delete analog of
         // sequential typing: if our only extra dep is the current tail of an
         // existing chain, extend that chain in place.
-        if let [target] = targets[..] {
-            if extra_deps.len() == 1 {
-                let dep = extra_deps.first().unwrap();
-                if let Some(dep) = self.idx_of(dep)
-                    && let Loc::RemoveChain { chain, pos } = self.loc_of(dep)
-                    && pos as usize + 1 == self.remove_runs[&chain].links.len()
-                {
-                    let idx = self.intern(
-                        id,
-                        Loc::RemoveChain {
-                            chain,
-                            pos: pos + 1,
-                        },
-                    );
-                    let rr = self.remove_runs.get_mut(&chain).unwrap();
-                    rr.targets.push(target);
-                    rr.links.push(idx);
-                    return;
-                }
+        if let [target] = *targets.as_slice() {
+            if let [dep] = *extra_deps.as_slice()
+                && let Loc::RemoveChain { chain, pos } = self.loc_of(dep)
+                && pos as usize + 1 == self.remove_runs[&chain].links.len()
+            {
+                let idx = self.intern(
+                    id,
+                    Loc::RemoveChain {
+                        chain,
+                        pos: pos + 1,
+                    },
+                );
+                let rr = self.remove_runs.get_mut(&chain).unwrap();
+                rr.targets.push(target);
+                rr.links.push(idx);
+                return;
             }
             // Start a new chain (a lone remove is a 1-link chain).
             let idx = self.next_idx();
             self.intern(id, Loc::RemoveChain { chain: idx, pos: 0 });
-            let first_extra_deps = SortedIdVec::from_id_set(&extra_deps, |d| self.idx_of_known(d));
             self.remove_runs.insert(
                 idx,
                 RemoveRun {
-                    first_extra_deps,
+                    first_extra_deps: extra_deps,
                     targets: vec![target],
                     links: vec![idx],
                 },
@@ -2014,23 +1925,22 @@ impl HashSeq {
         }
 
         let idx = self.intern(id, Loc::MultiRemove);
-        let pins = SortedIdVec::from_id_set(&extra_deps, |d| self.idx_of_known(d));
         self.remove_nodes.insert(
             idx,
             CausalRemove {
-                pins,
-                nodes: targets.into(),
+                pins: extra_deps,
+                nodes: targets,
             },
         );
     }
 
-    /// `anchor` is `before.anchor` resolved (a checked dependency, so interned).
-    fn insert_before(&mut self, id: Id, anchor: NodeIdx, before: CausalInsert) {
-        if let Loc::MoveOp = self.loc_of(anchor) {
-            self.ensure_op_fragment(anchor);
+    /// `anchor` is the insert's resolved `Before` anchor.
+    fn insert_before(&mut self, id: Id, before: CausalInsert) {
+        if let Loc::MoveOp = self.loc_of(before.anchor) {
+            self.ensure_op_fragment(before.anchor);
         }
 
-        let target = self.before_sibling_target(anchor, &id);
+        let target = self.before_sibling_target(before.anchor, &id);
 
         // The anchor may sit mid-run: no split is needed. Iteration visits the
         // befores of every run element individually (see HashSeqIter), and unlike
@@ -2038,12 +1948,11 @@ impl HashSeq {
         // always lands immediately before its anchor.
         let idx = self.next_idx();
         self.intern(id, Loc::Run { run: idx, pos: 0 });
-        let first_extra_deps = SortedIdVec::from_id_set(&before.pins, |d| self.idx_of_known(d));
         self.runs.insert(
             idx,
             StoredRun {
-                at: Anchor::Before(before.anchor),
-                first_pins: first_extra_deps,
+                at: InternedAnchor::Before(before.anchor),
+                first_pins: before.pins,
                 interior_pins: BTreeMap::new(),
                 text: before.ch.to_string(),
                 elements: vec![idx],
@@ -2055,7 +1964,7 @@ impl HashSeq {
         }
 
         self.befores_by_anchor
-            .entry(anchor)
+            .entry(before.anchor)
             .or_default()
             .insert(idx, &self.ids);
 
@@ -2082,199 +1991,249 @@ impl HashSeq {
         outcome
     }
 
-    /// The ref an orphan is keyed on: the first ref in `iter_refs` order
-    /// that is not applied here, or `None` when every ref is.
-    /// This is a hard requirement of the delivery module to ensure idempotency.
-    pub(crate) fn canonical_orphan_dependency(&self, node: &HashNode) -> Option<Id> {
-        node.iter_refs().find(|d| !self.contains_node(d)).copied()
-    }
-
+    /// Resolve the node's refs to handles — once, for everything past this
+    /// point — or orphan it on the first ref (in `iter_refs` order) that is
+    /// not applied here. That key is a hard requirement of the delivery
+    /// module: it keeps re-delivery of an orphan idempotent.
     fn orphan_or_dispatch(
         &mut self,
         id: Id,
         node: HashNode,
         queue: &mut Vec<(Id, HashNode)>,
     ) -> Result<Outcome, Refused> {
-        if let Some(key) = self.canonical_orphan_dependency(&node) {
-            return Ok(if self.delivery.orphan(key, id, node) {
-                Outcome::Orphaned
-            } else {
-                Outcome::Known
-            });
-        }
+        let interned = match InternedHashNode::resolve(&node, |r| self.idx_of(r)) {
+            Ok(interned) => interned,
+            Err(missing) => {
+                return Ok(if self.delivery.orphan(missing, id, node) {
+                    Outcome::Orphaned
+                } else {
+                    Outcome::Known
+                });
+            }
+        };
         // A refused node is dropped; its dependents stay orphaned.
-        self.interpret(id, node)?;
+        self.interpret(id, interned)?;
         self.delivery.wake(&id, queue);
         Ok(Outcome::Applied)
     }
 
-    /// Interpret one node whose refs are all applied — this projection's
-    /// admission rows. `Err` hands the node back; the caller drops it.
-    // The Err carries the node back by value — same move the parameters
-    // make; boxing would buy an allocation per refused op for nothing.
-    /// `insert_anchor`: the resolved anchor handle when `node` is an
-    /// Insert (see `orphan_or_dispatch`), `None` otherwise.
-    fn interpret(&mut self, id: Id, node: HashNode) -> Result<(), Refused> {
-        // dereference insert anchor once for multiple use sites.
-        // only meaningful in Insert op contexts
-        let insert_at = match &node.op {
-            Op::Insert { at, .. } => self.idx_of_known(at.id()),
-            _ => NodeIdx(u32::MAX), // sentinel value
-        };
-
+    /// Interpret one node whose refs are all applied (so it arrives
+    /// interned) — this projection's admission rows. `Err` says why it was
+    /// refused; the caller drops it.
+    fn interpret(&mut self, id: Id, node: InternedHashNode) -> Result<(), Refused> {
         match &node.op {
-            Op::Insert { .. } => {
-                if !matches!(
-                    self.loc_of(insert_at),
-                    Loc::Run { .. } | Loc::Origin | Loc::MoveOp
-                ) {
+            InternedOp::Insert { at, .. } => {
+                if !self.loc_of(at.idx()).is_glue_point() {
                     return Err(Refused::NotAGluePoint);
                 }
             }
-            Op::Move { target, to, .. } => {
-                let target_idx = self.idx_of_known(target);
-
+            InternedOp::Move { target, to, .. } => {
                 // Move target must be a sequence element
-                if !matches!(self.loc_of(target_idx), Loc::Run { .. }) {
+                if !matches!(self.loc_of(*target), Loc::Run { .. }) {
                     return Err(Refused::NotAnElement);
                 }
-
-                let to_idx = self.idx_of_known(to.id());
-                let to_loc = self.loc_of(to_idx);
-                if !matches!(to_loc, Loc::Run { .. } | Loc::Origin | Loc::MoveOp) {
+                if !self.loc_of(to.idx()).is_glue_point() {
                     return Err(Refused::NotAGluePoint);
                 }
-
-                if to_idx == target_idx {
+                if to.idx() == *target {
                     return Err(Refused::SelfMove);
                 }
             }
-            Op::Mark { start, end, .. } => self.mark_admissible(start, end)?,
-            Op::Remove(_) | Op::Place { .. } => (),
-            _ => return Err(Refused::WrongObjectKind),
+            InternedOp::Mark { start, end, .. } => self.mark_admissible(*start, *end)?,
+            InternedOp::Remove(_) | InternedOp::Place { .. } => (),
+            InternedOp::Put { .. } => return Err(Refused::WrongObjectKind),
         };
 
-        for tip in node.iter_refs() {
-            self.tips.remove(tip);
+        for r in node.refs() {
+            self.tips.remove(&self.ids[r.0 as usize]);
         }
         self.tips.insert(id);
 
-        if let Op::Mark {
-            start,
-            end,
-            kind_v,
-            value,
-            overwrites,
-        } = node.op
-        {
-            self.apply_mark(id, node.pins, start, end, kind_v, value, overwrites);
-            return Ok(());
-        }
-
+        let pins = node.pins;
         match node.op {
-            Op::Insert { at, payload } => {
+            InternedOp::Insert { at, payload } => {
                 let (ch, payload) = match payload.resolved() {
                     Payload::Char(c) => (c, None),
                     Payload::Id(v) => (ATOM_CHAR, Some(v)),
                 };
-                let ci = |anchor| CausalInsert {
-                    pins: node.pins,
-                    anchor,
+                let ci = CausalInsert {
+                    anchor: at.idx(),
+                    pins,
                     ch,
                     payload,
                 };
                 match at {
-                    Anchor::After(anchor) => self.insert_after(id, insert_at, ci(anchor)),
-                    Anchor::Before(anchor) => self.insert_before(id, insert_at, ci(anchor)),
+                    InternedAnchor::After(_) => self.insert_after(id, ci),
+                    InternedAnchor::Before(_) => self.insert_before(id, ci),
                 }
             }
-            Op::Remove(nodes) => self.apply_remove(id, node.pins, nodes),
-            Op::Move {
+            InternedOp::Remove(targets) => self.apply_remove(id, pins, targets),
+            InternedOp::Move {
                 target,
                 to,
                 overwrites,
-            } => self.apply_move(id, node.pins, target, to, overwrites),
-            Op::Place {
+            } => self.apply_move(id, pins, target, to, overwrites),
+            InternedOp::Mark {
+                start,
+                end,
+                kind_v,
+                value,
+                overwrites,
+            } => self.apply_mark(id, pins, start, end, kind_v, value, overwrites),
+            InternedOp::Place {
                 placed_at,
                 overwrites,
-            } => self.apply_place(id, node.pins, placed_at, overwrites),
-            _ => unreachable!("refused above"),
+            } => self.apply_place(id, pins, placed_at, overwrites),
+            InternedOp::Put { .. } => unreachable!("refused above"),
         }
         Ok(())
     }
 
-    /// Reconstruct a remove chain's `HashNode`s (for merge / re-broadcast).
-    pub fn remove_run_nodes(&self, rr: &RemoveRun) -> Vec<HashNode> {
-        rr.targets
-            .iter()
-            .enumerate()
-            .map(|(i, target)| HashNode {
-                pins: if i == 0 {
-                    rr.first_extra_deps.to_id_set(&self.ids)
-                } else {
-                    BTreeSet::from_iter([self.id_of(rr.links[i - 1])])
-                },
-                op: Op::Remove(BTreeSet::from_iter([self.id_of(*target)])),
-            })
-            .collect()
-    }
-
-    /// Reconstruct the node behind one handle from its stored form (the
-    /// per-handle twin of `all_nodes`, which walks the side tables in
-    /// bulk). Ids come from the local table — no rehashing. The origin has
-    /// no node.
-    pub(crate) fn node_at(&self, idx: NodeIdx) -> Option<HashNode> {
-        Some(match self.loc_of(idx) {
+    /// The interned node behind one handle, rebuilt from its stored form —
+    /// the one place the per-kind storage turns back into a node. The
+    /// origin has no node.
+    pub(crate) fn interned_at(&self, idx: NodeIdx) -> Option<InternedHashNode> {
+        let (pins, op) = match self.loc_of(idx) {
             Loc::Origin => return None,
             Loc::Run { run, pos } => {
-                if self.is_atom(idx) {
-                    return Some(self.atom_node(idx));
-                }
                 let r = &self.runs[&run];
                 let pos = pos as usize;
-                let ch = r.char_at(pos);
-                if pos == 0 {
-                    HashNode {
-                        pins: r.first_pins.to_id_set(&self.ids),
-                        op: Op::Insert {
-                            at: r.at,
-                            payload: Payload::Char(ch),
-                        },
-                    }
+                // Atoms are single-element runs: their run text is the
+                // placeholder, the commitment lives in the value column.
+                let payload = if self.is_atom(idx) {
+                    Payload::Id(self.elem_payloads[&idx])
                 } else {
-                    HashNode {
-                        pins: r
-                            .interior_pins
-                            .get(&pos)
-                            .map(|d| d.to_id_set(&self.ids))
-                            .unwrap_or_default(),
-                        op: Op::insert_after(self.id_of(r.elements[pos - 1]), ch),
-                    }
-                }
+                    Payload::Char(r.char_at(pos))
+                };
+                let (at, pins) = if pos == 0 {
+                    (r.at, r.first_pins.clone())
+                } else {
+                    (
+                        InternedAnchor::After(r.elements[pos - 1]),
+                        r.interior_pins.get(&pos).cloned().unwrap_or_default(),
+                    )
+                };
+                (pins, InternedOp::Insert { at, payload })
             }
             Loc::RemoveChain { chain, pos } => {
                 let rr = &self.remove_runs[&chain];
                 let pos = pos as usize;
-                HashNode {
-                    pins: if pos == 0 {
-                        rr.first_extra_deps.to_id_set(&self.ids)
-                    } else {
-                        BTreeSet::from_iter([self.id_of(rr.links[pos - 1])])
-                    },
-                    op: Op::Remove(BTreeSet::from_iter([self.id_of(rr.targets[pos])])),
-                }
+                let pins = if pos == 0 {
+                    rr.first_extra_deps.clone()
+                } else {
+                    SortedIdVec::single(rr.links[pos - 1])
+                };
+                (
+                    pins,
+                    InternedOp::Remove(SortedIdVec::single(rr.targets[pos])),
+                )
             }
             Loc::MultiRemove => {
                 let cr = &self.remove_nodes[&idx];
-                HashNode {
-                    pins: cr.pins.to_id_set(&self.ids),
-                    op: Op::Remove(cr.nodes.iter().map(|i| self.id_of(*i)).collect()),
-                }
+                (cr.pins.clone(), InternedOp::Remove(cr.nodes.clone()))
             }
-            Loc::MoveOp => self.move_node(idx, &self.move_nodes[&idx]),
-            Loc::MarkOp => self.mark_node(&self.mark_nodes[&idx]),
-            Loc::PlaceOp => self.place_node(&self.place_nodes[&idx]),
-        })
+            Loc::MoveOp => {
+                let mv = &self.move_nodes[&idx];
+                (
+                    mv.pins.clone(),
+                    InternedOp::Move {
+                        target: mv.target,
+                        to: mv.to,
+                        overwrites: mv.overwrites.clone(),
+                    },
+                )
+            }
+            Loc::MarkOp => {
+                let mk = &self.mark_nodes[&idx];
+                (
+                    mk.pins.clone(),
+                    InternedOp::Mark {
+                        start: mk.start,
+                        end: mk.end,
+                        kind_v: mk.kind,
+                        value: mk.value,
+                        overwrites: mk.overwrites.clone(),
+                    },
+                )
+            }
+            Loc::PlaceOp => {
+                let sp = &self.place_nodes[&idx];
+                (
+                    sp.pins.clone(),
+                    InternedOp::Place {
+                        placed_at: sp.placed_at,
+                        overwrites: sp.overwrites.clone(),
+                    },
+                )
+            }
+        };
+        Some(InternedHashNode { pins, op })
+    }
+
+    /// The wire node behind one handle: `interned_at` mapped back through
+    /// the id table. Ids come from the local table — no rehashing.
+    pub(crate) fn node_at(&self, idx: NodeIdx) -> Option<HashNode> {
+        self.interned_at(idx).map(|n| n.to_node(&self.ids))
+    }
+
+    /// Visit every handle the node at `idx` references, straight from its
+    /// stored form: `interned_at(idx).refs()` without building the node
+    /// (`check_for_each_ref_matches_interned_refs` keeps the two equal). This is
+    /// the edge function of the clock walk and of the encoder's depth pass.
+    pub(crate) fn for_each_ref(&self, idx: NodeIdx, mut f: impl FnMut(NodeIdx)) {
+        let (pins, named, set): (Option<&SortedIdVec>, [Option<NodeIdx>; 2], &[NodeIdx]) =
+            match self.loc_of(idx) {
+                Loc::Origin => return,
+                Loc::Run { run, pos } => {
+                    let r = &self.runs[&run];
+                    let pos = pos as usize;
+                    if pos == 0 {
+                        (Some(&r.first_pins), [Some(r.at.idx()), None], &[])
+                    } else {
+                        (
+                            r.interior_pins.get(&pos),
+                            [Some(r.elements[pos - 1]), None],
+                            &[],
+                        )
+                    }
+                }
+                Loc::RemoveChain { chain, pos } => {
+                    let rr = &self.remove_runs[&chain];
+                    let pos = pos as usize;
+                    if pos == 0 {
+                        (Some(&rr.first_extra_deps), [Some(rr.targets[0]), None], &[])
+                    } else {
+                        (None, [Some(rr.links[pos - 1]), Some(rr.targets[pos])], &[])
+                    }
+                }
+                Loc::MultiRemove => {
+                    let cr = &self.remove_nodes[&idx];
+                    (Some(&cr.pins), [None, None], cr.nodes.as_slice())
+                }
+                Loc::MoveOp => {
+                    let mv = &self.move_nodes[&idx];
+                    (
+                        Some(&mv.pins),
+                        [Some(mv.target), Some(mv.to.idx())],
+                        mv.overwrites.as_slice(),
+                    )
+                }
+                Loc::MarkOp => {
+                    let mk = &self.mark_nodes[&idx];
+                    (
+                        Some(&mk.pins),
+                        [Some(mk.start.idx()), Some(mk.end.idx())],
+                        mk.overwrites.as_slice(),
+                    )
+                }
+                Loc::PlaceOp => {
+                    let sp = &self.place_nodes[&idx];
+                    (Some(&sp.pins), [None, None], sp.overwrites.as_slice())
+                }
+            };
+        pins.into_iter().flatten().for_each(&mut f);
+        named.into_iter().flatten().for_each(&mut f);
+        set.iter().copied().for_each(&mut f);
     }
 
     /// Every applied node in apply order — a causally safe order: each
@@ -2306,9 +2265,9 @@ impl HashSeq {
     /// pops after all its descendants, so a node under the peer's tips is
     /// coloured PEER by the time it pops; a node that pops OURS-only is
     /// new and ships. The sweep ends as soon as no OURS-only node is left
-    /// in the heap. Edges come from the same reconstruction that ships
-    /// (`node_at`), so the walk and the wire can never disagree about a
-    /// node's refs.
+    /// in the heap. Edges come from the stored forms in handle space
+    /// (`for_each_ref`) — the refs of the very node that ships (`node_at`),
+    /// so the walk and the wire can never disagree about a node's refs.
     pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
         const OURS: u8 = 1;
         const PEER: u8 = 2;
@@ -2375,11 +2334,13 @@ impl HashSeq {
             .map(|i| i.0 as usize)
     }
 
-    /// The handles a node references, from its reconstruction.
+    /// The handles a node references (the origin is an axiom, not a node).
     fn walk_deps(&self, i: usize, out: &mut Vec<usize>) {
-        if let Some(node) = self.node_at(NodeIdx(i as u32)) {
-            out.extend(node.iter_refs().filter_map(|r| self.walk_idx(r)));
-        }
+        self.for_each_ref(NodeIdx(i as u32), |r| {
+            if r != ORIGIN_IDX {
+                out.push(r.0 as usize);
+            }
+        });
     }
 
     /// Every applied node as `(id, HashNode)` — runs decompressed, remove
@@ -2394,31 +2355,15 @@ impl HashSeq {
             }
             out.extend(run.to_run(&self.ids).decompress_with_ids());
         }
-        for &e in self.elem_payloads.keys() {
-            out.push((self.id_of(e), self.atom_node(e)));
-        }
-        for rr in self.remove_runs.values() {
-            for (i, node) in self.remove_run_nodes(rr).into_iter().enumerate() {
-                out.push((self.id_of(rr.links[i]), node));
+        // Everything that is not a char run element reconstructs per handle.
+        for i in 0..self.ids.len() {
+            let idx = NodeIdx(i as u32);
+            if matches!(self.loc_of(idx), Loc::Run { .. }) && !self.is_atom(idx) {
+                continue;
             }
-        }
-        for (idx, causal_remove) in &self.remove_nodes {
-            out.push((
-                self.id_of(*idx),
-                HashNode {
-                    pins: causal_remove.pins.to_id_set(&self.ids),
-                    op: Op::Remove(causal_remove.nodes.iter().map(|i| self.id_of(*i)).collect()),
-                },
-            ));
-        }
-        for (idx, mv) in &self.move_nodes {
-            out.push((self.id_of(*idx), self.move_node(*idx, mv)));
-        }
-        for (idx, mk) in &self.mark_nodes {
-            out.push((self.id_of(*idx), self.mark_node(mk)));
-        }
-        for (idx, sp) in &self.place_nodes {
-            out.push((self.id_of(*idx), self.place_node(sp)));
+            if let Some(node) = self.node_at(idx) {
+                out.push((self.ids[i], node));
+            }
         }
         out
     }
@@ -2571,7 +2516,7 @@ impl HashSeq {
             (None, None) => Anchor::After(self.origin),
         };
         Some(Cursor {
-            pins: self.tips_minus(&at.id()),
+            pins: self.tips_minus(at.id()),
             at,
         })
     }
@@ -3181,7 +3126,26 @@ mod test {
     /// index-derived (id_at, position_of, and the production fragment-walk
     /// iterators) must match it. Checked on a merged seq (merging is what
     /// creates sibling forks) plus more local edits on top.
+    /// `for_each_ref` (edges straight from the stored forms) must visit
+    /// exactly `interned_at(idx).refs()`, and the interned node must map
+    /// back to the node that hashes to the stored id.
+    fn check_for_each_ref_matches_interned_refs(seq: &HashSeq) {
+        for i in 0..seq.ids.len() {
+            let idx = NodeIdx(i as u32);
+            let mut visited = Vec::new();
+            seq.for_each_ref(idx, |r| visited.push(r));
+            let Some(interned) = seq.interned_at(idx) else {
+                assert_eq!(idx, ORIGIN_IDX);
+                assert!(visited.is_empty());
+                continue;
+            };
+            assert_eq!(visited, interned.refs().collect::<Vec<_>>());
+            assert_eq!(interned.to_node(&seq.ids).id(), seq.ids[i]);
+        }
+    }
+
     fn check_index_matches_iter(seq: &HashSeq) {
+        check_for_each_ref_matches_interned_refs(seq);
         let iter_ids: Vec<Id> = seq.iter_idxs_causal().map(|i| seq.id_of(i)).collect();
         assert_eq!(seq.len(), iter_ids.len());
         let index_ids: Vec<Id> = seq.iter_ids().copied().collect();
@@ -5052,6 +5016,7 @@ mod test {
         .unwrap();
         seq.place(Id([0x77; 32]));
 
+        check_for_each_ref_matches_interned_refs(&seq);
         let since: Vec<(Id, HashNode)> = seq.nodes_in_apply_order().collect();
         assert_eq!(
             since.len(),

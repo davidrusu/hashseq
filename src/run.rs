@@ -72,7 +72,7 @@ impl Run {
     ) -> Result<Self, RunError> {
         let mut chars = text.chars();
         let first = chars.next().ok_or(RunError::Empty)?;
-        if first_pins.contains(&at.id()) {
+        if first_pins.contains(at.id()) {
             return Err(RunError::RedundantDep);
         }
         let mut run = Self::new(at, first_pins, first);
