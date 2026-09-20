@@ -93,8 +93,20 @@ pub enum Loc {
 }
 
 impl Loc {
-    fn is_glue_point(&self) -> bool {
-        matches!(&self, Loc::Run { .. } | Loc::Origin | Loc::MoveOp)
+    fn ensure_element(&self) -> Result<(), Refused> {
+        if matches!(&self, Loc::Run { .. }) {
+            Ok(())
+        } else {
+            Err(Refused::NotAnElement)
+        }
+    }
+
+    fn ensure_glue_point(&self) -> Result<(), Refused> {
+        if matches!(&self, Loc::Run { .. } | Loc::Origin | Loc::MoveOp) {
+            Ok(())
+        } else {
+            Err(Refused::NotAGluePoint)
+        }
     }
 }
 
@@ -1429,9 +1441,10 @@ impl HashSeq {
     /// Resolve a mark anchor to a glue point `(node, after-side)`: an
     /// element, the origin, or a move op (its splice point — the bracket
     /// around wherever its target renders). `None` for anything else.
-    fn glue_point(&self, a: &Anchor) -> Option<(NodeIdx, bool)> {
-        let i = self.idx_of(a.id())?;
-        self.loc_of(i).is_glue_point().then_some((i, a.is_after()))
+    fn glue_point(&self, a: &Anchor) -> Result<(NodeIdx, bool), Refused> {
+        let i = self.idx_of(a.id()).ok_or(Refused::NotAGluePoint)?;
+        self.loc_of(i).ensure_glue_point()?;
+        Ok((i, a.is_after()))
     }
 
     /// Mark admissibility (the Mark admission rows): both anchors resolve to
@@ -1445,9 +1458,9 @@ impl HashSeq {
         start: InternedAnchor,
         end: InternedAnchor,
     ) -> Result<(), Refused> {
-        if !self.loc_of(start.idx()).is_glue_point() || !self.loc_of(end.idx()).is_glue_point() {
-            return Err(Refused::NotAGluePoint);
-        }
+        self.loc_of(start.idx()).ensure_glue_point()?;
+        self.loc_of(end.idx()).ensure_glue_point()?;
+
         let (s, e) = (start.point(), end.point());
         for (n, _) in [s, e] {
             if let Loc::MoveOp = self.loc_of(n) {
@@ -1817,10 +1830,9 @@ impl HashSeq {
         kind: Id,
         value: Id,
     ) -> Result<HashNode, Refused> {
-        let (Some(s), Some(e)) = (self.glue_point(&start), self.glue_point(&end)) else {
-            // Both anchors must be glue points before anything applies.
-            return Err(Refused::NotAGluePoint);
-        };
+        let s = self.glue_point(&start)?;
+        let e = self.glue_point(&end)?;
+
         // Overwrites hygiene (open problem 1, simple form): name every
         // same-kind mark whose span intersects the new range.
         for (n, _) in [s, e] {
@@ -2022,19 +2034,13 @@ impl HashSeq {
     /// refused; the caller drops it.
     fn interpret(&mut self, id: Id, node: InternedHashNode) -> Result<(), Refused> {
         match &node.op {
-            InternedOp::Insert { at, .. } => {
-                if !self.loc_of(at.idx()).is_glue_point() {
-                    return Err(Refused::NotAGluePoint);
-                }
-            }
+            InternedOp::Insert { at, .. } => self.loc_of(at.idx()).ensure_glue_point()?,
             InternedOp::Move { target, to, .. } => {
-                // Move target must be a sequence element
-                if !matches!(self.loc_of(*target), Loc::Run { .. }) {
-                    return Err(Refused::NotAnElement);
-                }
-                if !self.loc_of(to.idx()).is_glue_point() {
-                    return Err(Refused::NotAGluePoint);
-                }
+                // move target must be an element
+                self.loc_of(*target).ensure_element()?;
+                // destination must be a glue point
+                self.loc_of(to.idx()).ensure_glue_point()?;
+                // self-moves are refused
                 if to.idx() == *target {
                     return Err(Refused::SelfMove);
                 }
