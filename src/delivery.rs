@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::hashseq::IdMap;
+use rustc_hash::FxHashMap;
+
 use crate::{HashNode, Id};
 
 #[derive(Debug, Clone, Default)]
@@ -12,7 +13,7 @@ pub struct Delivery {
     /// Outer keys are adversary-chosen bytes (an op can name any id as a
     /// dep), so the outer map stays a std `HashMap` for SipHash's HashDoS
     /// protection.
-    pub(crate) orphaned: HashMap<Id, IdMap<HashNode>>,
+    pub(crate) orphaned: HashMap<Id, FxHashMap<Id, HashNode>>,
 }
 
 impl Delivery {

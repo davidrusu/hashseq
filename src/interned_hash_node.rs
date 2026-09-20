@@ -13,8 +13,8 @@
 //! compared across replicas, or put on the wire; set-valued roles are
 //! `SortedIdVec`s, which keep `Id` order.
 
-use crate::hashseq::{InternedId, SortedIdVec};
 use crate::{Anchor, HashNode, Id, Op, Payload};
+use crate::{InternedId, SortedIdVec};
 
 /// The glued point in handle space: `Anchor` with its id resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

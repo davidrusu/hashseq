@@ -23,7 +23,6 @@
 use rustc_hash::FxHashMap;
 
 use crate::hashkv::HashKv;
-use crate::hashseq::IdMap;
 use crate::value::{KIND_KV, KIND_SEQ, Value, object_id};
 use crate::{Clock, HashNode, HashSeq, Id, Outcome, Refused};
 
@@ -34,7 +33,7 @@ use crate::{Clock, HashNode, HashSeq, Id, Outcome, Refused};
 /// transport, one per peer; the store keeps no delta state of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HashWebClock {
-    pub(crate) objs: IdMap<Clock>,
+    pub(crate) objs: FxHashMap<Id, Clock>,
 }
 
 impl HashWebClock {
@@ -72,7 +71,7 @@ pub struct HashWeb {
     /// std's SipHash, not Fx (the same reasoning as `Delivery::orphaned`).
     pub(crate) orphaned: std::collections::HashMap<Id, Vec<(Id, HashNode)>>,
     /// Value-artifact side store shared across objects.
-    pub(crate) values: IdMap<Vec<u8>>,
+    pub(crate) values: FxHashMap<Id, Vec<u8>>,
     /// Delta sync is on (`enable_delta_sync`; APP_NOTES #8): minted
     /// small artifacts are tracked for `take_new_artifacts`. Off by
     /// default — servers and tests don't flush. The deltas themselves

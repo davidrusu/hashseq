@@ -20,7 +20,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::hashseq::InternedId;
+use crate::InternedId;
 
 const NIL: u32 = u32::MAX;
 

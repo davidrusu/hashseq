@@ -15,11 +15,10 @@ use std::collections::{BTreeSet, BinaryHeap};
 use rustc_hash::FxHashMap;
 
 use crate::delivery::Delivery;
-use crate::hashseq::{IdMap, InternedId};
 use crate::interned_hash_node::{InternedHashNode, InternedOp};
 use crate::placement::PlacementRegister;
 use crate::value::{TOMBSTONE, Value};
-use crate::{HashNode, Id, Op, Outcome, Refused};
+use crate::{HashNode, Id, InternedId, Op, Outcome, Refused};
 
 /// A key's register state: the live put heads, in id order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -58,14 +57,14 @@ pub struct HashKv {
     /// key value-id -> register. Keyed by the key's id — already a BLAKE3
     /// output, so FxHash is safe (the HASHKV_SPEC key rule: adversarial key
     /// bytes cost their author derivation, never a table).
-    keys: IdMap<KeyState>,
+    keys: FxHashMap<Id, KeyState>,
     /// Value-artifact side store: artifact bytes by value id, for the ids
     /// this replica has seen bytes for. Reads without bytes are `pending`.
     /// Standalone this is the whole store; inside a `HashWeb` it is the
     /// per-object view of the store-wide one — the web mirrors in the
     /// artifacts each delivered put names (`HashKv::hydrate`), and the
     /// canonical snapshot carries the union.
-    pub(crate) values: IdMap<Vec<u8>>,
+    pub(crate) values: FxHashMap<Id, Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Applied node ids in apply order — the map's arena, append-only
     /// (orphans never enter), and the id table the interned nodes' handles
@@ -74,7 +73,7 @@ pub struct HashKv {
     /// clock walk's order (`delta_for`).
     pub(crate) order: Vec<Id>,
     /// Arena position by id (`order[slot[id]] == id`).
-    pub(crate) slot: IdMap<u32>,
+    pub(crate) slot: FxHashMap<Id, u32>,
     /// Delta sync is on (`HashWeb::enable_delta_sync`): minted small
     /// artifacts are tracked in `new_artifacts`. Deltas themselves are a
     /// DAG diff against a peer clock and need no switch.
@@ -108,11 +107,11 @@ impl HashKv {
         let mut kv = Self {
             origin,
             nodes: Vec::new(),
-            keys: IdMap::default(),
-            values: IdMap::default(),
+            keys: Default::default(),
+            values: Default::default(),
             tips: BTreeSet::new(),
             order: Vec::new(),
-            slot: IdMap::default(),
+            slot: Default::default(),
             delta_sync: false,
             new_artifacts: Vec::new(),
             placement: PlacementRegister::default(),
@@ -164,13 +163,13 @@ impl HashKv {
     /// key and value) that `store` holds — the web-side hydration that
     /// keeps `get`/`resolve` on an object inside a `HashWeb` from missing
     /// values the web holds. Bounded by what the node references.
-    pub(crate) fn hydrate(&mut self, node: &HashNode, store: &IdMap<Vec<u8>>) {
+    pub(crate) fn hydrate(&mut self, node: &HashNode, store: &FxHashMap<Id, Vec<u8>>) {
         if let Op::Put { key, value, .. } = &node.op {
             self.hydrate_ids([*key, *value], store);
         }
     }
 
-    fn hydrate_ids(&mut self, ids: [Id; 2], store: &IdMap<Vec<u8>>) {
+    fn hydrate_ids(&mut self, ids: [Id; 2], store: &FxHashMap<Id, Vec<u8>>) {
         for id in ids {
             if !self.values.contains_key(&id)
                 && let Some(bytes) = store.get(&id)
@@ -181,7 +180,7 @@ impl HashKv {
     }
 
     /// `hydrate` over every node this object holds (applied and orphaned).
-    pub(crate) fn hydrate_all(&mut self, store: &IdMap<Vec<u8>>) {
+    pub(crate) fn hydrate_all(&mut self, store: &FxHashMap<Id, Vec<u8>>) {
         let applied = self.nodes.iter().map(|n| match &n.op {
             InternedOp::Put { key, value, .. } => Some([*key, *value]),
             _ => None,

@@ -1,4 +1,4 @@
-use crate::hashseq::{HashSeq, InternedId, Loc};
+use crate::{HashSeq, InternedId, Loc};
 
 /// Core in-order traversal, in handle space: run interiors walk `elements`
 /// directly (no hashing); explicit forks and befores resolve their Id-ordered
