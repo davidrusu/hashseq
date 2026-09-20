@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, BinaryHeap};
 use rustc_hash::FxHashMap;
 
 use crate::delivery::Delivery;
-use crate::hashseq::{IdMap, NodeIdx};
+use crate::hashseq::{IdMap, InternedId};
 use crate::interned_hash_node::{InternedHashNode, InternedOp};
 use crate::placement::PlacementRegister;
 use crate::value::{TOMBSTONE, Value};
@@ -43,7 +43,7 @@ pub enum Read {
 }
 
 /// The origin's arena slot — always the first.
-const ORIGIN_SLOT: NodeIdx = NodeIdx(0);
+const ORIGIN_SLOT: InternedId = InternedId(0);
 
 #[derive(Debug, Clone)]
 pub struct HashKv {
@@ -138,12 +138,12 @@ impl HashKv {
         self.slot.contains_key(id)
     }
 
-    fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
-        self.slot.get(id).map(|s| NodeIdx(*s))
+    fn idx_of(&self, id: &Id) -> Option<InternedId> {
+        self.slot.get(id).map(|s| InternedId(*s))
     }
 
     /// The applied node at arena slot `idx` (not the origin's).
-    fn node(&self, idx: NodeIdx) -> &InternedHashNode {
+    fn node(&self, idx: InternedId) -> &InternedHashNode {
         &self.nodes[idx.0 as usize - 1]
     }
 
@@ -259,7 +259,7 @@ impl HashKv {
         let heads = self.heads(key);
         let live: Vec<Id> = heads
             .iter()
-            .map(|h| match &self.node(NodeIdx(self.slot[h])).op {
+            .map(|h| match &self.node(InternedId(self.slot[h])).op {
                 InternedOp::Put { value, .. } => *value,
                 _ => unreachable!("heads hold puts"),
             })
@@ -467,7 +467,7 @@ impl HashKv {
         }
         out.reverse();
         out.into_iter()
-            .map(|i| self.node(NodeIdx(i as u32)).to_node(&self.order))
+            .map(|i| self.node(InternedId(i as u32)).to_node(&self.order))
             .collect()
     }
 
@@ -480,7 +480,7 @@ impl HashKv {
     }
 
     fn walk_deps(&self, i: usize, out: &mut Vec<usize>) {
-        let refs = self.node(NodeIdx(i as u32)).refs();
+        let refs = self.node(InternedId(i as u32)).refs();
         out.extend(refs.filter(|r| *r != ORIGIN_SLOT).map(|r| r.0 as usize));
     }
 

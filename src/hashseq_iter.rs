@@ -1,4 +1,4 @@
-use crate::hashseq::{HashSeq, Loc, NodeIdx};
+use crate::hashseq::{HashSeq, InternedId, Loc};
 
 /// Core in-order traversal, in handle space: run interiors walk `elements`
 /// directly (no hashing); explicit forks and befores resolve their Id-ordered
@@ -17,7 +17,7 @@ use crate::hashseq::{HashSeq, Loc, NodeIdx};
 #[derive(Debug, Clone)]
 pub(crate) struct HashSeqIdxIter<'a> {
     seq: &'a HashSeq,
-    waiting_stack: Vec<(NodeIdx, Vec<NodeIdx>)>,
+    waiting_stack: Vec<(InternedId, Vec<InternedId>)>,
 }
 
 #[allow(dead_code)]
@@ -36,15 +36,15 @@ impl<'a> HashSeqIdxIter<'a> {
         iter
     }
 
-    fn push_waiting(&mut self, n: NodeIdx) {
+    fn push_waiting(&mut self, n: InternedId) {
         // befores_of yields Id-sorted; reverse so .pop() returns ascending order.
-        let deps: Vec<NodeIdx> = self.seq.befores_of(n).rev().collect();
+        let deps: Vec<InternedId> = self.seq.befores_of(n).rev().collect();
         self.waiting_stack.push((n, deps));
     }
 }
 
 impl<'a> Iterator for HashSeqIdxIter<'a> {
-    type Item = NodeIdx;
+    type Item = InternedId;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -60,7 +60,7 @@ impl<'a> Iterator for HashSeqIdxIter<'a> {
                 // queue up any nodes who come after this one
                 if let Some(afters) = self.seq.afters.get(&n) {
                     // Iterates in Id order; reverse for stack push.
-                    let afters: Vec<NodeIdx> = afters.iter().rev().collect();
+                    let afters: Vec<InternedId> = afters.iter().rev().collect();
                     for s in afters {
                         self.push_waiting(s);
                     }
@@ -70,7 +70,7 @@ impl<'a> Iterator for HashSeqIdxIter<'a> {
                     // n is the head of a run: push the remaining elements
                     // (skip the head itself, which is n). Use push_waiting to
                     // properly handle each element's befores.
-                    let rest: Vec<NodeIdx> = self.seq.runs[&run]
+                    let rest: Vec<InternedId> = self.seq.runs[&run]
                         .elements
                         .iter()
                         .skip(1)

@@ -6,7 +6,7 @@ use crate::hashkv::HashKv;
 use crate::hashseq::{CausalRemove, Loc};
 use crate::hashweb::HashWeb;
 use crate::run::RunError;
-use crate::{Anchor, HashNode, HashSeq, Id, NodeIdx, Op, Payload, Run};
+use crate::{Anchor, HashNode, HashSeq, Id, InternedId, Op, Payload, Run};
 use crate::{Clock, HashWebClock, Outcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -770,7 +770,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         },
     }
     struct Block {
-        head: NodeIdx,
+        head: InternedId,
         head_id: Id,
         exposed: Vec<Id>,
         payload: Payload,
@@ -792,7 +792,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         first_pins: BTreeSet<Id>,
         text: String,
         interior: BTreeMap<usize, BTreeSet<Id>>,
-        elements: Vec<NodeIdx>,
+        elements: Vec<InternedId>,
     }
 
     // Causal depth of every applied node: depth(u) = 1 + max depth(refs(u)),
@@ -811,7 +811,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         // Refs only: a Place's `placed_at` is a foreign commitment — not in
         // this object's id table, so it cannot affect depth.
         let mut d = 0u64;
-        seq.for_each_ref(NodeIdx(i as u32), |r| d = d.max(depth[r.0 as usize] + 1));
+        seq.for_each_ref(InternedId(i as u32), |r| d = d.max(depth[r.0 as usize] + 1));
         depth[i] = d;
     }
 
@@ -820,7 +820,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // never carry explicit afters (forks split the stored run), so their
     // stored successor is their only extender; at stored tails the `afters`
     // set decides (move-op siblings are not extenders).
-    let chain_child = |p: NodeIdx| -> Option<NodeIdx> {
+    let chain_child = |p: InternedId| -> Option<InternedId> {
         if seq.is_atom(p) {
             return None; // atoms never chain: their text is a placeholder
         }
@@ -838,7 +838,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             .min_by_key(|h| (depth[h.0 as usize], seq.id_of(*h)))
     };
     // Pins of one insert element, from wherever its stored run keeps them.
-    let elem_pins = |e: NodeIdx| -> BTreeSet<Id> {
+    let elem_pins = |e: InternedId| -> BTreeSet<Id> {
         let Loc::Run { run, pos } = seq.loc_of(e) else {
             unreachable!("insert elements live in runs")
         };
@@ -853,7 +853,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         }
     };
     // One element's anchor: (side, anchor id, anchor element if it is one).
-    let elem_anchor = |e: NodeIdx| -> (Anchor, Option<NodeIdx>) {
+    let elem_anchor = |e: InternedId| -> (Anchor, Option<InternedId>) {
         let Loc::Run { run, pos } = seq.loc_of(e) else {
             unreachable!("insert elements live in runs")
         };
@@ -882,13 +882,13 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             }
             // e heads a canonical run: walk smallest-child extensions.
             let ci = canon_runs.len() as u32;
-            let mut elements: Vec<NodeIdx> = Vec::new();
+            let mut elements: Vec<InternedId> = Vec::new();
             let mut text = String::new();
             let mut interior = BTreeMap::new();
             let mut cur = e;
             // Chains mostly walk a stored run in order; keep one `Chars`
             // cursor per stored run instead of an O(pos) `nth` per element.
-            let mut chars: Option<(NodeIdx, u32, std::str::Chars<'_>)> = None;
+            let mut chars: Option<(InternedId, u32, std::str::Chars<'_>)> = None;
             loop {
                 elem_canon[cur.0 as usize] = (ci, elements.len() as u32);
                 if !elements.is_empty() {
@@ -947,14 +947,14 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // link; a link that loses its fork heads a chain whose first deps are
     // `{predecessor}`, which reconstructs identically.
     // link -> (stored chain key, index within it)
-    let mut link_pos: FxHashMap<NodeIdx, (NodeIdx, usize)> = FxHashMap::default();
+    let mut link_pos: FxHashMap<InternedId, (InternedId, usize)> = FxHashMap::default();
     for (&key, chain) in &seq.remove_runs {
         for (i, &l) in chain.links.iter().enumerate() {
             link_pos.insert(l, (key, i));
         }
     }
     // link r -> stored-chain heads whose first deps are exactly {id(r)}.
-    let mut heads_pinning: FxHashMap<NodeIdx, Vec<NodeIdx>> = FxHashMap::default();
+    let mut heads_pinning: FxHashMap<InternedId, Vec<InternedId>> = FxHashMap::default();
     for chain in seq.remove_runs.values() {
         if let [di] = *chain.first_extra_deps.as_slice()
             && link_pos.contains_key(&di)
@@ -962,7 +962,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             heads_pinning.entry(di).or_default().push(chain.links[0]);
         }
     }
-    let next_link = |r: NodeIdx| -> Option<NodeIdx> {
+    let next_link = |r: InternedId| -> Option<InternedId> {
         let (key, i) = link_pos[&r];
         let stored_next = seq.remove_runs[&key].links.get(i + 1).copied();
         let contenders = heads_pinning.get(&r).into_iter().flatten().copied();
@@ -973,7 +973,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             .min_by_key(|l| (depth[l.0 as usize], seq.id_of(*l)))
     };
     // Does r canonically continue its pinned predecessor?
-    let link_continues = |r: NodeIdx| -> bool {
+    let link_continues = |r: InternedId| -> bool {
         let (key, i) = link_pos[&r];
         let parent = if i > 0 {
             Some(seq.remove_runs[&key].links[i - 1])
@@ -992,12 +992,12 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // become others. Segments after the first synthesize extra_deps =
     // {previous remove id} — exactly the deps those links carry, so decode
     // reconstructs identical nodes.
-    let elem_of = |idx: NodeIdx| -> Option<(usize, usize)> {
+    let elem_of = |idx: InternedId| -> Option<(usize, usize)> {
         let (ci, off) = elem_canon[idx.0 as usize];
         (ci != u32::MAX).then_some((ci as usize, off as usize))
     };
 
-    let mut canon_chains: Vec<(Vec<NodeIdx>, Vec<NodeIdx>, BTreeSet<Id>)> = Vec::new();
+    let mut canon_chains: Vec<(Vec<InternedId>, Vec<InternedId>, BTreeSet<Id>)> = Vec::new();
     for stored in seq.remove_runs.values() {
         for (i, &l) in stored.links.iter().enumerate() {
             if link_continues(l) {
@@ -1103,7 +1103,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
 
     // Multi-target removes (identity-preserving — decode rebuilds the exact
     // Op::Remove set so the node id survives).
-    let mut multi_removes: Vec<(NodeIdx, &CausalRemove)> =
+    let mut multi_removes: Vec<(InternedId, &CausalRemove)> =
         seq.remove_nodes.iter().map(|(i, r)| (*i, r)).collect();
     multi_removes.sort_by_key(|(idx, _)| seq.id_of(*idx));
     for (idx, remove) in &multi_removes {

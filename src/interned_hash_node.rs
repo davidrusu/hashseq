@@ -13,19 +13,19 @@
 //! compared across replicas, or put on the wire; set-valued roles are
 //! `SortedIdVec`s, which keep `Id` order.
 
-use crate::hashseq::{NodeIdx, SortedIdVec};
+use crate::hashseq::{InternedId, SortedIdVec};
 use crate::{Anchor, HashNode, Id, Op, Payload};
 
 /// The glued point in handle space: `Anchor` with its id resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InternedAnchor {
-    Before(NodeIdx),
-    After(NodeIdx),
+    Before(InternedId),
+    After(InternedId),
 }
 
 impl InternedAnchor {
     #[inline]
-    pub fn idx(&self) -> NodeIdx {
+    pub fn idx(&self) -> InternedId {
         match self {
             InternedAnchor::Before(i) | InternedAnchor::After(i) => *i,
         }
@@ -44,7 +44,7 @@ impl InternedAnchor {
     /// The point as `(node, after-side)` — the shape the glue-point
     /// comparisons take.
     #[inline]
-    pub fn point(&self) -> (NodeIdx, bool) {
+    pub fn point(&self) -> (InternedId, bool) {
         (self.idx(), self.is_after())
     }
 
@@ -58,7 +58,10 @@ impl InternedAnchor {
     }
 
     #[inline]
-    fn resolve(a: &Anchor, to_handle: &mut impl FnMut(&Id) -> Option<NodeIdx>) -> Result<Self, Id> {
+    fn resolve(
+        a: &Anchor,
+        to_handle: &mut impl FnMut(&Id) -> Option<InternedId>,
+    ) -> Result<Self, Id> {
         let idx = to_handle(a.id()).ok_or(*a.id())?;
         Ok(match a {
             Anchor::Before(_) => InternedAnchor::Before(idx),
@@ -78,7 +81,7 @@ pub enum InternedOp {
     /// Targets in `Id` order.
     Remove(SortedIdVec),
     Move {
-        target: NodeIdx,
+        target: InternedId,
         to: InternedAnchor,
         overwrites: SortedIdVec,
     },
@@ -114,7 +117,7 @@ impl InternedHashNode {
     /// key the node orphans on, so the walk order here must stay that order.
     pub fn resolve(
         node: &HashNode,
-        mut to_handle: impl FnMut(&Id) -> Option<NodeIdx>,
+        mut to_handle: impl FnMut(&Id) -> Option<InternedId>,
     ) -> Result<Self, Id> {
         let h = &mut to_handle;
         let pins = SortedIdVec::try_from_id_set(&node.pins, &mut *h)?;
@@ -167,7 +170,7 @@ impl InternedHashNode {
     }
 
     /// Every handle this node references, in `HashNode::iter_refs` order.
-    pub fn refs(&self) -> impl Iterator<Item = NodeIdx> + '_ {
+    pub fn refs(&self) -> impl Iterator<Item = InternedId> + '_ {
         let (primary, secondary, set) = match &self.op {
             InternedOp::Insert { at, .. } => (Some(at.idx()), None, None),
             InternedOp::Remove(targets) => (None, None, Some(targets)),
@@ -319,8 +322,12 @@ mod tests {
         (0..16).map(tid).collect()
     }
 
-    fn lookup(ids: &[Id]) -> impl FnMut(&Id) -> Option<NodeIdx> + '_ {
-        |id| ids.iter().position(|i| i == id).map(|p| NodeIdx(p as u32))
+    fn lookup(ids: &[Id]) -> impl FnMut(&Id) -> Option<InternedId> + '_ {
+        |id| {
+            ids.iter()
+                .position(|i| i == id)
+                .map(|p| InternedId(p as u32))
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::hashseq::NodeIdx;
+use crate::hashseq::InternedId;
 
 const NIL: u32 = u32::MAX;
 
@@ -40,7 +40,7 @@ struct Frag {
     /// Treap heap priority (max-heap).
     prio: u32,
     /// Owning span: run head handle, or the root element's own handle.
-    head: NodeIdx,
+    head: InternedId,
     /// Element offset within the run where this fragment starts.
     start: u32,
     /// Element count covered by this fragment.
@@ -208,9 +208,9 @@ pub(crate) enum IndexTarget {
     /// Directly after this moved element's destination fragment.
     AfterMoved(ElemRef),
     /// Directly before this move op's zero-width splice fragment.
-    BeforeSplice(NodeIdx),
+    BeforeSplice(InternedId),
     /// Directly after this move op's zero-width splice fragment.
-    AfterSplice(NodeIdx),
+    AfterSplice(InternedId),
     /// At the very end of the document.
     Back,
 }
@@ -219,7 +219,7 @@ pub(crate) enum IndexTarget {
 pub(crate) struct RunIndex {
     frags: Vec<Frag>,
     root: u32,
-    frags_of: FxHashMap<NodeIdx, FragsOf>,
+    frags_of: FxHashMap<InternedId, FragsOf>,
     rng: u64,
     /// Rendered relocation (moves): element base ref -> its destination
     /// fragment. The base slot keeps its (cleared) bit for life — the origin
@@ -230,7 +230,7 @@ pub(crate) struct RunIndex {
     /// that content anchored to keeps a permanent slot at its rank; the same
     /// slot converts to/from a destination fragment as the op gains/loses
     /// decider status, so its position never recomputes.
-    splice: FxHashMap<NodeIdx, u32>,
+    splice: FxHashMap<InternedId, u32>,
     /// Arena slots freed by deleted destination fragments.
     free: Vec<u32>,
 }
@@ -251,7 +251,7 @@ impl Default for RunIndex {
 
 /// An element reference: (span head, element offset within the run). Root
 /// elements are (their own handle, 0).
-pub(crate) type ElemRef = (NodeIdx, u32);
+pub(crate) type ElemRef = (InternedId, u32);
 
 /// A comparable crossing in the sweep order: (treap slot, element offset
 /// within it, tie). Tie orders a slot's coincident crossings: 0 = a
@@ -274,7 +274,7 @@ pub(crate) struct FragView<'a> {
 }
 
 impl FragView<'_> {
-    pub(crate) fn head(&self) -> NodeIdx {
+    pub(crate) fn head(&self) -> InternedId {
         self.frag.head
     }
 
@@ -468,7 +468,7 @@ impl RunIndex {
     /// ghosts (`head` is the move op handle) — they yield no elements but
     /// op-anchored mark events fire at their crossing. This is the mark
     /// sweep's walk.
-    pub(crate) fn sweep_coverage(&self) -> Vec<(NodeIdx, u32, u32, SweepFrag)> {
+    pub(crate) fn sweep_coverage(&self) -> Vec<(InternedId, u32, u32, SweepFrag)> {
         let moved_slots: FxHashSet<u32> = self.moved.values().copied().collect();
         let splice_slots: FxHashSet<u32> = self.splice.values().copied().collect();
         let mut out = Vec::new();
@@ -524,7 +524,7 @@ impl RunIndex {
 
     /// Append one visible element at the run's tail. `off` is the new
     /// element's offset (the run's previous length), for coverage checking.
-    pub(crate) fn extend_run(&mut self, head: NodeIdx, off: u32) {
+    pub(crate) fn extend_run(&mut self, head: InternedId, off: u32) {
         let slot = match self.frags_of.get(&head) {
             Some(FragsOf::One(s)) => *s,
             Some(FragsOf::Many(v)) => *v.last().unwrap(),
@@ -541,7 +541,7 @@ impl RunIndex {
     }
 
     /// Insert a fresh 1-element span for `head` at `target`.
-    pub(crate) fn insert_span_at(&mut self, target: IndexTarget, head: NodeIdx) {
+    pub(crate) fn insert_span_at(&mut self, target: IndexTarget, head: InternedId) {
         let n = self.new_span(head);
         self.attach_at(target, n);
         self.settle(n);
@@ -603,7 +603,7 @@ impl RunIndex {
 
     /// Place a zero-width splice fragment for move op `op` at `target` (the
     /// op is anchored-to but not rendering its target).
-    pub(crate) fn place_splice_at(&mut self, target: IndexTarget, op: NodeIdx) {
+    pub(crate) fn place_splice_at(&mut self, target: IndexTarget, op: InternedId) {
         let n = self.new_frag(op, 0, 0, 0, Bits::Small(0));
         let prev = self.splice.insert(op, n);
         debug_assert!(prev.is_none(), "op already has a splice slot");
@@ -611,12 +611,12 @@ impl RunIndex {
         self.settle(n);
     }
 
-    pub(crate) fn has_splice(&self, op: NodeIdx) -> bool {
+    pub(crate) fn has_splice(&self, op: InternedId) -> bool {
         !self.splice.is_empty() && self.splice.contains_key(&op)
     }
 
     /// The treap slot of `op`'s zero-width splice ghost, if one exists.
-    pub(crate) fn splice_slot(&self, op: NodeIdx) -> Option<u32> {
+    pub(crate) fn splice_slot(&self, op: InternedId) -> Option<u32> {
         if self.splice.is_empty() {
             return None;
         }
@@ -635,7 +635,7 @@ impl RunIndex {
     /// Convert `elem`'s destination fragment into `op`'s zero-width splice
     /// ghost, in place — the op lost decider status but content anchored to
     /// it keeps its rank. Returns false if `elem` is not moved-rendered.
-    pub(crate) fn demote_to_splice(&mut self, elem: ElemRef, op: NodeIdx) -> bool {
+    pub(crate) fn demote_to_splice(&mut self, elem: ElemRef, op: InternedId) -> bool {
         if self.moved.is_empty() {
             return false;
         }
@@ -656,7 +656,7 @@ impl RunIndex {
 
     /// Convert `op`'s splice ghost back into a destination fragment
     /// rendering `elem` — the op regained decider status at its old rank.
-    pub(crate) fn promote_splice(&mut self, op: NodeIdx, elem: ElemRef) {
+    pub(crate) fn promote_splice(&mut self, op: InternedId, elem: ElemRef) {
         let slot = self.splice.remove(&op).expect("op has a splice slot");
         let f = &mut self.frags[slot as usize];
         f.head = elem.0;
@@ -728,7 +728,7 @@ impl RunIndex {
 
     /// Mirror `StoredRun::split_at`: fragments covering `[at..)` now belong to
     /// `right_head`, with offsets rebased. Visible counts are untouched.
-    pub(crate) fn split_run(&mut self, head: NodeIdx, at: u32, right_head: NodeIdx) {
+    pub(crate) fn split_run(&mut self, head: InternedId, at: u32, right_head: InternedId) {
         // Make the split point a fragment boundary first.
         if let Some(slot) = self.frag_containing(head, at)
             && self.frags[slot as usize].start < at
@@ -816,7 +816,7 @@ impl RunIndex {
     }
 
     /// Fragment of `head` covering element offset `off`.
-    fn frag_containing(&self, head: NodeIdx, off: u32) -> Option<u32> {
+    fn frag_containing(&self, head: InternedId, off: u32) -> Option<u32> {
         let slot = match self.frags_of.get(&head)? {
             FragsOf::One(s) => *s,
             FragsOf::Many(v) => {
@@ -840,7 +840,14 @@ impl RunIndex {
         (self.rng >> 33) as u32
     }
 
-    fn new_frag(&mut self, head: NodeIdx, start: u32, len: u32, visible: u32, bits: Bits) -> u32 {
+    fn new_frag(
+        &mut self,
+        head: InternedId,
+        start: u32,
+        len: u32,
+        visible: u32,
+        bits: Bits,
+    ) -> u32 {
         let prio = self.next_prio();
         let frag = Frag {
             left: NIL,
@@ -863,7 +870,7 @@ impl RunIndex {
         }
     }
 
-    fn new_span(&mut self, head: NodeIdx) -> u32 {
+    fn new_span(&mut self, head: InternedId) -> u32 {
         let slot = self.new_frag(head, 0, 1, 1, Bits::Small(1));
         let prev = self.frags_of.insert(head, FragsOf::One(slot));
         debug_assert!(prev.is_none(), "span heads are unique");
@@ -992,8 +999,8 @@ impl RunIndex {
 mod tests {
     use super::*;
 
-    fn n(i: u32) -> NodeIdx {
-        NodeIdx(i)
+    fn n(i: u32) -> InternedId {
+        InternedId(i)
     }
 
     #[test]
@@ -1124,10 +1131,10 @@ mod tests {
         };
 
         // model: document as Vec of (head, offset, visible)
-        let mut doc: Vec<(NodeIdx, u32, bool)> = Vec::new();
+        let mut doc: Vec<(InternedId, u32, bool)> = Vec::new();
         let mut ix = RunIndex::default();
         let mut next_head = 0u32;
-        let mut run_len: FxHashMap<NodeIdx, u32> = FxHashMap::default();
+        let mut run_len: FxHashMap<InternedId, u32> = FxHashMap::default();
 
         for step in 0..2000 {
             match rand(5) {
@@ -1155,7 +1162,7 @@ mod tests {
                 // extend appends at the tail fragment, which mirrors HashSeq
                 // always extending with the run's last element)
                 1 => {
-                    let heads: Vec<NodeIdx> = run_len.keys().copied().collect();
+                    let heads: Vec<InternedId> = run_len.keys().copied().collect();
                     if heads.is_empty() {
                         continue;
                     }
@@ -1181,7 +1188,7 @@ mod tests {
                 }
                 // split a random run with len >= 2
                 3 => {
-                    let candidates: Vec<(NodeIdx, u32)> = run_len
+                    let candidates: Vec<(InternedId, u32)> = run_len
                         .iter()
                         .filter(|&(_, &l)| l >= 2)
                         .map(|(&h, &l)| (h, l))

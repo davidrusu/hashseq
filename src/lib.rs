@@ -20,7 +20,7 @@ pub use self::encoding::{
 };
 pub use self::hash_node::{Anchor, HashNode, Op, Payload};
 pub use self::hashkv::{HashKv, Read};
-pub use self::hashseq::{Cursor, HashSeq, Loc, MarkSet, NodeIdx, StoredRun};
+pub use self::hashseq::{Cursor, HashSeq, InternedId, Loc, MarkSet, StoredRun};
 pub use self::hashweb::{HashWeb, HashWebClock};
 pub use self::run::Run;
 pub use self::value::{Value, object_id};

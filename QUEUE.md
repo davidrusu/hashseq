@@ -1,8 +1,7 @@
 # Queue
 
 - can we consolidate insert_before and insert_after functions now?
-- rename NodeIdx to InternedId
-- Loc::ensure_glue_point/::ensure_element that return result to simplify validation logic
+- check if self-moves are actually problematic, currently we guard against it.
 
 ## Core
 

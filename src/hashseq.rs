@@ -16,15 +16,15 @@ pub type IdMap<V> = FxHashMap<Id, V>;
 /// HashSet of `Id`. Same FxHash rationale as `IdMap`.
 pub type IdSet = FxHashSet<Id>;
 
-/// The `Id -> NodeIdx` intern map, keyed by the id's u64 prefix instead of the
+/// The `Id -> InternedId` intern map, keyed by the id's u64 prefix instead of the
 /// full 32 bytes. A prefix hit is verified against `ids[idx]`, which makes
 /// lookups exact, a true prefix collision just fails verification and falls
 /// through to the `spill` map of full-key entries (expected to stay empty:
 /// ~N^2 / 2^64 chance per pair, and harmless when it does fire).
 #[derive(Debug, Default, Clone)]
 struct IdIndex {
-    prefix: FxHashMap<u64, NodeIdx>,
-    spill: IdMap<NodeIdx>,
+    prefix: FxHashMap<u64, InternedId>,
+    spill: IdMap<InternedId>,
 }
 
 fn id_prefix(id: &Id) -> u64 {
@@ -32,8 +32,8 @@ fn id_prefix(id: &Id) -> u64 {
 }
 
 impl IdIndex {
-    /// `ids` is the `NodeIdx -> Id` table used to verify prefix hits.
-    fn get(&self, id: &Id, ids: &[Id]) -> Option<NodeIdx> {
+    /// `ids` is the `InternedId -> Id` table used to verify prefix hits.
+    fn get(&self, id: &Id, ids: &[Id]) -> Option<InternedId> {
         let idx = *self.prefix.get(&id_prefix(id))?;
         if ids[idx.0 as usize] == *id {
             Some(idx)
@@ -42,7 +42,7 @@ impl IdIndex {
         }
     }
 
-    fn insert(&mut self, id: Id, idx: NodeIdx) {
+    fn insert(&mut self, id: Id, idx: InternedId) {
         match self.prefix.entry(id_prefix(&id)) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(idx);
@@ -57,7 +57,7 @@ impl IdIndex {
 }
 
 /// Compact handle for an applied node. Handles are allocated densely in local
-/// apply order, so `Vec`s indexed by `NodeIdx` replace `Id`-keyed maps for
+/// apply order, so `Vec`s indexed by `InternedId` replace `Id`-keyed maps for
 /// everything but the single interning map.
 ///
 /// Handles are replica-local: two replicas applying the same ops in different
@@ -65,22 +65,22 @@ impl IdIndex {
 /// convergence-relevant — sibling ordering, hashing, and the wire format all
 /// operate on `Id`s.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeIdx(pub u32);
+pub struct InternedId(pub u32);
 
 /// The virtual origin's handle — always the first interned node.
-pub(crate) const ORIGIN_IDX: NodeIdx = NodeIdx(0);
+pub(crate) const ORIGIN_IDX: InternedId = InternedId(0);
 
 /// Where an applied node lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Loc {
     /// Element of an insert run: (run head, position within the run).
-    Run { run: NodeIdx, pos: u32 },
-    /// The document's virtual origin (`NodeIdx(0)`, interned at construction).
+    Run { run: InternedId, pos: u32 },
+    /// The document's virtual origin (`InternedId(0)`, interned at construction).
     /// Never visible, never yielded; it exists so ops can anchor at the
     /// document itself — a "root" insert is just `InsertAfter(origin, ch)`.
     Origin,
     /// Link in a remove chain: (chain head, position within the chain).
-    RemoveChain { chain: NodeIdx, pos: u32 },
+    RemoveChain { chain: InternedId, pos: u32 },
     /// Multi-target remove (stored in `remove_nodes`).
     MultiRemove,
     /// A placement-register move op (stored in `move_nodes`).
@@ -112,7 +112,7 @@ impl Loc {
 
 /// `Loc` packed into 8 bytes for the per-node `locs` Vec (the enum is 12).
 /// Layout: 3-bit kind | 32-bit handle | 29-bit position. The handle keeps the
-/// full `NodeIdx` (u32) range; `pos` is a within-run/-chain offset, so 29 bits
+/// full `InternedId` (u32) range; `pos` is a within-run/-chain offset, so 29 bits
 /// (~536M) is far beyond any real run length (the longest in the test corpus
 /// is ~69k).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,14 +128,14 @@ impl PackedLoc {
     const KIND_PLACE_OP: u64 = 6;
 
     #[inline]
-    fn pack(handle: NodeIdx, pos: u32, kind: u64) -> Self {
+    fn pack(handle: InternedId, pos: u32, kind: u64) -> Self {
         debug_assert!(pos < (1 << 29), "Loc position {pos} exceeds 29 bits");
         PackedLoc(kind | (handle.0 as u64) << 3 | (pos as u64) << 35)
     }
 
     #[inline]
     fn unpack(self) -> Loc {
-        let handle = NodeIdx((self.0 >> 3) as u32);
+        let handle = InternedId((self.0 >> 3) as u32);
         let pos = (self.0 >> 35) as u32;
         match self.0 & 0b111 {
             Self::KIND_RUN => Loc::Run { run: handle, pos },
@@ -154,14 +154,14 @@ impl From<Loc> for PackedLoc {
     fn from(loc: Loc) -> Self {
         match loc {
             Loc::Run { run, pos } => PackedLoc::pack(run, pos, PackedLoc::KIND_RUN),
-            Loc::Origin => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_ORIGIN),
+            Loc::Origin => PackedLoc::pack(InternedId(0), 0, PackedLoc::KIND_ORIGIN),
             Loc::RemoveChain { chain, pos } => {
                 PackedLoc::pack(chain, pos, PackedLoc::KIND_REMOVE_CHAIN)
             }
-            Loc::MultiRemove => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MULTI_REMOVE),
-            Loc::MoveOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MOVE_OP),
-            Loc::MarkOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_MARK_OP),
-            Loc::PlaceOp => PackedLoc::pack(NodeIdx(0), 0, PackedLoc::KIND_PLACE_OP),
+            Loc::MultiRemove => PackedLoc::pack(InternedId(0), 0, PackedLoc::KIND_MULTI_REMOVE),
+            Loc::MoveOp => PackedLoc::pack(InternedId(0), 0, PackedLoc::KIND_MOVE_OP),
+            Loc::MarkOp => PackedLoc::pack(InternedId(0), 0, PackedLoc::KIND_MARK_OP),
+            Loc::PlaceOp => PackedLoc::pack(InternedId(0), 0, PackedLoc::KIND_PLACE_OP),
         }
     }
 }
@@ -206,7 +206,7 @@ impl Cursor {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CausalInsert {
-    pub anchor: NodeIdx,
+    pub anchor: InternedId,
     pub pins: SortedIdVec,
     pub ch: char,
     /// `Some(value id)` for an atom (a non-char payload): `ch` is then the
@@ -230,7 +230,7 @@ pub struct CausalRemove {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMove {
-    pub target: NodeIdx,
+    pub target: InternedId,
     pub to: InternedAnchor,
     pub overwrites: SortedIdVec,
     pub pins: SortedIdVec,
@@ -255,9 +255,9 @@ pub struct StoredMark {
 pub struct RemoveRun {
     pub first_extra_deps: SortedIdVec,
     /// Element handles removed, in removal order.
-    pub targets: Vec<NodeIdx>,
+    pub targets: Vec<InternedId>,
     /// Handles of the remove nodes themselves; `links[i]` removes `targets[i]`.
-    pub links: Vec<NodeIdx>,
+    pub links: Vec<InternedId>,
 }
 
 impl RemoveRun {
@@ -279,7 +279,7 @@ pub struct StoredRun {
     /// across a remove instead of starting a new run per burst.
     pub interior_pins: BTreeMap<usize, SortedIdVec>,
     pub text: String,
-    pub elements: Vec<NodeIdx>,
+    pub elements: Vec<InternedId>,
 }
 
 impl StoredRun {
@@ -300,15 +300,15 @@ impl StoredRun {
         }
     }
 
-    pub fn head(&self) -> NodeIdx {
+    pub fn head(&self) -> InternedId {
         self.elements[0]
     }
 
-    pub fn last(&self) -> NodeIdx {
+    pub fn last(&self) -> InternedId {
         *self.elements.last().unwrap()
     }
 
-    fn extend(&mut self, idx: NodeIdx, ch: char, extra_deps: SortedIdVec) {
+    fn extend(&mut self, idx: InternedId, ch: char, extra_deps: SortedIdVec) {
         if !extra_deps.is_empty() {
             self.interior_pins.insert(self.elements.len(), extra_deps);
         }
@@ -318,7 +318,7 @@ impl StoredRun {
 
     /// Split at element index `at` (0 < at < len), returning the right portion.
     /// `right_anchor` is the left portion's last element.
-    fn split_at(&mut self, at: usize, right_anchor: NodeIdx) -> StoredRun {
+    fn split_at(&mut self, at: usize, right_anchor: InternedId) -> StoredRun {
         assert!(at > 0 && at < self.len(), "Invalid split position");
         let right_elements = self.elements.split_off(at);
         let byte_pos = self.text.char_indices().nth(at).unwrap().0;
@@ -357,11 +357,11 @@ impl StoredRun {
     }
 }
 
-/// A set of node handles kept sorted by their `Id`, stored as `Vec<NodeIdx>`
+/// A set of node handles kept sorted by their `Id`, stored as `Vec<InternedId>`
 /// (4 bytes/entry) instead of `BTreeSet<Id>` (32 bytes/entry plus a ~400 B
 /// B-tree node each).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SortedIdVec(Vec<NodeIdx>);
+pub struct SortedIdVec(Vec<InternedId>);
 
 impl SortedIdVec {
     /// Index of the handle whose id equals `id` (`Ok`) or where it would be
@@ -376,16 +376,16 @@ impl SortedIdVec {
     /// `Err` is the first member (in `Id` order) with no handle.
     pub(crate) fn try_from_id_set(
         set: &BTreeSet<Id>,
-        mut to_handle: impl FnMut(&Id) -> Option<NodeIdx>,
+        mut to_handle: impl FnMut(&Id) -> Option<InternedId>,
     ) -> Result<Self, Id> {
         set.iter()
             .map(|id| to_handle(id).ok_or(*id))
-            .collect::<Result<Vec<NodeIdx>, Id>>()
+            .collect::<Result<Vec<InternedId>, Id>>()
             .map(SortedIdVec)
     }
 
     /// The one-member set.
-    pub(crate) fn single(handle: NodeIdx) -> Self {
+    pub(crate) fn single(handle: InternedId) -> Self {
         SortedIdVec(vec![handle])
     }
 
@@ -401,7 +401,7 @@ impl SortedIdVec {
 
     /// Insert `handle` keyed by its id; a no-op if an equal id is already
     /// present (set semantics, like the `BTreeSet<Id>` it replaces).
-    pub fn insert(&mut self, handle: NodeIdx, ids: &[Id]) {
+    pub fn insert(&mut self, handle: InternedId, ids: &[Id]) {
         let id = ids[handle.0 as usize];
         if let Err(pos) = self.search(&id, ids) {
             self.0.insert(pos, handle);
@@ -422,18 +422,18 @@ impl SortedIdVec {
 
     /// Handle with the smallest id.
     #[inline]
-    pub fn first(&self) -> Option<NodeIdx> {
+    pub fn first(&self) -> Option<InternedId> {
         self.0.first().copied()
     }
 
     /// Handle with the largest id.
     #[inline]
-    pub fn last(&self) -> Option<NodeIdx> {
+    pub fn last(&self) -> Option<InternedId> {
         self.0.last().copied()
     }
 
     /// Handle with the smallest id `>= id` (the `range(id..).next()` seek).
-    pub fn first_ge(&self, id: &Id, ids: &[Id]) -> Option<NodeIdx> {
+    pub fn first_ge(&self, id: &Id, ids: &[Id]) -> Option<InternedId> {
         let pos = match self.search(id, ids) {
             Ok(p) | Err(p) => p,
         };
@@ -441,13 +441,13 @@ impl SortedIdVec {
     }
 
     #[inline]
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = InternedId> + '_ {
         self.0.iter().copied()
     }
 
     /// The handles, in `Id` order.
     #[inline]
-    pub fn as_slice(&self) -> &[NodeIdx] {
+    pub fn as_slice(&self) -> &[InternedId] {
         &self.0
     }
 
@@ -462,8 +462,8 @@ impl SortedIdVec {
 }
 
 impl<'a> IntoIterator for &'a SortedIdVec {
-    type Item = NodeIdx;
-    type IntoIter = std::iter::Copied<std::slice::Iter<'a, NodeIdx>>;
+    type Item = InternedId;
+    type IntoIter = std::iter::Copied<std::slice::Iter<'a, InternedId>>;
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter().copied()
     }
@@ -480,66 +480,66 @@ impl<'a> IntoIterator for &'a SortedIdVec {
 pub struct MoveRegister {
     pub heads: SortedIdVec,
     /// `None` = the creation placement (base slot).
-    pub decider: Option<NodeIdx>,
+    pub decider: Option<InternedId>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HashSeq {
     /// The document's identity: ops anchor at this id to insert at top level.
     /// All op hashes transitively commit to it, so documents with different
-    /// origins can never merge. Interned as `NodeIdx(0)`, tombstoned (it is
+    /// origins can never merge. Interned as `InternedId(0)`, tombstoned (it is
     /// virtual and never visible).
     origin: Id,
     // ---- id <-> handle interning: the only Id-keyed lookup structure ----
     id_to_idx: IdIndex,
-    /// NodeIdx -> Id (append-only).
+    /// InternedId -> Id (append-only).
     pub ids: Vec<Id>,
-    /// NodeIdx -> location (8 bytes each; see [`PackedLoc`]).
+    /// InternedId -> location (8 bytes each; see [`PackedLoc`]).
     pub locs: Vec<PackedLoc>,
-    /// NodeIdx -> tombstone (one bit per handle).
+    /// InternedId -> tombstone (one bit per handle).
     pub removed: BitSet,
 
     // All inserts live in runs: sequential typing extends a run, and a lone
     // insert is just a 1-char run. A run is After- or Before-anchored
     // (`StoredRun::first_op`); subsequent elements always chain InsertAfter.
     // Top-level inserts are runs anchored at `origin` like any other.
-    pub runs: FxHashMap<NodeIdx, StoredRun>,
+    pub runs: FxHashMap<InternedId, StoredRun>,
     /// Reverse index: anchor -> heads of Before-runs anchored at it. Values are
     /// Id-ordered (a [`SortedIdVec`]): sibling order is a convergence concern,
     /// so it must not use replica-local handles.
-    pub befores_by_anchor: FxHashMap<NodeIdx, SortedIdVec>,
+    pub befores_by_anchor: FxHashMap<InternedId, SortedIdVec>,
     /// Multi-target removes only; single-target removes coalesce into chains.
-    pub remove_nodes: FxHashMap<NodeIdx, CausalRemove>,
+    pub remove_nodes: FxHashMap<InternedId, CausalRemove>,
     /// Applied move ops, by their own handle (the placement-register
     /// history: `overwrites` edges are walked by the last-agreed rule).
-    pub move_nodes: FxHashMap<NodeIdx, StoredMove>,
+    pub move_nodes: FxHashMap<InternedId, StoredMove>,
     /// Placement registers: target element -> live move heads + their
     /// resolved decider (see `MoveRegister`).
-    pub moves: FxHashMap<NodeIdx, MoveRegister>,
+    pub moves: FxHashMap<InternedId, MoveRegister>,
     #[cfg(test)]
     /// How many contested resolutions `resolve_decider` has run (tests
     /// assert reads never re-resolve).
     pub(crate) resolutions: std::cell::Cell<usize>,
     /// Chained single-target removes (backspace/delete bursts), keyed by the
     /// first remove's handle.
-    pub remove_runs: FxHashMap<NodeIdx, RemoveRun>,
+    pub remove_runs: FxHashMap<InternedId, RemoveRun>,
     /// Fork tracking: anchor -> handles that fork from it (Id-ordered, see
     /// `befores_by_anchor`).
-    pub afters: FxHashMap<NodeIdx, SortedIdVec>,
+    pub afters: FxHashMap<InternedId, SortedIdVec>,
 
     /// The value column: atom elements' payload commitment ids (HASHSEQ_SPEC
     /// "Payload"). Atoms are single-element runs holding `ATOM_CHAR` as
     /// placeholder text; empty in char-only documents — hot paths guard on
     /// that first.
-    pub elem_payloads: FxHashMap<NodeIdx, Id>,
+    pub elem_payloads: FxHashMap<InternedId, Id>,
     /// Applied mark ops, by their own handle (MARKS.md).
-    pub mark_nodes: FxHashMap<NodeIdx, StoredMark>,
+    pub mark_nodes: FxHashMap<InternedId, StoredMark>,
     /// Anchor events for the mark sweep: anchor element (or origin) ->
     /// events crossing at its glue points. Empty in mark-free documents.
-    mark_events: FxHashMap<NodeIdx, Vec<MarkEvent>>,
+    mark_events: FxHashMap<InternedId, Vec<MarkEvent>>,
     /// Applied place ops, by their own handle — this object's containment-
     /// register history (PLACEMENT_SPEC.md). Retention: the full spine.
-    pub place_nodes: FxHashMap<NodeIdx, StoredPlace>,
+    pub place_nodes: FxHashMap<InternedId, StoredPlace>,
     /// The containment register: live heads + the last-agreed walk.
     pub(crate) placement: PlacementRegister,
 
@@ -562,7 +562,7 @@ pub type MarkSet = Vec<(Id, Vec<(Id, Id)>)>;
 /// One crossing at an anchor's glue point: a mark op starting or ending.
 #[derive(Debug, Clone, Copy)]
 struct MarkEvent {
-    op: NodeIdx,
+    op: InternedId,
     start: bool,
     /// Which of the anchor's two points: `After` (true) or `Before`.
     after: bool,
@@ -641,11 +641,11 @@ impl HashSeq {
 
     // ---- interning ----
 
-    fn next_idx(&self) -> NodeIdx {
-        NodeIdx(self.ids.len() as u32)
+    fn next_idx(&self) -> InternedId {
+        InternedId(self.ids.len() as u32)
     }
 
-    fn intern(&mut self, id: Id, loc: Loc) -> NodeIdx {
+    fn intern(&mut self, id: Id, loc: Loc) -> InternedId {
         let idx = self.next_idx();
         self.ids.push(id);
         self.locs.push(loc.into());
@@ -654,23 +654,23 @@ impl HashSeq {
         idx
     }
 
-    pub fn idx_of(&self, id: &Id) -> Option<NodeIdx> {
+    pub fn idx_of(&self, id: &Id) -> Option<InternedId> {
         self.id_to_idx.get(id, &self.ids)
     }
 
-    pub fn id_of(&self, idx: NodeIdx) -> Id {
+    pub fn id_of(&self, idx: InternedId) -> Id {
         self.ids[idx.0 as usize]
     }
 
-    pub(crate) fn id_ref(&self, idx: NodeIdx) -> &Id {
+    pub(crate) fn id_ref(&self, idx: InternedId) -> &Id {
         &self.ids[idx.0 as usize]
     }
 
-    pub fn loc_of(&self, idx: NodeIdx) -> Loc {
+    pub fn loc_of(&self, idx: InternedId) -> Loc {
         self.locs[idx.0 as usize].unpack()
     }
 
-    pub fn is_removed(&self, idx: NodeIdx) -> bool {
+    pub fn is_removed(&self, idx: InternedId) -> bool {
         self.removed.get(idx.0 as usize)
     }
 
@@ -680,7 +680,7 @@ impl HashSeq {
     }
 
     /// Is this element an atom (a non-char payload)?
-    pub(crate) fn is_atom(&self, e: NodeIdx) -> bool {
+    pub(crate) fn is_atom(&self, e: InternedId) -> bool {
         !self.elem_payloads.is_empty() && self.elem_payloads.contains_key(&e)
     }
 
@@ -692,7 +692,7 @@ impl HashSeq {
         self.elem_payloads.get(&e).copied()
     }
 
-    pub(crate) fn char_at(&self, idx: NodeIdx) -> char {
+    pub(crate) fn char_at(&self, idx: InternedId) -> char {
         match self.loc_of(idx) {
             Loc::Run { run, pos } => self.runs[&run].char_at(pos as usize),
             _ => panic!("char_at on a non-insert node"),
@@ -719,7 +719,10 @@ impl HashSeq {
     // ---- causal adjacency (handle space) ----
 
     /// Successors of `idx`: explicit forks (Id-ordered) or the run continuation.
-    pub(crate) fn afters_of(&self, idx: NodeIdx) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
+    pub(crate) fn afters_of(
+        &self,
+        idx: InternedId,
+    ) -> impl DoubleEndedIterator<Item = InternedId> + '_ {
         let explicit = self.afters.get(&idx);
         // Run fallback only fires when there's no explicit afters entry.
         let from_run = if explicit.is_none() {
@@ -734,7 +737,10 @@ impl HashSeq {
     }
 
     /// Before-run heads anchored at `idx`, in Id order.
-    pub(crate) fn befores_of(&self, idx: NodeIdx) -> impl DoubleEndedIterator<Item = NodeIdx> + '_ {
+    pub(crate) fn befores_of(
+        &self,
+        idx: InternedId,
+    ) -> impl DoubleEndedIterator<Item = InternedId> + '_ {
         self.befores_by_anchor.get(&idx).into_iter().flatten()
     }
 
@@ -763,7 +769,7 @@ impl HashSeq {
     // ---- position index plumbing ----
 
     /// The index addresses an insert as (run head, element offset).
-    fn elem_ref(&self, idx: NodeIdx) -> ElemRef {
+    fn elem_ref(&self, idx: InternedId) -> ElemRef {
         match self.loc_of(idx) {
             Loc::Run { run, pos } => (run, pos),
             _ => panic!("elem_ref on a non-insert node"),
@@ -771,14 +777,14 @@ impl HashSeq {
     }
 
     /// The insert node at visible position `pos`.
-    fn element_at(&self, pos: usize) -> Option<NodeIdx> {
+    fn element_at(&self, pos: usize) -> Option<InternedId> {
         let (head, off) = self.index.get(pos)?;
         Some(self.runs[&head].elements[off as usize])
     }
 
     /// First element, in document order, of the region rooted at `n`: a node's
     /// before-runs precede it, recursively.
-    fn region_first(&self, mut n: NodeIdx) -> NodeIdx {
+    fn region_first(&self, mut n: InternedId) -> InternedId {
         while let Some(first) = self.befores_by_anchor.get(&n).and_then(|s| s.first()) {
             n = first;
         }
@@ -789,7 +795,7 @@ impl HashSeq {
     /// follow the run to its tail, then the largest after-fork, repeatedly.
     /// (Befores precede their anchors, so they never contribute the last
     /// element; run interiors never carry explicit afters — forks split.)
-    fn subtree_last(&self, mut n: NodeIdx) -> NodeIdx {
+    fn subtree_last(&self, mut n: InternedId) -> InternedId {
         loop {
             if let Loc::Run { run, .. } = self.loc_of(n) {
                 n = self.runs[&run].last();
@@ -807,7 +813,7 @@ impl HashSeq {
     /// explicit forks, the implicit run continuation, and rendered move-ins;
     /// tombstones don't matter (a removed element's region still occupies
     /// its place in document order).
-    fn after_sibling_target(&self, anchor: NodeIdx, id: &Id) -> (NodeIdx, bool) {
+    fn after_sibling_target(&self, anchor: InternedId, id: &Id) -> (InternedId, bool) {
         // Explicit-afters case: O(log n) range seek. Run-fallback case: at
         // most one candidate, just check it.
         let next_node = if let Some(siblings) = self.afters.get(&anchor) {
@@ -826,7 +832,7 @@ impl HashSeq {
     /// next bigger before-sibling's region, or — as the biggest — directly
     /// before the anchor itself. (Before-siblings release in Id order,
     /// directly before their anchor.)
-    fn before_sibling_target(&self, anchor: NodeIdx, id: &Id) -> NodeIdx {
+    fn before_sibling_target(&self, anchor: InternedId, id: &Id) -> InternedId {
         match self
             .befores_by_anchor
             .get(&anchor)
@@ -837,7 +843,7 @@ impl HashSeq {
         }
     }
 
-    fn neighbours(&self, idx: usize) -> (Option<NodeIdx>, Option<NodeIdx>) {
+    fn neighbours(&self, idx: usize) -> (Option<InternedId>, Option<InternedId>) {
         let left = idx
             .checked_sub(1)
             .and_then(|prev_idx| self.element_at(prev_idx));
@@ -959,7 +965,7 @@ impl HashSeq {
     /// destination fragment), or the virtual origin, whose "position" is the
     /// start of its afters region (the origin's own befores precede that
     /// point — with no afters, everything precedes it, so it is the end).
-    fn index_target(&self, el: NodeIdx, before: bool) -> IndexTarget {
+    fn index_target(&self, el: InternedId, before: bool) -> IndexTarget {
         if el == ORIGIN_IDX {
             if before {
                 return match self.afters.get(&ORIGIN_IDX).and_then(|s| s.first()) {
@@ -1075,7 +1081,7 @@ impl HashSeq {
     /// Split the run `run` at element index `at` (0 < at < len). The right
     /// portion becomes its own run, re-located and tracked in `afters` of the
     /// left portion's last element. Returns the right run's head.
-    fn split_run_at(&mut self, run: NodeIdx, at: usize) -> NodeIdx {
+    fn split_run_at(&mut self, run: InternedId, at: usize) -> InternedId {
         let r = self.runs.get_mut(&run).unwrap();
         let left_last = r.elements[at - 1];
         let right_run = r.split_at(at, left_last);
@@ -1108,7 +1114,7 @@ impl HashSeq {
         &mut self,
         id: Id,
         pins: SortedIdVec,
-        target_idx: NodeIdx,
+        target_idx: InternedId,
         to: InternedAnchor,
         overwrites: SortedIdVec,
     ) {
@@ -1136,7 +1142,7 @@ impl HashSeq {
         // The head set changed: resolve once, here, and cache it on the
         // register (the history it depends on — `move_nodes` — is
         // append-only, so nothing else can invalidate it).
-        let heads: Vec<NodeIdx> = self.moves[&target_idx].heads.iter().collect();
+        let heads: Vec<InternedId> = self.moves[&target_idx].heads.iter().collect();
         let new_decider = self.resolve_decider(heads);
         self.moves
             .get_mut(&target_idx)
@@ -1187,11 +1193,11 @@ impl HashSeq {
     /// The move op whose destination `target` renders at (`None` = the
     /// creation placement). Pure register read — removal is the caller's
     /// concern.
-    pub(crate) fn decider_of(&self, t: NodeIdx) -> Option<NodeIdx> {
+    pub(crate) fn decider_of(&self, t: InternedId) -> Option<InternedId> {
         self.moves.get(&t)?.decider
     }
 
-    fn move_anchor(&self, m: NodeIdx) -> Anchor {
+    fn move_anchor(&self, m: InternedId) -> Anchor {
         self.move_nodes[&m].to.to_anchor(&self.ids)
     }
 
@@ -1201,9 +1207,9 @@ impl HashSeq {
     /// ids are ignored, never errors), so a remote op may name an insert or
     /// a move of another target, and those must not surface as candidate
     /// deciders — `resolve_decider` indexes `move_nodes` by what comes back.
-    fn move_ancestors(&self, m: NodeIdx, target: NodeIdx) -> FxHashSet<NodeIdx> {
-        let mut seen: FxHashSet<NodeIdx> = FxHashSet::default();
-        let mut stack: Vec<NodeIdx> = vec![m];
+    fn move_ancestors(&self, m: InternedId, target: InternedId) -> FxHashSet<InternedId> {
+        let mut seen: FxHashSet<InternedId> = FxHashSet::default();
+        let mut stack: Vec<InternedId> = vec![m];
         while let Some(n) = stack.pop() {
             let Some(mv) = self.move_nodes.get(&n) else {
                 continue;
@@ -1220,29 +1226,29 @@ impl HashSeq {
 
     /// The last-agreed decider of a head set. Called by `apply_move` only;
     /// reads use the cached `MoveRegister::decider`.
-    fn resolve_decider(&self, heads: Vec<NodeIdx>) -> Option<NodeIdx> {
+    fn resolve_decider(&self, heads: Vec<InternedId>) -> Option<InternedId> {
         // Ancestor sets are reused across the intersection, the maximal
         // filter (which asks for every pair) and the recursion.
-        let mut ancestors: FxHashMap<NodeIdx, FxHashSet<NodeIdx>> = FxHashMap::default();
+        let mut ancestors: FxHashMap<InternedId, FxHashSet<InternedId>> = FxHashMap::default();
         self.resolve_decider_with(heads, &mut ancestors)
     }
 
     /// `move_ancestors`, memoized for one resolution.
     fn ancestors_memo<'m>(
         &self,
-        m: NodeIdx,
-        target: NodeIdx,
-        memo: &'m mut FxHashMap<NodeIdx, FxHashSet<NodeIdx>>,
-    ) -> &'m FxHashSet<NodeIdx> {
+        m: InternedId,
+        target: InternedId,
+        memo: &'m mut FxHashMap<InternedId, FxHashSet<InternedId>>,
+    ) -> &'m FxHashSet<InternedId> {
         memo.entry(m)
             .or_insert_with(|| self.move_ancestors(m, target))
     }
 
     fn resolve_decider_with(
         &self,
-        heads: Vec<NodeIdx>,
-        ancestors: &mut FxHashMap<NodeIdx, FxHashSet<NodeIdx>>,
-    ) -> Option<NodeIdx> {
+        heads: Vec<InternedId>,
+        ancestors: &mut FxHashMap<InternedId, FxHashSet<InternedId>>,
+    ) -> Option<InternedId> {
         match heads.as_slice() {
             [] => None, // the creation placement — the implicit root
             [one] => Some(*one),
@@ -1267,8 +1273,8 @@ impl HashSeq {
                 }
                 // Maximal elements: drop anything transitively overwritten by
                 // another member of the set.
-                let members: Vec<NodeIdx> = common.iter().copied().collect();
-                let mut maximal: Vec<NodeIdx> = Vec::new();
+                let members: Vec<InternedId> = common.iter().copied().collect();
+                let mut maximal: Vec<InternedId> = Vec::new();
                 for &c in &members {
                     let dominated = members
                         .iter()
@@ -1290,7 +1296,7 @@ impl HashSeq {
     /// anchor's sibling set like an insert child, keyed by its own id, and
     /// the destination fragment is placed exactly where an insert with that
     /// id would land. Later inserts interleave with it by the same rules.
-    fn rerender(&mut self, target: NodeIdx, old: Option<NodeIdx>, new: Option<NodeIdx>) {
+    fn rerender(&mut self, target: InternedId, old: Option<InternedId>, new: Option<InternedId>) {
         match old {
             Some(op) => {
                 // An op with splice children keeps its rank: its destination
@@ -1324,7 +1330,7 @@ impl HashSeq {
     /// so presence means non-empty; `mark_events` is keyed by anchor and
     /// only ever grows, so an entry at `op` means a mark point sits there.)
     /// Anchored ops keep a physical fragment at their rank for life.
-    fn op_has_children(&self, op: NodeIdx) -> bool {
+    fn op_has_children(&self, op: InternedId) -> bool {
         self.afters.contains_key(&op)
             || self.befores_by_anchor.contains_key(&op)
             || (!self.mark_events.is_empty() && self.mark_events.contains_key(&op))
@@ -1334,7 +1340,7 @@ impl HashSeq {
     /// like an insert child) and place its op fragment at that rank: the
     /// rendered target element when `render`, a zero-width splice ghost
     /// otherwise.
-    fn register_op_fragment(&mut self, op: NodeIdx, render: bool) {
+    fn register_op_fragment(&mut self, op: InternedId, render: bool) {
         let op_id = self.id_of(op);
         let mv = &self.move_nodes[&op];
         let (anchor, to_before, target) = (mv.to.idx(), mv.to.is_before(), mv.target);
@@ -1378,7 +1384,7 @@ impl HashSeq {
     /// is about to anchor at its splice point. No-op when the op currently
     /// renders its target (the destination fragment serves) or already has a
     /// splice ghost.
-    fn ensure_op_fragment(&mut self, op: NodeIdx) {
+    fn ensure_op_fragment(&mut self, op: InternedId) {
         let target = self.move_nodes[&op].target;
         if self.decider_of(target) == Some(op) && !self.is_removed(target) {
             return;
@@ -1394,7 +1400,7 @@ impl HashSeq {
     /// exist" everywhere (`afters_of`'s run fallback, the causal iterator's
     /// run-rest release), so an empty entry would suppress the implicit run
     /// continuation.
-    fn unregister_sibling(&mut self, op: NodeIdx) {
+    fn unregister_sibling(&mut self, op: InternedId) {
         let mv = &self.move_nodes[&op];
         let (anchor, to_before) = (mv.to.idx(), mv.to.is_before());
         let op_id = self.id_of(op);
@@ -1413,7 +1419,7 @@ impl HashSeq {
 
     /// Is `t` rendered away from its base slot (a live element whose
     /// register decides a move)?
-    pub(crate) fn rendered_elsewhere(&self, t: NodeIdx) -> bool {
+    pub(crate) fn rendered_elsewhere(&self, t: InternedId) -> bool {
         !self.moves.is_empty() && !self.is_removed(t) && self.decider_of(t).is_some()
     }
 
@@ -1441,7 +1447,7 @@ impl HashSeq {
     /// Resolve a mark anchor to a glue point `(node, after-side)`: an
     /// element, the origin, or a move op (its splice point — the bracket
     /// around wherever its target renders). `None` for anything else.
-    fn glue_point(&self, a: &Anchor) -> Result<(NodeIdx, bool), Refused> {
+    fn glue_point(&self, a: &Anchor) -> Result<(InternedId, bool), Refused> {
         let i = self.idx_of(a.id()).ok_or(Refused::NotAGluePoint)?;
         self.loc_of(i).ensure_glue_point()?;
         Ok((i, a.is_after()))
@@ -1477,7 +1483,7 @@ impl HashSeq {
     /// Sweep position of a move op's fragment point (fragment must exist —
     /// deciders own their destination fragment, anchored ops their splice
     /// slot).
-    fn op_point_pos(&self, op: NodeIdx, tie: u8) -> SweepPos {
+    fn op_point_pos(&self, op: InternedId, tie: u8) -> SweepPos {
         let target = self.move_nodes[&op].target;
         if self.decider_of(target) == Some(op) && !self.is_removed(target) {
             let slot = self
@@ -1498,7 +1504,7 @@ impl HashSeq {
     /// Origin points compare below every element point (imprecise only for
     /// content inserted Before(origin) — the sweep's activation guard keeps
     /// that corner inert).
-    fn cmp_points(&self, a: (NodeIdx, bool), b: (NodeIdx, bool)) -> std::cmp::Ordering {
+    fn cmp_points(&self, a: (InternedId, bool), b: (InternedId, bool)) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         if a.0 == b.0 {
             return a.1.cmp(&b.1);
@@ -1601,7 +1607,7 @@ impl HashSeq {
     /// Sweep position of a mark anchor point: fixed at the anchor's base
     /// slot (its ghost — points never relocate, so no move can reshape a
     /// span's region). `None` = an origin point (below every element).
-    fn point_pos(&self, anchor: NodeIdx, after: bool) -> Option<SweepPos> {
+    fn point_pos(&self, anchor: InternedId, after: bool) -> Option<SweepPos> {
         if anchor == ORIGIN_IDX {
             return None;
         }
@@ -1616,7 +1622,7 @@ impl HashSeq {
     /// fixed at their anchors' base slots, and membership is whether `x`'s
     /// *rendered* crossing falls strictly between them — a moved-out
     /// element sheds the region's marks, a moved-in element acquires them.
-    fn mark_covers(&self, mk: &StoredMark, x: NodeIdx) -> bool {
+    fn mark_covers(&self, mk: &StoredMark, x: InternedId) -> bool {
         use std::cmp::Ordering;
         let xp = self.index.rendered_pos(self.elem_ref(x));
         let after_start = match self.point_pos(mk.start.idx(), mk.start.is_after()) {
@@ -1644,7 +1650,7 @@ impl HashSeq {
         if !matches!(self.loc_of(x), Loc::Run { .. }) || self.mark_nodes.is_empty() {
             return Vec::new();
         }
-        let covering: Vec<NodeIdx> = self
+        let covering: Vec<InternedId> = self
             .mark_nodes
             .iter()
             .filter(|(_, mk)| self.mark_covers(mk, x))
@@ -1656,8 +1662,8 @@ impl HashSeq {
     /// Suppression among a set of covering marks: drop those named in the
     /// overwrites of a same-kind member. Returns (kind, [(mark id, value)])
     /// groups, both levels id-ordered.
-    fn live_set(&self, covering: &[NodeIdx]) -> MarkSet {
-        let mut by_kind: BTreeMap<Id, Vec<NodeIdx>> = BTreeMap::new();
+    fn live_set(&self, covering: &[InternedId]) -> MarkSet {
+        let mut by_kind: BTreeMap<Id, Vec<InternedId>> = BTreeMap::new();
         for &m in covering {
             by_kind.entry(self.mark_nodes[&m].kind).or_default().push(m);
         }
@@ -1700,12 +1706,12 @@ impl HashSeq {
 
         // Base sweep: per-element live sets, recomputed only when the
         // active set changes.
-        let mut active: FxHashSet<NodeIdx> = FxHashSet::default();
-        let mut ended: FxHashSet<NodeIdx> = FxHashSet::default();
+        let mut active: FxHashSet<InternedId> = FxHashSet::default();
+        let mut ended: FxHashSet<InternedId> = FxHashSet::default();
         let fire = |events: &Vec<MarkEvent>,
                     after: bool,
-                    active: &mut FxHashSet<NodeIdx>,
-                    ended: &mut FxHashSet<NodeIdx>|
+                    active: &mut FxHashSet<InternedId>,
+                    ended: &mut FxHashSet<InternedId>|
          -> bool {
             let mut changed = false;
             for ev in events.iter().filter(|ev| ev.after == after) {
@@ -1775,7 +1781,7 @@ impl HashSeq {
                         current = 0;
                         dirty = false;
                     } else if dirty || current == 0 {
-                        let members: Vec<NodeIdx> = active.iter().copied().collect();
+                        let members: Vec<InternedId> = active.iter().copied().collect();
                         let set = self.live_set(&members);
                         // Suppression can leave the live set unchanged across
                         // an event boundary — keep the index so spans coalesce.
@@ -2098,7 +2104,7 @@ impl HashSeq {
     /// The interned node behind one handle, rebuilt from its stored form —
     /// the one place the per-kind storage turns back into a node. The
     /// origin has no node.
-    pub(crate) fn interned_at(&self, idx: NodeIdx) -> Option<InternedHashNode> {
+    pub(crate) fn interned_at(&self, idx: InternedId) -> Option<InternedHashNode> {
         let (pins, op) = match self.loc_of(idx) {
             Loc::Origin => return None,
             Loc::Run { run, pos } => {
@@ -2178,7 +2184,7 @@ impl HashSeq {
 
     /// The wire node behind one handle: `interned_at` mapped back through
     /// the id table. Ids come from the local table — no rehashing.
-    pub(crate) fn node_at(&self, idx: NodeIdx) -> Option<HashNode> {
+    pub(crate) fn node_at(&self, idx: InternedId) -> Option<HashNode> {
         self.interned_at(idx).map(|n| n.to_node(&self.ids))
     }
 
@@ -2186,8 +2192,8 @@ impl HashSeq {
     /// stored form: `interned_at(idx).refs()` without building the node
     /// (`check_for_each_ref_matches_interned_refs` keeps the two equal). This is
     /// the edge function of the clock walk and of the encoder's depth pass.
-    pub(crate) fn for_each_ref(&self, idx: NodeIdx, mut f: impl FnMut(NodeIdx)) {
-        let (pins, named, set): (Option<&SortedIdVec>, [Option<NodeIdx>; 2], &[NodeIdx]) =
+    pub(crate) fn for_each_ref(&self, idx: InternedId, mut f: impl FnMut(InternedId)) {
+        let (pins, named, set): (Option<&SortedIdVec>, [Option<InternedId>; 2], &[InternedId]) =
             match self.loc_of(idx) {
                 Loc::Origin => return,
                 Loc::Run { run, pos } => {
@@ -2247,7 +2253,7 @@ impl HashSeq {
     /// interned, so they never appear.
     pub fn nodes_in_apply_order(&self) -> impl Iterator<Item = (Id, HashNode)> + '_ {
         (0..self.ids.len()).filter_map(move |i| {
-            let idx = NodeIdx(i as u32);
+            let idx = InternedId(i as u32);
             self.node_at(idx).map(|n| (self.ids[i], n))
         })
     }
@@ -2328,7 +2334,7 @@ impl HashSeq {
         }
         out.reverse();
         out.into_iter()
-            .filter_map(|i| self.node_at(NodeIdx(i as u32)))
+            .filter_map(|i| self.node_at(InternedId(i as u32)))
             .collect()
     }
 
@@ -2342,7 +2348,7 @@ impl HashSeq {
 
     /// The handles a node references (the origin is an axiom, not a node).
     fn walk_deps(&self, i: usize, out: &mut Vec<usize>) {
-        self.for_each_ref(NodeIdx(i as u32), |r| {
+        self.for_each_ref(InternedId(i as u32), |r| {
             if r != ORIGIN_IDX {
                 out.push(r.0 as usize);
             }
@@ -2363,7 +2369,7 @@ impl HashSeq {
         }
         // Everything that is not a char run element reconstructs per handle.
         for i in 0..self.ids.len() {
-            let idx = NodeIdx(i as u32);
+            let idx = InternedId(i as u32);
             if matches!(self.loc_of(idx), Loc::Run { .. }) && !self.is_atom(idx) {
                 continue;
             }
@@ -2407,7 +2413,7 @@ impl HashSeq {
     /// O(visible + fragments) — tombstones skip in bulk and no per-element
     /// hashmap probes. The causal traversal (`iter_idxs_causal`) remains the
     /// semantic reference; `prop_index_matches_iterator` keeps them equal.
-    pub(crate) fn iter_idxs(&self) -> impl Iterator<Item = NodeIdx> + '_ {
+    pub(crate) fn iter_idxs(&self) -> impl Iterator<Item = InternedId> + '_ {
         self.index.frags_in_order().flat_map(move |fv| {
             let elements = &self.runs[&fv.head()].elements;
             (0..fv.len())
@@ -2421,7 +2427,7 @@ impl HashSeq {
     /// of document order; production iteration rides the index instead, and
     /// the props hold the two equal (hence test-only callers).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn iter_idxs_causal(&self) -> impl Iterator<Item = NodeIdx> + '_ {
+    pub(crate) fn iter_idxs_causal(&self) -> impl Iterator<Item = InternedId> + '_ {
         crate::hashseq_iter::HashSeqIdxIter::new(self)
     }
 
@@ -2486,7 +2492,7 @@ impl HashSeq {
     /// anchor: a moved-in element is represented by its deciding move op, so
     /// typing next to moved content anchors at the splice point and renders
     /// where the user sees it — never at the element's base ghost.
-    fn render_anchor(&self, idx: NodeIdx) -> NodeIdx {
+    fn render_anchor(&self, idx: InternedId) -> InternedId {
         if self.rendered_elsewhere(idx) {
             self.decider_of(idx)
                 .expect("rendered_elsewhere implies a decider")
@@ -2556,11 +2562,11 @@ mod test {
         let pos = pos & ((1 << 29) - 1); // pos is a within-run offset (29 bits)
         let cases = [
             Loc::Run {
-                run: NodeIdx(handle),
+                run: InternedId(handle),
                 pos,
             },
             Loc::RemoveChain {
-                chain: NodeIdx(handle),
+                chain: InternedId(handle),
                 pos,
             },
             Loc::Origin,
@@ -3137,7 +3143,7 @@ mod test {
     /// back to the node that hashes to the stored id.
     fn check_for_each_ref_matches_interned_refs(seq: &HashSeq) {
         for i in 0..seq.ids.len() {
-            let idx = NodeIdx(i as u32);
+            let idx = InternedId(i as u32);
             let mut visited = Vec::new();
             seq.for_each_ref(idx, |r| visited.push(r));
             let Some(interned) = seq.interned_at(idx) else {
