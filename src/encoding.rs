@@ -806,8 +806,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // on honest histories — from the op set alone — which keeps blocks
     // temporally contiguous and the block graph near-acyclic (few dict
     // spills; ENCODING_SPEC.md open problem 5).
-    let mut depth: Vec<u64> = vec![0; seq.ids.len()];
-    for i in 0..seq.ids.len() {
+    let mut depth: Vec<u64> = vec![0; seq.interns.len()];
+    for i in 0..seq.interns.len() {
         // Refs only: a Place's `placed_at` is a foreign commitment — not in
         // this object's id table, so it cannot affect depth.
         let mut d = 0u64;
@@ -835,7 +835,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             .into_iter()
             .flatten()
             .filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }) && !seq.is_atom(*a))
-            .min_by_key(|h| (depth[h.0 as usize], seq.id_of(*h)))
+            .min_by_key(|h| (depth[h.0 as usize], *seq.interns.id(*h)))
     };
     // Pins of one insert element, from wherever its stored run keeps them.
     let elem_pins = |e: InternedId| -> BTreeSet<Id> {
@@ -844,11 +844,11 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         };
         let r = &seq.runs[&run];
         if pos == 0 {
-            r.first_pins.to_id_set(&seq.ids)
+            r.first_pins.to_id_set(&seq.interns)
         } else {
             r.interior_pins
                 .get(&(pos as usize))
-                .map(|d| d.to_id_set(&seq.ids))
+                .map(|d| d.to_id_set(&seq.interns))
                 .unwrap_or_default()
         }
     };
@@ -859,18 +859,18 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         };
         if pos > 0 {
             let p = seq.runs[&run].elements[pos as usize - 1];
-            (Anchor::After(seq.id_of(p)), Some(p))
+            (Anchor::After(*seq.interns.id(p)), Some(p))
         } else {
             let r = &seq.runs[&run];
             let anchor_elem =
                 Some(r.at.idx()).filter(|a| matches!(seq.loc_of(*a), Loc::Run { .. }));
-            (r.at.to_anchor(&seq.ids), anchor_elem)
+            (r.at.to_anchor(&seq.interns), anchor_elem)
         }
     };
 
     let mut canon_runs: Vec<CanonRun> = Vec::new();
     // element handle -> (canonical run index, offset); u32::MAX = unset.
-    let mut elem_canon: Vec<(u32, u32)> = vec![(u32::MAX, 0); seq.ids.len()];
+    let mut elem_canon: Vec<(u32, u32)> = vec![(u32::MAX, 0); seq.interns.len()];
     for stored in seq.runs.values() {
         for &e in &stored.elements {
             if seq.is_atom(e) {
@@ -931,7 +931,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
 
     let mut blocks: Vec<Block> = Vec::new();
     for (ci, cr) in canon_runs.iter().enumerate() {
-        let exposed: Vec<Id> = cr.elements.iter().map(|e| seq.id_of(*e)).collect();
+        let exposed: Vec<Id> = cr.elements.iter().map(|e| *seq.interns.id(*e)).collect();
         blocks.push(Block {
             head: cr.elements[0],
             head_id: exposed[0],
@@ -970,7 +970,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
         stored_next
             .into_iter()
             .chain(contenders)
-            .min_by_key(|l| (depth[l.0 as usize], seq.id_of(*l)))
+            .min_by_key(|l| (depth[l.0 as usize], *seq.interns.id(*l)))
     };
     // Does r canonically continue its pinned predecessor?
     let link_continues = |r: InternedId| -> bool {
@@ -1004,9 +1004,9 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                 continue;
             }
             let first_deps = if i > 0 {
-                BTreeSet::from_iter([seq.id_of(stored.links[i - 1])])
+                BTreeSet::from_iter([*seq.interns.id(stored.links[i - 1])])
             } else {
-                stored.first_extra_deps.to_id_set(&seq.ids)
+                stored.first_extra_deps.to_id_set(&seq.interns)
             };
             let mut links = Vec::new();
             let mut targets = Vec::new();
@@ -1023,14 +1023,14 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             canon_chains.push((links, targets, first_deps));
         }
     }
-    canon_chains.sort_by_key(|(links, _, _)| seq.id_of(links[0]));
+    canon_chains.sort_by_key(|(links, _, _)| *seq.interns.id(links[0]));
     for (links, targets, first_deps) in &canon_chains {
         let mut i = 0;
         while i < targets.len() {
             let deps = if i == 0 {
                 first_deps.clone()
             } else {
-                BTreeSet::from_iter([seq.id_of(links[i - 1])])
+                BTreeSet::from_iter([*seq.interns.id(links[i - 1])])
             };
             match elem_of(targets[i]) {
                 Some((run_head, elem_idx)) => {
@@ -1057,7 +1057,8 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                         last = e2;
                         j += 1;
                     }
-                    let exposed: Vec<Id> = links[i..j].iter().map(|l| seq.id_of(*l)).collect();
+                    let exposed: Vec<Id> =
+                        links[i..j].iter().map(|l| *seq.interns.id(*l)).collect();
                     if j - i > 1 {
                         blocks.push(Block {
                             head: links[i],
@@ -1078,21 +1079,21 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
                             exposed,
                             payload: Payload::Single {
                                 extra_deps: deps,
-                                target: seq.id_of(targets[i]),
+                                target: *seq.interns.id(targets[i]),
                             },
                         });
                     }
                     i = j;
                 }
                 None => {
-                    let id = seq.id_of(links[i]);
+                    let id = *seq.interns.id(links[i]);
                     blocks.push(Block {
                         head: links[i],
                         head_id: id,
                         exposed: vec![id],
                         payload: Payload::Other {
                             extra_deps: deps,
-                            targets: vec![seq.id_of(targets[i])],
+                            targets: vec![*seq.interns.id(targets[i])],
                         },
                     });
                     i += 1;
@@ -1105,16 +1106,16 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
     // Op::Remove set so the node id survives).
     let mut multi_removes: Vec<(InternedId, &CausalRemove)> =
         seq.remove_nodes.iter().map(|(i, r)| (*i, r)).collect();
-    multi_removes.sort_by_key(|(idx, _)| seq.id_of(*idx));
+    multi_removes.sort_by_key(|(idx, _)| *seq.interns.id(*idx));
     for (idx, remove) in &multi_removes {
-        let id = seq.id_of(*idx);
-        let targets = remove.nodes.iter_ids(&seq.ids).collect();
+        let id = *seq.interns.id(*idx);
+        let targets = remove.nodes.iter_ids(&seq.interns).collect();
         blocks.push(Block {
             head: *idx,
             head_id: id,
             exposed: vec![id],
             payload: Payload::Other {
-                extra_deps: remove.pins.to_id_set(&seq.ids),
+                extra_deps: remove.pins.to_id_set(&seq.interns),
                 targets,
             },
         });
@@ -1338,7 +1339,7 @@ pub fn encode_hashseq(seq: &HashSeq) -> Vec<u8> {
             .chain(seq.elem_payloads.keys());
         for &idx in applied {
             let node = seq.node_at(idx).expect("op and atom handles hold nodes");
-            nodes.push((seq.id_of(idx), node));
+            nodes.push((*seq.interns.id(idx), node));
         }
         nodes.sort_by_key(|(id, _)| *id);
         nodes.into_iter().map(|(_, node)| node).collect()

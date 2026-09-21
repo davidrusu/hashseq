@@ -352,8 +352,10 @@ mod hashseq_viz {
                     return Some(*pos);
                 }
                 // Check if this ID is inside a run
-                if let Some(hashseq::Loc::Run { run, .. }) = seq.idx_of(id).map(|i| seq.loc_of(i)) {
-                    return nodes.get(&seq.id_of(run)).copied();
+                if let Some(hashseq::Loc::Run { run, .. }) =
+                    seq.interns.get(id).map(|i| seq.loc_of(i))
+                {
+                    return nodes.get(seq.interns.id(run)).copied();
                 }
                 None
             };
@@ -361,7 +363,7 @@ mod hashseq_viz {
             // Helper to get the right edge of a node (for InsertAfter positioning)
             let get_node_right_edge = |id: &Id, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
                 // Check if id IS a run
-                if let Some(run) = seq.idx_of(id).and_then(|i| seq.runs.get(&i))
+                if let Some(run) = seq.interns.get(id).and_then(|i| seq.runs.get(&i))
                     && let Some(center) = nodes.get(id)
                 {
                     let width = run.text.chars().count() as f32 * char_width + padding * 2.0;
@@ -372,9 +374,9 @@ mod hashseq_viz {
                 }
                 // Check if id is INSIDE a run
                 if let Some(hashseq::Loc::Run { run: head, .. }) =
-                    seq.idx_of(id).map(|i| seq.loc_of(i))
+                    seq.interns.get(id).map(|i| seq.loc_of(i))
                     && let Some(run) = seq.runs.get(&head)
-                    && let Some(center) = nodes.get(&seq.id_of(head))
+                    && let Some(center) = nodes.get(seq.interns.id(head))
                 {
                     let width = run.text.chars().count() as f32 * char_width + padding * 2.0;
                     return Some(Point {
@@ -389,7 +391,7 @@ mod hashseq_viz {
             // Helper to get the left edge of a node (for InsertBefore positioning)
             let get_node_left_edge = |id: &Id, nodes: &BTreeMap<Id, Point>| -> Option<Point> {
                 // Check if id IS a run
-                if let Some(run) = seq.idx_of(id).and_then(|i| seq.runs.get(&i))
+                if let Some(run) = seq.interns.get(id).and_then(|i| seq.runs.get(&i))
                     && let Some(center) = nodes.get(id)
                 {
                     let width = run.text.chars().count() as f32 * char_width + padding * 2.0;
@@ -400,9 +402,9 @@ mod hashseq_viz {
                 }
                 // Check if id is INSIDE a run
                 if let Some(hashseq::Loc::Run { run: head, .. }) =
-                    seq.idx_of(id).map(|i| seq.loc_of(i))
+                    seq.interns.get(id).map(|i| seq.loc_of(i))
                     && let Some(run) = seq.runs.get(&head)
-                    && let Some(center) = nodes.get(&seq.id_of(head))
+                    && let Some(center) = nodes.get(seq.interns.id(head))
                 {
                     let width = run.text.chars().count() as f32 * char_width + padding * 2.0;
                     return Some(Point {
@@ -458,8 +460,8 @@ mod hashseq_viz {
                     let mut r: Vec<Id> = seq
                         .runs
                         .iter()
-                        .filter(|(_, run)| seq.id_of(run.at.idx()) == seq.origin())
-                        .map(|(head, _)| seq.id_of(*head))
+                        .filter(|(_, run)| *seq.interns.id(run.at.idx()) == seq.origin())
+                        .map(|(head, _)| *seq.interns.id(*head))
                         .collect();
                     r.sort();
                     r
@@ -511,16 +513,16 @@ mod hashseq_viz {
 
                 // Process before-runs - stratify concurrent befores into lanes
                 for (head, before_run) in seq.runs.iter().filter(|(_, r)| r.at.is_before()) {
-                    let id = &seq.id_of(*head);
+                    let id = seq.interns.id(*head);
                     let pos = *self.node_pos.entry(*id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let parent = &seq.id_of(before_run.at.idx());
+                    let parent = seq.interns.id(before_run.at.idx());
                     let target_pos = if let Some(p) = get_node_left_edge(parent, &self.node_pos) {
                         // Get all siblings (nodes before the same parent).
                         // befores() yields sorted order already.
-                        let sorted_siblings: Vec<Id> = seq.befores(parent).collect();
+                        let sorted_siblings: Vec<Id> = seq.befores(parent).copied().collect();
                         let sibling_idx = sorted_siblings.iter().position(|s| s == id).unwrap_or(0);
 
                         // Calculate lane offset - always offset below the anchor
@@ -550,12 +552,12 @@ mod hashseq_viz {
 
                 // Process remove nodes
                 for (idx, remove_node) in seq.remove_nodes.iter() {
-                    let id = &seq.id_of(*idx);
+                    let id = seq.interns.id(*idx);
                     let pos = *self.node_pos.entry(*id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
                     });
-                    let targets: Vec<Id> = remove_node.nodes.iter_ids(&seq.ids).collect();
+                    let targets: Vec<Id> = remove_node.nodes.iter_ids(&seq.interns).collect();
                     let target_pos = if !targets.is_empty() {
                         let p: Vector = targets
                             .iter()
@@ -586,7 +588,7 @@ mod hashseq_viz {
                 // Process After-runs - position each run as a single entity.
                 // (Before-runs are positioned by the befores loop above.)
                 for (head, run) in seq.runs.iter().filter(|(_, r)| r.at.is_after()) {
-                    let run_id = &seq.id_of(*head);
+                    let run_id = seq.interns.id(*head);
                     let pos = *self.node_pos.entry(*run_id).or_insert_with(|| Point {
                         x: rand::random::<f32>() * bounds.width,
                         y: rand::random::<f32>() * bounds.height,
@@ -597,11 +599,11 @@ mod hashseq_viz {
                     // Determine target position based on run structure
                     let target_pos = {
                         // Has left dependencies
-                        let parent = seq.id_of(run.at.idx());
+                        let parent = *seq.interns.id(run.at.idx());
                         if let Some(p) = get_node_right_edge(&parent, &self.node_pos) {
                             // Check how many siblings this run has (concurrent branches from same parent).
                             // afters() yields sorted order already.
-                            let sorted_siblings: Vec<Id> = seq.afters(&parent).collect();
+                            let sorted_siblings: Vec<Id> = seq.afters(&parent).copied().collect();
                             let num_siblings = sorted_siblings.len();
                             let sibling_idx = sorted_siblings
                                 .iter()
@@ -767,19 +769,21 @@ mod hashseq_viz {
                         }
                         // Check if this ID is inside a run
                         if let Some(hashseq::Loc::Run { run, .. }) =
-                            self.seq.idx_of(id).map(|i| self.seq.loc_of(i))
+                            self.seq.interns.get(id).map(|i| self.seq.loc_of(i))
                         {
-                            return self.state.node_pos.get(&self.seq.id_of(run)).copied();
+                            return self.state.node_pos.get(self.seq.interns.id(run)).copied();
                         }
                         None
                     };
 
                     // Helper to get the width of a node's bounding box (includes removed chars)
                     let get_node_width = |id: &Id| -> f32 {
-                        if let Some(run) = self.seq.idx_of(id).and_then(|i| self.seq.runs.get(&i)) {
+                        if let Some(run) =
+                            self.seq.interns.get(id).and_then(|i| self.seq.runs.get(&i))
+                        {
                             run.text.chars().count() as f32 * char_width
                         } else if let Some(hashseq::Loc::Run { run, .. }) =
-                            self.seq.idx_of(id).map(|i| self.seq.loc_of(i))
+                            self.seq.interns.get(id).map(|i| self.seq.loc_of(i))
                         {
                             // ID is inside a run - get the run's width
                             self.seq.runs[&run].text.chars().count() as f32 * char_width
@@ -827,11 +831,11 @@ mod hashseq_viz {
 
                     // Draw "after" edges (green) - from right edge to left edge
                     for (idx, afters) in self.seq.afters.iter() {
-                        let Some(from) = get_node_right_edge(&self.seq.id_of(*idx)) else {
+                        let Some(from) = get_node_right_edge(self.seq.interns.id(*idx)) else {
                             continue;
                         };
                         for after in afters.iter() {
-                            let Some(to) = get_node_left_edge(&self.seq.id_of(after)) else {
+                            let Some(to) = get_node_left_edge(self.seq.interns.id(after)) else {
                                 continue;
                             };
                             frame.stroke(
@@ -842,11 +846,11 @@ mod hashseq_viz {
                     }
                     // Draw "before" edges (red) - from left edge to center of before node
                     for (idx, befores) in self.seq.befores_by_anchor.iter() {
-                        let Some(from) = get_node_left_edge(&self.seq.id_of(*idx)) else {
+                        let Some(from) = get_node_left_edge(self.seq.interns.id(*idx)) else {
                             continue;
                         };
                         for before in befores {
-                            let Some(to) = get_node_pos(&self.seq.id_of(before)) else {
+                            let Some(to) = get_node_pos(self.seq.interns.id(before)) else {
                                 continue;
                             };
                             frame.stroke(
@@ -859,9 +863,11 @@ mod hashseq_viz {
                     // Render all nodes (both individual and runs)
                     for (id, pos) in self.state.node_pos.iter() {
                         // Check if this ID corresponds to a run
-                        if let Some(run) = self.seq.idx_of(id).and_then(|i| self.seq.runs.get(&i)) {
+                        if let Some(run) =
+                            self.seq.interns.get(id).and_then(|i| self.seq.runs.get(&i))
+                        {
                             // Decompress to get individual character nodes
-                            let nodes = run.to_run(&self.seq.ids).decompress();
+                            let nodes = run.to_run(&self.seq.interns).decompress();
                             let num_chars = nodes.len();
 
                             let total_width = num_chars as f32 * char_width;
@@ -934,7 +940,8 @@ mod hashseq_viz {
                             }
                         } else if self
                             .seq
-                            .idx_of(id)
+                            .interns
+                            .get(id)
                             .is_some_and(|i| self.seq.remove_nodes.contains_key(&i))
                         {
                             // Skip rendering remove nodes - removals are shown via strikethrough on affected chars

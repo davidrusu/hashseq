@@ -411,7 +411,7 @@ fn memory_breakdown(seq: &HashSeq, total: usize, label: &str) {
             .map(|r| r.text.clone())
             .collect::<Vec<_>>()
     });
-    let intern = measure_alloc(|| (seq.ids.clone(), seq.locs.clone(), seq.removed.clone()));
+    let intern = measure_alloc(|| (seq.interns.clone(), seq.locs.clone(), seq.removed.clone()));
     let befores = measure_alloc(|| seq.befores_by_anchor.clone());
     let afters = measure_alloc(|| seq.afters.clone());
 

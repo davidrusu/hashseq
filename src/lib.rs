@@ -40,24 +40,15 @@ impl std::fmt::Debug for Id {
     }
 }
 
-/// Compact handle for accepted ids. Handles are allocated densely in local
-/// apply order, so `Vec`s indexed by `InternedId` replace `Id`-keyed maps for
-/// everything but the single interning map.
-///
-/// Handles are replica-local: two replicas applying the same ops in different
-/// orders assign different handles. They must never participate in anything
-/// convergence-relevant — sibling ordering, hashing, and the wire format all
-/// operate on `Id`s.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct InternedId(pub u32);
+pub struct InternedId(u32);
 
-/// The `Id -> InternedId` intern map, keyed by the id's u64 prefix instead of the
-/// full 32 bytes. A prefix hit is verified against `ids[idx]`, which makes
-/// lookups exact, a true prefix collision just fails verification and falls
-/// through to the `spill` map of full-key entries (expected to stay empty:
-/// ~N^2 / 2^64 chance per pair, and harmless when it does fire).
 #[derive(Debug, Default, Clone)]
-struct IdIndex {
+pub struct InternIndex {
+    /// InternedId -> Id (append-only).
+    ids: Vec<Id>,
+
+    /// Id -> InternedId (64bit prefix map with full ID spillover map on collision)
     prefix: FxHashMap<u64, InternedId>,
     spill: FxHashMap<Id, InternedId>,
 }
@@ -66,27 +57,52 @@ fn id_prefix(id: &Id) -> u64 {
     u64::from_le_bytes(id.0[..8].try_into().expect("Id has 32 bytes"))
 }
 
-impl IdIndex {
-    /// `ids` is the `InternedId -> Id` table used to verify prefix hits.
-    fn get(&self, id: &Id, ids: &[Id]) -> Option<InternedId> {
-        let idx = *self.prefix.get(&id_prefix(id))?;
-        if ids[idx.0 as usize] == *id {
-            Some(idx)
-        } else {
-            self.spill.get(id).copied()
+impl InternIndex {
+    fn intern(&mut self, id: Id) -> InternedId {
+        match self.prefix.entry(id_prefix(&id)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let intern = InternedId(self.ids.len() as u32);
+                e.insert(intern);
+                self.ids.push(id);
+                return intern;
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let existing_intern = *e.get();
+                if self.id(existing_intern) == &id {
+                    return existing_intern;
+                } else {
+                    let intern = InternedId(self.ids.len() as u32);
+                    self.spill.insert(id, intern);
+                    self.ids.push(id);
+                    return intern;
+                }
+            }
         }
     }
 
-    fn insert(&mut self, id: Id, idx: InternedId) {
-        match self.prefix.entry(id_prefix(&id)) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(idx);
-            }
-            std::collections::hash_map::Entry::Occupied(e) => {
-                if *e.get() != idx {
-                    self.spill.insert(id, idx);
-                }
-            }
+    /// The handle the next `intern` of a new id will return.
+    fn next_interned(&self) -> InternedId {
+        InternedId(self.ids.len() as u32)
+    }
+
+    pub fn id(&self, interned_id: InternedId) -> &Id {
+        &self.ids[interned_id.0 as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn get(&self, id: &Id) -> Option<InternedId> {
+        let idx = *self.prefix.get(&id_prefix(id))?;
+        if self.ids[idx.0 as usize] == *id {
+            Some(idx)
+        } else {
+            self.spill.get(id).copied()
         }
     }
 }
@@ -101,19 +117,16 @@ impl SortedIdVec {
     /// Index of the handle whose id equals `id` (`Ok`) or where it would be
     /// inserted to stay sorted (`Err`).
     #[inline]
-    fn search(&self, id: &Id, ids: &[Id]) -> Result<usize, usize> {
-        self.0.binary_search_by(|h| ids[h.0 as usize].cmp(id))
+    fn search(&self, id: &Id, interns: &InternIndex) -> Result<usize, usize> {
+        self.0.binary_search_by(|h| interns.id(*h).cmp(id))
     }
 
     /// Build from an already-`Id`-sorted set, mapping each id to its handle
     /// (`BTreeSet` iterates in `Id` order, so the handles land sorted).
     /// `Err` is the first member (in `Id` order) with no handle.
-    pub(crate) fn try_from_id_set(
-        set: &BTreeSet<Id>,
-        mut to_handle: impl FnMut(&Id) -> Option<InternedId>,
-    ) -> Result<Self, Id> {
+    pub(crate) fn try_from_id_set(set: &BTreeSet<Id>, interns: &InternIndex) -> Result<Self, Id> {
         set.iter()
-            .map(|id| to_handle(id).ok_or(*id))
+            .map(|id| interns.get(id).ok_or(*id))
             .collect::<Result<Vec<InternedId>, Id>>()
             .map(SortedIdVec)
     }
@@ -124,32 +137,32 @@ impl SortedIdVec {
     }
 
     /// Rebuild the `Id` set (for the wire format / hashing).
-    pub fn to_id_set(&self, ids: &[Id]) -> BTreeSet<Id> {
-        self.0.iter().map(|h| ids[h.0 as usize]).collect()
+    pub fn to_id_set(&self, interns: &InternIndex) -> BTreeSet<Id> {
+        self.iter_ids(interns).collect()
     }
 
     /// Iterate the member ids in `Id` order.
-    pub fn iter_ids<'a>(&'a self, ids: &'a [Id]) -> impl Iterator<Item = Id> + 'a {
-        self.0.iter().map(move |h| ids[h.0 as usize])
+    pub fn iter_ids<'a>(&'a self, interns: &'a InternIndex) -> impl Iterator<Item = Id> + 'a {
+        self.0.iter().map(move |h| *interns.id(*h))
     }
 
     /// Insert `handle` keyed by its id; a no-op if an equal id is already
     /// present (set semantics, like the `BTreeSet<Id>` it replaces).
-    pub fn insert(&mut self, handle: InternedId, ids: &[Id]) {
-        let id = ids[handle.0 as usize];
-        if let Err(pos) = self.search(&id, ids) {
+    pub fn insert(&mut self, handle: InternedId, interns: &InternIndex) {
+        let id = interns.id(handle);
+        if let Err(pos) = self.search(id, interns) {
             self.0.insert(pos, handle);
         }
     }
 
     /// Is a handle whose id equals `id` a member?
-    pub fn contains(&self, id: &Id, ids: &[Id]) -> bool {
-        self.search(id, ids).is_ok()
+    pub fn contains(&self, id: &Id, interns: &InternIndex) -> bool {
+        self.search(id, interns).is_ok()
     }
 
     /// Remove the handle whose id equals `id`, if present.
-    pub fn remove(&mut self, id: &Id, ids: &[Id]) {
-        if let Ok(pos) = self.search(id, ids) {
+    pub fn remove(&mut self, id: &Id, interns: &InternIndex) {
+        if let Ok(pos) = self.search(id, interns) {
             self.0.remove(pos);
         }
     }
@@ -167,8 +180,8 @@ impl SortedIdVec {
     }
 
     /// Handle with the smallest id `>= id` (the `range(id..).next()` seek).
-    pub fn first_ge(&self, id: &Id, ids: &[Id]) -> Option<InternedId> {
-        let pos = match self.search(id, ids) {
+    pub fn first_ge(&self, id: &Id, interns: &InternIndex) -> Option<InternedId> {
+        let pos = match self.search(id, interns) {
             Ok(p) | Err(p) => p,
         };
         self.0.get(pos).copied()

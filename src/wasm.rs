@@ -270,8 +270,8 @@ impl WasmHashSeq {
         // run's *tip*, a different element of the same box than its anchor).
         // Keeping the offset lets each edge attach to the right character.
         let resolve = |id: &Id| -> (Id, usize) {
-            match s.idx_of(id).map(|i| s.loc_of(i)) {
-                Some(Loc::Run { run, pos }) => (s.id_of(run), pos as usize),
+            match s.interns.get(id).map(|i| s.loc_of(i)) {
+                Some(Loc::Run { run, pos }) => (*s.interns.id(run), pos as usize),
                 _ => (*id, 0),
             }
         };
@@ -280,7 +280,7 @@ impl WasmHashSeq {
         for (head, run) in &s.runs {
             // Origin-anchored runs are the document's top level — emitted
             // with no anchor, like the old standalone root nodes.
-            let at = run.at.to_anchor(&s.ids);
+            let at = run.at.to_anchor(&s.interns);
             let is_top_level = *at.id() == s.origin();
 
             let (kind, rel) = match at {
@@ -307,7 +307,7 @@ impl WasmHashSeq {
             let mut seen = std::collections::BTreeSet::new();
             let deps = run
                 .first_pins
-                .iter_ids(&s.ids)
+                .iter_ids(&s.interns)
                 .map(|id| resolve(&id))
                 .filter(|bo| seen.insert(*bo)) // dedup by (box, offset)
                 .map(|(box_id, off)| StructureDep {
@@ -316,7 +316,7 @@ impl WasmHashSeq {
                 })
                 .collect();
             nodes.push(StructureNode {
-                id: id_to_hex(&s.id_of(*head)),
+                id: id_to_hex(s.interns.id(*head)),
                 kind,
                 text: run.text.clone(),
                 parent,

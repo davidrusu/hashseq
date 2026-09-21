@@ -18,7 +18,7 @@ use crate::delivery::Delivery;
 use crate::interned_hash_node::{InternedHashNode, InternedOp};
 use crate::placement::PlacementRegister;
 use crate::value::{TOMBSTONE, Value};
-use crate::{HashNode, Id, InternedId, Op, Outcome, Refused};
+use crate::{HashNode, Id, InternIndex, InternedId, Op, Outcome, Refused};
 
 /// A key's register state: the live put heads, in id order.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub struct HashKv {
     origin: Id,
     /// Applied nodes (the register history — retention: keep all; the
     /// supersession spine is what the read rules walk), interned against
-    /// `order` and parallel to it: the node at arena slot `s` is
+    /// `interns` and parallel to it: the node at arena slot `s` is
     /// `nodes[s - 1]` — slot 0 is the origin, which has no node.
     pub(crate) nodes: Vec<InternedHashNode>,
     /// key value-id -> register. Keyed by the key's id — already a BLAKE3
@@ -71,9 +71,7 @@ pub struct HashKv {
     /// index. Slot 0 is the origin: an axiom, present so refs to it resolve
     /// like any other. Deps precede dependents, so the position is the
     /// clock walk's order (`delta_for`).
-    pub(crate) order: Vec<Id>,
-    /// Arena position by id (`order[slot[id]] == id`).
-    pub(crate) slot: FxHashMap<Id, u32>,
+    pub(crate) interns: InternIndex,
     /// Delta sync is on (`HashWeb::enable_delta_sync`): minted small
     /// artifacts are tracked in `new_artifacts`. Deltas themselves are a
     /// DAG diff against a peer clock and need no switch.
@@ -110,8 +108,7 @@ impl HashKv {
             keys: Default::default(),
             values: Default::default(),
             tips: BTreeSet::new(),
-            order: Vec::new(),
-            slot: Default::default(),
+            interns: InternIndex::default(),
             delta_sync: false,
             new_artifacts: Vec::new(),
             placement: PlacementRegister::default(),
@@ -119,8 +116,8 @@ impl HashKv {
         };
         // The origin is axiomatically present: the map's frontier begins at
         // it, so a fresh map's first put pins {origin}.
-        kv.slot.insert(origin, ORIGIN_SLOT.0);
-        kv.order.push(origin);
+        let origin_slot = kv.interns.intern(origin);
+        debug_assert_eq!(origin_slot, ORIGIN_SLOT);
         kv.tips.insert(origin);
         kv
     }
@@ -134,11 +131,7 @@ impl HashKv {
     }
 
     pub(crate) fn contains_node(&self, id: &Id) -> bool {
-        self.slot.contains_key(id)
-    }
-
-    fn idx_of(&self, id: &Id) -> Option<InternedId> {
-        self.slot.get(id).map(|s| InternedId(*s))
+        self.interns.get(id).is_some()
     }
 
     /// The applied node at arena slot `idx` (not the origin's).
@@ -258,9 +251,14 @@ impl HashKv {
         let heads = self.heads(key);
         let live: Vec<Id> = heads
             .iter()
-            .map(|h| match &self.node(InternedId(self.slot[h])).op {
-                InternedOp::Put { value, .. } => *value,
-                _ => unreachable!("heads hold puts"),
+            .map(|h| {
+                match &self
+                    .node(self.interns.get(h).expect("heads are applied"))
+                    .op
+                {
+                    InternedOp::Put { value, .. } => *value,
+                    _ => unreachable!("heads hold puts"),
+                }
             })
             .collect();
         match live.as_slice() {
@@ -320,7 +318,7 @@ impl HashKv {
         node: HashNode,
         queue: &mut Vec<(Id, HashNode)>,
     ) -> Result<Outcome, Refused> {
-        let interned = match InternedHashNode::resolve(&node, |r| self.idx_of(r)) {
+        let interned = match InternedHashNode::resolve(&node, &self.interns) {
             Ok(interned) => interned,
             Err(missing) => {
                 return Ok(if self.delivery.orphan(missing, id, node) {
@@ -351,7 +349,7 @@ impl HashKv {
 
         // tips update: everything referenced leaves the frontier.
         for r in node.refs() {
-            self.tips.remove(&self.order[r.0 as usize]);
+            self.tips.remove(self.interns.id(r));
         }
         self.tips.insert(id);
 
@@ -361,7 +359,7 @@ impl HashKv {
                 overwrites,
             } => {
                 self.placement
-                    .apply(id, *placed_at, overwrites.to_id_set(&self.order));
+                    .apply(id, *placed_at, overwrites.to_id_set(&self.interns));
                 self.admit(id, node);
                 return Ok(());
             }
@@ -377,7 +375,7 @@ impl HashKv {
         // here — ignored, never an error (it cannot corrupt another
         // register).
         let ks = self.keys.entry(key).or_default();
-        ks.heads.retain(|h| !overwrites.contains(h, &self.order));
+        ks.heads.retain(|h| !overwrites.contains(h, &self.interns));
         let pos = ks.heads.binary_search(&id).unwrap_or_else(|p| p);
         ks.heads.insert(pos, id);
 
@@ -387,17 +385,17 @@ impl HashKv {
 
     /// Store an admitted node: the register history plus the arena slot.
     fn admit(&mut self, id: Id, node: InternedHashNode) {
-        self.slot.insert(id, self.order.len() as u32);
-        self.order.push(id);
+        self.interns.intern(id);
         self.nodes.push(node);
     }
 
     /// Every applied node in apply order (causally safe: each node's refs
     /// precede it).
     pub fn nodes_in_apply_order(&self) -> impl Iterator<Item = (Id, HashNode)> + '_ {
-        let ids = self.order.iter().skip(1); // slot 0 is the origin
-        ids.zip(&self.nodes)
-            .map(|(id, node)| (*id, node.to_node(&self.order)))
+        self.nodes.iter().enumerate().map(|(i, node)| {
+            let idx = InternedId(i as u32 + 1); // slot 0 is the origin
+            (*self.interns.id(idx), node.to_node(&self.interns))
+        })
     }
 
     /// This replica's clock for the object: what a peer that has
@@ -409,8 +407,8 @@ impl HashKv {
 
     /// The delta for the peer behind `clock`: every applied node outside
     /// the peer's causal closure, in apply order (see `HashSeq::delta_for`).
-    /// Same sweep as `HashSeq::delta_for` over the map's arena (`order`,
-    /// apply order; `slot` for the reverse lookup). The origin is an
+    /// Same sweep as `HashSeq::delta_for` over the map's arena (`interns`,
+    /// apply order, with the reverse lookup). The origin is an
     /// axiom, not a node, so it is never walked or shipped.
     pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
         const OURS: u8 = 1;
@@ -466,14 +464,15 @@ impl HashKv {
         }
         out.reverse();
         out.into_iter()
-            .map(|i| self.node(InternedId(i as u32)).to_node(&self.order))
+            .map(|i| self.node(InternedId(i as u32)).to_node(&self.interns))
             .collect()
     }
 
     /// The walk's view of a slot: the origin is an axiom, not a node.
     #[inline]
     fn walk_idx(&self, id: &Id) -> Option<usize> {
-        self.idx_of(id)
+        self.interns
+            .get(id)
             .filter(|i| *i != ORIGIN_SLOT)
             .map(|i| i.0 as usize)
     }

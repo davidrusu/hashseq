@@ -13,7 +13,7 @@
 //! compared across replicas, or put on the wire; set-valued roles are
 //! `SortedIdVec`s, which keep `Id` order.
 
-use crate::{Anchor, HashNode, Id, Op, Payload};
+use crate::{Anchor, HashNode, Id, InternIndex, Op, Payload};
 use crate::{InternedId, SortedIdVec};
 
 /// The glued point in handle space: `Anchor` with its id resolved.
@@ -48,24 +48,20 @@ impl InternedAnchor {
         (self.idx(), self.is_after())
     }
 
-    /// Map the handle back through the id table (`ids[h.0]` is `h`'s id).
+    /// Map the handle back through the id table (`interns.id(h)` is `h`'s id).
     #[inline]
-    pub fn to_anchor(&self, ids: &[Id]) -> Anchor {
+    pub fn to_anchor(&self, interns: &InternIndex) -> Anchor {
         match self {
-            InternedAnchor::Before(i) => Anchor::Before(ids[i.0 as usize]),
-            InternedAnchor::After(i) => Anchor::After(ids[i.0 as usize]),
+            InternedAnchor::Before(i) => Anchor::Before(*interns.id(*i)),
+            InternedAnchor::After(i) => Anchor::After(*interns.id(*i)),
         }
     }
 
     #[inline]
-    fn resolve(
-        a: &Anchor,
-        to_handle: &mut impl FnMut(&Id) -> Option<InternedId>,
-    ) -> Result<Self, Id> {
-        let idx = to_handle(a.id()).ok_or(*a.id())?;
+    fn resolve(a: &Anchor, index: &InternIndex) -> Result<Self, Id> {
         Ok(match a {
-            Anchor::Before(_) => InternedAnchor::Before(idx),
-            Anchor::After(_) => InternedAnchor::After(idx),
+            Anchor::Before(id) => InternedAnchor::Before(index.get(id).ok_or(*id)?),
+            Anchor::After(id) => InternedAnchor::After(index.get(id).ok_or(*id)?),
         })
     }
 }
@@ -115,26 +111,24 @@ impl InternedHashNode {
     /// Resolve every ref of `node` through `to_handle`, once. `Err` is the
     /// first ref in `HashNode::iter_refs` order that is not present — the
     /// key the node orphans on, so the walk order here must stay that order.
-    pub fn resolve(
-        node: &HashNode,
-        mut to_handle: impl FnMut(&Id) -> Option<InternedId>,
-    ) -> Result<Self, Id> {
-        let h = &mut to_handle;
-        let pins = SortedIdVec::try_from_id_set(&node.pins, &mut *h)?;
+    pub fn resolve(node: &HashNode, interns: &InternIndex) -> Result<Self, Id> {
+        let pins = SortedIdVec::try_from_id_set(&node.pins, interns)?;
         let op = match &node.op {
             Op::Insert { at, payload } => InternedOp::Insert {
-                at: InternedAnchor::resolve(at, h)?,
+                at: InternedAnchor::resolve(at, interns)?,
                 payload: *payload,
             },
-            Op::Remove(targets) => InternedOp::Remove(SortedIdVec::try_from_id_set(targets, h)?),
+            Op::Remove(targets) => {
+                InternedOp::Remove(SortedIdVec::try_from_id_set(targets, interns)?)
+            }
             Op::Move {
                 target,
                 to,
                 overwrites,
             } => InternedOp::Move {
-                target: h(target).ok_or(*target)?,
-                to: InternedAnchor::resolve(to, h)?,
-                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+                target: interns.get(target).ok_or(*target)?,
+                to: InternedAnchor::resolve(to, interns)?,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, interns)?,
             },
             Op::Put {
                 key,
@@ -143,7 +137,7 @@ impl InternedHashNode {
             } => InternedOp::Put {
                 key: *key,
                 value: *value,
-                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, interns)?,
             },
             Op::Mark {
                 start,
@@ -152,18 +146,18 @@ impl InternedHashNode {
                 value,
                 overwrites,
             } => InternedOp::Mark {
-                start: InternedAnchor::resolve(start, h)?,
-                end: InternedAnchor::resolve(end, h)?,
+                start: InternedAnchor::resolve(start, interns)?,
+                end: InternedAnchor::resolve(end, interns)?,
                 kind_v: *kind_v,
                 value: *value,
-                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, interns)?,
             },
             Op::Place {
                 placed_at,
                 overwrites,
             } => InternedOp::Place {
                 placed_at: *placed_at,
-                overwrites: SortedIdVec::try_from_id_set(overwrites, h)?,
+                overwrites: SortedIdVec::try_from_id_set(overwrites, interns)?,
             },
         };
         Ok(InternedHashNode { pins, op })
@@ -197,23 +191,23 @@ impl InternedHashNode {
     }
 
     /// The wire form: every handle mapped back through the id table
-    /// (`ids[h.0]` is `h`'s id). No rehashing — the node's own id is
-    /// `ids[its handle]`.
-    pub fn to_node(&self, ids: &[Id]) -> HashNode {
+    /// (`interns.id(h)` is `h`'s id). No rehashing — the node's own id is
+    /// `interns.id(its handle)`.
+    pub fn to_node(&self, interns: &InternIndex) -> HashNode {
         let op = match &self.op {
             InternedOp::Insert { at, payload } => Op::Insert {
-                at: at.to_anchor(ids),
+                at: at.to_anchor(interns),
                 payload: *payload,
             },
-            InternedOp::Remove(targets) => Op::Remove(targets.to_id_set(ids)),
+            InternedOp::Remove(targets) => Op::Remove(targets.to_id_set(interns)),
             InternedOp::Move {
                 target,
                 to,
                 overwrites,
             } => Op::Move {
-                target: ids[target.0 as usize],
-                to: to.to_anchor(ids),
-                overwrites: overwrites.to_id_set(ids),
+                target: *interns.id(*target),
+                to: to.to_anchor(interns),
+                overwrites: overwrites.to_id_set(interns),
             },
             InternedOp::Put {
                 key,
@@ -222,7 +216,7 @@ impl InternedHashNode {
             } => Op::Put {
                 key: *key,
                 value: *value,
-                overwrites: overwrites.to_id_set(ids),
+                overwrites: overwrites.to_id_set(interns),
             },
             InternedOp::Mark {
                 start,
@@ -231,22 +225,22 @@ impl InternedHashNode {
                 value,
                 overwrites,
             } => Op::Mark {
-                start: start.to_anchor(ids),
-                end: end.to_anchor(ids),
+                start: start.to_anchor(interns),
+                end: end.to_anchor(interns),
                 kind_v: *kind_v,
                 value: *value,
-                overwrites: overwrites.to_id_set(ids),
+                overwrites: overwrites.to_id_set(interns),
             },
             InternedOp::Place {
                 placed_at,
                 overwrites,
             } => Op::Place {
                 placed_at: *placed_at,
-                overwrites: overwrites.to_id_set(ids),
+                overwrites: overwrites.to_id_set(interns),
             },
         };
         HashNode {
-            pins: self.pins.to_id_set(ids),
+            pins: self.pins.to_id_set(interns),
             op,
         }
     }
@@ -318,33 +312,34 @@ mod tests {
 
     /// An id table holding `tid(0)..tid(15)` at handle `n`: sorted by id, so
     /// handle order and id order coincide.
-    fn table() -> Vec<Id> {
-        (0..16).map(tid).collect()
+    fn table() -> InternIndex {
+        table_without(&BTreeSet::new())
     }
 
-    fn lookup(ids: &[Id]) -> impl FnMut(&Id) -> Option<InternedId> + '_ {
-        |id| {
-            ids.iter()
-                .position(|i| i == id)
-                .map(|p| InternedId(p as u32))
+    /// `table()` minus the `unknown` ids.
+    fn table_without(unknown: &BTreeSet<Id>) -> InternIndex {
+        let mut interns = InternIndex::default();
+        for id in (0..16).map(tid).filter(|id| !unknown.contains(id)) {
+            interns.intern(id);
         }
+        interns
     }
 
     #[test]
     fn resolve_then_to_node_is_identity() {
-        let ids = table();
+        let interns = table();
         for node in sample_nodes() {
-            let interned = InternedHashNode::resolve(&node, lookup(&ids)).expect("all refs known");
-            assert_eq!(interned.to_node(&ids), node);
+            let interned = InternedHashNode::resolve(&node, &interns).expect("all refs known");
+            assert_eq!(interned.to_node(&interns), node);
         }
     }
 
     #[test]
     fn refs_follow_iter_refs_order() {
-        let ids = table();
+        let interns = table();
         for node in sample_nodes() {
-            let interned = InternedHashNode::resolve(&node, lookup(&ids)).expect("all refs known");
-            let via_handles: Vec<Id> = interned.refs().map(|h| ids[h.0 as usize]).collect();
+            let interned = InternedHashNode::resolve(&node, &interns).expect("all refs known");
+            let via_handles: Vec<Id> = interned.refs().map(|h| *interns.id(h)).collect();
             let via_ids: Vec<Id> = node.iter_refs().copied().collect();
             assert_eq!(via_handles, via_ids);
         }
@@ -353,19 +348,12 @@ mod tests {
     /// The orphan key: the first ref in `iter_refs` order that is missing.
     #[test]
     fn resolve_reports_first_missing_ref_in_iter_refs_order() {
-        let ids = table();
         for node in sample_nodes() {
             let refs: Vec<Id> = node.iter_refs().copied().collect();
             for missing_from in 0..refs.len() {
                 // Everything from `missing_from` on is unknown.
                 let unknown: BTreeSet<Id> = refs[missing_from..].iter().copied().collect();
-                let got = InternedHashNode::resolve(&node, |id| {
-                    if unknown.contains(id) {
-                        None
-                    } else {
-                        lookup(&ids)(id)
-                    }
-                });
+                let got = InternedHashNode::resolve(&node, &table_without(&unknown));
                 let want = refs.iter().find(|r| unknown.contains(r)).copied();
                 assert_eq!(got.err(), want);
             }
