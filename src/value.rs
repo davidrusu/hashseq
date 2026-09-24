@@ -243,13 +243,50 @@ static ASCII_CHAR_OF_VALUE_ID: LazyLock<rustc_hash::FxHashMap<Id, char>> = LazyL
         .collect()
 });
 
-/// The char whose artifact `id` names, when that can be decided without
-/// the artifact: a pure function of `id` over the ASCII table, so every
-/// replica agrees. Non-ASCII char ids are not recognized (inverting them
-/// needs the artifact bytes, i.e. a value store); they read as opaque
-/// value commitments.
-pub fn ascii_char_of_value_id(id: &Id) -> Option<char> {
-    ASCII_CHAR_OF_VALUE_ID.get(id).copied()
+/// Every non-ASCII char, keyed by the low 32 bits of its value id's
+/// first word, sorted: ~9 MB, ~0.1 s to build natively. Built on first
+/// use — honest peers inline chars, so only a by-id non-ASCII char
+/// payload reaches it.
+static CHAR_BY_ID_PREFIX: LazyLock<Vec<(u32, char)>> = LazyLock::new(|| {
+    let mut table: Vec<(u32, char)> = (128..=char::MAX as u32)
+        .filter_map(char::from_u32)
+        .map(|c| {
+            let mut tmp = [0u8; 5];
+            (
+                id_prefix32(&value_id_of_bytes(char_artifact(c, &mut tmp))),
+                c,
+            )
+        })
+        .collect();
+    table.sort_unstable();
+    table
+});
+
+fn id_prefix32(id: &Id) -> u32 {
+    u32::from_le_bytes(id.0[..4].try_into().expect("Id has 32 bytes"))
+}
+
+/// The char whose artifact `id` names, if any: a pure function of `id`
+/// over the whole char range (ASCII by table, the rest by the lazily
+/// built prefix table), so every replica agrees. The same node id must
+/// have one stored form whether its char payload arrived inline or by
+/// id — resolving only part of the range lets the transport form decide
+/// what renders.
+pub fn char_of_value_id(id: &Id) -> Option<char> {
+    if let Some(c) = ASCII_CHAR_OF_VALUE_ID.get(id) {
+        return Some(*c);
+    }
+    let prefix = id_prefix32(id);
+    let table = &*CHAR_BY_ID_PREFIX;
+    let start = table.partition_point(|(p, _)| *p < prefix);
+    table[start..]
+        .iter()
+        .take_while(|(p, _)| *p == prefix)
+        .map(|(_, c)| *c)
+        .find(|c| {
+            let mut tmp = [0u8; 5];
+            value_id_of_bytes(char_artifact(*c, &mut tmp)) == *id
+        })
 }
 
 /// A char's canonical artifact bytes (`VK_CHAR ‖ utf8`), written into a
@@ -282,6 +319,28 @@ pub fn char_value_id(c: char) -> Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_of_value_id_inverts_every_char_id() {
+        for c in [
+            '\u{0}',
+            'a',
+            '\u{7F}',
+            '\u{80}',
+            'é',
+            '\u{D7FF}',
+            '\u{E000}',
+            '🦀',
+            char::MAX,
+        ] {
+            assert_eq!(char_of_value_id(&char_value_id(c)), Some(c));
+        }
+        assert_eq!(
+            char_of_value_id(&Value::String("é".into()).value_id()),
+            None
+        );
+        assert_eq!(char_of_value_id(&Id([0; 32])), None);
+    }
 
     #[test]
     fn artifacts_roundtrip() {

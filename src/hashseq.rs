@@ -4474,6 +4474,43 @@ mod test {
         check_index_matches_iter(&seq);
     }
 
+    /// A char payload sent by id is the same node as the inline char, so
+    /// it must store and render the same — for every char, not just ASCII
+    /// — or equal node sets diverge in text and snapshot bytes.
+    #[test]
+    fn by_id_char_payload_stores_as_the_char() {
+        for ch in ['a', 'é', '🦀', '\u{10FFFF}'] {
+            let mut inline = HashSeq::default();
+            let mut by_id = HashSeq::default();
+            let at = Anchor::After(inline.origin());
+            let a = HashNode {
+                pins: BTreeSet::new(),
+                op: Op::Insert {
+                    at,
+                    payload: Payload::Char(ch),
+                },
+            };
+            let b = HashNode {
+                pins: BTreeSet::new(),
+                op: Op::Insert {
+                    at,
+                    payload: Payload::Id(crate::value::char_value_id(ch)),
+                },
+            };
+            assert_eq!(a.id(), b.id());
+            inline.apply(a).unwrap();
+            by_id.apply(b).unwrap();
+            inline.insert(1, 'x');
+            by_id.insert(1, 'x');
+            assert_eq!(by_id.iter().collect::<String>(), format!("{ch}x"));
+            assert_eq!(inline, by_id);
+            assert_eq!(
+                crate::encode_hashseq(&inline),
+                crate::encode_hashseq(&by_id)
+            );
+        }
+    }
+
     /// Typing adjacent to an atom never extends through it — the atom's
     /// placeholder text is not identity input, so chains must not absorb it.
     #[test]
