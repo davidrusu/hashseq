@@ -70,8 +70,9 @@ pub struct HashWeb {
     /// per-node state at all. Keyed by attacker-chosen object ids, so
     /// std's SipHash, not Fx (the same reasoning as `Delivery::orphaned`).
     pub(crate) orphaned: std::collections::HashMap<Id, Vec<(Id, HashNode)>>,
-    /// Value-artifact side store shared across objects.
-    pub(crate) values: FxHashMap<Id, Vec<u8>>,
+    /// Value-artifact side store shared across objects. Seeded hasher:
+    /// value ids are not guaranteed to stay unsteerable BLAKE3 outputs.
+    pub(crate) values: std::collections::HashMap<Id, Vec<u8>>,
     /// Delta sync is on (`enable_delta_sync`; APP_NOTES #8): minted
     /// small artifacts are tracked for `take_new_artifacts`. Off by
     /// default — servers and tests don't flush. The deltas themselves

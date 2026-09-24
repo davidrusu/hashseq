@@ -10,7 +10,7 @@
 //! (or op-node / origin ids — links). Artifact bytes ride a side store;
 //! an absent artifact is the `pending` state, never papered over.
 
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
 use rustc_hash::FxHashMap;
 
@@ -54,17 +54,16 @@ pub struct HashKv {
     /// `interns` and parallel to it: the node at arena slot `s` is
     /// `nodes[s - 1]` — slot 0 is the origin, which has no node.
     pub(crate) nodes: Vec<InternedHashNode>,
-    /// key value-id -> register. Keyed by the key's id — already a BLAKE3
-    /// output, so FxHash is safe (the HASHKV_SPEC key rule: adversarial key
-    /// bytes cost their author derivation, never a table).
-    keys: FxHashMap<Id, KeyState>,
+    /// key value-id -> register. `Put.key` rides the wire as a raw id, so
+    /// its author picks it freely: a seeded hasher, never FxHash.
+    keys: HashMap<Id, KeyState>,
     /// Value-artifact side store: artifact bytes by value id, for the ids
     /// this replica has seen bytes for. Reads without bytes are `pending`.
     /// Standalone this is the whole store; inside a `HashWeb` it is the
     /// per-object view of the store-wide one — the web mirrors in the
     /// artifacts each delivered put names (`HashKv::hydrate`), and the
     /// canonical snapshot carries the union.
-    pub(crate) values: FxHashMap<Id, Vec<u8>>,
+    pub(crate) values: HashMap<Id, Vec<u8>>,
     pub(crate) tips: BTreeSet<Id>,
     /// Applied node ids in apply order — the map's arena, append-only
     /// (orphans never enter), and the id table the interned nodes' handles
@@ -156,13 +155,13 @@ impl HashKv {
     /// key and value) that `store` holds — the web-side hydration that
     /// keeps `get`/`resolve` on an object inside a `HashWeb` from missing
     /// values the web holds. Bounded by what the node references.
-    pub(crate) fn hydrate(&mut self, node: &HashNode, store: &FxHashMap<Id, Vec<u8>>) {
+    pub(crate) fn hydrate(&mut self, node: &HashNode, store: &HashMap<Id, Vec<u8>>) {
         if let Op::Put { key, value, .. } = &node.op {
             self.hydrate_ids([*key, *value], store);
         }
     }
 
-    fn hydrate_ids(&mut self, ids: [Id; 2], store: &FxHashMap<Id, Vec<u8>>) {
+    fn hydrate_ids(&mut self, ids: [Id; 2], store: &HashMap<Id, Vec<u8>>) {
         for id in ids {
             if !self.values.contains_key(&id)
                 && let Some(bytes) = store.get(&id)
@@ -173,7 +172,7 @@ impl HashKv {
     }
 
     /// `hydrate` over every node this object holds (applied and orphaned).
-    pub(crate) fn hydrate_all(&mut self, store: &FxHashMap<Id, Vec<u8>>) {
+    pub(crate) fn hydrate_all(&mut self, store: &HashMap<Id, Vec<u8>>) {
         let applied = self.nodes.iter().map(|n| match &n.op {
             InternedOp::Put { key, value, .. } => Some([*key, *value]),
             _ => None,

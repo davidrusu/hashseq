@@ -19,10 +19,10 @@ blake3 = "1.8"  # hazmat: pre-hashed context keys on the id hot path
 hex = "0.4"
 wasm-bindgen = "0.2"
 getrandom = { version = "0.2", features = ["js"] }
-# Non-cryptographic hasher used for HashMap<Id, _> / HashSet<Id>. Safe because
-# Id is already a BLAKE3 hash — adversaries cannot craft Id values that collide
-# in FxHash without inverting BLAKE3, so HashDoS protection from SipHash is
-# redundant here.
+# Non-cryptographic hasher for maps keyed by replica-local handles and by ids
+# this replica derives itself (node ids, object ids): those are BLAKE3 outputs
+# nobody can steer. Maps keyed by ids read raw off the wire (refs, envelopes,
+# Put keys) or by value ids use std's seeded SipHash instead.
 rustc-hash = "2"
 # structure_json (wasm introspection) serializes through serde_json.
 serde_json = "1"
