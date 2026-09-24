@@ -1153,15 +1153,21 @@ impl HashSeq {
     /// rendered target element when `render`, a zero-width splice ghost
     /// otherwise.
     fn register_op_fragment(&mut self, op: InternedId, render: bool) {
-        let op_id = *self.interns.id(op);
-        let mv = &self.move_nodes[&op];
-        let (anchor, to_before, target) = (mv.to.idx(), mv.to.is_before(), mv.target);
         // A destination on another op's splice point: that op needs a
-        // physical rank first (terminates — anchors are causal refs, so
-        // the recursion strictly descends the DAG).
+        // physical rank first.
+        let anchor = self.move_nodes[&op].to.idx();
         if let Loc::MoveOp = self.loc_of(anchor) {
             self.ensure_op_fragment(anchor);
         }
+        self.place_op_fragment(op, render);
+    }
+
+    /// `register_op_fragment` once the anchor's own fragment (if it is a
+    /// move op) exists.
+    fn place_op_fragment(&mut self, op: InternedId, render: bool) {
+        let op_id = *self.interns.id(op);
+        let mv = &self.move_nodes[&op];
+        let (anchor, to_before, target) = (mv.to.idx(), mv.to.is_before(), mv.target);
         let (el, before) = if to_before {
             (self.before_sibling_target(anchor, &op_id), true)
         } else {
@@ -1196,15 +1202,34 @@ impl HashSeq {
     /// is about to anchor at its splice point. No-op when the op currently
     /// renders its target (the destination fragment serves) or already has a
     /// splice ghost.
+    ///
+    /// Iterative: a chain of op-anchored ops with no fragment (e.g. moves of
+    /// a removed element, each anchored at the previous one's splice point)
+    /// is peer-controlled in length, so walk it anchor-ward, then place the
+    /// missing fragments bottom-up — the order the recursion would take,
+    /// without its stack depth.
     fn ensure_op_fragment(&mut self, op: InternedId) {
+        let mut missing = Vec::new();
+        let mut cur = op;
+        while !self.op_has_fragment(cur) {
+            missing.push(cur);
+            let anchor = self.move_nodes[&cur].to.idx();
+            if !matches!(self.loc_of(anchor), Loc::MoveOp) {
+                break;
+            }
+            cur = anchor;
+        }
+        for op in missing.into_iter().rev() {
+            self.place_op_fragment(op, false);
+        }
+    }
+
+    /// Does `op` have a physical fragment: the destination fragment it
+    /// renders its target at, or a splice ghost?
+    fn op_has_fragment(&self, op: InternedId) -> bool {
         let target = self.move_nodes[&op].target;
-        if self.decider_of(target) == Some(op) && !self.is_removed(target) {
-            return;
-        }
-        if self.index.has_splice(op) {
-            return;
-        }
-        self.register_op_fragment(op, false);
+        (self.decider_of(target) == Some(op) && !self.is_removed(target))
+            || self.index.has_splice(op)
     }
 
     /// Retire a no-longer-deciding move op from its anchor's sibling set.
@@ -4337,6 +4362,74 @@ mod test {
         assert_eq!(seq.iter().collect::<String>(), "ay");
         assert_eq!(seq.position_of(&m), None);
         check_index_matches_iter(&seq);
+    }
+
+    /// Moves of a removed element, each anchored at the previous move's
+    /// splice point, get no fragment at apply time; the first insert at the
+    /// chain's end materializes all of them. The chain length is peer
+    /// controlled, so that must not recurse per link.
+    fn deep_splice_chain(n: usize, mark: bool) -> HashSeq {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "xa".chars());
+        let x = seq.id_at(0).unwrap();
+        let a = seq.id_at(1).unwrap();
+        seq.remove(0);
+        let mut prev = a;
+        for _ in 0..n {
+            let overwrites = if prev == a {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([prev])
+            };
+            let node = HashNode {
+                pins: BTreeSet::new(),
+                op: Op::Move {
+                    target: x,
+                    to: Anchor::After(prev),
+                    overwrites,
+                },
+            };
+            prev = node.id();
+            seq.apply(node).unwrap();
+        }
+        let last = if mark {
+            // Inverted, so refused — but admission materializes the chain.
+            Op::Mark {
+                start: Anchor::After(prev),
+                end: Anchor::Before(prev),
+                kind_v: bold(),
+                value: yes(),
+                overwrites: BTreeSet::new(),
+            }
+        } else {
+            Op::insert_after(prev, '!')
+        };
+        let res = seq.apply(HashNode {
+            pins: BTreeSet::new(),
+            op: last,
+        });
+        assert_eq!(res.is_err(), mark);
+        seq
+    }
+
+    #[test]
+    fn deep_splice_chain_materializes_without_recursion() {
+        let seq = deep_splice_chain(8, false);
+        assert_eq!(seq.iter().collect::<String>(), "a!");
+        check_index_matches_iter(&seq);
+
+        // Far deeper than a 256 KiB stack could recurse.
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                let seq = deep_splice_chain(20_000, false);
+                assert_eq!(seq.iter().collect::<String>(), "a!");
+                let seq = deep_splice_chain(20_000, true);
+                assert_eq!(seq.iter().collect::<String>(), "a");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// Splice-anchored runs survive the wire (their anchor is a move-op id,
