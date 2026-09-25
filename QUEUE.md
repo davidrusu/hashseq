@@ -75,7 +75,7 @@ Fix: one-line comment on the `RUN_OP_*` / `BLK_RUN_*` constants saying the polar
 
 Where: `src/hashweb.rs`, the `src/hashseq.rs` apply path, `src/encoding.rs` `decode_payload`.
 
-Problem: the by-id payload form is never refused; the id is resolved on read when the replica knows the value. Chars are done (2026-09-24): `value::char_of_value_id` inverts every char id as a pure function of the id (ASCII table + a lazily built ~9 MB prefix table of all non-ASCII chars), so a char sent as `0x01 id` stores as the char on every replica — no artifact needed, so steps 1–4 below are no longer needed for chars. Still open: the spec says inline `0x00 len bytes` is mandatory for any artifact ≤ 32 B, but the encoder inlines only `Payload::Char` and the decoder drops the bytes of an inline non-char artifact.
+Problem: the by-id payload form is never refused; the id is resolved on read when the replica knows the value. Small values are done (2026-09-24): artifacts of ≤ 15 bytes are their own value id (GRAMMAR_SPEC.md "Identity-form value ids"), so a char — or any small value — sent as `0x01 id` resolves from the id on every replica with no artifact and no table; steps 1–4 below remain only for hashed (16–32 B) artifacts. Still open: the spec says inline `0x00 len bytes` is mandatory for any artifact ≤ 32 B, but the encoder inlines only `Payload::Char` and the decoder drops the bytes of an inline non-char artifact.
 
 Plan: keep the store on HashWeb; resolve at apply and re-resolve on artifact arrival; no signature change to `iter`/`char_at`; never use `CHAR_MEMO` (thread-local, history-dependent).
 

@@ -1,8 +1,10 @@
 //! Value artifacts: content-addressed values (GRAMMAR_SPEC.md).
 //!
-//! A value artifact is a kind-tagged canonical byte encoding; its identity is
-//! `value_id = BLAKE3::derive_key(VALUE_CONTEXT, artifact_bytes)`. Op payloads,
-//! map keys, and map values commit to values by these ids (HASHSEQ_SPEC.md
+//! A value artifact is a kind-tagged canonical byte encoding. Its identity
+//! is `value_id`: an artifact of at most `IDENTITY_MAX` bytes is its own id
+//! (`len ‖ artifact ‖ 0…`, the identity form), anything longer is
+//! `BLAKE3::derive_key(VALUE_CONTEXT, artifact_bytes)`. Op payloads, map
+//! keys, and map values commit to values by these ids (HASHSEQ_SPEC.md
 //! "Payload"): the preimage always carries the 32-byte id, while transport
 //! inlines artifacts at or below the hash size.
 //!
@@ -45,12 +47,56 @@ static VALUE_KEY: LazyLock<blake3::hazmat::ContextKey> =
 static OBJECT_KEY: LazyLock<blake3::hazmat::ContextKey> =
     LazyLock::new(|| blake3::hazmat::hash_derive_key_context(OBJECT_CONTEXT));
 
-/// `value_id` of raw canonical artifact bytes (tag ‖ payload).
+/// Artifacts this long or shorter are their own value id (the identity
+/// form). The bound keeps at least 16 bytes of every identity id zero, so
+/// the identity ids are at most ~2^120 of the 2^256 id space: landing a
+/// BLAKE3 value id on one costs ≥ 2^128 work, BLAKE3's collision bound.
+pub const IDENTITY_MAX: usize = 15;
+
+/// `value_id` of raw canonical artifact bytes (tag ‖ payload): the identity
+/// form when the artifact fits, BLAKE3 otherwise. Kind-agnostic — which
+/// form applies depends on length alone, so a new small artifact kind
+/// changes no existing id and an old replica derives new kinds' ids too.
 pub fn value_id_of_bytes(artifact: &[u8]) -> Id {
     use blake3::hazmat::HasherExt;
+    if let Some(id) = identity_id(artifact) {
+        return id;
+    }
     let mut hasher = blake3::Hasher::new_from_context_key(&VALUE_KEY);
     hasher.update(artifact);
     Id(*hasher.finalize().as_bytes())
+}
+
+/// The identity form, `len ‖ artifact ‖ 0^(31 − len)`, for
+/// `1 ≤ len ≤ IDENTITY_MAX`.
+#[inline]
+fn identity_id(artifact: &[u8]) -> Option<Id> {
+    let len = artifact.len();
+    if !(1..=IDENTITY_MAX).contains(&len) {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    id[0] = len as u8;
+    id[1..1 + len].copy_from_slice(artifact);
+    Some(Id(id))
+}
+
+/// The artifact an identity-form value id carries, or `None` for any other
+/// id (a BLAKE3 value id, a node id, garbage). Total and pure: every
+/// replica reads the same bytes out of the same id, holding nothing.
+pub fn identity_artifact(id: &Id) -> Option<&[u8]> {
+    let len = id.0[0] as usize;
+    if !(1..=IDENTITY_MAX).contains(&len) {
+        return None;
+    }
+    let (artifact, pad) = id.0[1..].split_at(len);
+    pad.iter().all(|b| *b == 0).then_some(artifact)
+}
+
+/// Is `id` an identity-form value id? Such values are never stored: the id
+/// is the bytes.
+pub fn is_identity(id: &Id) -> bool {
+    identity_artifact(id).is_some()
 }
 
 /// An object's store address:
@@ -161,6 +207,12 @@ impl Value {
         buf
     }
 
+    /// The value an identity-form id carries (`None` for a hashed id, or
+    /// an identity artifact of a kind this build does not know).
+    pub fn from_identity_id(id: &Id) -> Option<Value> {
+        Value::decode(identity_artifact(id)?)
+    }
+
     pub fn value_id(&self) -> Id {
         if let Value::Char(c) = self {
             return char_value_id(*c);
@@ -216,77 +268,12 @@ fn decode_zigzag(bytes: &[u8]) -> Option<(i64, usize)> {
 /// `TOMBSTONE = value_id([VK_TOMBSTONE])`.
 pub static TOMBSTONE: LazyLock<Id> = LazyLock::new(|| value_id_of_bytes(&[VK_TOMBSTONE]));
 
-// ---- char value-id cache ----
-//
-// Text is the hot path: every insert's preimage hashes its payload's value
-// id, so char→value_id must be effectively free. Char artifacts are a fixed
-// universe: ASCII rides a precomputed table; the rest go through a
-// thread-local memo (one BLAKE3 of ≤5 bytes on first sight per thread).
-
-static ASCII_VALUE_IDS: LazyLock<[Id; 128]> = LazyLock::new(|| {
-    std::array::from_fn(|i| {
-        let c = i as u8 as char;
-        value_id_of_bytes(&Value::Char(c).encoded())
-    })
-});
-
-thread_local! {
-    static CHAR_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<char, Id>> =
-        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
-}
-
-static ASCII_CHAR_OF_VALUE_ID: LazyLock<rustc_hash::FxHashMap<Id, char>> = LazyLock::new(|| {
-    ASCII_VALUE_IDS
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (*id, i as u8 as char))
-        .collect()
-});
-
-/// Every non-ASCII char, keyed by the low 32 bits of its value id's
-/// first word, sorted: ~9 MB, ~0.1 s to build natively. Built on first
-/// use — honest peers inline chars, so only a by-id non-ASCII char
-/// payload reaches it.
-static CHAR_BY_ID_PREFIX: LazyLock<Vec<(u32, char)>> = LazyLock::new(|| {
-    let mut table: Vec<(u32, char)> = (128..=char::MAX as u32)
-        .filter_map(char::from_u32)
-        .map(|c| {
-            let mut tmp = [0u8; 5];
-            (
-                id_prefix32(&value_id_of_bytes(char_artifact(c, &mut tmp))),
-                c,
-            )
-        })
-        .collect();
-    table.sort_unstable();
-    table
-});
-
-fn id_prefix32(id: &Id) -> u32 {
-    u32::from_le_bytes(id.0[..4].try_into().expect("Id has 32 bytes"))
-}
-
-/// The char whose artifact `id` names, if any: a pure function of `id`
-/// over the whole char range (ASCII by table, the rest by the lazily
-/// built prefix table), so every replica agrees. The same node id must
-/// have one stored form whether its char payload arrived inline or by
-/// id — resolving only part of the range lets the transport form decide
-/// what renders.
+/// The char a value id names, if it is a char's (identity-form) id.
 pub fn char_of_value_id(id: &Id) -> Option<char> {
-    if let Some(c) = ASCII_CHAR_OF_VALUE_ID.get(id) {
-        return Some(*c);
+    match Value::from_identity_id(id)? {
+        Value::Char(c) => Some(c),
+        _ => None,
     }
-    let prefix = id_prefix32(id);
-    let table = &*CHAR_BY_ID_PREFIX;
-    let start = table.partition_point(|(p, _)| *p < prefix);
-    table[start..]
-        .iter()
-        .take_while(|(p, _)| *p == prefix)
-        .map(|(_, c)| *c)
-        .find(|c| {
-            let mut tmp = [0u8; 5];
-            value_id_of_bytes(char_artifact(*c, &mut tmp)) == *id
-        })
 }
 
 /// A char's canonical artifact bytes (`VK_CHAR ‖ utf8`), written into a
@@ -299,26 +286,55 @@ pub(crate) fn char_artifact(c: char, tmp: &mut [u8; 5]) -> &[u8] {
     &tmp[..1 + n]
 }
 
-/// `value_id` of a char artifact, cached.
+/// `value_id` of a char artifact: its identity form (≤ 5 bytes), no hash.
 #[inline]
 pub fn char_value_id(c: char) -> Id {
-    if (c as u32) < 128 {
-        return ASCII_VALUE_IDS[c as usize];
+    // `identity_id(char_artifact(c))`, written in place (the typing path).
+    let mut id = [0u8; 32];
+    if c.is_ascii() {
+        id[0] = 2;
+        id[1] = VK_CHAR;
+        id[2] = c as u8;
+        return Id(id);
     }
-    CHAR_MEMO.with(|m| {
-        if let Some(id) = m.borrow().get(&c) {
-            return *id;
-        }
-        let mut tmp = [0u8; 5];
-        let id = value_id_of_bytes(char_artifact(c, &mut tmp));
-        m.borrow_mut().insert(c, id);
-        id
-    })
+    let n = c.encode_utf8(&mut id[2..6]).len();
+    id[0] = 1 + n as u8;
+    id[1] = VK_CHAR;
+    Id(id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The identity form round-trips every artifact that fits and never
+    /// claims one that does not; the parser rejects every other layout.
+    #[quickcheck_macros::quickcheck]
+    fn prop_identity_form_is_exact(artifact: Vec<u8>) -> bool {
+        let id = value_id_of_bytes(&artifact);
+        match identity_artifact(&id) {
+            Some(bytes) => (1..=IDENTITY_MAX).contains(&artifact.len()) && bytes == &artifact[..],
+            None => !(1..=IDENTITY_MAX).contains(&artifact.len()),
+        }
+    }
+
+    #[test]
+    fn identity_parser_rejects_malformed_layouts() {
+        let mut id = value_id_of_bytes(&[VK_INT, 0]).0;
+        assert_eq!(identity_artifact(&Id(id)), Some(&[VK_INT, 0][..]));
+        id[31] = 1; // non-zero padding
+        assert_eq!(identity_artifact(&Id(id)), None);
+        assert_eq!(identity_artifact(&Id([0; 32])), None, "len 0");
+        let mut long = [0u8; 32];
+        long[0] = IDENTITY_MAX as u8 + 1;
+        assert_eq!(identity_artifact(&Id(long)), None, "len past the bound");
+        // Trailing zero bytes inside the artifact are framed by the length.
+        let a = value_id_of_bytes(&[VK_BYTES, 0]);
+        let b = value_id_of_bytes(&[VK_BYTES]);
+        assert_ne!(a, b);
+        assert_eq!(Value::from_identity_id(&a), Some(Value::Bytes(vec![0])));
+        assert_eq!(Value::from_identity_id(&b), Some(Value::Bytes(vec![])));
+    }
 
     #[test]
     fn char_of_value_id_inverts_every_char_id() {
@@ -386,10 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn char_cache_matches_direct_derivation() {
+    fn char_value_id_matches_direct_derivation() {
         for c in ['a', 'Z', ' ', '\n', '\u{7f}', 'é', '🦀', '中'] {
             let direct = value_id_of_bytes(&Value::Char(c).encoded());
-            assert_eq!(char_value_id(c), direct, "cache drift for {c:?}");
+            assert_eq!(char_value_id(c), direct, "char id drift for {c:?}");
             assert_eq!(Value::Char(c).value_id(), direct);
         }
     }

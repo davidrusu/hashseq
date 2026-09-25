@@ -1,6 +1,6 @@
 //! GRAMMAR_SPEC.md test vectors — locked. Any change to these values is an
 //! identity hard fork and must be deliberate (context-string bump).
-use hashseq::value::{KIND_KV, KIND_SEQ, TOMBSTONE, char_value_id};
+use hashseq::value::{KIND_KV, KIND_SEQ, TOMBSTONE, Value, char_value_id};
 use hashseq::{Anchor, HashNode, Id, Op, Payload, object_id};
 use std::collections::BTreeSet;
 
@@ -12,11 +12,21 @@ fn hx(id: &Id) -> String {
 fn derived_constants_are_locked() {
     assert_eq!(
         hx(&TOMBSTONE),
-        "37e7b9a9496baa6bc45fc76168e02a70e2b640a7ae2ca826fb5990f48f772f8a"
+        "0100000000000000000000000000000000000000000000000000000000000000"
     );
     assert_eq!(
         hx(&char_value_id('a')),
-        "555c4ad3f1f89bacc6d46a3d7c6cf897f83e8c0500da8f2dc9a46fc85a740638"
+        "0203610000000000000000000000000000000000000000000000000000000000"
+    );
+    // The identity-form boundary: a 15-byte artifact is its own id, a
+    // 16-byte one is hashed.
+    assert_eq!(
+        hx(&Value::String("x".repeat(14)).value_id()),
+        "0f04787878787878787878787878787800000000000000000000000000000000"
+    );
+    assert_eq!(
+        hx(&Value::String("x".repeat(15)).value_id()),
+        "a9361588e0f7f0a7645285a5229fa64588d56d4ad5572efbf79d439d086e0b16"
     );
     assert_eq!(
         hx(&object_id(KIND_SEQ, &Id([0x11; 32]))),
@@ -40,7 +50,7 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&insert.id()),
-        "796e3d6b9739303167ce099a5e801545aee245227e1d0c483592fc839a3e66d2"
+        "d3a27cd3533aa80075c856bc33d5f2a6faee839be84506626594ac4322dcdfa2"
     );
     let remove = HashNode {
         pins: BTreeSet::new(),
@@ -48,7 +58,7 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&remove.id()),
-        "d4758f38bc31acaafd5412c51024fb487b71fe85ac212775337cc32b033054c3"
+        "1f739bfc1cd26ce72f410f6af7d62b75e4e75cc99bac90973b5539070cafef3e"
     );
     let mv = HashNode {
         pins: BTreeSet::new(),
@@ -60,7 +70,7 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&mv.id()),
-        "7380372f8478f820e04005cc1623df522408f612934db03ded6b9e27a35d3ffb"
+        "9e6e16085d8ff7d374c1f81f363d4190244ad446899da61a157b360ec019a621"
     );
     let put = HashNode {
         pins: BTreeSet::from_iter([origin]),
@@ -72,6 +82,6 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&put.id()),
-        "d6a4f360e484441bec208b2510bf4412b74b2f8ea258f09275799ae485cb80a5"
+        "4533c5edf5b7c7cdd956eb76f39dc8cbc4290d375010ec97bfd095c659e4ce4d"
     );
 }

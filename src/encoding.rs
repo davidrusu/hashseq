@@ -1978,7 +1978,11 @@ fn decode_hashkv_v(bytes: &[u8], tagged: bool) -> Result<HashKv, DecodeError> {
         let len = c.step(decode_varint)?;
         let b = c.take(len)?.to_vec();
         let vid = crate::value::value_id_of_bytes(&b);
-        kv.values.entry(vid).or_insert(b);
+        // An identity-form artifact is its id; stores never hold one (so a
+        // stream carrying one re-encodes differently: strict rejects it).
+        if !crate::value::is_identity(&vid) {
+            kv.values.entry(vid).or_insert(b);
+        }
     }
     Ok(kv)
 }
@@ -2120,7 +2124,9 @@ pub fn decode_hashweb(bytes: &[u8]) -> Result<HashWeb, DecodeError> {
         let len = c.step(decode_varint)?;
         let b = c.take(len)?.to_vec();
         let vid = crate::value::value_id_of_bytes(&b);
-        web.values.entry(vid).or_insert(b);
+        if !crate::value::is_identity(&vid) {
+            web.values.entry(vid).or_insert(b);
+        }
     }
 
     let no = c.step(decode_varint)?;
@@ -2832,7 +2838,7 @@ mod tests {
         assert_eq!(encode_hashseq(&b), bytes, "equal sets, equal bytes");
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "10b5ca85664c02dcff34ec400fb225469ab331e604180867aabf2ab7ab0eedde",
+            "3f6aabf942668176741d4ae1ad36ee1262d9d76d291acf82195b6e51c165bc4f",
             "canonical snapshot bytes moved — bump knowingly"
         );
     }
@@ -3542,8 +3548,8 @@ mod delta_tests {
 
     /// Small artifacts minted locally ride next to the delta (the title
     /// string behind a put is vocabulary the peer needs NOW, not at the
-    /// next resync); dedupes, blobs, and received-not-minted values stay
-    /// out of the minted set.
+    /// next resync); dedupes, blobs, identity-form values (their id is the
+    /// bytes), and received-not-minted values stay out of the minted set.
     #[test]
     fn minted_small_artifacts_queue_once() {
         use crate::value::Value;
@@ -3554,27 +3560,30 @@ mod delta_tests {
         assert!(a.take_new_artifacts().is_empty());
 
         a.enable_delta_sync();
-        let t = a.provide_value(&Value::String("Title".into()));
-        let again = a.provide_value(&Value::String("Title".into()));
+        let t = a.provide_value(&Value::String("A Title Past The Identity Form".into()));
+        let again = a.provide_value(&Value::String("A Title Past The Identity Form".into()));
         assert_eq!(t, again);
         let blob = a.provide_value(&Value::Bytes(vec![7u8; WIRE_ARTIFACT_MAX + 1]));
         let small = a.provide_value(&Value::Bytes(vec![7u8; 16]));
+        let identity = a.provide_value(&Value::String("Title".into()));
+        assert!(crate::value::is_identity(&identity));
+        assert!(a.artifact_bytes(&identity).is_none(), "never stored");
+        assert_eq!(a.resolve(&identity), Some(Value::String("Title".into())));
         let minted = a.take_new_artifacts();
-        assert_eq!(
-            minted,
-            vec![t, small],
-            "once per new small value; blobs excluded"
-        );
+        let mut want = vec![t, small];
+        want.sort();
+        assert_eq!(minted, want, "once per new small value; blobs excluded");
         assert!(a.take_new_artifacts().is_empty(), "drained");
         assert!(
             a.artifact_bytes(&blob).is_some(),
             "the blob is still stored"
         );
+        let _ = identity;
 
         // Bytes that ARRIVE (0xAF / lazy GET) are not re-pushed.
         let mut b = HashWeb::new();
         b.enable_delta_sync();
-        b.provide_artifact_bytes(Value::String("Title".into()).encoded());
+        b.provide_artifact_bytes(Value::String("A Title Past The Identity Form".into()).encoded());
         assert!(
             b.take_new_artifacts().is_empty(),
             "received artifacts never echo"

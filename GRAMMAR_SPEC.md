@@ -36,7 +36,9 @@ VALUE_CONTEXT  = "hashweb v1 value id"
 OBJECT_CONTEXT = "hashweb v1 object id"
 
 id(u)              = BLAKE3::derive_key(NODE_CONTEXT,   node_bytes(u))
-value_id(a)        = BLAKE3::derive_key(VALUE_CONTEXT,  artifact_bytes(a))
+value_id(a)        = len ‖ a ‖ 0^(31 − len)          if 1 ≤ len ≤ 15   -- identity form
+                   = BLAKE3::derive_key(VALUE_CONTEXT,  a)  otherwise
+                       -- a = artifact_bytes(a), len = |a| as one byte
 object_id(k, origin) = BLAKE3::derive_key(OBJECT_CONTEXT, k ‖ origin)
                        -- k: the object kind tag (KIND_KV = 0x00 /
                        --    KIND_SEQ = 0x01, one byte); origin: an
@@ -56,6 +58,35 @@ the same origin opened as a Seq and as a Kv is two different objects, and
 kind mis-agreement is unrepresentable rather than refused. Kinds are tags
 inside the encodings. Bump a context string ⟺ identity hard fork; there
 is no other versioning at this layer.
+
+### Identity-form value ids
+
+A small artifact is its own value id — no hash, and inverting it is a
+parse (`identity_artifact`), so every replica reads the same value out of
+the same id while holding nothing. Why:
+
+- **One stored form per node, with no store.** A payload's rendering must
+  be a function of the node set. With hashed ids only, a small value sent
+  by id renders as the value on a replica that can invert the id and as an
+  opaque atom elsewhere — the same node id, two states (the 2026-09
+  review: a non-ASCII char sent `0x01 id` rendered U+FFFC). Inverting a
+  hash needs a table over the value universe (≈ 9 MB for chars alone); the
+  identity form needs nothing.
+- **No tag bit.** Identity ids are recognized by shape: `len ∈ 1..=15` and
+  at least 16 zero bytes of padding. That set holds ≈ 2^120 ids of 2^256,
+  so landing a BLAKE3 value id on one costs ≥ 2^128 work — BLAKE3's own
+  collision bound. The bound on `len` is exactly what keeps it there; do
+  not raise it. BLAKE3 ids keep all 256 bits.
+- **Extensible.** Which form applies depends on the artifact's length
+  alone, never its kind: a new small artifact kind changes no id, and a
+  replica that does not know the kind still derives, verifies and carries
+  its id (it renders a placeholder). The length byte frames the artifact,
+  so trailing `0x00` bytes inside it are unambiguous.
+- **Consequences.** Identity values are never held in a value store (the
+  id is the bytes; a stream `ValueStore` entry for one is non-canonical)
+  and never shipped as artifact frames. Value ids are no longer uniform:
+  an author picks small ones directly, so nothing may key an unseeded
+  hash table by value id (or by any id read raw off the wire).
 
 ### The node grammar: envelope ‖ body
 
@@ -164,7 +195,7 @@ artifact := kind:varint ‖ payload
 
 | tag | kind        | payload                            | notes                                                                         |
 |-----|-------------|------------------------------------|-------------------------------------------------------------------------------|
-| 0   | `Tombstone` | empty                              | `TOMBSTONE = value_id(0x00)` — derived constant                               |
+| 0   | `Tombstone` | empty                              | `TOMBSTONE = value_id(0x00)` — derived constant (identity form)               |
 | 1   | `Bool`      | 1 byte, 0x00/0x01                  |                                                                               |
 | 2   | `Int`       | zigzag varint                      | i64 range; out-of-range is app-level                                          |
 | 3   | `Char`      | minimal UTF-8, one scalar          | text payloads                                                                 |
@@ -183,7 +214,8 @@ undecidable *within* one encoding (op bodies count their interior lists for
 this reason), and nowhere else — so a future artifact kind with more than
 one variable-length field must self-delimit all but its final field.
 Unknown artifact tags are carried opaquely — the id verifies, renderers
-show placeholders.
+show placeholders. (An internal length is also unnecessary for the
+identity form: the id's own length byte frames the artifact.)
 `TOMBSTONE` is an ordinary derived id: a computed constant, published as
 a test vector, never magic bytes in id space.
 
@@ -244,26 +276,30 @@ field appears and the artifact is in this stream's `ValueStore` with
 artifact bytes ≤ 32, the stream form inlines `0x00 len bytes`; otherwise
 `0x01 id`. Inline is mandatory when present-and-small — no choice — and
 the decoder derives the value_id to reconstruct the Part A preimage
-exactly. Chain interiors elide tips/anchor (implicit `prev`); the decoder
+exactly. Identity-form values are never in a `ValueStore`; the
+implemented encoder inlines chars and sends other identity-form values
+`0x01 id` (the id carries the bytes). Chain interiors elide tips/anchor (implicit `prev`); the decoder
 reconstructs each member's full envelope deterministically.
 
 ## Open items
 
 1. **Test vectors — generated and locked** (2026-07-02, by the first
-   implementation; mirrored in `tests/grammar_vectors.rs`, which fails on
+   implementation; regenerated 2026-09-24 for identity-form value ids — pre-release, so no context bump; mirrored in `tests/grammar_vectors.rs`, which fails on
    any drift):
 
    ```
-   TOMBSTONE            = 37e7b9a9496baa6bc45fc76168e02a70e2b640a7ae2ca826fb5990f48f772f8a
-   value_id(Char 'a')   = 555c4ad3f1f89bacc6d46a3d7c6cf897f83e8c0500da8f2dc9a46fc85a740638
+   TOMBSTONE            = 0100000000000000000000000000000000000000000000000000000000000000
+   value_id(Char 'a')   = 0203610000000000000000000000000000000000000000000000000000000000
+   value_id(String 'x'×14) = 0f04787878787878787878787878787800000000000000000000000000000000
+   value_id(String 'x'×15) = a9361588e0f7f0a7645285a5229fa64588d56d4ad5572efbf79d439d086e0b16
    object_id(seq, 0x11 × 32) = dec2ca1db8abc0150e54eac174fdbf56a0ffeb833d83ba0d53eb91e4b063b58b
    object_id(kv,  0x11 × 32) = d17caee6e539818d5cf8c5f5087d3e6ad43797cf2674b3196b3b4c0dc601f757
 
    with origin = 0x00 × 32:
-   Insert{After(origin), 'a'} (no pins)      = 796e3d6b9739303167ce099a5e801545aee245227e1d0c483592fc839a3e66d2
-   Remove{that insert} (no pins)             = d4758f38bc31acaafd5412c51024fb487b71fe85ac212775337cc32b033054c3
-   Move{that insert → Before(origin)}        = 7380372f8478f820e04005cc1623df522408f612934db03ded6b9e27a35d3ffb
-   Put{'k' → TOMBSTONE, pins={origin}}       = d6a4f360e484441bec208b2510bf4412b74b2f8ea258f09275799ae485cb80a5
+   Insert{After(origin), 'a'} (no pins)      = d3a27cd3533aa80075c856bc33d5f2a6faee839be84506626594ac4322dcdfa2
+   Remove{that insert} (no pins)             = 1f739bfc1cd26ce72f410f6af7d62b75e4e75cc99bac90973b5539070cafef3e
+   Move{that insert → Before(origin)}        = 9e6e16085d8ff7d374c1f81f363d4190244ad446899da61a157b360ec019a621
+   Put{'k' → TOMBSTONE, pins={origin}}       = 4533c5edf5b7c7cdd956eb76f39dc8cbc4290d375010ec97bfd095c659e4ce4d
    ```
 
    Still owed: a small canonical snapshot vector once the Part B stream

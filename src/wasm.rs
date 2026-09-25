@@ -1495,11 +1495,12 @@ impl WasmHashWeb {
 
     /// Would these artifact bytes be news to this replica? (False for our
     /// own 0xAF push echoed back by the relay — the caller skips the
-    /// re-render.)
+    /// re-render.) Never news for an identity-form artifact: its id
+    /// already carries the bytes.
     #[wasm_bindgen(js_name = hasArtifactBytes)]
     pub fn has_artifact_bytes(&self, bytes: &[u8]) -> bool {
         let id = crate::value::value_id_of_bytes(bytes);
-        self.inner.artifact_bytes(&id).is_some()
+        crate::value::is_identity(&id) || self.inner.artifact_bytes(&id).is_some()
     }
 
     /// Store raw artifact bytes (the 0xAF frame payload); returns the

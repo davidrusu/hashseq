@@ -25,7 +25,8 @@ identity cost of payload-as-id: the per-char preimage grew from ~40 to 68
 bytes (kind ‖ ref_count ‖ anchor ‖ body_len ‖ anchor-ref ‖ value_id), which
 crosses a BLAKE3 block boundary — one extra compression per chained hash.
 Mitigations already in: cached char value-ids (ASCII table + thread-local
-memo) and a single-buffer fast path (the whole 68-byte preimage assembled on
+memo; since 2026-09-24 a char's value id is its identity form, no hash or
+cache at all) and a single-buffer fast path (the whole 68-byte preimage assembled on
 the stack, one hasher update — recovered roughly half of the initial
 regression). A same-conditions A/B against the pre-Move commit confirmed the
 Move/HashKv additions cost nothing on text traces.

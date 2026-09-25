@@ -150,7 +150,9 @@ is the same orphan-until-upgrade class as unknown kinds. Rule of thumb:
 
 Value artifacts at or below the hash size encode inline (identity-neutral:
 the value id is derived at decode — ENCODING_SPEC.md); larger artifacts live
-in a content-addressed side store.
+in a content-addressed side store. Artifacts of ≤ 15 bytes are their own
+value id (GRAMMAR_SPEC.md "Identity-form value ids") and never enter the
+store.
 
 - identical values dedupe; large values sync lazily — the op DAG verifies
   with no payload bytes at all;

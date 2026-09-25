@@ -85,9 +85,9 @@ impl Payload {
     /// The stored form: a by-id payload whose value this replica can
     /// resolve becomes the resolved value. Identity is unchanged (the
     /// preimage hashes the value id either way); only the rendering is —
-    /// the char instead of an opaque atom. Resolution covers every char
-    /// (`value::char_of_value_id`); a value store would widen it to other
-    /// small values.
+    /// the char instead of an opaque atom. A char's value id is its
+    /// identity form (`value::char_of_value_id`), so every replica
+    /// resolves it the same way without holding anything.
     #[inline]
     pub fn resolved(self) -> Payload {
         match self {

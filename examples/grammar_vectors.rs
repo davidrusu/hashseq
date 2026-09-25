@@ -1,5 +1,5 @@
 // examples/grammar_vectors.rs — print the GRAMMAR_SPEC test vectors
-use hashseq::value::{KIND_KV, KIND_SEQ, TOMBSTONE, char_value_id};
+use hashseq::value::{KIND_KV, KIND_SEQ, TOMBSTONE, Value, char_value_id};
 use hashseq::{Anchor, HashNode, Id, Op, Payload, object_id};
 use std::collections::BTreeSet;
 
@@ -10,6 +10,14 @@ fn hex(id: &Id) -> String {
 fn main() {
     println!("TOMBSTONE = {}", hex(&TOMBSTONE));
     println!("value_id('a') = {}", hex(&char_value_id('a')));
+    println!(
+        "value_id(String 'x' * 14) = {}",
+        hex(&Value::String("x".repeat(14)).value_id())
+    );
+    println!(
+        "value_id(String 'x' * 15) = {}",
+        hex(&Value::String("x".repeat(15)).value_id())
+    );
     let x = Id([0x11; 32]);
     println!(
         "object_id(seq, 0x11*32) = {}",

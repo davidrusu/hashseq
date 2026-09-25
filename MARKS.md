@@ -175,9 +175,10 @@ painter" session chain can run-compress later if profiles say so.
   position is the op's id-rank in its anchor's fork order — permanent, so
   the inverted-span verdict stays stable — and ops that marks anchor at
   retain their fragment for life.
-- `kind` and `value` are ids (BLAKE3 outputs), so in-memory keying by kind
-  id is fast-hash-safe — no SipHash needed (the HASHKV_SPEC.md key rule;
-  adversarial kind bytes cost their author indirection, never a table).
+- `kind` and `value` are value ids, which an author picks freely (they
+  ride the wire raw, and small ones are identity-form — GRAMMAR_SPEC.md),
+  so any in-memory keying by kind id must use a seeded hasher, never Fx.
+  Today marks group kinds in sorted `Vec`s, not hash tables.
 - **Amplification**: one O(log F) comparison per malicious op and nothing
   stored (refused ops are dropped) — linear in attacker effort. Mark spam over huge ranges
   costs the renderer O(anchor events), not O(range); MVR set growth is the

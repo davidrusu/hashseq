@@ -139,8 +139,12 @@ impl HashKv {
     }
 
     /// Store a value artifact's bytes (resolves `pending` reads of its id).
+    /// Identity-form values are never stored: the id is the bytes.
     pub fn provide_value(&mut self, v: &Value) -> Id {
         let id = v.value_id();
+        if crate::value::is_identity(&id) {
+            return id;
+        }
         if let std::collections::hash_map::Entry::Vacant(e) = self.values.entry(id) {
             let bytes = v.encoded();
             if self.delta_sync && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
@@ -190,7 +194,8 @@ impl HashKv {
     /// Resolve a value id to its artifact, if this replica holds the bytes.
     /// `None` = pending/unavailable (or the id names an op/origin — a link).
     pub fn resolve(&self, value_id: &Id) -> Option<Value> {
-        self.values.get(value_id).and_then(|b| Value::decode(b))
+        Value::from_identity_id(value_id)
+            .or_else(|| self.values.get(value_id).and_then(|b| Value::decode(b)))
     }
 
     // ---- local authoring ----

@@ -227,16 +227,20 @@ impl HashWeb {
         out.into_iter().map(|(_, g)| g).collect()
     }
 
-    /// Canonical bytes of one artifact, if this replica holds them
-    /// (the content-addressed GET path).
+    /// Canonical bytes of one hashed artifact, if this replica holds them
+    /// (the content-addressed GET path). Identity-form ids carry their
+    /// bytes (`value::identity_artifact`) and are never held here.
     pub fn artifact_bytes(&self, id: &Id) -> Option<&Vec<u8>> {
         self.values.get(id)
     }
 
     /// Store raw artifact bytes (content-addressed; the 0xAF wire frame).
+    /// Identity-form artifacts are not stored: their id is the bytes.
     pub fn provide_artifact_bytes(&mut self, bytes: Vec<u8>) -> Id {
         let vid = crate::value::value_id_of_bytes(&bytes);
-        self.values.entry(vid).or_insert(bytes);
+        if !crate::value::is_identity(&vid) {
+            self.values.entry(vid).or_insert(bytes);
+        }
         vid
     }
 
@@ -256,6 +260,9 @@ impl HashWeb {
 
     pub fn provide_value(&mut self, v: &Value) -> Id {
         let id = v.value_id();
+        if crate::value::is_identity(&id) {
+            return id;
+        }
         if let std::collections::hash_map::Entry::Vacant(e) = self.values.entry(id) {
             let bytes = v.encoded();
             if self.delta_sync && bytes.len() <= crate::encoding::WIRE_ARTIFACT_MAX {
@@ -281,7 +288,8 @@ impl HashWeb {
     }
 
     pub fn resolve(&self, value_id: &Id) -> Option<Value> {
-        self.values.get(value_id).and_then(|b| Value::decode(b))
+        Value::from_identity_id(value_id)
+            .or_else(|| self.values.get(value_id).and_then(|b| Value::decode(b)))
     }
 
     // ---- delivery (the routing envelope: `obj_id ‖ HashNode`) ----
@@ -664,23 +672,34 @@ pub(crate) mod tests {
         // raw id: the authoring object never saw the bytes, so its own
         // view stays pending here (`web.resolve` is the store-wide read);
         // every replica that decodes or merges this store hydrates it.
-        let vid = doc.provide_value(&s("green"));
-        let key_id = doc.provide_value(&s("shade"));
+        let vid = doc.provide_value(&s("a green past the identity form"));
+        let key_id = doc.provide_value(&s("a shade past the identity form"));
         doc.kv_mut(&root).unwrap().put_ids(key_id, vid);
-        assert_eq!(doc.kv(&root).unwrap().get(&s("shade")), None);
-        assert_eq!(doc.resolve(&vid), Some(s("green")));
+        assert_eq!(
+            doc.kv(&root)
+                .unwrap()
+                .get(&s("a shade past the identity form")),
+            None
+        );
+        assert_eq!(doc.resolve(&vid), Some(s("a green past the identity form")));
 
         let bytes = crate::encoding::encode_hashweb(&doc);
         let decoded = crate::encoding::decode_hashweb(&bytes).expect("decodes");
         let kv = decoded.kv(&root).unwrap();
         assert_eq!(kv.get(&s("color")), Some(s("blue")));
-        assert_eq!(kv.get(&s("shade")), Some(s("green")));
+        assert_eq!(
+            kv.get(&s("a shade past the identity form")),
+            Some(s("a green past the identity form"))
+        );
 
         let mut fresh = HashWeb::new();
         fresh.merge(doc.clone());
         let kv = fresh.kv(&root).unwrap();
         assert_eq!(kv.get(&s("color")), Some(s("blue")));
-        assert_eq!(kv.get(&s("shade")), Some(s("green")));
+        assert_eq!(
+            kv.get(&s("a shade past the identity form")),
+            Some(s("a green past the identity form"))
+        );
 
         // Delivery order: the op first, orphaned on an unknown object, the
         // object opened later — hydration happens at delivery.
@@ -703,19 +722,31 @@ pub(crate) mod tests {
         let mut web = HashWeb::new();
         let root = web.create_kv(oid(9));
         web.enable_delta_sync();
-        web.kv_mut(&root).unwrap().put(s("title"), s("Hello"));
+        let (title, hello) = (
+            s("a title past the identity form"),
+            s("Hello, past the identity form"),
+        );
+        web.kv_mut(&root).unwrap().put(title.clone(), hello.clone());
         let mut minted = web.take_new_artifacts();
         minted.sort();
-        let mut want = vec![s("title").value_id(), s("Hello").value_id()];
+        let mut want = vec![title.value_id(), hello.value_id()];
         want.sort();
         assert_eq!(minted, want);
         assert!(web.take_new_artifacts().is_empty(), "drained");
 
         // Minted store-wide and then again through the object: one id.
-        put(&mut web, &root, s("k"), s("v"));
+        let (k, v) = (
+            s("a key past the identity form"),
+            s("a value past the identity form"),
+        );
+        put(&mut web, &root, k.clone(), v);
         let minted = web.take_new_artifacts();
         assert_eq!(minted.len(), 2);
-        assert!(minted.contains(&s("k").value_id()));
+        assert!(minted.contains(&k.value_id()));
+
+        // Identity-form values carry their bytes in the id: nothing ships.
+        web.kv_mut(&root).unwrap().put(s("k"), s("v"));
+        assert!(web.take_new_artifacts().is_empty());
 
         // Off unless delta sync is enabled (servers/tests don't flush).
         let mut quiet = HashWeb::new();

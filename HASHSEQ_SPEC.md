@@ -100,8 +100,9 @@ promotes back if the register re-agrees on it). Still refused: a Move whose
 
 The payload is an **id, not a raw value**: the id of a content-addressed
 value artifact (a kind-tagged canonical value encoding — char, int, bytes,
-…; `value_id = BLAKE3::derive_key(VALUE_CONTEXT, encoding)`, one context for
-all value kinds; well-known artifacts like `TOMBSTONE` are ordinary
+…; `value_id` is the artifact itself when it is ≤ 15 bytes (the identity
+form) and `BLAKE3::derive_key(VALUE_CONTEXT, encoding)` otherwise, one
+rule for all value kinds — GRAMMAR_SPEC.md; well-known artifacts like `TOMBSTONE` are ordinary
 derived value ids — computed constants, never magic ids), of an object id
 (a link; transclusion when the object lives elsewhere — HASHWEB_SPEC.md),
 or of an op node.
@@ -119,8 +120,8 @@ anchors, marks, removes, and moves name); the payload id is the element's
   store. Inline vs indirect is pure encoding — the node id is identical
   either way, so the same logical value can never yield two op identities.
 - **For text this is identity-only.** State, rendering, run storage, and
-  wire bytes are unchanged; the preimage hashes `value_id(char)` (a fixed,
-  cacheable universe) in place of the char. Cost is a wider chain-hash
+  wire bytes are unchanged; the preimage hashes `value_id(char)` (its
+  identity form: the char's artifact bytes, no hash) in place of the char. Cost is a wider chain-hash
   input — benchmark against the sequential_traces discipline.
 
 Any payload kind is insertable; what a renderer does with a payload it
