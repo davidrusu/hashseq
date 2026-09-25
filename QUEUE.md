@@ -1,6 +1,5 @@
 # Queue
 
-- remove the closure given to InternedXX::resolve(), pass IdIndex directly
 - can we consolidate insert_before and insert_after functions now?
 - check if self-moves are actually problematic, currently we guard against it.
 - author and apply flows duplicate effort
