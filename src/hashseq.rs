@@ -149,16 +149,6 @@ impl Cursor {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct CausalInsert {
-    pub anchor: InternedId,
-    pub pins: SortedIdVec,
-    pub ch: char,
-    /// `Some(value id)` for an atom (a non-char payload): `ch` is then the
-    /// U+FFFC placeholder and the commitment id lives in the value column.
-    pub payload: Option<Id>,
-}
-
 /// The placeholder char an atom occupies in run text and `iter()` output —
 /// U+FFFC OBJECT REPLACEMENT CHARACTER; renderers substitute the resolved
 /// value (the payload id is the identity, `payload_of` reads it).
@@ -620,38 +610,56 @@ impl HashSeq {
         }
     }
 
-    /// Where a node with `id` anchored `After(anchor)` lands: directly
-    /// before the next bigger sibling's region — or, as the biggest sibling,
-    /// directly after everything hanging off the anchor. Siblings are
-    /// explicit forks, the implicit run continuation, and rendered move-ins;
-    /// tombstones don't matter (a removed element's region still occupies
-    /// its place in document order).
-    fn after_sibling_target(&self, anchor: InternedId, id: &Id) -> (InternedId, bool) {
-        // Explicit-afters case: O(log n) range seek. Run-fallback case: at
-        // most one candidate, just check it.
-        let next_node = if let Some(siblings) = self.afters.get(&anchor) {
-            siblings.first_ge(id, &self.interns)
-        } else {
-            self.afters_of(anchor).find(|a| self.interns.id(*a) >= id)
+    /// Where a new after-sibling `id` of `anchor` lands, from what hangs
+    /// off `anchor`'s after side as the caller already read it: its explicit
+    /// `forks`, or else `cont`, the run continuation when `anchor` sits
+    /// mid-run (a run interior never also has explicit forks — forks split).
+    /// Answers "directly before/after node `el`" (`(el, before)`): before
+    /// the next bigger sibling's region or, as the biggest, after everything
+    /// hanging off `anchor`. Tombstones don't matter (a removed element's
+    /// region still occupies its place in document order).
+    fn after_target(
+        &self,
+        anchor: InternedId,
+        forks: Option<&SortedIdVec>,
+        cont: Option<InternedId>,
+        id: &Id,
+    ) -> (InternedId, bool) {
+        let next = match forks {
+            Some(forks) => forks.first_ge(id, &self.interns),
+            None => cont.filter(|c| self.interns.id(*c) >= id),
         };
-        match next_node {
+        match next {
             Some(next) => (self.region_first(next), true),
             None => (self.subtree_last(anchor), false),
         }
     }
 
-    /// Where a node with `id` anchored `Before(anchor)` lands: before the
-    /// next bigger before-sibling's region, or — as the biggest — directly
-    /// before the anchor itself. (Before-siblings release in Id order,
-    /// directly before their anchor.)
-    fn before_sibling_target(&self, anchor: InternedId, id: &Id) -> InternedId {
-        match self
-            .befores_by_anchor
-            .get(&anchor)
-            .and_then(|s| s.first_ge(id, &self.interns))
-        {
+    /// Where a new before-sibling `id` of `anchor` lands, given `anchor`'s
+    /// before-`siblings`: directly before the next bigger one's region or,
+    /// as the biggest, directly before `anchor` (before-siblings release in
+    /// Id order).
+    fn before_target(
+        &self,
+        anchor: InternedId,
+        siblings: Option<&SortedIdVec>,
+        id: &Id,
+    ) -> InternedId {
+        match siblings.and_then(|s| s.first_ge(id, &self.interns)) {
             Some(next) => self.region_first(next),
             None => anchor,
+        }
+    }
+
+    /// A run element's run, offset, and the element after it in the run
+    /// (`None` at the run's tail); `None` for any other loc.
+    fn run_position(&self, loc: Loc) -> Option<(InternedId, u32, Option<InternedId>)> {
+        match loc {
+            Loc::Run { run, pos } => {
+                let next = self.runs[&run].elements.get(pos as usize + 1).copied();
+                Some((run, pos, next))
+            }
+            _ => None,
         }
     }
 
@@ -813,77 +821,92 @@ impl HashSeq {
         }
     }
 
-    /// `anchor` is the insert's resolved `After` anchor.
-    fn insert_after(&mut self, id: Id, after: CausalInsert) {
-        if let Loc::MoveOp = self.loc_of(after.anchor) {
-            self.ensure_op_fragment(after.anchor);
+    /// Apply an insert at its resolved anchor. Branches on the side once;
+    /// what it learns about the anchor (its loc, run position, siblings) is
+    /// read once and carried through.
+    fn apply_insert(&mut self, id: Id, pins: SortedIdVec, at: InternedAnchor, payload: Payload) {
+        // An atom (a non-char payload) occupies the U+FFFC placeholder in
+        // run text; its commitment id lives in the value column.
+        let (ch, atom) = match payload.resolved() {
+            Payload::Char(c) => (c, None),
+            Payload::Id(v) => (ATOM_CHAR, Some(v)),
+        };
+        let anchor = at.idx();
+        let loc = self.loc_of(anchor);
+        if let Loc::MoveOp = loc {
+            // Content anchors at the op's splice point: it needs a physical
+            // fragment. (The op's own loc stays `MoveOp`.)
+            self.ensure_op_fragment(anchor);
         }
 
-        // Fast path: extend the run whose tail is the anchor. Extra deps on
-        // the new element (e.g. `{remove_id}` when typing resumes after a
-        // delete) don't block extension — they're stored sparsely at the
-        // element's offset and participate in its id, so the chain still
-        // reconstructs exactly.
-        if let Loc::Run { run, pos } = self.loc_of(after.anchor) {
-            // Check for explicit forks first (cheap u32-keyed lookup)
-            let has_explicit_afters = self
-                .afters
-                .get(&after.anchor)
-                .is_some_and(|ns| !ns.is_empty());
-
-            let atomic = after.payload.is_some() || self.is_atom(after.anchor);
-            if !has_explicit_afters && !atomic && pos as usize + 1 == self.runs[&run].len() {
-                // Run extension - most common case for sequential typing
-                let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
-                self.runs
-                    .get_mut(&run)
-                    .unwrap()
-                    .extend(idx, after.ch, after.pins);
-                self.index.extend_run(run, pos + 1);
-                return;
-            }
-        }
-
-        // Slow path: this insert forks.
-        let target = self.after_sibling_target(after.anchor, &id);
-
-        // We are inserting after a node inside a run (the extension case was
-        // handled by the fast path above, so this is a fork). If the anchor isn't
-        // the run's tail, split off everything after it first.
-        if let Loc::Run { run, pos } = self.loc_of(after.anchor)
-            && (pos as usize) + 1 < self.runs[&run].len()
-        {
-            self.split_run_at(run, pos as usize + 1);
-            debug_assert_eq!(self.runs[&run].last(), after.anchor);
-        }
-
-        // Start a new run anchored at the anchor node.
+        // The handle a new run's head gets.
         let idx = self.interns.next_interned();
-        self.intern(id, Loc::Run { run: idx, pos: 0 });
+        let (el, before) = match at {
+            InternedAnchor::After(_) => {
+                let run_pos = self.run_position(loc);
+                let forks = self.afters.get(&anchor);
+
+                // Fast path: extend the run whose tail is the anchor. Extra
+                // deps on the new element (e.g. `{remove_id}` when typing
+                // resumes after a delete) don't block extension — they're
+                // stored sparsely at the element's offset and participate in
+                // its id, so the chain still reconstructs exactly.
+                if let Some((run, pos, None)) = run_pos
+                    && forks.is_none_or(|f| f.is_empty())
+                    && atom.is_none()
+                    && !self.is_atom(anchor)
+                {
+                    let idx = self.intern(id, Loc::Run { run, pos: pos + 1 });
+                    self.runs.get_mut(&run).unwrap().extend(idx, ch, pins);
+                    self.index.extend_run(run, pos + 1);
+                    return;
+                }
+
+                // Fork. The landing point is resolved before the split; an
+                // anchor mid-run then splits, so the continuation becomes an
+                // explicit sibling (`afters_of`'s run fallback is suppressed
+                // by the new afters entry).
+                let target = self.after_target(anchor, forks, run_pos.and_then(|r| r.2), &id);
+                if let Some((run, pos, Some(_))) = run_pos {
+                    self.split_run_at(run, pos as usize + 1);
+                    debug_assert_eq!(self.runs[&run].last(), anchor);
+                }
+                self.intern(id, Loc::Run { run: idx, pos: 0 });
+                self.afters
+                    .entry(anchor)
+                    .or_default()
+                    .insert(idx, &self.interns);
+                target
+            }
+            InternedAnchor::Before(_) => {
+                // No split, even mid-run: iteration visits every run
+                // element's befores.
+                let target = self.before_target(anchor, self.befores_by_anchor.get(&anchor), &id);
+                self.intern(id, Loc::Run { run: idx, pos: 0 });
+                self.befores_by_anchor
+                    .entry(anchor)
+                    .or_default()
+                    .insert(idx, &self.interns);
+                (target, true)
+            }
+        };
+
+        // A new single-element run, a sibling of whatever else hangs off
+        // the anchor on this side.
         self.runs.insert(
             idx,
             StoredRun {
-                at: InternedAnchor::After(after.anchor),
-                first_pins: after.pins,
+                at,
+                first_pins: pins,
                 interior_pins: BTreeMap::new(),
-                text: after.ch.to_string(),
+                text: ch.to_string(),
                 elements: vec![idx],
             },
         );
-
-        if let Some(v) = after.payload {
+        if let Some(v) = atom {
             self.elem_payloads.insert(idx, v);
         }
-
-        // run extension is handled in the fast path above, fork/split updates the afters set
-        self.afters
-            .entry(after.anchor)
-            .or_default()
-            .insert(idx, &self.interns);
-
-        // Resolve the target node only now: the split above may have
-        // relocated it into the right-hand run.
-        let (el, before) = target;
+        // Resolved only now: a split above may have relocated `el`.
         let t = self.index_target(el, before);
         self.index.insert_span_at(t, idx);
     }
@@ -1167,29 +1190,35 @@ impl HashSeq {
     fn place_op_fragment(&mut self, op: InternedId, render: bool) {
         let op_id = *self.interns.id(op);
         let mv = &self.move_nodes[&op];
-        let (anchor, to_before, target) = (mv.to.idx(), mv.to.is_before(), mv.target);
-        let (el, before) = if to_before {
-            (self.before_sibling_target(anchor, &op_id), true)
-        } else {
-            let (el, before) = self.after_sibling_target(anchor, &op_id);
-            // Mirror the insert fork path: materialize the run fork when the
-            // anchor sits mid-run, so the continuation becomes an explicit
-            // sibling (afters_of's run fallback is suppressed by the new
-            // afters entry). The split can rebase element refs — including
-            // the target's — so refs resolve fresh after it.
-            if let Loc::Run { run, pos } = self.loc_of(anchor)
-                && (pos as usize) + 1 < self.runs[&run].len()
-            {
-                self.split_run_at(run, pos as usize + 1);
+        let (to, target) = (mv.to, mv.target);
+        let anchor = to.idx();
+        // The sibling slot an insert's fork opens (`apply_insert`). The
+        // split can rebase element refs — including the target's — so refs
+        // resolve fresh after it.
+        let (el, before) = match to {
+            InternedAnchor::After(_) => {
+                let run_pos = self.run_position(self.loc_of(anchor));
+                let forks = self.afters.get(&anchor);
+                let t = self.after_target(anchor, forks, run_pos.and_then(|r| r.2), &op_id);
+                if let Some((run, pos, Some(_))) = run_pos {
+                    self.split_run_at(run, pos as usize + 1);
+                }
+                self.afters
+                    .entry(anchor)
+                    .or_default()
+                    .insert(op, &self.interns);
+                t
             }
-            (el, before)
+            InternedAnchor::Before(_) => {
+                let siblings = self.befores_by_anchor.get(&anchor);
+                let t = self.before_target(anchor, siblings, &op_id);
+                self.befores_by_anchor
+                    .entry(anchor)
+                    .or_default()
+                    .insert(op, &self.interns);
+                (t, true)
+            }
         };
-        let set = if to_before {
-            self.befores_by_anchor.entry(anchor).or_default()
-        } else {
-            self.afters.entry(anchor).or_default()
-        };
-        set.insert(op, &self.interns);
         let t = self.index_target(el, before);
         if render {
             self.index.place_moved_at(t, self.elem_ref(target));
@@ -1789,44 +1818,6 @@ impl HashSeq {
         );
     }
 
-    /// `anchor` is the insert's resolved `Before` anchor.
-    fn insert_before(&mut self, id: Id, before: CausalInsert) {
-        if let Loc::MoveOp = self.loc_of(before.anchor) {
-            self.ensure_op_fragment(before.anchor);
-        }
-
-        let target = self.before_sibling_target(before.anchor, &id);
-
-        // The anchor may sit mid-run: no split is needed. Iteration visits the
-        // befores of every run element individually (see HashSeqIter), and unlike
-        // an after-fork there is no sibling ordering to resolve — a Before-run
-        // always lands immediately before its anchor.
-        let idx = self.interns.next_interned();
-        self.intern(id, Loc::Run { run: idx, pos: 0 });
-        self.runs.insert(
-            idx,
-            StoredRun {
-                at: InternedAnchor::Before(before.anchor),
-                first_pins: before.pins,
-                interior_pins: BTreeMap::new(),
-                text: before.ch.to_string(),
-                elements: vec![idx],
-            },
-        );
-
-        if let Some(v) = before.payload {
-            self.elem_payloads.insert(idx, v);
-        }
-
-        self.befores_by_anchor
-            .entry(before.anchor)
-            .or_default()
-            .insert(idx, &self.interns);
-
-        let t = self.index_target(target, true);
-        self.index.insert_span_at(t, idx);
-    }
-
     pub fn apply(&mut self, node: HashNode) -> Result<Outcome, Refused> {
         let id = node.id();
         self.apply_with_id(id, node)
@@ -1900,22 +1891,7 @@ impl HashSeq {
 
         let pins = node.pins;
         match node.op {
-            InternedOp::Insert { at, payload } => {
-                let (ch, payload) = match payload.resolved() {
-                    Payload::Char(c) => (c, None),
-                    Payload::Id(v) => (ATOM_CHAR, Some(v)),
-                };
-                let ci = CausalInsert {
-                    anchor: at.idx(),
-                    pins,
-                    ch,
-                    payload,
-                };
-                match at {
-                    InternedAnchor::After(_) => self.insert_after(id, ci),
-                    InternedAnchor::Before(_) => self.insert_before(id, ci),
-                }
-            }
+            InternedOp::Insert { at, payload } => self.apply_insert(id, pins, at, payload),
             InternedOp::Remove(targets) => self.apply_remove(id, pins, targets),
             InternedOp::Move {
                 target,

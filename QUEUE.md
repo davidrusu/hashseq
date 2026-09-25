@@ -1,6 +1,5 @@
 # Queue
 
-- can we consolidate insert_before and insert_after functions now?
 - check if self-moves are actually problematic, currently we guard against it.
 - author and apply flows duplicate effort
 - afters_of | befores_of, can they return sortedidvec? seems that way.
