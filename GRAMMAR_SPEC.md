@@ -82,6 +82,9 @@ the same id while holding nothing. Why:
   replica that does not know the kind still derives, verifies and carries
   its id (it renders a placeholder). The length byte frames the artifact,
   so trailing `0x00` bytes inside it are unambiguous.
+- **Short preimage fields.** A value field in a node preimage is the
+  id's unpadded prefix for identity-form ids ("Value fields" below), so
+  small values cost their size, not 32 bytes, in every node hash.
 - **Consequences.** Identity values are never held in a value store (the
   id is the bytes; a stream `ValueStore` entry for one is non-canonical)
   and never shipped as artifact frames. Value ids are no longer uniform:
@@ -171,21 +174,25 @@ naming unknown object ids orphan store-wide until the object is opened or
 adopted; ops inside a live object orphan on their first missing ref in that
 object's own buffer.
 
-### Value fields: always by id in the preimage
+### Value fields: a function of the id in the preimage
 
 ```
-value := id            -- 32 raw bytes: a value_id or an op-node id
+value := len:u8 ‖ artifact     -- the id is identity-form (len 1..=15):
+                               --   its own bytes, minus the zero padding
+       | 0x20 ‖ id             -- any other id: 32 raw bytes (a hashed
+                               --   value_id, an op-node id, an object id)
 ```
 
-In the preimage, a payload/key/value is **always the 32-byte id**, never
-inline bytes and never a ref-table index. Rationale: identity must be
-availability-independent — an inline-iff-small rule inside the preimage
-would make "is this encoding canonical?" depend on whether a replica holds
-the artifact bytes, and no id-level verdict may depend on availability.
-Inline transport lives in Part B, where the bytes are present by
-construction. (Cost note: this is the wider-chain-hash-input the payload
-decision already carries — value ids for chars are a fixed, cacheable
-universe; the benchmark obligation stands.)
+A payload/key/value field is the id's **short form**: an identity-form id
+contributes `id[..1+len]`, any other id `0x20 ‖ id` — never a ref-table
+index. The form is a function of the 32-byte id alone, so identity stays
+availability-independent (no verdict depends on whether a replica holds
+the artifact bytes — the rule that forbids an inline-iff-small preimage).
+It is injective: the first byte is ≤ 15 exactly for the short form, which
+zero-pads back to the id. Why not always 32 bytes: a typing-path insert
+preimage (`kind ‖ ref_count ‖ anchor ‖ body_len ‖ anchor_ref ‖ value`) is
+then 39–42 bytes — one BLAKE3 block — instead of 68 (two); measured −6 to
+−11% on every sequential trace (2026-09-25).
 
 ### Value artifact grammar
 
@@ -284,7 +291,7 @@ reconstructs each member's full envelope deterministically.
 ## Open items
 
 1. **Test vectors — generated and locked** (2026-07-02, by the first
-   implementation; regenerated 2026-09-24 for identity-form value ids — pre-release, so no context bump; mirrored in `tests/grammar_vectors.rs`, which fails on
+   implementation; regenerated 2026-09-24 for identity-form value ids and 2026-09-25 for short-form value fields — pre-release, so no context bump; mirrored in `tests/grammar_vectors.rs`, which fails on
    any drift):
 
    ```
@@ -296,10 +303,12 @@ reconstructs each member's full envelope deterministically.
    object_id(kv,  0x11 × 32) = d17caee6e539818d5cf8c5f5087d3e6ad43797cf2674b3196b3b4c0dc601f757
 
    with origin = 0x00 × 32:
-   Insert{After(origin), 'a'} (no pins)      = d3a27cd3533aa80075c856bc33d5f2a6faee839be84506626594ac4322dcdfa2
-   Remove{that insert} (no pins)             = 1f739bfc1cd26ce72f410f6af7d62b75e4e75cc99bac90973b5539070cafef3e
-   Move{that insert → Before(origin)}        = 9e6e16085d8ff7d374c1f81f363d4190244ad446899da61a157b360ec019a621
-   Put{'k' → TOMBSTONE, pins={origin}}       = 4533c5edf5b7c7cdd956eb76f39dc8cbc4290d375010ec97bfd095c659e4ce4d
+   Insert{After(origin), 'a'} (no pins)      = 727ed23ef98ab2cefcb93482e388c1681fb4320b4fb4e2d6d86c4b91b72b984a
+   Remove{that insert} (no pins)             = 45fb743e2035d8b2419358e3132e1639f6236581a84c2034ad1710f1b2f08e6b
+   Move{that insert → Before(origin)}        = f1c0ee1237aaf7be2263f9674bb600e0d5e604cce6e7a63a3691de5aebcd487a
+   Put{'k' → TOMBSTONE, pins={origin}}       = 517f394b1f2f4134a5096ac64e95d9891c2675e4c2039e377827817a0bfb2c93
+   Put{'x'×15 → 'x'×14, pins={origin}}       = bc713a67d53f9485334cbe2d44cfb193ff0c93a6c9354dd45a7dcf445918c47d
+                                               (both value-field forms)
    ```
 
    Still owed: a small canonical snapshot vector once the Part B stream

@@ -392,7 +392,8 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(Payload, usize), DecodeError> {
 }
 
 /// The Part A canonical preimage (GRAMMAR_SPEC.md identity grammar):
-/// `kind ‖ ref_count ‖ refs ‖ body_len ‖ body`, value fields always by id.
+/// `kind ‖ ref_count ‖ refs ‖ body_len ‖ body`, value fields in their
+/// preimage form (`value::value_field`).
 /// This is the reference encoder that `HashNode::id`'s streaming hasher is
 /// locked to by test.
 pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
@@ -409,6 +410,11 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
             .expect("named id is in the refs table")
     };
     let subset_idxs = |set: &BTreeSet<Id>| sorted_subset_indices(&refs, set);
+    let field = |id: &Id| {
+        let mut out = [0u8; crate::value::VALUE_FIELD_MAX];
+        let n = crate::value::value_field(id, &mut out);
+        out[..n].to_vec()
+    };
 
     let kind = match &node.op {
         Op::Insert { .. } => KIND_INSERT,
@@ -427,9 +433,10 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
     match &node.op {
         Op::Insert { at, payload } => {
             let packed = (ref_idx(at.id()) << 1) | at.side_bit();
-            encode_varint(varint_len(packed) + 32, buf); // body_len
+            let f = field(&payload.value_id());
+            encode_varint(varint_len(packed) + f.len(), buf); // body_len
             encode_varint(packed, buf);
-            encode_id(&payload.value_id(), buf);
+            buf.extend_from_slice(&f);
         }
         Op::Remove(targets) => {
             let idxs = subset_idxs(targets);
@@ -467,11 +474,14 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
             overwrites,
         } => {
             let idxs = subset_idxs(overwrites);
-            let body_len =
-                64 + varint_len(idxs.len()) + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
+            let (kf, vf) = (field(key), field(value));
+            let body_len = kf.len()
+                + vf.len()
+                + varint_len(idxs.len())
+                + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
             encode_varint(body_len, buf);
-            encode_id(key, buf);
-            encode_id(value, buf);
+            buf.extend_from_slice(&kf);
+            buf.extend_from_slice(&vf);
             encode_varint(idxs.len(), buf);
             for i in idxs {
                 encode_varint(i, buf);
@@ -487,16 +497,18 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
             let sp = (ref_idx(start.id()) << 1) | start.side_bit();
             let ep = (ref_idx(end.id()) << 1) | end.side_bit();
             let idxs = subset_idxs(overwrites);
+            let (kf, vf) = (field(kind_v), field(value));
             let body_len = varint_len(sp)
                 + varint_len(ep)
-                + 64
+                + kf.len()
+                + vf.len()
                 + varint_len(idxs.len())
                 + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
             encode_varint(body_len, buf);
             encode_varint(sp, buf);
             encode_varint(ep, buf);
-            encode_id(kind_v, buf);
-            encode_id(value, buf);
+            buf.extend_from_slice(&kf);
+            buf.extend_from_slice(&vf);
             encode_varint(idxs.len(), buf);
             for i in idxs {
                 encode_varint(i, buf);
@@ -507,10 +519,12 @@ pub fn encode_node_preimage(node: &HashNode, buf: &mut Vec<u8>) {
             overwrites,
         } => {
             let idxs = subset_idxs(overwrites);
-            let body_len =
-                32 + varint_len(idxs.len()) + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
+            let pf = field(placed_at);
+            let body_len = pf.len()
+                + varint_len(idxs.len())
+                + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
             encode_varint(body_len, buf);
-            encode_id(placed_at, buf);
+            buf.extend_from_slice(&pf);
             encode_varint(idxs.len(), buf);
             for i in idxs {
                 encode_varint(i, buf);
@@ -2838,7 +2852,7 @@ mod tests {
         assert_eq!(encode_hashseq(&b), bytes, "equal sets, equal bytes");
         assert_eq!(
             blake3::hash(&bytes).to_hex().as_str(),
-            "3f6aabf942668176741d4ae1ad36ee1262d9d76d291acf82195b6e51c165bc4f",
+            "f839daa9d7f93c2348ace8c787712891548d4d0dae6c9c12ca99e2668655e3a3",
             "canonical snapshot bytes moved — bump knowingly"
         );
     }

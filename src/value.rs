@@ -93,6 +93,33 @@ pub fn identity_artifact(id: &Id) -> Option<&[u8]> {
     pad.iter().all(|b| *b == 0).then_some(artifact)
 }
 
+/// Longest value-field preimage form: `0x20 ‖ id`.
+pub const VALUE_FIELD_MAX: usize = 33;
+
+/// A value field's node-preimage form (GRAMMAR_SPEC.md "Value fields"):
+/// an identity-form id contributes its unpadded prefix `len ‖ artifact`,
+/// any other id `0x20 ‖ id`. Written into `out`; returns the length.
+///
+/// A function of the id alone (never of what a replica holds), and
+/// injective: the first byte is ≤ 15 exactly for the short form, and the
+/// short form zero-pads back to the id. It keeps a typing-path insert's
+/// preimage inside one BLAKE3 block.
+#[inline]
+pub fn value_field(id: &Id, out: &mut [u8; VALUE_FIELD_MAX]) -> usize {
+    match identity_artifact(id) {
+        Some(artifact) => {
+            let n = 1 + artifact.len();
+            out[..n].copy_from_slice(&id.0[..n]);
+            n
+        }
+        None => {
+            out[0] = 32;
+            out[1..].copy_from_slice(&id.0);
+            VALUE_FIELD_MAX
+        }
+    }
+}
+
 /// Is `id` an identity-form value id? Such values are never stored: the id
 /// is the bytes.
 pub fn is_identity(id: &Id) -> bool {
@@ -316,6 +343,31 @@ mod tests {
             Some(bytes) => (1..=IDENTITY_MAX).contains(&artifact.len()) && bytes == &artifact[..],
             None => !(1..=IDENTITY_MAX).contains(&artifact.len()),
         }
+    }
+
+    /// The value-field preimage form is injective: it decodes back to
+    /// exactly the id, for identity-form and arbitrary ids alike.
+    #[quickcheck_macros::quickcheck]
+    fn prop_value_field_is_injective(raw: Vec<u8>, small: bool) -> bool {
+        let id = if small {
+            value_id_of_bytes(&raw[..raw.len().min(IDENTITY_MAX)])
+        } else {
+            let mut b = [0u8; 32];
+            for (d, s) in b.iter_mut().zip(raw.iter()) {
+                *d = *s;
+            }
+            Id(b)
+        };
+        let mut out = [0u8; VALUE_FIELD_MAX];
+        let n = value_field(&id, &mut out);
+        let back = if out[0] == 32 {
+            n == VALUE_FIELD_MAX && out[1..] == id.0
+        } else {
+            let mut b = [0u8; 32];
+            b[..n].copy_from_slice(&out[..n]);
+            (out[0] as usize) + 1 == n && Id(b) == id
+        };
+        back && (is_identity(&id) == (n <= IDENTITY_MAX + 1))
     }
 
     #[test]

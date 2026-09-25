@@ -50,7 +50,7 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&insert.id()),
-        "d3a27cd3533aa80075c856bc33d5f2a6faee839be84506626594ac4322dcdfa2"
+        "727ed23ef98ab2cefcb93482e388c1681fb4320b4fb4e2d6d86c4b91b72b984a"
     );
     let remove = HashNode {
         pins: BTreeSet::new(),
@@ -58,7 +58,7 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&remove.id()),
-        "1f739bfc1cd26ce72f410f6af7d62b75e4e75cc99bac90973b5539070cafef3e"
+        "45fb743e2035d8b2419358e3132e1639f6236581a84c2034ad1710f1b2f08e6b"
     );
     let mv = HashNode {
         pins: BTreeSet::new(),
@@ -70,7 +70,7 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&mv.id()),
-        "9e6e16085d8ff7d374c1f81f363d4190244ad446899da61a157b360ec019a621"
+        "f1c0ee1237aaf7be2263f9674bb600e0d5e604cce6e7a63a3691de5aebcd487a"
     );
     let put = HashNode {
         pins: BTreeSet::from_iter([origin]),
@@ -82,6 +82,20 @@ fn node_preimages_are_locked() {
     };
     assert_eq!(
         hx(&put.id()),
-        "4533c5edf5b7c7cdd956eb76f39dc8cbc4290d375010ec97bfd095c659e4ce4d"
+        "517f394b1f2f4134a5096ac64e95d9891c2675e4c2039e377827817a0bfb2c93"
+    );
+    // Both value-field forms in one preimage: a hashed key (`0x20 ‖ id`)
+    // and an identity-form value (`len ‖ artifact`).
+    let put_long = HashNode {
+        pins: BTreeSet::from_iter([origin]),
+        op: Op::Put {
+            key: Value::String("x".repeat(15)).value_id(),
+            value: Value::String("x".repeat(14)).value_id(),
+            overwrites: BTreeSet::new(),
+        },
+    };
+    assert_eq!(
+        hx(&put_long.id()),
+        "bc713a67d53f9485334cbe2d44cfb193ff0c93a6c9354dd45a7dcf445918c47d"
     );
 }

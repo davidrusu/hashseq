@@ -26,7 +26,7 @@ fn main() {
 
     // Full current id() on the typing-chain fast path.
     let mut prev = Id([7; 32]);
-    bench("id() fast path (68B preimage)", n, || {
+    bench("id() fast path (39B preimage)", n, || {
         let node = HashNode {
             pins: BTreeSet::new(),
             op: Op::insert_after(prev, 'a'),
@@ -37,7 +37,7 @@ fn main() {
     // Isolate input width: same clone+update+finalize, 68 vs 36 bytes.
     let buf68 = [0x5Au8; 68];
     let buf36 = [0x5Au8; 36];
-    bench("clone+hash 68B (new width)", n, || {
+    bench("clone+hash 68B (pre-2026-09-25 width)", n, || {
         let mut h = template.clone();
         h.update(black_box(&buf68));
         black_box(h.finalize());

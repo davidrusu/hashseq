@@ -2789,7 +2789,9 @@ mod test {
         seq_a.merge(seq_b);
 
         let merged = seq_a.iter().collect::<String>();
-        assert_eq!(merged, "hello my name is zameenadavid");
+        // The two tails are concurrent siblings: their order is
+        // id-determined (either is legal; this locks determinism).
+        assert_eq!(merged, "hello my name is davidzameena");
     }
 
     #[test]
@@ -2804,7 +2806,8 @@ mod test {
         assert_eq!(&seq_b.iter().collect::<String>(), "aza");
 
         seq_a.merge(seq_b);
-        assert_eq!(&seq_a.iter().collect::<String>(), "azaba");
+        // Concurrent siblings, id-determined order (see below).
+        assert_eq!(&seq_a.iter().collect::<String>(), "abaza");
     }
 
     #[test]
@@ -2821,7 +2824,7 @@ mod test {
         // 'b' and 'c' are concurrent siblings in one gap: their mutual order
         // is id-determined (either is a legal outcome; the concrete value
         // locks determinism under the current preimage grammar).
-        assert_eq!(merged, "aaacb");
+        assert_eq!(merged, "aaabc");
     }
 
     #[test]

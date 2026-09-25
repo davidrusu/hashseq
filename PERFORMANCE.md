@@ -31,6 +31,14 @@ the stack, one hasher update — recovered roughly half of the initial
 regression). A same-conditions A/B against the pre-Move commit confirmed the
 Move/HashKv additions cost nothing on text traces.
 
+**Update 2026-09-25: the second block is gone.** With identity-form value
+ids, a preimage value field is the id's unpadded prefix (GRAMMAR_SPEC.md
+"Value fields"), so a char insert's fast-path preimage is 39–42 bytes — one
+BLAKE3 block. Interleaved A/B (6 pairs) vs 9c35c99, min: automerge 114.8 →
+107.4 ms (−6.5%), rustcode 307.5 → 285.8 (−7.1%), svelte 45.7 → 42.4
+(−7.3%), seph 114.9 → 106.9 (−7.0%), clownschool 8.63 → 7.89 (−8.6%),
+friendsforever 9.97 → 9.13 (−8.4%), json-crdt 14.52 → 12.94 (−10.9%).
+
 **Update (same day): the regression is gone.** The `hash_cost` microbench
 decomposed the per-op id() cost and confirmed the attribution — preimage
 width (68B vs 36B ≈ 50–58 ns/op, the second BLAKE3 block), not value-id

@@ -57,4 +57,14 @@ fn main() {
         },
     };
     println!("put_k_tombstone_pin_zero   = {}", hex(&put.id()));
+    // Both value-field forms in one preimage: a hashed key, an identity value.
+    let put_long = HashNode {
+        pins: BTreeSet::from_iter([origin]),
+        op: Op::Put {
+            key: Value::String("x".repeat(15)).value_id(),
+            value: Value::String("x".repeat(14)).value_id(),
+            overwrites: BTreeSet::new(),
+        },
+    };
+    println!("put_x15_to_x14_pin_zero    = {}", hex(&put_long.id()));
 }

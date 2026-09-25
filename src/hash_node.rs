@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 
 use crate::Id;
-use crate::value::{NODE_CONTEXT, char_value_id};
+use crate::value::{NODE_CONTEXT, VALUE_FIELD_MAX, char_value_id, value_field};
 
 /// Op kind tags (GRAMMAR_SPEC.md "Op kinds"). One shared tag space; kinds are
 /// tags inside the encoding, never separate contexts.
@@ -303,19 +303,23 @@ impl HashNode {
         // Fast path — the typing chain: an insert whose only ref is its
         // anchor. refs = [anchor], anchor ref_idx = 0; every length is a
         // single-byte varint. This is the shape of every run-interior op.
-        // The whole 68-byte preimage is assembled on the stack and hashed in
-        // one update call (per-update overhead dominates at this size).
+        // The whole preimage is assembled on the stack and hashed in one
+        // update call (per-update overhead dominates at this size). A char
+        // payload's value field is its short form, so the preimage is 39–42
+        // bytes: one BLAKE3 block, one compression.
         if let Op::Insert { at, payload } = &self.op
             && self.pins.is_empty()
         {
-            let mut pre = [0u8; 68];
+            let mut pre = [0u8; 36 + VALUE_FIELD_MAX];
             pre[0] = KIND_INSERT;
             pre[1] = 1; // ref_count
             pre[2..34].copy_from_slice(&at.id().0);
-            pre[34] = 33; // body_len: anchor varint (1) + value id (32)
+            let field: &mut [u8; VALUE_FIELD_MAX] =
+                (&mut pre[36..]).try_into().expect("sized for one field");
+            let n = value_field(&payload.value_id(), field);
+            pre[34] = 1 + n as u8; // body_len: anchor varint (1) + value field
             pre[35] = at.side_bit() as u8;
-            pre[36..68].copy_from_slice(&payload.value_id().0);
-            hasher.update(&pre);
+            hasher.update(&pre[..36 + n]);
             return Id(*hasher.finalize().as_bytes());
         }
 
@@ -334,9 +338,10 @@ impl HashNode {
         match &self.op {
             Op::Insert { at, payload } => {
                 let packed = (ref_idx(at.id()) << 1) | at.side_bit();
-                update_varint(&mut hasher, varint_len(packed) + 32); // body_len
+                let (field, n) = field_of(&payload.value_id());
+                update_varint(&mut hasher, varint_len(packed) + n); // body_len
                 update_varint(&mut hasher, packed);
-                hasher.update(&payload.value_id().0);
+                hasher.update(&field[..n]);
             }
             Op::Remove(targets) => {
                 // Ascending target indices via a sorted merge walk.
@@ -375,12 +380,14 @@ impl HashNode {
                 overwrites,
             } => {
                 let idxs = sorted_subset_indices(&refs, overwrites);
-                let body_len = 64
+                let ((kf, kn), (vf, vn)) = (field_of(key), field_of(value));
+                let body_len = kn
+                    + vn
                     + varint_len(idxs.len())
                     + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
                 update_varint(&mut hasher, body_len);
-                hasher.update(&key.0);
-                hasher.update(&value.0);
+                hasher.update(&kf[..kn]);
+                hasher.update(&vf[..vn]);
                 update_varint(&mut hasher, idxs.len());
                 for i in idxs {
                     update_varint(&mut hasher, i);
@@ -396,16 +403,18 @@ impl HashNode {
                 let sp = (ref_idx(start.id()) << 1) | start.side_bit();
                 let ep = (ref_idx(end.id()) << 1) | end.side_bit();
                 let idxs = sorted_subset_indices(&refs, overwrites);
+                let ((kf, kn), (vf, vn)) = (field_of(kind_v), field_of(value));
                 let body_len = varint_len(sp)
                     + varint_len(ep)
-                    + 64
+                    + kn
+                    + vn
                     + varint_len(idxs.len())
                     + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
                 update_varint(&mut hasher, body_len);
                 update_varint(&mut hasher, sp);
                 update_varint(&mut hasher, ep);
-                hasher.update(&kind_v.0);
-                hasher.update(&value.0);
+                hasher.update(&kf[..kn]);
+                hasher.update(&vf[..vn]);
                 update_varint(&mut hasher, idxs.len());
                 for i in idxs {
                     update_varint(&mut hasher, i);
@@ -416,11 +425,12 @@ impl HashNode {
                 overwrites,
             } => {
                 let idxs = sorted_subset_indices(&refs, overwrites);
-                let body_len = 32
+                let (pf, pn) = field_of(placed_at);
+                let body_len = pn
                     + varint_len(idxs.len())
                     + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
                 update_varint(&mut hasher, body_len);
-                hasher.update(&placed_at.0);
+                hasher.update(&pf[..pn]);
                 update_varint(&mut hasher, idxs.len());
                 for i in idxs {
                     update_varint(&mut hasher, i);
@@ -429,6 +439,14 @@ impl HashNode {
         }
         Id(*hasher.finalize().as_bytes())
     }
+}
+
+/// A value field's preimage form and its length (`value::value_field`).
+#[inline]
+fn field_of(id: &Id) -> ([u8; VALUE_FIELD_MAX], usize) {
+    let mut out = [0u8; VALUE_FIELD_MAX];
+    let n = value_field(id, &mut out);
+    (out, n)
 }
 
 /// Indices (ascending) of `subset`'s members within sorted `refs`.
