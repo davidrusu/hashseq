@@ -15,7 +15,7 @@ pub mod wasm;
 
 use std::collections::BTreeSet;
 
-use rustc_hash::FxHashMap;
+use hashbrown::HashTable;
 
 pub use self::encoding::{
     DecodeError, EncodableOp, decode_hashkv, decode_hashkv_strict, decode_hashseq,
@@ -48,34 +48,36 @@ pub struct InternIndex {
     /// InternedId -> Id (append-only).
     ids: Vec<Id>,
 
-    /// Id -> InternedId (64bit prefix map with full ID spillover map on collision)
-    prefix: FxHashMap<u64, InternedId>,
-    spill: FxHashMap<Id, InternedId>,
+    /// Id -> InternedId: a table of bare 4-byte handles (plus hashbrown's
+    /// 1-byte control tags); each handle's key is read from `ids`, so no id
+    /// bytes are stored twice. Hashed by the id's first 8 bytes.
+    table: HashTable<InternedId>,
 }
 
-fn id_prefix(id: &Id) -> u64 {
+/// An id's table hash: its first 8 bytes. Node ids are BLAKE3 outputs,
+/// already uniform, so no further mixing (the prefix map this replaced
+/// keyed by the same bits).
+#[inline]
+fn id_hash(id: &Id) -> u64 {
     u64::from_le_bytes(id.0[..8].try_into().expect("Id has 32 bytes"))
 }
 
 impl InternIndex {
+    /// The handle of `id`, interning it first if new.
     fn intern(&mut self, id: Id) -> InternedId {
-        match self.prefix.entry(id_prefix(&id)) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let intern = InternedId(self.ids.len() as u32);
-                e.insert(intern);
+        let ids = &self.ids;
+        let entry = self.table.entry(
+            id_hash(&id),
+            |h| ids[h.0 as usize] == id,
+            |h| id_hash(&ids[h.0 as usize]),
+        );
+        match entry {
+            hashbrown::hash_table::Entry::Occupied(e) => *e.get(),
+            hashbrown::hash_table::Entry::Vacant(e) => {
+                let handle = InternedId(self.ids.len() as u32);
+                e.insert(handle);
                 self.ids.push(id);
-                return intern;
-            }
-            std::collections::hash_map::Entry::Occupied(e) => {
-                let existing_intern = *e.get();
-                if self.id(existing_intern) == &id {
-                    return existing_intern;
-                } else {
-                    let intern = InternedId(self.ids.len() as u32);
-                    self.spill.insert(id, intern);
-                    self.ids.push(id);
-                    return intern;
-                }
+                handle
             }
         }
     }
@@ -98,12 +100,9 @@ impl InternIndex {
     }
 
     pub fn get(&self, id: &Id) -> Option<InternedId> {
-        let idx = *self.prefix.get(&id_prefix(id))?;
-        if self.ids[idx.0 as usize] == *id {
-            Some(idx)
-        } else {
-            self.spill.get(id).copied()
-        }
+        self.table
+            .find(id_hash(id), |h| self.ids[h.0 as usize] == *id)
+            .copied()
     }
 }
 
@@ -279,5 +278,34 @@ impl std::fmt::Display for Refused {
             Refused::InvertedSpan => "the span is inverted",
             Refused::WrongObjectKind => "op kind does not belong in this object",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ids sharing their 8-byte hash prefix stay distinct, and re-interning
+    /// any of them returns its first handle (never a second one).
+    #[test]
+    fn intern_is_idempotent_under_prefix_collisions() {
+        let mut interns = InternIndex::default();
+        let ids: Vec<Id> = (0..5u8)
+            .map(|i| {
+                let mut b = [0xAB; 32];
+                b[31] = i; // same first 8 bytes, different ids
+                Id(b)
+            })
+            .collect();
+        let handles: Vec<InternedId> = ids.iter().map(|id| interns.intern(*id)).collect();
+        for (id, h) in ids.iter().zip(&handles) {
+            assert_eq!(interns.intern(*id), *h, "re-intern returns the same handle");
+            assert_eq!(interns.get(id), Some(*h));
+            assert_eq!(interns.id(*h), id);
+        }
+        assert_eq!(interns.len(), ids.len());
+        let mut unknown = ids[0].0;
+        unknown[31] = 0xFF;
+        assert_eq!(interns.get(&Id(unknown)), None);
     }
 }

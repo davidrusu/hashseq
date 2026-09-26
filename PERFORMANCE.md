@@ -31,6 +31,16 @@ the stack, one hasher update — recovered roughly half of the initial
 regression). A same-conditions A/B against the pre-Move commit confirmed the
 Move/HashKv additions cost nothing on text traces.
 
+**Update 2026-09-26: the id index is a table of handles.** `InternIndex`'s
+`FxHashMap<u64, InternedId>` prefix map (+ spill map) became a
+`hashbrown::HashTable<InternedId>`: 5 B/slot (handle + control tag) instead
+of ~17, keys read from `ids`. Memory, before → after: automerge 24.02 →
+17.73 MB (−26.2%), rustcode 46.81 → 34.22 (−26.9%), svelte 8.49 → 6.91
+(−18.5%), seph 20.88 → 17.74 (−15.1%), clownschool 2.26 → 1.87 (−17.4%),
+friendsforever 2.58 → 2.18 (−15.3%), json-crdt 3.84 → 3.05 (−20.5%).
+Speed within noise, leaning faster (12 interleaved pairs, min −0.3..−1.3%).
+The largest remaining per-node cost is the 32-byte id itself.
+
 **Update 2026-09-25: the second block is gone.** With identity-form value
 ids, a preimage value field is the id's unpadded prefix (GRAMMAR_SPEC.md
 "Value fields"), so a char insert's fast-path preimage is 39–42 bytes — one

@@ -1076,6 +1076,7 @@ dependencies = [
  "criterion",
  "flate2",
  "getrandom 0.2.16",
+ "hashbrown 0.15.4",
  "hex",
  "iced",
  "quickcheck",

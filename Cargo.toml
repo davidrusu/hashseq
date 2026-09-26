@@ -24,6 +24,9 @@ getrandom = { version = "0.2", features = ["js"] }
 # nobody can steer. Maps keyed by ids read raw off the wire (refs, envelopes,
 # Put keys) or by value ids use std's seeded SipHash instead.
 rustc-hash = "2"
+# `HashTable` for the id intern index: a table of bare handles whose keys
+# live in a side vector (no hasher needed, hence no default features).
+hashbrown = { version = "0.15", default-features = false, features = ["inline-more"] }
 # structure_json (wasm introspection) serializes through serde_json.
 serde_json = "1"
 
