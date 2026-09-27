@@ -31,6 +31,15 @@ the stack, one hasher update — recovered roughly half of the initial
 regression). A same-conditions A/B against the pre-Move commit confirmed the
 Move/HashKv additions cost nothing on text traces.
 
+**Update 2026-09-27: position walks.** `RunIndex::seek` + `elems_from`
+(one descent, then an in-order walk that skips tombstone-only subtrees by
+their visible counts and deleted bits a word at a time) replace per-position
+`get`s in `make_remove_batch` (which also bulk-builds its target set) and
+`cursor_at`'s neighbour lookup. Load-gated A/B (12 pairs) vs 418c20b, min:
+rustcode −32.1% (3.39M → 5.11M char edits/s), svelte −15.8%, seph −11.4%,
+json-crdt −2.2%; automerge +3.5% (median +0.7%), clownschool +2.1% (median
++1.4%), friendsforever flat — the typing traces within noise.
+
 **Update 2026-09-26: the id index is a table of handles.** `InternIndex`'s
 `FxHashMap<u64, InternedId>` prefix map (+ spill map) became a
 `hashbrown::HashTable<InternedId>`: 5 B/slot (handle + control tag) instead

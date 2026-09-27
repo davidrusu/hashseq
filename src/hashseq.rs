@@ -585,6 +585,24 @@ impl HashSeq {
         Some(self.runs[&head].elements[off as usize])
     }
 
+    /// The insert nodes from visible position `pos` on, in document order:
+    /// one index descent, then a walk. Consecutive elements mostly share a
+    /// run, so the run's element list is looked up once per run change.
+    fn elements_from(&self, pos: usize) -> impl Iterator<Item = InternedId> + '_ {
+        let mut run: Option<(InternedId, &[InternedId])> = None;
+        self.index.elems_from(pos).map(move |(head, off)| {
+            let elements = match run {
+                Some((h, elements)) if h == head => elements,
+                _ => {
+                    let elements = &self.runs[&head].elements[..];
+                    run = Some((head, elements));
+                    elements
+                }
+            };
+            elements[off as usize]
+        })
+    }
+
     /// First element, in document order, of the region rooted at `n`: a node's
     /// before-runs precede it, recursively.
     fn region_first(&self, mut n: InternedId) -> InternedId {
@@ -663,12 +681,16 @@ impl HashSeq {
         }
     }
 
+    /// The visible elements at `idx - 1` and `idx`: one seek, both read
+    /// off the walk.
     fn neighbours(&self, idx: usize) -> (Option<InternedId>, Option<InternedId>) {
-        let left = idx
-            .checked_sub(1)
-            .and_then(|prev_idx| self.element_at(prev_idx));
-        let right = self.element_at(idx);
-        (left, right)
+        match idx.checked_sub(1) {
+            Some(prev_idx) => {
+                let mut walk = self.elements_from(prev_idx);
+                (walk.next(), walk.next())
+            }
+            None => (None, self.element_at(0)),
+        }
     }
 
     /// Clone of `self.tips` with `anchor` removed.
@@ -760,18 +782,19 @@ impl HashSeq {
             return None;
         }
 
-        let mut to_remove = BTreeSet::new();
-        for pos in idx..idx.saturating_add(amount) {
-            if let Some(i) = self.element_at(pos) {
-                to_remove.insert(*self.interns.id(i));
-            } else {
-                break;
-            }
-        }
-
-        if to_remove.is_empty() {
-            return None;
-        }
+        // One seek and a walk. A single-char remove (a backspace) builds its
+        // one-element set directly; a wider one bulk-builds from the
+        // collected ids (`FromIterator` sorts once) instead of one tree
+        // insert per id.
+        let mut ids = self
+            .elements_from(idx)
+            .take(amount)
+            .map(|i| *self.interns.id(i));
+        let first = ids.next()?;
+        let to_remove = match ids.next() {
+            None => BTreeSet::from([first]),
+            Some(second) => [first, second].into_iter().chain(ids).collect(),
+        };
 
         let pins = BTreeSet::from_iter(self.tips.difference(&to_remove).cloned());
         Some(HashNode {

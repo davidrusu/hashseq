@@ -95,6 +95,35 @@ impl Frag {
         self.visible += 1;
     }
 
+    /// Offset of the first visible element at or after `k`, a word at a
+    /// time (tombstones skipped without testing each bit).
+    fn next_visible(&self, k: u32) -> Option<u32> {
+        if k >= self.len {
+            return None;
+        }
+        let found = match &self.bits {
+            Bits::Small(w) => {
+                let m = w >> k;
+                (m != 0).then(|| k + m.trailing_zeros())
+            }
+            Bits::Large(ws) => {
+                let mut i = k as usize / 64;
+                let mut m = ws[i] & !low_mask(k % 64);
+                loop {
+                    if m != 0 {
+                        break Some(i as u32 * 64 + m.trailing_zeros());
+                    }
+                    i += 1;
+                    match ws.get(i) {
+                        Some(&w) => m = w,
+                        None => break None,
+                    }
+                }
+            }
+        };
+        found.filter(|&off| off < self.len)
+    }
+
     /// Count of visible elements strictly before element offset `k`.
     fn rank(&self, k: u32) -> u32 {
         match &self.bits {
@@ -321,6 +350,31 @@ impl<'a> Iterator for FragsInOrder<'a> {
     }
 }
 
+/// Visible elements in document order from a position (`elems_from`):
+/// the current slot and the fragment-local offset to resume from.
+pub(crate) struct ElemsFrom<'a> {
+    index: &'a RunIndex,
+    slot: u32,
+    k: u32,
+}
+
+impl Iterator for ElemsFrom<'_> {
+    type Item = ElemRef;
+
+    fn next(&mut self) -> Option<ElemRef> {
+        while self.slot != NIL {
+            let f = &self.index.frags[self.slot as usize];
+            if let Some(k) = f.next_visible(self.k) {
+                self.k = k + 1;
+                return Some((f.head, f.start + k));
+            }
+            self.slot = self.index.next_visible_frag(self.slot);
+            self.k = 0;
+        }
+        None
+    }
+}
+
 impl RunIndex {
     pub(crate) fn len(&self) -> usize {
         self.subtree(self.root)
@@ -332,6 +386,48 @@ impl RunIndex {
         FragsInOrder {
             index: self,
             next: self.leftmost(self.root),
+        }
+    }
+
+    /// The next fragment after slot `n`, in order, with a visible element
+    /// (`NIL` if none). Uses the subtree visible counts to skip subtrees
+    /// holding only tombstones, as `seek` does — never visits a fully
+    /// deleted fragment.
+    fn next_visible_frag(&self, mut n: u32) -> u32 {
+        let right = self.frags[n as usize].right;
+        if self.subtree(right) > 0 {
+            return self.first_visible(right);
+        }
+        loop {
+            let p = self.frags[n as usize].parent;
+            if p == NIL {
+                return NIL;
+            }
+            let pf = &self.frags[p as usize];
+            if pf.left == n {
+                if pf.visible > 0 {
+                    return p;
+                }
+                if self.subtree(pf.right) > 0 {
+                    return self.first_visible(pf.right);
+                }
+            }
+            n = p;
+        }
+    }
+
+    /// The first fragment, in order, under `n` with a visible element.
+    /// Requires `subtree(n) > 0`.
+    fn first_visible(&self, mut n: u32) -> u32 {
+        loop {
+            let f = &self.frags[n as usize];
+            if self.subtree(f.left) > 0 {
+                n = f.left;
+            } else if f.visible > 0 {
+                return n;
+            } else {
+                n = f.right;
+            }
         }
     }
 
@@ -368,6 +464,26 @@ impl RunIndex {
 
     /// Span head + element offset of the visible element at position `pos`.
     pub(crate) fn get(&self, pos: usize) -> Option<ElemRef> {
+        let (slot, k) = self.seek(pos)?;
+        let f = &self.frags[slot as usize];
+        Some((f.head, f.start + k))
+    }
+
+    /// The visible elements from position `pos` on, in document order: one
+    /// descent (`seek`), then an in-order walk — O(log F + k) for k
+    /// elements, where k separate `get`s cost O(k log F).
+    pub(crate) fn elems_from(&self, pos: usize) -> ElemsFrom<'_> {
+        let (slot, k) = self.seek(pos).unwrap_or((NIL, 0));
+        ElemsFrom {
+            index: self,
+            slot,
+            k,
+        }
+    }
+
+    /// The treap slot holding the visible element at position `pos`, and
+    /// the element's fragment-local offset.
+    fn seek(&self, pos: usize) -> Option<(u32, u32)> {
         if pos >= self.len() {
             return None;
         }
@@ -379,8 +495,7 @@ impl RunIndex {
             if pos < left_count {
                 n = f.left;
             } else if pos < left_count + f.visible as usize {
-                let r = (pos - left_count) as u32;
-                return Some((f.head, f.start + f.select(r)));
+                return Some((n, f.select((pos - left_count) as u32)));
             } else {
                 pos -= left_count + f.visible as usize;
                 n = f.right;
@@ -1117,6 +1232,20 @@ mod tests {
         let p = ix.position_of((n(1), 0)).unwrap();
         assert_eq!(ix.get(p), Some((n(1), 0)));
         assert_eq!(ix.get(p + 1), Some((n(0), 151))); // 150 is removed (multiple of 3)
+
+        // The walk skips tombstones across 64-bit words and whole deleted
+        // words: clear offsets 64..192 so a gap spans two full words.
+        for off in 64..192 {
+            ix.remove_element((n(0), off));
+        }
+        let walked: Vec<ElemRef> = ix.elems_from(0).collect();
+        let want: Vec<ElemRef> = (0..ix.len()).map(|p| ix.get(p).unwrap()).collect();
+        assert_eq!(walked, want);
+        assert!(
+            walked
+                .iter()
+                .all(|&(h, off)| h != n(0) || !(64..192).contains(&off))
+        );
     }
 
     /// Randomized model check: drive the index and a naive Vec model with the
@@ -1221,6 +1350,11 @@ mod tests {
                         assert_eq!(ix.get(p), Some(e), "get({p}) at step {step}");
                         assert_eq!(ix.position_of(e), Some(p), "position_of at step {step}");
                     }
+                    // The walk from any position is the model's suffix.
+                    let from = rand(visible.len() as u64 + 2);
+                    let walked: Vec<ElemRef> = ix.elems_from(from).collect();
+                    let want = visible.get(from..).unwrap_or(&[]);
+                    assert_eq!(walked, want, "elems_from({from}) at step {step}");
                     for &(h, off, vis) in &doc {
                         if !vis {
                             assert_eq!(ix.position_of((h, off)), None, "step {step}");
