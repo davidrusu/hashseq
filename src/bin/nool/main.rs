@@ -81,6 +81,20 @@ fn main() {
     }
 }
 
+/// nool's files each start with a magic, versioned together. Node ids
+/// changed at v2 (identity-form value ids, 2026-09-29): a file from an older
+/// nool would decode but read as an empty repo or orphaned ops, so it is
+/// refused instead.
+pub const SIDECAR_MAGIC: &[u8] = b"noolseq2\n";
+pub const STORE_MAGIC: &[u8] = b"noolweb2\n";
+
+/// `bytes` without `magic`, or why `path` is not a current nool file.
+pub fn strip_magic<'a>(bytes: &'a [u8], magic: &[u8], path: &str) -> Result<&'a [u8], String> {
+    bytes.strip_prefix(magic).ok_or_else(|| {
+        format!("{path}: not a current nool file (written by an older nool, or not nool's)")
+    })
+}
+
 pub fn short_id(id: &Id) -> String {
     hex::encode(&id.0[..4])
 }
@@ -92,7 +106,8 @@ pub fn random_id() -> Result<Id, String> {
 }
 
 /// Write via a pid-suffixed temp file + fsync + rename so an interrupted
-/// save can't truncate history and concurrent invocations don't share a tmp.
+/// write can't leave a truncated file and concurrent invocations don't share
+/// a tmp. An existing file keeps its permissions.
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     let mut tmp = path.as_os_str().to_owned();
@@ -105,6 +120,9 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("writing {}: {e}", tmp.display()));
     drop(file);
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);

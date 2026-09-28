@@ -1,12 +1,12 @@
 //! Single-file mode: `note.md` + `note.md.nool`, no repo. Active whenever the
 //! current directory is not inside a nool repo.
 
-use hashseq::encoding::{apply_delta, decode_hashseq, encode_hashseq};
+use hashseq::encoding::{decode_hashseq, encode_hashseq};
 use hashseq::value::KIND_SEQ;
-use hashseq::{HashNode, HashSeq, HashWeb, Id};
+use hashseq::{HashSeq, Id, Outcome};
 
 use crate::diff::{apply_edits, diff_edits, edit_totals, lines, render_line_diff};
-use crate::{USAGE, delta, random_id, short_id, write_atomic};
+use crate::{SIDECAR_MAGIC, USAGE, delta, random_id, short_id, strip_magic, write_atomic};
 
 pub fn dispatch(cmd: &str, args: &[String]) -> Result<(), String> {
     match cmd {
@@ -54,11 +54,23 @@ fn load_seq(sidecar: &str) -> Result<HashSeq, String> {
         }
         Err(e) => return Err(format!("reading {sidecar}: {e}")),
     };
-    decode_hashseq(&bytes).map_err(|e| format!("decoding {sidecar}: {e:?}"))
+    decode_hashseq(strip_magic(&bytes, SIDECAR_MAGIC, sidecar)?)
+        .map_err(|e| format!("decoding {sidecar}: {e:?}"))
 }
 
 fn store_seq(sidecar: &str, seq: &HashSeq) -> Result<(), String> {
-    write_atomic(std::path::Path::new(sidecar), &encode_hashseq(seq))
+    let mut bytes = SIDECAR_MAGIC.to_vec();
+    bytes.extend_from_slice(&encode_hashseq(seq));
+    write_atomic(std::path::Path::new(sidecar), &bytes)
+}
+
+/// Rewrite `file` from a history just saved to its sidecar. On failure the
+/// sidecar is ahead of the file, and committing the stale file would record
+/// the difference as edits — `nool revert` finishes the write instead.
+fn write_realized(file: &str, seq: &HashSeq) -> Result<(), String> {
+    write_atomic(std::path::Path::new(file), realize(seq).as_bytes()).map_err(|e| {
+        format!("{e}\nnool: {file}.nool is updated but {file} is not — fix the problem and run `nool revert {file}`")
+    })
 }
 
 fn realize(seq: &HashSeq) -> String {
@@ -86,21 +98,33 @@ fn track(file: &str) -> Result<(), String> {
 }
 
 fn commit_many(files: &[String]) -> Result<(), String> {
-    let files = if files.is_empty() {
-        tracked_in_cwd()?
+    let (files, bare) = if files.is_empty() {
+        (tracked_in_cwd()?, true)
     } else {
-        files.to_vec()
+        (files.to_vec(), false)
     };
+    let mut failed = Vec::new();
     for file in &files {
-        commit(file).map_err(|e| format!("commit {file}: {e}"))?;
+        // A bare commit skips sidecars without a working file (a deleted
+        // file, or a peer's history dropped here to merge).
+        if bare && !std::fs::exists(file).unwrap_or(false) {
+            continue;
+        }
+        if let Err(e) = commit(file) {
+            eprintln!("nool: commit {file}: {e}");
+            failed.push(file.as_str());
+        }
     }
-    Ok(())
+    match failed.as_slice() {
+        [] => Ok(()),
+        _ => Err(format!("not committed: {}", failed.join(", "))),
+    }
 }
 
 fn commit(file: &str) -> Result<(), String> {
     let sidecar = sidecar_path(file);
     let mut seq = load_seq(&sidecar)?;
-    let old: Vec<char> = realize(&seq).chars().collect();
+    let old: Vec<char> = seq.iter().collect();
     let new: Vec<char> = read_working(file)?.chars().collect();
     let edits = diff_edits(&old, &new);
     let (ins, del) = edit_totals(&edits);
@@ -109,7 +133,7 @@ fn commit(file: &str) -> Result<(), String> {
         return Ok(());
     }
     apply_edits(&mut seq, &edits, &new);
-    debug_assert_eq!(realize(&seq).chars().collect::<Vec<_>>(), new);
+    debug_assert!(seq.iter().eq(new.iter().copied()));
     store_seq(&sidecar, &seq)?;
     println!("{file}: committed +{ins} −{del} chars");
     Ok(())
@@ -138,9 +162,9 @@ fn status(files: &[String]) -> Result<(), String> {
 fn status_of(file: &str) -> Result<String, String> {
     let seq = load_seq(&sidecar_path(file))?;
     if !std::fs::exists(file).unwrap_or(false) {
-        return Ok("missing (nool revert to restore)".into());
+        return Ok("no working file (deleted, or a stray sidecar; nool revert restores it)".into());
     }
-    let old: Vec<char> = realize(&seq).chars().collect();
+    let old: Vec<char> = seq.iter().collect();
     let new: Vec<char> = read_working(file)?.chars().collect();
     let (ins, del) = edit_totals(&diff_edits(&old, &new));
     if ins == 0 && del == 0 {
@@ -210,17 +234,13 @@ fn merge_cmd(args: &[String]) -> Result<(), String> {
     let sidecar = sidecar_path(file);
     let mut ours = load_seq(&sidecar)?;
 
-    let working: Vec<char> = read_working(file)?.chars().collect();
-    if realize(&ours).chars().collect::<Vec<_>>() != working {
+    if realize(&ours) != read_working(file)? {
         return Err(format!(
             "{file} has uncommitted edits — run `nool commit {file}` first"
         ));
     }
 
-    let theirs_bytes =
-        std::fs::read(theirs_path).map_err(|e| format!("reading {theirs_path}: {e}"))?;
-    let theirs =
-        decode_hashseq(&theirs_bytes).map_err(|e| format!("decoding {theirs_path}: {e:?}"))?;
+    let theirs = load_seq(theirs_path)?;
 
     if ours.origin() != theirs.origin() {
         return Err(format!(
@@ -233,7 +253,7 @@ fn merge_cmd(args: &[String]) -> Result<(), String> {
     let before = ours.len();
     ours.merge(theirs);
     store_seq(&sidecar, &ours)?;
-    std::fs::write(file, realize(&ours)).map_err(|e| format!("writing {file}: {e}"))?;
+    write_realized(file, &ours)?;
     println!(
         "{file}: merged {theirs_path} ({} → {} chars, {} tips)",
         before,
@@ -260,12 +280,7 @@ fn delta_cmd(args: &[String]) -> Result<(), String> {
             short_id(&have.origin())
         ));
     }
-    let missing: Vec<HashNode> = have
-        .all_nodes()
-        .into_iter()
-        .filter(|(id, _)| !base.contains_node(id))
-        .map(|(_, node)| node)
-        .collect();
+    let missing = have.delta_for(&base.clock());
     let ops = missing.len();
     let groups = if missing.is_empty() {
         Vec::new()
@@ -299,44 +314,34 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
         ));
     }
     let bytes = std::fs::read(delta_path).map_err(|e| format!("reading {delta_path}: {e}"))?;
-    let (artifacts, msg) = delta::parse_file(&bytes)?;
-    for (kind, origin, _) in delta::group_heads(msg)? {
-        if kind != KIND_SEQ || origin != seq.origin() {
+    // Text ops carry chars, never artifacts: only the op groups matter.
+    let groups = delta::parse_file(&bytes)
+        .and_then(|(_, msg)| delta::decode_groups(msg))
+        .map_err(|e| format!("{delta_path}: {e}"))?;
+    for (kind, origin, _) in &groups {
+        if *kind != KIND_SEQ || *origin != seq.origin() {
             return Err(format!(
                 "{delta_path} addresses a different document (doc {}, ours is {})",
-                short_id(&origin),
+                short_id(origin),
                 short_id(&seq.origin())
             ));
         }
     }
-    // Rebuild the seq inside a temp web so the delta rides the standard
-    // apply path (idempotent, orphans out-of-order nodes), then clone it out.
-    // Previously orphans ride along too (all_nodes excludes them), so
-    // a delta that arrives ahead of its dependencies survives to be unparked.
-    let mut web = HashWeb::new();
-    let obj = web.create_seq(seq.origin());
-    let applied_before = seq.all_nodes();
-    let applied_before_len = applied_before.len();
-    for (id, node) in applied_before {
-        let _ = web.apply_to_with_id(obj, id, node);
-    }
-    for node in seq.orphans() {
-        let _ = web.apply_to(obj, node.clone());
-    }
-    for artifact in artifacts {
-        web.provide_artifact_bytes(artifact);
-    }
-    let delivered =
-        apply_delta(&mut web, msg).map_err(|e| format!("applying {delta_path}: {e:?}"))?;
+    let mut seq = seq;
+    let applied_before = seq.all_nodes().len();
+    let delivered = groups
+        .into_iter()
+        .flat_map(|(_, _, nodes)| nodes)
+        .filter(|node| seq.apply(node.clone()).is_ok_and(Outcome::is_news))
+        .count();
     if delivered == 0 {
         println!("{file}: nothing new — already converged");
         return Ok(());
     }
-    let merged = web.seq(&obj).expect("created above").clone();
-    store_seq(&sidecar, &merged)?;
-    std::fs::write(file, realize(&merged)).map_err(|e| format!("writing {file}: {e}"))?;
-    let applied = merged.all_nodes().len() - applied_before_len;
-    let orphaned = merged.orphans().count();
+    store_seq(&sidecar, &seq)?;
+    write_realized(file, &seq)?;
+    let applied = seq.all_nodes().len() - applied_before;
+    let orphaned = seq.orphans().count();
     let mut note = String::new();
     if applied > delivered {
         note += &format!(" (incl. {} previously orphaned)", applied - delivered);
@@ -346,8 +351,8 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
     }
     println!(
         "{file}: {delivered} new op(s): {applied} applied{note} ({} chars, {} tips)",
-        merged.len(),
-        merged.tips().len()
+        seq.len(),
+        seq.tips().len()
     );
     Ok(())
 }
@@ -360,7 +365,7 @@ fn cat(file: &str) -> Result<(), String> {
 
 fn revert(file: &str) -> Result<(), String> {
     let seq = load_seq(&sidecar_path(file))?;
-    std::fs::write(file, realize(&seq)).map_err(|e| format!("writing {file}: {e}"))?;
+    write_atomic(std::path::Path::new(file), realize(&seq).as_bytes())?;
     println!("{file}: restored to last commit ({} chars)", seq.len());
     Ok(())
 }

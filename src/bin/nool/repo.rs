@@ -18,7 +18,7 @@ use hashseq::value::{KIND_KV, object_id};
 use hashseq::{HashWeb, Id, Value};
 
 use crate::diff::{apply_edits, diff_edits, edit_totals, lines, render_line_diff, shared_chars};
-use crate::{USAGE, delta, random_id, short_id, take_flag, write_atomic};
+use crate::{STORE_MAGIC, USAGE, delta, random_id, short_id, strip_magic, take_flag, write_atomic};
 
 pub fn dispatch(cmd: &str, args: &[String], root: PathBuf) -> Result<(), String> {
     // The two-operand `.nool`-file diff still belongs to sidecar mode even
@@ -115,12 +115,18 @@ struct Stage {
     untracked: Vec<String>,
 }
 
+/// A tracked file's working copy against its committed realization.
+#[derive(PartialEq)]
+enum OnDisk {
+    Missing,
+    Clean,
+    Modified,
+}
+
 impl Repo {
     fn load(root: PathBuf) -> Result<Self, String> {
         let registry = read_registry_id(&root.join(".nool/root"))?;
-        let bytes = std::fs::read(root.join(".nool/store"))
-            .map_err(|e| format!("reading .nool/store: {e}"))?;
-        let web = decode_hashweb(&bytes).map_err(|e| format!("decoding .nool/store: {e:?}"))?;
+        let web = read_store(&root)?;
         if web.kv(&registry).is_none() {
             return Err(format!(
                 "registry {} missing from store",
@@ -135,7 +141,9 @@ impl Repo {
     }
 
     fn save(&self) -> Result<(), String> {
-        write_atomic(&self.root.join(".nool/store"), &encode_hashweb(&self.web))
+        let mut bytes = STORE_MAGIC.to_vec();
+        bytes.extend_from_slice(&encode_hashweb(&self.web));
+        write_atomic(&self.root.join(".nool/store"), &bytes)
     }
 
     /// Repo-relative path (with `/` separators) for a user-supplied path.
@@ -184,10 +192,17 @@ impl Repo {
     /// safe repo-relative path are left out (see `safe_key`); `status`
     /// reports them.
     fn tracked(&self) -> BTreeMap<String, Tracked> {
-        tracked_files(&self.web, &self.registry)
+        self.tracked_checked().0
+    }
+
+    /// `tracked`, plus the registry keys skipped as unsafe.
+    fn tracked_checked(&self) -> (BTreeMap<String, Tracked>, Vec<String>) {
+        let (files, skipped) = tracked_files_checked(&self.web, &self.registry);
+        let tracked = files
             .into_iter()
             .map(|(path, (obj, conflicted))| (path, Tracked { obj, conflicted }))
-            .collect()
+            .collect();
+        (tracked, skipped)
     }
 
     fn realize(&self, obj: &Id) -> Result<String, String> {
@@ -204,6 +219,14 @@ impl Repo {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("reading {rel}: {e}")),
         }
+    }
+
+    fn on_disk(&self, rel: &str, t: &Tracked) -> Result<OnDisk, String> {
+        Ok(match self.read_disk(rel)? {
+            None => OnDisk::Missing,
+            Some(disk) if disk == self.realize(&t.obj)? => OnDisk::Clean,
+            Some(_) => OnDisk::Modified,
+        })
     }
 
     /// Resolve command args to tracked paths; no args means every tracked file.
@@ -223,11 +246,9 @@ impl Repo {
         Ok(out)
     }
 
-    /// Register `obj` at `path` per PLACEMENT_SPEC's two-ops-one-gesture: a
-    /// registry put claims the slot (the link atom), and a `Place` in the
-    /// object's own DAG claims membership, superseding any prior placement.
-    /// On a move the old registry entry is NOT deleted — it goes dead by the
-    /// membership rule in `tracked_files` and remains a ghost.
+    /// Register `obj` at `path` (PLACEMENT_SPEC's two ops, one gesture): a
+    /// registry put links the path, a `Place` in the object's DAG makes that
+    /// link its home. A moved-from entry stays as a dead ghost.
     fn register_at(&mut self, rel: &str, obj: Id) {
         let kv = self.web.kv_mut(&self.registry).expect("checked at load");
         let put = kv.put(Value::String(rel.to_owned()), Value::Bytes(obj.0.to_vec()));
@@ -311,7 +332,7 @@ impl Repo {
         if !args.is_empty() {
             return self.commit_paths(args);
         }
-        let stage = self.stage()?;
+        let stage = self.stage(&self.tracked())?;
         let mut committed = 0;
         for (from, to, t) in &stage.moves {
             // A detected move gets the same encoding as `nool mv`.
@@ -377,21 +398,17 @@ impl Repo {
     /// The stage: the working tree scanned against the store. Missing tracked
     /// paths are paired with untracked files by content similarity — a pair
     /// at or above `MOVE_SIMILARITY` is a detected move.
-    fn stage(&self) -> Result<Stage, String> {
-        let tracked = self.tracked();
+    fn stage(&self, tracked: &BTreeMap<String, Tracked>) -> Result<Stage, String> {
         let mut modified = Vec::new();
         let mut missing: Vec<String> = Vec::new();
-        for (rel, t) in &tracked {
-            match self.read_disk(rel)? {
-                None => missing.push(rel.clone()),
-                Some(disk) => {
-                    if disk != self.realize(&t.obj)? {
-                        modified.push((rel.clone(), *t));
-                    }
-                }
+        for (rel, t) in tracked {
+            match self.on_disk(rel, t)? {
+                OnDisk::Missing => missing.push(rel.clone()),
+                OnDisk::Modified => modified.push((rel.clone(), *t)),
+                OnDisk::Clean => {}
             }
         }
-        let mut untracked = self.scan_untracked(&tracked)?;
+        let mut untracked = self.scan_untracked(tracked)?;
         let mut moves = Vec::new();
         let mut still_missing = Vec::new();
         for rel in missing {
@@ -459,14 +476,14 @@ impl Repo {
     }
 
     fn status(&self) -> Result<(), String> {
-        let tracked = self.tracked();
-        let stage = self.stage()?;
+        let (tracked, unsafe_keys) = self.tracked_checked();
+        let stage = self.stage(&tracked)?;
         println!(
             "repo {} — {} tracked file(s)",
             home_rel(&self.root),
             tracked.len()
         );
-        for key in unsafe_keys(&self.web, &self.registry) {
+        for key in unsafe_keys {
             println!("  ignored unsafe path in registry: {key:?}");
         }
         let moved_from: Vec<&String> = stage.moves.iter().map(|(from, _, _)| from).collect();
@@ -474,18 +491,15 @@ impl Repo {
             if moved_from.contains(&rel) {
                 continue; // reported below as a detected move
             }
-            let state = match self.read_disk(rel)? {
-                None => "missing — `nool rm` to record the deletion".to_string(),
-                Some(disk) => {
-                    let old: Vec<char> = self.realize(&t.obj)?.chars().collect();
-                    let new: Vec<char> = disk.chars().collect();
-                    let (ins, del) = edit_totals(&diff_edits(&old, &new));
-                    if ins == 0 && del == 0 {
-                        "clean".to_string()
-                    } else {
-                        format!("modified (+{ins} −{del} chars uncommitted)")
-                    }
-                }
+            let state = if stage.missing.contains(rel) {
+                "missing — `nool rm` to record the deletion".to_string()
+            } else if stage.modified.iter().any(|(m, _)| m == rel) {
+                let old: Vec<char> = self.realize(&t.obj)?.chars().collect();
+                let new: Vec<char> = self.read_disk(rel)?.unwrap_or_default().chars().collect();
+                let (ins, del) = edit_totals(&diff_edits(&old, &new));
+                format!("modified (+{ins} −{del} chars uncommitted)")
+            } else {
+                "clean".to_string()
             };
             let flag = if t.conflicted {
                 " [registry conflict — resolved deterministically]"
@@ -529,9 +543,7 @@ impl Repo {
             // Deleting the working file would drop edits nothing has recorded.
             let mut dirty = Vec::new();
             for (rel, t) in &targets {
-                if let Some(disk) = self.read_disk(rel)?
-                    && disk != self.realize(&t.obj)?
-                {
+                if self.on_disk(rel, t)? == OnDisk::Modified {
                     dirty.push(rel.clone());
                 }
             }
@@ -542,18 +554,27 @@ impl Repo {
                 ));
             }
         }
-        for (rel, _) in targets {
-            let kv = self.web.kv_mut(&self.registry).expect("checked at load");
+        // Store first, then the tree: a failed removal leaves an untracked
+        // file behind, never a tracked one gone from disk.
+        let kv = self.web.kv_mut(&self.registry).expect("checked at load");
+        for (rel, _) in &targets {
             kv.del(Value::String(rel.clone()));
+        }
+        self.save()?;
+        for (rel, _) in targets {
             match std::fs::remove_file(self.abs(&rel)) {
                 Ok(()) => println!("{rel}: untracked and deleted"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     println!("{rel}: deletion recorded")
                 }
-                Err(e) => return Err(format!("removing {rel}: {e}")),
+                Err(e) => {
+                    return Err(format!(
+                        "{rel}: deletion recorded, but removing it failed: {e}"
+                    ));
+                }
             }
         }
-        self.save()
+        Ok(())
     }
 
     fn cat(&self, args: &[String]) -> Result<(), String> {
@@ -611,7 +632,8 @@ impl Repo {
             ));
         };
         self.require_clean()?;
-        let theirs = self.load_other(Path::new(other))?;
+        let theirs = read_store(Path::new(other))?;
+        self.require_lineage(&theirs, other)?;
         let before = self.tracked();
         self.web.merge(theirs);
         if !force {
@@ -644,14 +666,11 @@ impl Repo {
                 ));
             }
         };
-        let source = source.as_ref().unwrap_or(&self.web);
-        if !share_registry(&receiver, source) {
-            return Err(
-                "unrelated repos: no shared registry — deltas only make sense between clones \
-                 (repos share history by cloning, not by init twice)"
-                    .into(),
-            );
+        self.require_lineage(&receiver, &args[0])?;
+        if let Some(source) = &source {
+            self.require_lineage(source, &args[1])?;
         }
+        let source = source.as_ref().unwrap_or(&self.web);
         let (groups, artifacts) = delta::diff(&receiver, source);
         let ops: usize = groups.iter().map(|(_, _, nodes)| nodes.len()).sum();
         let bytes = delta::encode_file(&groups, &artifacts);
@@ -678,10 +697,10 @@ impl Repo {
         };
         self.require_clean()?;
         let bytes = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
-        let (artifacts, msg) = delta::parse_file(&bytes)?;
+        let (artifacts, msg) = delta::parse_file(&bytes).map_err(|e| format!("{path}: {e}"))?;
         // Lineage gate: a delta from an unrelated repo would plant a foreign
         // registry (or orphan objects nothing references) — reject both.
-        let heads = delta::group_heads(msg)?;
+        let heads = delta::decode_groups(msg).map_err(|e| format!("{path}: {e}"))?;
         for (kind, origin, _) in &heads {
             let obj = object_id(*kind, origin);
             if *kind == KIND_KV && obj != self.registry {
@@ -724,11 +743,7 @@ impl Repo {
     fn require_clean(&self) -> Result<(), String> {
         let mut dirty = Vec::new();
         for (rel, t) in self.targets(&[])? {
-            let clean = match self.read_disk(&rel)? {
-                None => false,
-                Some(disk) => disk == self.realize(&t.obj)?,
-            };
-            if !clean {
+            if self.on_disk(&rel, &t)? != OnDisk::Clean {
                 dirty.push(rel);
             }
         }
@@ -751,9 +766,7 @@ impl Repo {
             if before.contains_key(&rel) {
                 continue;
             }
-            if let Some(disk) = self.read_disk(&rel)?
-                && disk != self.realize(&t.obj)?
-            {
+            if self.on_disk(&rel, &t)? == OnDisk::Modified {
                 clobbered.push(rel);
             }
         }
@@ -816,27 +829,17 @@ impl Repo {
         Ok((changed, deleted))
     }
 
-    /// The merge operand: a repo directory (registry must match) or a bare
-    /// store file (assumed same lineage).
-    fn load_other(&self, path: &Path) -> Result<HashWeb, String> {
-        let (store_path, root_path) = if path.join(".nool/store").is_file() {
-            (path.join(".nool/store"), Some(path.join(".nool/root")))
+    /// A store is this repo's lineage iff it holds our registry (nool makes
+    /// exactly one kv per repo: clones share it, independent inits never do).
+    fn require_lineage(&self, other: &HashWeb, name: &str) -> Result<(), String> {
+        if other.kv(&self.registry).is_some() {
+            Ok(())
         } else {
-            (path.to_path_buf(), None)
-        };
-        if let Some(root_path) = root_path {
-            let their_registry = read_registry_id(&root_path)?;
-            if their_registry != self.registry {
-                return Err(format!(
-                    "unrelated repo: registry {} vs ours {} (repos share history by cloning, not by init twice)",
-                    short_id(&their_registry),
-                    short_id(&self.registry)
-                ));
-            }
+            Err(format!(
+                "unrelated repo: {name} has no registry {} (repos share history by cloning, not by init twice)",
+                short_id(&self.registry)
+            ))
         }
-        let bytes = std::fs::read(&store_path)
-            .map_err(|e| format!("reading {}: {e}", store_path.display()))?;
-        decode_hashweb(&bytes).map_err(|e| format!("decoding {}: {e:?}", store_path.display()))
     }
 
     fn write_working(&self, rel: &str, content: &str) -> Result<(), String> {
@@ -845,7 +848,7 @@ impl Repo {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
-        std::fs::write(&abs, content).map_err(|e| format!("writing {rel}: {e}"))
+        write_atomic(&abs, content.as_bytes())
     }
 }
 
@@ -860,14 +863,6 @@ fn home_rel(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// Two stores are the same lineage iff they share a kv object — nool creates
-/// exactly one kv per repo (the registry), so clones share it and independent
-/// inits never do.
-fn share_registry(a: &HashWeb, b: &HashWeb) -> bool {
-    a.objects()
-        .any(|obj| a.kv(obj).is_some() && b.kv(obj).is_some())
-}
-
 /// A store operand: a repo directory (its `.nool/store`) or a bare store file.
 fn read_store(path: &Path) -> Result<HashWeb, String> {
     let store = if path.join(".nool/store").is_file() {
@@ -875,8 +870,10 @@ fn read_store(path: &Path) -> Result<HashWeb, String> {
     } else {
         path.to_path_buf()
     };
-    let bytes = std::fs::read(&store).map_err(|e| format!("reading {}: {e}", store.display()))?;
-    decode_hashweb(&bytes).map_err(|e| format!("decoding {}: {e:?}", store.display()))
+    let shown = store.display().to_string();
+    let bytes = std::fs::read(&store).map_err(|e| format!("reading {shown}: {e}"))?;
+    decode_hashweb(strip_magic(&bytes, STORE_MAGIC, &shown)?)
+        .map_err(|e| format!("decoding {shown}: {e:?}"))
 }
 
 fn read_registry_id(path: &Path) -> Result<Id, String> {
@@ -928,29 +925,16 @@ fn as_obj_id(v: Value) -> Option<Id> {
     }
 }
 
-/// Registry keys `tracked_files` skipped as unsafe (live entries only).
-fn unsafe_keys(web: &HashWeb, registry: &Id) -> Vec<String> {
-    tracked_files_checked(web, registry).1
-}
-
-fn tracked_files(web: &HashWeb, registry: &Id) -> BTreeMap<String, (Id, bool)> {
-    tracked_files_checked(web, registry).0
-}
-
-/// Registry read: path -> (seq object id, conflicted). Value artifacts may
-/// live in the registry kv's own store (local puts) or in the web-level store
-/// (deposited there by `HashWeb::merge`), so resolution checks both.
+/// Registry read: path -> (seq object id, conflicted), plus the live keys
+/// skipped as unsafe (`safe_key`: never a path outside the repo). Values
+/// resolve through the registry's own store, then the web's (`merge`
+/// deposits there).
 ///
-/// Membership (PLACEMENT_SPEC): a registry put is only a *link atom*. When
-/// the pointed-at object has authored `Place` ops, its placement register
-/// elects a single home link, and a registry entry is live only if it is that
-/// link — a moved-away path stays in the registry as a dead ghost. Under a
-/// placement conflict (concurrent moves) the first id-sorted head wins, the
-/// same pick on every replica. An object with no `Place` ops falls back to
-/// the legacy-presence rule: the registry entry alone decides.
-///
-/// Returns (tracked, unsafe keys skipped): a live entry whose key fails
-/// `safe_key` is never tracked, so it can't become a path outside the repo.
+/// Membership (PLACEMENT_SPEC): a registry put is only a link. An object
+/// with `Place` ops is live only at the link its placement register elects
+/// (first id-sorted head under a conflict — the same pick everywhere); a
+/// moved-away path stays behind as a dead ghost. Without `Place` ops the
+/// registry entry alone decides.
 fn tracked_files_checked(
     web: &HashWeb,
     registry: &Id,
@@ -1005,6 +989,10 @@ fn tracked_files_checked(
 mod tests {
     use super::*;
     use hashseq::encoding::{decode_hashweb, encode_hashweb};
+
+    fn tracked_files(web: &HashWeb, registry: &Id) -> BTreeMap<String, (Id, bool)> {
+        tracked_files_checked(web, registry).0
+    }
 
     pub fn track(web: &mut HashWeb, registry: &Id, path: &str, content: &str, seed: Id) -> Id {
         let obj = web.create_seq(seed);

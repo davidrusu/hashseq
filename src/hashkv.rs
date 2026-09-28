@@ -537,6 +537,12 @@ impl HashKv {
     }
 
     /// Value artifacts this replica holds bytes for.
+    /// Canonical bytes of one hashed artifact, if this object's store holds
+    /// them (as `HashWeb::artifact_bytes`).
+    pub fn artifact_bytes(&self, id: &Id) -> Option<&Vec<u8>> {
+        self.values.get(id)
+    }
+
     pub fn value_store(&self) -> impl Iterator<Item = (&Id, &Vec<u8>)> {
         self.values.iter()
     }

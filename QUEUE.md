@@ -384,6 +384,22 @@ Problem: `init` writes `store` before `root`; `tracked_in_cwd` turns a stray `.n
 
 Fix: check; fix or drop.
 
+### 59. No lock on `.nool/store` or sidecars — OPEN
+
+Where: `src/bin/nool/repo.rs` `Repo::load` … `save`; `src/bin/nool/sidecar.rs` `load_seq` … `store_seq`.
+
+Problem: two concurrent invocations both load, and the last save wins. A merge/apply whose save is lost has already rewritten the working tree, so the next commit records the merged text as local inserts — duplicated on the next merge with that peer. (2026-09-29 nool review.)
+
+Fix: an exclusive lock file (`.nool/lock`, `<file>.nool.lock`) held from load to save.
+
+### 60. `status` / bare `commit` scan the whole tree with no ignore list — OPEN
+
+Where: `src/bin/nool/repo.rs` `scan_untracked`, `stage`.
+
+Problem: the scan descends into `target/`, `node_modules/` and the like; with any tracked file missing, `stage` diffs it against every untracked file for move detection. A code checkout is read in full on every `status`. (2026-09-29 nool review.)
+
+Fix: an ignore file (`.noolignore`), or at least skip common build directories.
+
 ## Basecamp
 
 ### 33. Concurrent editing of one focused block corrupts positions — OPEN
