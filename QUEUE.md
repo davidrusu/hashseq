@@ -1,7 +1,6 @@
 # Queue
 
 - check if self-moves are actually problematic, currently we guard against it.
-- author and apply flows duplicate effort
 - afters_of | befores_of, can they return sortedidvec? seems that way.
 ## Core
 
@@ -165,6 +164,94 @@ Where: `src/encoding.rs:2260` `test_id`, `:3470` `oid`, and siblings.
 
 Fix: one shared test helper module.
 
+### 45. `HashSeq::apply` admits nodes the wire decoders reject — OPEN
+
+Where: `src/hashseq.rs` `apply_with_id` (and `HashKv::apply_with_id`); `src/hash_node.rs` `HashNode::id` only `debug_assert!`s normalization.
+
+Problem: a node with a redundant pin (pin = its anchor) hashes to the same id as its normalized twin and is accepted; so is a ref-less `Remove({})`. The replica then stores a form its own snapshot cannot decode (`RedundantPin` / `NoRefs`) — every peer rejects its snapshots and deltas; debug builds panic in `apply`. Reachable through the public API and `merge` from an untrusted `HashSeq`; every network path goes through `validate_node`. (2026-09-24 review.)
+
+Fix: run the `validate_node` rules (`is_normalized`, non-empty refs) in `apply_with_id` and refuse, or normalize before interning.
+
+### 46. Decode amplification: remove blocks expand superlinearly — OPEN
+
+Where: `src/encoding.rs` decode of `BLK_REMOVE_FWD | BLK_REMOVE_BWD` (~1651) and `BLK_REMOVE_OTHER` segments (~1712).
+
+Problem: each ~8-byte remove-span block mints a whole chain over an existing run, so N blocks with distinct first pins mint N × run-length nodes (measured 4.9 KB → 250k nodes; ~1 MB of input is an OOM). `REMOVE_OTHER` segments need not be sorted or disjoint: S overlapping segments cost S × L. Strict mode does not help — it decodes before comparing. ENCODING_SPEC claims decode is never superlinear. (2026-09-24 review.)
+
+Fix: require segments strictly ascending and non-adjacent, and enforce a global expansion budget (expanded targets + minted nodes ≤ c × input bytes).
+
+### 47. `apply_delta` opens objects before validating them — OPEN
+
+Where: `src/encoding.rs` `apply_delta` (~3370): `create_seq` / `create_kv` per group before any node is checked.
+
+Problem: ~34 bytes per junk object, even for empty groups and for deltas later rejected; the junk persists in every snapshot and ships to peers, while `delivered` reports 0. (2026-09-24 review.)
+
+Fix: open an object only once one of its nodes applies (or orphans), and never on a rejected delta.
+
+### 48. Unknown op kinds are rejected, not carried — DECISION
+
+Where: `src/encoding.rs` `decode_node_with` / block tags (`InvalidOpTag`); GRAMMAR_SPEC.md "Grammar-level validation".
+
+Problem: the spec says unknown kinds are not malformed and must be carried opaquely, but every decoder rejects them, and the standalone/trailing node form (`tag ‖ pins ‖ per-kind fields`) has no length envelope, so an unknown kind cannot even be skipped. One future-kind op aborts a whole delta or snapshot: adding a kind is a hard fork. Related: clocks ignore refusals, so replicas that disagree on a verdict (a "loosening" upgrade) re-ship the same suffix on every sync. (2026-09-24 review.)
+
+Fix: decide the extension story — a length-framed node envelope on the wire plus carry-opaque storage — or amend the spec to "unknown kinds are a hard fork".
+
+### 49. Contested move-register resolution is super-cubic — OPEN
+
+Where: `src/hashseq.rs` `resolve_decider_with` (~1108), called on every `apply_move`.
+
+Problem: a "ladder" history (a_k, b_k each overwriting {a_{k-1}, b_{k-1}} — two synced users repeatedly moving the same element) re-resolves the whole ladder per apply, with an O(n²) ancestor memo: 1,600 ops take 14 s. Honest-reachable, and decode replays it. (2026-09-24 review.)
+
+Fix: a generation number per move op and an iterative descent of the maximal common set, or cache the last-agreed op per antichain incrementally.
+
+### 50. Treap priorities are a fixed, public LCG — OPEN
+
+Where: `src/run_index.rs` `rng: 0x9E3779B97F4A7C15` (~273), `next_prio` (~950).
+
+Problem: every insert creates one fragment with a predictable priority, so a peer can order its inserts to make the treap a path: depth 39,998 at 40k inserts, and every later `get` / `seek` / `position_of` / `cmp_sweep` on that replica is O(n). (2026-09-24 review.)
+
+Fix: seed per replica from a random source, or derive priorities from a keyed hash of the slot. Perf-gated (item 11's run-index rule).
+
+### 51. Forking through a long run is quadratic — OPEN
+
+Where: `src/hashseq.rs` `split_run_at` (~943) relocates every element of the right part; `src/run_index.rs` `Frag::split_bits` (~159) copies `Bits::Large` one bit at a time and keeps the left piece in place.
+
+Problem: forking left-to-right through a long run is O(n²) (40k chars: 6.4 s); `Before` inserts marching forward through a large fragment likewise (40k: 5.5 s vs 0.1 s in reverse). Honest-reachable, peer-triggerable. (2026-09-24 review.)
+
+Fix: relocate the smaller side; shift bitmap words, not bits.
+
+### 52. Encoder is O(k²) / O(F²) on some shapes — OPEN
+
+Where: `src/encoding.rs` force-emit victim scan over `blocked` (~1282); the fork-extender minimum recomputed per child (~852) and per remove link (`heads_pinning`, ~971-987).
+
+Problem: k soft cycles cost O(k²) (8k cycles: 0.6 s); F fork children of one element cost O(F²) (16k: 2.5 s to encode a 144 KB snapshot). Strict decode re-encodes, so it inherits both. (2026-09-24 review.)
+
+Fix: keep hard-ready blocked blocks in an ordered set keyed by `(depth, idx)`; memoize the extender per parent.
+
+### 53. `live_set` scans overwrites linearly per member pair — OPEN
+
+Where: `src/hashseq.rs` `live_set` (~1557), under `marks_at` / `marked_spans`.
+
+Problem: `overwrites.iter().any(..)` makes each read O(k² · W) for k marks naming W ids (k = W = 1000: 326 ms per `marks_at`). Related: honest mark toggling grows overwrites quadratically on the wire (MARKS.md open problem 1). (2026-09-24 review.)
+
+Fix: `SortedIdVec::contains` (binary search), or one suppressed-id set per kind group.
+
+### 54. Orphans are never evicted — DECISION
+
+Where: `src/delivery.rs` `orphaned`; `src/hashweb.rs` store-level `orphaned`.
+
+Problem: nodes waiting on a ref that never arrives (or was refused) are kept forever, re-applied on `merge`, and dropped only by encode. Memory is linear in attacker input, with no bound. (2026-09-24 review.)
+
+Fix: decide a policy — per-object / per-peer caps, age-out, or drop-on-encode made explicit.
+
+### 55. Non-strict decoders accept trailing bytes and duplicate sections — OPEN
+
+Where: `src/encoding.rs` `decode_hashseq` / `decode_hashkv` / `decode_hashweb` (non-strict); `decode_hashweb` object sections (`insert`, not merge); wasm `applyTo` ignores consumed length.
+
+Problem: trailing garbage is accepted silently, and a duplicated object section replaces the earlier one (a full section followed by an empty one decodes to empty text). Strict mode catches both. (2026-09-24 review.)
+
+Fix: reject trailing bytes everywhere; merge or reject duplicate object sections.
+
 ## HashKv / HashWeb / value
 
 ### 21. Locally minted value stays pending in the local kv view — OPEN
@@ -214,6 +301,30 @@ Where: `src/hashweb.rs:8` vs tests.
 Problem: disagreement on whether a link payload is the origin or the object id.
 
 Fix: pick one, fix the other.
+
+### 56. Parent/child op replay across the composition convention — DECISION
+
+Where: `src/hashweb.rs` `apply_to_with_id` (~313) and the module docs ("one object's ops can never merge into another"); HASHWEB_SPEC.md "the envelope needs no trust".
+
+Problem: a child opened at parent op X has origin X, which is also an ordinary element of the parent, so any op whose refs are ⊆ {X} ∪ child ops is valid in both objects; the untrusted envelope picks which. Confirmed: child text re-enveloped into the parent (`"abEVIL"`), a child put into the parent kv, a parent put into the child, and the child's birth `Place` into the parent's placement register (can manufacture containment cycles or freeze a register). Per-object convergence holds; integrity and attribution do not. (2026-09-24 review.)
+
+Fix: decide — a per-object domain separator in the preimage (commit each op to its object), or state in the spec that parent and child share one commitment domain at X.
+
+### 57. `HashKv::get` depends on artifact vs op delivery order — OPEN
+
+Where: `src/hashkv.rs` `hydrate` (~162); `src/hashweb.rs` `provide_artifact_bytes` (~239), `merge` (~352).
+
+Problem: store artifacts are mirrored into a kv only when a node is delivered; bytes that arrive later (0xAF frames, `HashWeb::merge`) never reach kvs that already exist. Replica A (artifact then op) reads `Some`, replica B (op then artifact) reads `None`, yet `A == B`. A snapshot round-trip heals it; wasm and nool read the web store first. Mostly moot for values ≤ 15 bytes (identity-form ids resolve without the store). (2026-09-24 review.)
+
+Fix: resolve kv reads through the web store, or re-hydrate kvs when new artifacts arrive.
+
+### 58. D4 cycle detachment is not in the crate — OPEN
+
+Where: `src/placement.rs` (register + `chain()` only); `web/kb.js` approximates it.
+
+Problem: HASHWEB_SPEC / CYCLE_REVERT.md specify cyclic SCCs detach, flagged; the core has no implementation, and kb.js checks only `chain[0]` instead of falling back along the chain. `chain()` itself is O(n³–n⁴) (`closure` recomputed inside `maximal`'s double loop: 400 Place ops → 4.4 s per read). Item 56 lets a peer manufacture the cycles. (2026-09-24 review.)
+
+Fix: implement D4 in the crate; memoize closures in `chain()` (or compute maximal elements in one reverse-topological pass).
 
 ## wasm / web
 
