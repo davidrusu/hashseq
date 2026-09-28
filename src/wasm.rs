@@ -370,7 +370,8 @@ impl WasmHashSeq {
     /// broadcast, or undefined if nothing was removed.
     #[wasm_bindgen(js_name = removeAndEncodeOp)]
     pub fn remove_and_encode_op(&mut self, idx: usize, n: usize) -> Option<Vec<u8>> {
-        self.inner.remove_batch(idx, n).map(|node| {
+        let id = self.inner.remove_batch(idx, n)?;
+        self.inner.node(&id).map(|node| {
             let mut buf = Vec::new();
             encode_op(&EncodableOp::Node(node), &mut buf);
             buf

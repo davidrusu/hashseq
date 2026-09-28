@@ -130,6 +130,12 @@ impl SortedIdVec {
             .map(SortedIdVec)
     }
 
+    /// Wrap handles already in `Id` order (the caller sorted them or read
+    /// them off an id-ordered set).
+    pub(crate) fn from_id_sorted(handles: Vec<InternedId>) -> Self {
+        SortedIdVec(handles)
+    }
+
     /// The one-member set.
     pub(crate) fn single(handle: InternedId) -> Self {
         SortedIdVec(vec![handle])

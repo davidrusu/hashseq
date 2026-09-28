@@ -159,18 +159,6 @@ impl Op {
         Self::insert(Anchor::Before(at), Payload::Char(ch))
     }
 
-    #[inline]
-    fn kind(&self) -> u8 {
-        match self {
-            Op::Insert { .. } => KIND_INSERT,
-            Op::Remove(_) => KIND_REMOVE,
-            Op::Move { .. } => KIND_MOVE,
-            Op::Put { .. } => KIND_PUT,
-            Op::Mark { .. } => KIND_MARK,
-            Op::Place { .. } => KIND_PLACE,
-        }
-    }
-
     /// First named single-id role, if any (no allocation).
     #[inline]
     fn named_primary(&self) -> Option<&Id> {
@@ -298,29 +286,12 @@ impl HashNode {
             "pins must be normalized: refs ∖ named"
         );
 
-        let mut hasher = node_hasher();
-
         // Fast path — the typing chain: an insert whose only ref is its
-        // anchor. refs = [anchor], anchor ref_idx = 0; every length is a
-        // single-byte varint. This is the shape of every run-interior op.
-        // The whole preimage is assembled on the stack and hashed in one
-        // update call (per-update overhead dominates at this size). A char
-        // payload's value field is its short form, so the preimage is 39–42
-        // bytes: one BLAKE3 block, one compression.
+        // anchor.
         if let Op::Insert { at, payload } = &self.op
             && self.pins.is_empty()
         {
-            let mut pre = [0u8; 36 + VALUE_FIELD_MAX];
-            pre[0] = KIND_INSERT;
-            pre[1] = 1; // ref_count
-            pre[2..34].copy_from_slice(&at.id().0);
-            let field: &mut [u8; VALUE_FIELD_MAX] =
-                (&mut pre[36..]).try_into().expect("sized for one field");
-            let n = value_field(&payload.value_id(), field);
-            pre[34] = 1 + n as u8; // body_len: anchor varint (1) + value field
-            pre[35] = at.side_bit() as u8;
-            hasher.update(&pre[..36 + n]);
-            return Id(*hasher.finalize().as_bytes());
+            return chain_insert_id(at.id(), at.side_bit(), payload);
         }
 
         let refs = self.refs_table();
@@ -328,117 +299,208 @@ impl HashNode {
             refs.binary_search(id)
                 .expect("named id is in the refs table")
         };
-
-        hasher.update(&[self.op.kind()]);
-        update_varint(&mut hasher, refs.len());
-        for r in &refs {
-            hasher.update(&r.0);
-        }
-
-        match &self.op {
-            Op::Insert { at, payload } => {
-                let packed = (ref_idx(at.id()) << 1) | at.side_bit();
-                let (field, n) = field_of(&payload.value_id());
-                update_varint(&mut hasher, varint_len(packed) + n); // body_len
-                update_varint(&mut hasher, packed);
-                hasher.update(&field[..n]);
-            }
-            Op::Remove(targets) => {
-                // Ascending target indices via a sorted merge walk.
-                let idxs = sorted_subset_indices(&refs, targets);
-                let body_len =
-                    varint_len(idxs.len()) + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
-                update_varint(&mut hasher, body_len);
-                update_varint(&mut hasher, idxs.len());
-                for i in idxs {
-                    update_varint(&mut hasher, i);
-                }
-            }
+        let body = match &self.op {
+            Op::Insert { at, payload } => ResolvedBody::Insert {
+                packed: (ref_idx(at.id()) << 1) | at.side_bit(),
+                payload: payload.value_id(),
+            },
+            Op::Remove(targets) => ResolvedBody::Remove(sorted_subset_indices(&refs, targets)),
             Op::Move {
                 target,
                 to,
                 overwrites,
-            } => {
-                let t = ref_idx(target);
-                let packed = (ref_idx(to.id()) << 1) | to.side_bit();
-                let idxs = sorted_subset_indices(&refs, overwrites);
-                let body_len = varint_len(t)
-                    + varint_len(packed)
-                    + varint_len(idxs.len())
-                    + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
-                update_varint(&mut hasher, body_len);
-                update_varint(&mut hasher, t);
-                update_varint(&mut hasher, packed);
-                update_varint(&mut hasher, idxs.len());
-                for i in idxs {
-                    update_varint(&mut hasher, i);
-                }
-            }
+            } => ResolvedBody::Move {
+                target: ref_idx(target),
+                packed: (ref_idx(to.id()) << 1) | to.side_bit(),
+                overwrites: sorted_subset_indices(&refs, overwrites),
+            },
             Op::Put {
                 key,
                 value,
                 overwrites,
-            } => {
-                let idxs = sorted_subset_indices(&refs, overwrites);
-                let ((kf, kn), (vf, vn)) = (field_of(key), field_of(value));
-                let body_len = kn
-                    + vn
-                    + varint_len(idxs.len())
-                    + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
-                update_varint(&mut hasher, body_len);
-                hasher.update(&kf[..kn]);
-                hasher.update(&vf[..vn]);
-                update_varint(&mut hasher, idxs.len());
-                for i in idxs {
-                    update_varint(&mut hasher, i);
-                }
-            }
+            } => ResolvedBody::Put {
+                key: *key,
+                value: *value,
+                overwrites: sorted_subset_indices(&refs, overwrites),
+            },
             Op::Mark {
                 start,
                 end,
                 kind_v,
                 value,
                 overwrites,
-            } => {
-                let sp = (ref_idx(start.id()) << 1) | start.side_bit();
-                let ep = (ref_idx(end.id()) << 1) | end.side_bit();
-                let idxs = sorted_subset_indices(&refs, overwrites);
-                let ((kf, kn), (vf, vn)) = (field_of(kind_v), field_of(value));
-                let body_len = varint_len(sp)
-                    + varint_len(ep)
-                    + kn
-                    + vn
-                    + varint_len(idxs.len())
-                    + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
-                update_varint(&mut hasher, body_len);
-                update_varint(&mut hasher, sp);
-                update_varint(&mut hasher, ep);
-                hasher.update(&kf[..kn]);
-                hasher.update(&vf[..vn]);
-                update_varint(&mut hasher, idxs.len());
-                for i in idxs {
-                    update_varint(&mut hasher, i);
-                }
-            }
+            } => ResolvedBody::Mark {
+                start: (ref_idx(start.id()) << 1) | start.side_bit(),
+                end: (ref_idx(end.id()) << 1) | end.side_bit(),
+                kind_v: *kind_v,
+                value: *value,
+                overwrites: sorted_subset_indices(&refs, overwrites),
+            },
             Op::Place {
                 placed_at,
                 overwrites,
-            } => {
-                let idxs = sorted_subset_indices(&refs, overwrites);
-                let (pf, pn) = field_of(placed_at);
-                let body_len = pn
-                    + varint_len(idxs.len())
-                    + idxs.iter().map(|&i| varint_len(i)).sum::<usize>();
-                update_varint(&mut hasher, body_len);
-                hasher.update(&pf[..pn]);
-                update_varint(&mut hasher, idxs.len());
-                for i in idxs {
-                    update_varint(&mut hasher, i);
-                }
-            }
-        }
-        Id(*hasher.finalize().as_bytes())
+            } => ResolvedBody::Place {
+                placed_at: *placed_at,
+                overwrites: sorted_subset_indices(&refs, overwrites),
+            },
+        };
+        hash_resolved(refs.iter(), &body)
     }
+}
+
+/// The id of the typing-chain shape: an insert whose only ref is its
+/// anchor. refs = [anchor], anchor ref_idx = 0; every length is a
+/// single-byte varint. This is the shape of every run-interior op. The
+/// whole preimage is assembled on the stack and hashed in one update call
+/// (per-update overhead dominates at this size). A char payload's value
+/// field is its short form, so the preimage is 39–42 bytes: one BLAKE3
+/// block, one compression.
+#[inline]
+pub(crate) fn chain_insert_id(anchor: &Id, side_bit: usize, payload: &Payload) -> Id {
+    let mut pre = [0u8; 36 + VALUE_FIELD_MAX];
+    pre[0] = KIND_INSERT;
+    pre[1] = 1; // ref_count
+    pre[2..34].copy_from_slice(&anchor.0);
+    let field: &mut [u8; VALUE_FIELD_MAX] =
+        (&mut pre[36..]).try_into().expect("sized for one field");
+    let n = value_field(&payload.value_id(), field);
+    pre[34] = 1 + n as u8; // body_len: anchor varint (1) + value field
+    pre[35] = side_bit as u8;
+    let mut hasher = node_hasher();
+    hasher.update(&pre[..36 + n]);
+    Id(*hasher.finalize().as_bytes())
+}
+
+/// A node body with every named ref already its index in the refs table
+/// (anchors packed as `(index << 1) | side_bit`, sets as ascending
+/// indices). Both node forms — `HashNode` in id space, `InternedHashNode`
+/// in handle space — reduce to this, so the preimage layout lives once
+/// (`hash_resolved`).
+pub(crate) enum ResolvedBody {
+    Insert {
+        packed: usize,
+        payload: Id,
+    },
+    Remove(Vec<usize>),
+    Move {
+        target: usize,
+        packed: usize,
+        overwrites: Vec<usize>,
+    },
+    Put {
+        key: Id,
+        value: Id,
+        overwrites: Vec<usize>,
+    },
+    Mark {
+        start: usize,
+        end: usize,
+        kind_v: Id,
+        value: Id,
+        overwrites: Vec<usize>,
+    },
+    Place {
+        placed_at: Id,
+        overwrites: Vec<usize>,
+    },
+}
+
+/// `BLAKE3::derive_key(NODE_CONTEXT, kind ‖ ref_count ‖ refs ‖ body_len ‖
+/// body)` (GRAMMAR_SPEC.md Part A) from the sorted refs table and a
+/// resolved body. Streamed without building a buffer.
+pub(crate) fn hash_resolved<'a>(
+    refs: impl ExactSizeIterator<Item = &'a Id>,
+    body: &ResolvedBody,
+) -> Id {
+    let set_len = |idxs: &[usize]| {
+        varint_len(idxs.len()) + idxs.iter().map(|&i| varint_len(i)).sum::<usize>()
+    };
+    let put_set = |hasher: &mut blake3::Hasher, idxs: &[usize]| {
+        update_varint(hasher, idxs.len());
+        for &i in idxs {
+            update_varint(hasher, i);
+        }
+    };
+
+    let mut hasher = node_hasher();
+    let kind = match body {
+        ResolvedBody::Insert { .. } => KIND_INSERT,
+        ResolvedBody::Remove(_) => KIND_REMOVE,
+        ResolvedBody::Move { .. } => KIND_MOVE,
+        ResolvedBody::Put { .. } => KIND_PUT,
+        ResolvedBody::Mark { .. } => KIND_MARK,
+        ResolvedBody::Place { .. } => KIND_PLACE,
+    };
+    hasher.update(&[kind]);
+    update_varint(&mut hasher, refs.len());
+    for r in refs {
+        hasher.update(&r.0);
+    }
+
+    match body {
+        ResolvedBody::Insert { packed, payload } => {
+            let (field, n) = field_of(payload);
+            update_varint(&mut hasher, varint_len(*packed) + n); // body_len
+            update_varint(&mut hasher, *packed);
+            hasher.update(&field[..n]);
+        }
+        ResolvedBody::Remove(idxs) => {
+            update_varint(&mut hasher, set_len(idxs));
+            put_set(&mut hasher, idxs);
+        }
+        ResolvedBody::Move {
+            target,
+            packed,
+            overwrites,
+        } => {
+            update_varint(
+                &mut hasher,
+                varint_len(*target) + varint_len(*packed) + set_len(overwrites),
+            );
+            update_varint(&mut hasher, *target);
+            update_varint(&mut hasher, *packed);
+            put_set(&mut hasher, overwrites);
+        }
+        ResolvedBody::Put {
+            key,
+            value,
+            overwrites,
+        } => {
+            let ((kf, kn), (vf, vn)) = (field_of(key), field_of(value));
+            update_varint(&mut hasher, kn + vn + set_len(overwrites));
+            hasher.update(&kf[..kn]);
+            hasher.update(&vf[..vn]);
+            put_set(&mut hasher, overwrites);
+        }
+        ResolvedBody::Mark {
+            start,
+            end,
+            kind_v,
+            value,
+            overwrites,
+        } => {
+            let ((kf, kn), (vf, vn)) = (field_of(kind_v), field_of(value));
+            update_varint(
+                &mut hasher,
+                varint_len(*start) + varint_len(*end) + kn + vn + set_len(overwrites),
+            );
+            update_varint(&mut hasher, *start);
+            update_varint(&mut hasher, *end);
+            hasher.update(&kf[..kn]);
+            hasher.update(&vf[..vn]);
+            put_set(&mut hasher, overwrites);
+        }
+        ResolvedBody::Place {
+            placed_at,
+            overwrites,
+        } => {
+            let (pf, pn) = field_of(placed_at);
+            update_varint(&mut hasher, pn + set_len(overwrites));
+            hasher.update(&pf[..pn]);
+            put_set(&mut hasher, overwrites);
+        }
+    }
+    Id(*hasher.finalize().as_bytes())
 }
 
 /// A value field's preimage form and its length (`value::value_field`).

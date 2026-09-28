@@ -693,19 +693,24 @@ impl HashSeq {
         }
     }
 
-    /// Clone of `self.tips` with `anchor` removed.
+    /// The tips an op pins, as handles: every tip `named` does not already
+    /// reference (pins stay normalized: `refs ∖ named`). Tips are applied,
+    /// so each resolves.
     ///
-    /// Fast path: sequential typing leaves `tips == {anchor}`, in which case the
-    /// result is empty and we skip cloning the BTreeSet entirely (which would
-    /// allocate a tree node just to drop it).
-    fn tips_minus(&self, anchor: &Id) -> BTreeSet<Id> {
-        if self.tips.len() == 1 && self.tips.contains(anchor) {
-            BTreeSet::new()
-        } else {
-            let mut deps = self.tips.clone();
-            deps.remove(anchor);
-            deps
+    /// Fast path: sequential typing leaves `tips == {anchor}`, so the pins
+    /// are empty and nothing is allocated.
+    fn tip_pins(&self, named: impl Fn(&Id) -> bool) -> SortedIdVec {
+        if self.tips.len() == 1 && self.tips.first().is_some_and(&named) {
+            return SortedIdVec::default();
         }
+        // `tips` iterates in Id order, so the handles land sorted.
+        SortedIdVec::from_id_sorted(
+            self.tips
+                .iter()
+                .filter(|t| !named(t))
+                .map(|t| self.interns.get(t).expect("tips are applied"))
+                .collect(),
+        )
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {
@@ -721,25 +726,29 @@ impl HashSeq {
             return;
         };
 
-        let cursor = self
-            .cursor_at(idx.min(self.len()))
-            .expect("cursor_at is total for idx <= len");
-        let first_node = cursor.first_node(first_ch);
+        // Authored and applied in handle space: no `HashNode`, no id
+        // resolution (`author`).
+        let (at, pins) = self
+            .insert_point(idx.min(self.len()))
+            .expect("insert_point is total for idx <= len");
+        let (_, mut prev) = self.author(InternedHashNode {
+            pins,
+            op: InternedOp::Insert {
+                at,
+                payload: Payload::Char(first_ch),
+            },
+        });
 
-        // Cursor-derived inserts anchor on applied elements/origin and are
-        // always admitted, so the hot path applies directly — no clone.
-        let mut prev_id = first_node.id();
-        let _ = self.apply_with_id(prev_id, first_node);
-
-        // After the first apply, tips == {prev_id}, so the chained nodes carry no
-        // extra deps.
+        // After the first apply, tips == {prev}, so the chained nodes carry
+        // no pins.
         for ch in chars {
-            let node = HashNode {
-                pins: BTreeSet::new(),
-                op: Op::insert_after(prev_id, ch),
-            };
-            prev_id = node.id();
-            let _ = self.apply_with_id(prev_id, node);
+            (_, prev) = self.author(InternedHashNode {
+                pins: SortedIdVec::default(),
+                op: InternedOp::Insert {
+                    at: InternedAnchor::After(prev),
+                    payload: Payload::Char(ch),
+                },
+            });
         }
     }
 
@@ -766,40 +775,34 @@ impl HashSeq {
 
     /// Remove `amount` characters starting at visible position `idx`.
     ///
-    /// Returns the `HashNode` that was applied — useful when the caller wants to
-    /// re-broadcast the op over the wire. Returns `None` if `amount == 0` or if
-    /// `idx` is past the end (no characters were actually removed).
-    pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<HashNode> {
-        let node = self.make_remove_batch(idx, amount)?;
-        let _ = self.apply_with_id(node.id(), node.clone());
-        Some(node)
+    /// Returns the applied op's id — `node` gives its wire form, e.g. to
+    /// re-broadcast it. `None` if `amount == 0` or `idx` is past the end
+    /// (nothing was removed).
+    pub fn remove_batch(&mut self, idx: usize, amount: usize) -> Option<Id> {
+        let node = self.remove_node(idx, amount)?;
+        Some(self.author(node).0)
     }
 
     /// Build (without applying) the removal of `amount` characters starting
     /// at visible position `idx`. `None` if nothing is there to remove.
     pub fn make_remove_batch(&self, idx: usize, amount: usize) -> Option<HashNode> {
-        if amount == 0 {
+        Some(self.remove_node(idx, amount)?.to_node(&self.interns))
+    }
+
+    /// The removal of up to `amount` visible elements from `idx`, in handle
+    /// space: one index seek and a walk for the targets, the tips they
+    /// leave for pins.
+    fn remove_node(&self, idx: usize, amount: usize) -> Option<InternedHashNode> {
+        let mut targets: Vec<InternedId> = self.elements_from(idx).take(amount).collect();
+        if targets.is_empty() {
             return None;
         }
-
-        // One seek and a walk. A single-char remove (a backspace) builds its
-        // one-element set directly; a wider one bulk-builds from the
-        // collected ids (`FromIterator` sorts once) instead of one tree
-        // insert per id.
-        let mut ids = self
-            .elements_from(idx)
-            .take(amount)
-            .map(|i| *self.interns.id(i));
-        let first = ids.next()?;
-        let to_remove = match ids.next() {
-            None => BTreeSet::from([first]),
-            Some(second) => [first, second].into_iter().chain(ids).collect(),
-        };
-
-        let pins = BTreeSet::from_iter(self.tips.difference(&to_remove).cloned());
-        Some(HashNode {
+        targets.sort_unstable_by(|a, b| self.interns.id(*a).cmp(self.interns.id(*b)));
+        let targets = SortedIdVec::from_id_sorted(targets);
+        let pins = self.tip_pins(|t| targets.contains(t, &self.interns));
+        Some(InternedHashNode {
             pins,
-            op: Op::Remove(to_remove),
+            op: InternedOp::Remove(targets),
         })
     }
 
@@ -1854,10 +1857,40 @@ impl HashSeq {
         }
         let mut queue: Vec<(Id, HashNode)> = Vec::new();
         let outcome = self.orphan_or_dispatch(id, node, &mut queue);
+        self.drain_woken(queue);
+        outcome
+    }
+
+    /// Apply a locally authored op, built in handle space: its id is
+    /// computed there (`InternedHashNode::id`) and it skips resolution — its
+    /// refs are handles already. Returns the id and the op's handle.
+    fn author(&mut self, node: InternedHashNode) -> (Id, InternedId) {
+        let id = node.id(&self.interns);
+        if let Some(handle) = self.interns.get(&id) {
+            return (id, handle); // re-authoring an op this replica holds
+        }
+        // The op interns first when applied (woken orphans come after).
+        let handle = self.interns.next_interned();
+        self.interpret(id, node)
+            .expect("locally authored ops are admissible");
+        let mut queue = Vec::new();
+        self.delivery.wake(&id, &mut queue);
+        self.drain_woken(queue);
+        (id, handle)
+    }
+
+    /// Apply the orphans an application woke, and those they wake.
+    fn drain_woken(&mut self, mut queue: Vec<(Id, HashNode)>) {
         while let Some((id, node)) = queue.pop() {
             let _ = self.orphan_or_dispatch(id, node, &mut queue);
         }
-        outcome
+    }
+
+    /// The wire form of an applied op — e.g. to broadcast one just authored
+    /// (`remove_batch` returns its id).
+    pub fn node(&self, id: &Id) -> Option<HashNode> {
+        let interned = self.interned_at(self.interns.get(id)?)?;
+        Some(interned.to_node(&self.interns))
     }
 
     /// Resolve the node's refs to handles — once, for everything past this
@@ -2339,35 +2372,39 @@ impl HashSeq {
     }
 
     pub fn cursor_at(&self, idx: usize) -> Option<Cursor> {
+        let (at, pins) = self.insert_point(idx)?;
+        Some(Cursor {
+            at: at.to_anchor(&self.interns),
+            pins: pins.to_id_set(&self.interns),
+        })
+    }
+
+    /// Where an insert at visible position `idx` anchors, and the tips it
+    /// pins — in handle space (`cursor_at` is the id-space view).
+    fn insert_point(&self, idx: usize) -> Option<(InternedAnchor, SortedIdVec)> {
         if idx > self.len() {
             return None;
         }
         let (left, right) = self.neighbours(idx);
-        let at = match (
-            left.map(|l| self.render_anchor(l)),
-            right.map(|r| self.render_anchor(r)),
-        ) {
+        let at = match (left, right) {
             (Some(left), Some(_)) => {
-                // TODO: why not the visible right neighbor?
-
+                let left = self.render_anchor(left);
                 // Fugue rule. The Before anchor is left's traversal successor
                 // with tombstones included — not the visible right neighbor —
                 // and `region_first` guarantees it has no before-children, so
                 // the insert lands directly after left with no Id-ordered
                 // sibling race.
                 match self.afters_of(left).next() {
-                    Some(child) => Anchor::Before(*self.interns.id(self.region_first(child))),
-                    None => Anchor::After(*self.interns.id(left)),
+                    Some(child) => InternedAnchor::Before(self.region_first(child)),
+                    None => InternedAnchor::After(left),
                 }
             }
-            (Some(left), None) => Anchor::After(*self.interns.id(left)),
-            (None, Some(right)) => Anchor::Before(*self.interns.id(right)),
-            (None, None) => Anchor::After(self.origin),
+            (Some(left), None) => InternedAnchor::After(self.render_anchor(left)),
+            (None, Some(right)) => InternedAnchor::Before(self.render_anchor(right)),
+            (None, None) => InternedAnchor::After(ORIGIN_IDX),
         };
-        Some(Cursor {
-            pins: self.tips_minus(at.id()),
-            at,
-        })
+        let anchor = self.interns.id(at.idx());
+        Some((at, self.tip_pins(|t| t == anchor)))
     }
 
     /// Apply an `EncodableOp` to the sequence. `Run` ops are decompressed into their
@@ -4366,6 +4403,34 @@ mod test {
         check_index_matches_iter(&seq);
     }
 
+    /// Ops authored in handle space (`author`) have the ids their wire
+    /// forms hash to, and replay to the same document on a fresh replica.
+    #[test]
+    fn locally_authored_ops_match_their_wire_form() {
+        let mut seq = HashSeq::default();
+        seq.insert_batch(0, "hello world".chars());
+        seq.remove_batch(5, 1); // backspace-style single remove
+        seq.insert_batch(5, "_there_".chars()); // typing into the middle
+        let rm = seq.remove_batch(0, 3).unwrap(); // multi-target remove
+        seq.insert_batch(0, "J".chars());
+
+        let mut replay = HashSeq::default();
+        for (id, node) in seq.nodes_in_apply_order() {
+            assert_eq!(node.id(), id, "wire form hashes to the authored id");
+            assert_eq!(seq.node(&id), Some(node.clone()));
+            assert_eq!(replay.apply(node), Ok(Outcome::Applied));
+        }
+        assert_eq!(seq.node(&rm).map(|n| n.id()), Some(rm));
+        assert_eq!(
+            replay.iter().collect::<String>(),
+            seq.iter().collect::<String>()
+        );
+        assert_eq!(
+            crate::encoding::encode_hashseq(&replay),
+            crate::encoding::encode_hashseq(&seq)
+        );
+    }
+
     /// Moves of a removed element, each anchored at the previous move's
     /// splice point, get no fragment at apply time; the first insert at the
     /// chain's end materializes all of them. The chain length is peer
@@ -4625,7 +4690,7 @@ mod test {
             .unwrap();
 
         let before = crate::encoding::encode_hashseq(&seq);
-        for anchor in [rm.id(), mk.id()] {
+        for anchor in [rm, mk.id()] {
             let node = HashNode {
                 pins: BTreeSet::new(),
                 op: Op::insert_after(anchor, 'X'),
@@ -5025,7 +5090,7 @@ mod test {
         assert!(seq.marks_at(&seq.origin()).is_empty());
         assert!(seq.marks_at(&mark.id()).is_empty());
         let remove = seq.remove_batch(1, 1).unwrap();
-        assert!(seq.marks_at(&remove.id()).is_empty());
+        assert!(seq.marks_at(&remove).is_empty());
         let mv = seq.move_element(a, Anchor::After(c)).unwrap();
         assert!(seq.marks_at(&mv.id()).is_empty());
         for tip in seq.tips().clone() {
@@ -5073,7 +5138,7 @@ mod test {
         seq.insert_batch(0, "ab".chars());
         let a = seq.id_at(0).unwrap();
         let b = seq.id_at(1).unwrap();
-        let rm = seq.remove_batch(1, 1).unwrap().id();
+        let rm = seq.remove_batch(1, 1).unwrap();
         let tips = seq.tips().clone();
         let peer = seq.clock();
 
@@ -5577,7 +5642,7 @@ mod test {
         let node = HashNode {
             pins: BTreeSet::new(),
             op: Op::Move {
-                target: remove.id(),
+                target: remove,
                 to: Anchor::After(a),
                 overwrites: BTreeSet::new(),
             },

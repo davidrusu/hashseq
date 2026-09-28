@@ -31,6 +31,15 @@ the stack, one hasher update — recovered roughly half of the initial
 regression). A same-conditions A/B against the pre-Move commit confirmed the
 Move/HashKv additions cost nothing on text traces.
 
+**Update 2026-09-28: local ops author in handle space.** `insert_batch` /
+`remove_batch` build `InternedHashNode`s straight from handles, hash them
+there (`InternedHashNode::id`, sharing `hash_resolved` with `HashNode::id`)
+and apply without resolving — no id-space `BTreeSet`s, node clone, or
+id → handle lookups. `remove_batch` returns the op id (`node(&id)` gives the
+wire form). Load-gated A/B (12 pairs) vs 50bb35a, min: automerge −14.2%
+(2.39M → 2.81M char edits/s), json-crdt −9.0%, svelte −8.1%, seph −7.2%,
+clownschool −6.7%, rustcode −6.3%, friendsforever −6.3%.
+
 **Update 2026-09-27: position walks.** `RunIndex::seek` + `elems_from`
 (one descent, then an in-order walk that skips tombstone-only subtrees by
 their visible counts and deleted bits a word at a time) replace per-position

@@ -13,6 +13,7 @@
 //! compared across replicas, or put on the wire; set-valued roles are
 //! `SortedIdVec`s, which keep `Id` order.
 
+use crate::hash_node::{ResolvedBody, chain_insert_id, hash_resolved};
 use crate::{Anchor, HashNode, Id, InternIndex, Op, Payload};
 use crate::{InternedId, SortedIdVec};
 
@@ -34,6 +35,12 @@ impl InternedAnchor {
     #[inline]
     pub fn is_after(&self) -> bool {
         matches!(self, InternedAnchor::After(_))
+    }
+
+    /// GRAMMAR side bit: 0 = Before, 1 = After (`Anchor::side_bit`).
+    #[inline]
+    pub fn side_bit(&self) -> usize {
+        self.is_after() as usize
     }
 
     #[inline]
@@ -190,6 +197,75 @@ impl InternedHashNode {
             .chain(set.into_iter().flatten())
     }
 
+    /// The node's id, computed in handle space: the same preimage
+    /// `HashNode::id` hashes (`hash_node::hash_resolved`), with the refs
+    /// table ordered by the handles' ids — no `HashNode` is built. Locally
+    /// authored ops apply through this form directly.
+    pub fn id(&self, interns: &InternIndex) -> Id {
+        if let InternedOp::Insert { at, payload } = &self.op
+            && self.pins.is_empty()
+        {
+            return chain_insert_id(interns.id(at.idx()), at.side_bit(), payload);
+        }
+
+        let mut refs: Vec<InternedId> = self.refs().collect();
+        refs.sort_unstable_by(|a, b| interns.id(*a).cmp(interns.id(*b)));
+        refs.dedup();
+        let ref_idx = |h: InternedId| -> usize {
+            refs.binary_search_by(|x| interns.id(*x).cmp(interns.id(h)))
+                .expect("named handle is in the refs table")
+        };
+        // Set roles are `SortedIdVec`s (id order), so their indices ascend.
+        let set = |s: &SortedIdVec| -> Vec<usize> { s.iter().map(ref_idx).collect() };
+        let packed = |a: &InternedAnchor| (ref_idx(a.idx()) << 1) | a.side_bit();
+        let body = match &self.op {
+            InternedOp::Insert { at, payload } => ResolvedBody::Insert {
+                packed: packed(at),
+                payload: payload.value_id(),
+            },
+            InternedOp::Remove(targets) => ResolvedBody::Remove(set(targets)),
+            InternedOp::Move {
+                target,
+                to,
+                overwrites,
+            } => ResolvedBody::Move {
+                target: ref_idx(*target),
+                packed: packed(to),
+                overwrites: set(overwrites),
+            },
+            InternedOp::Put {
+                key,
+                value,
+                overwrites,
+            } => ResolvedBody::Put {
+                key: *key,
+                value: *value,
+                overwrites: set(overwrites),
+            },
+            InternedOp::Mark {
+                start,
+                end,
+                kind_v,
+                value,
+                overwrites,
+            } => ResolvedBody::Mark {
+                start: packed(start),
+                end: packed(end),
+                kind_v: *kind_v,
+                value: *value,
+                overwrites: set(overwrites),
+            },
+            InternedOp::Place {
+                placed_at,
+                overwrites,
+            } => ResolvedBody::Place {
+                placed_at: *placed_at,
+                overwrites: set(overwrites),
+            },
+        };
+        hash_resolved(refs.iter().map(|h| interns.id(*h)), &body)
+    }
+
     /// The wire form: every handle mapped back through the id table
     /// (`interns.id(h)` is `h`'s id). No rehashing — the node's own id is
     /// `interns.id(its handle)`.
@@ -331,6 +407,21 @@ mod tests {
         for node in sample_nodes() {
             let interned = InternedHashNode::resolve(&node, &interns).expect("all refs known");
             assert_eq!(interned.to_node(&interns), node);
+        }
+    }
+
+    /// The handle-space id is the id-space id for every op shape — with
+    /// handles interned in reverse, so handle order and id order disagree
+    /// and only an id-ordered refs table can match.
+    #[test]
+    fn interned_id_matches_node_id() {
+        let mut interns = InternIndex::default();
+        for i in (0..16).rev() {
+            interns.intern(tid(i));
+        }
+        for node in sample_nodes() {
+            let interned = InternedHashNode::resolve(&node, &interns).expect("all refs known");
+            assert_eq!(interned.id(&interns), node.id(), "{node:?}");
         }
     }
 
