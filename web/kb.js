@@ -27,7 +27,7 @@ const WS_ORIGIN = (() => {
   return hex(bytes);
 })();
 
-const STORAGE_KEY = 'hashweb-kb-snapshot-v4'; // v4: full reset, workspace.v2 origin
+const STORAGE_KEY = 'hashweb-kb-snapshot-v5'; // v5: full reset (identity-form value ids, 2026-09-29)
 
 function hex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
