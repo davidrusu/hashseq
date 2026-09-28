@@ -84,7 +84,7 @@ Plan: keep the store on HashWeb; resolve at apply and re-resolve on artifact arr
 6. Tests: by-id non-ASCII char applied before and after its artifact arrives renders as the char; ids equal; `payload_of` → None after resolution; strict web round-trip of resolved state.
 7. Docs: HASHSEQ_SPEC.md "Payload" (~:99) and the `ATOM_CHAR` doc: placeholder means "until resolved".
 
-Note: seq stream bytes change once an atom resolves (`0x01 id` → `0x00 len bytes`, mandatory per GRAMMAR_SPEC:241-244), so `decode_hashweb_strict` of an old snapshot holding a by-id atom plus its artifact reports `NotCanonical` after resolution. Correct per spec; a visible behaviour change.
+Note: seq stream bytes change once an atom resolves (`0x01 id` → `0x00 len bytes`, mandatory per GRAMMAR_SPEC "Stream references and value elision"), so `decode_hashweb_strict` of an old snapshot holding a by-id atom plus its artifact reports `NotCanonical` after resolution. Correct per spec; a visible behaviour change.
 
 ### 11. Bounded select/rank on large fragments — OPEN
 

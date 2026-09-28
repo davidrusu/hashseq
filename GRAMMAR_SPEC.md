@@ -1,30 +1,30 @@
 # Grammar spec: the freeze set
 
-Status: 2026-07-02, draft for review. The byte-level grammar in two parts
-with two different freeze strengths:
+The byte grammar, in two parts with different freeze strengths:
 
-- **Part A — identity grammar**: everything in the id preimage. Changing
-  any of it later is an identity hard fork (context-string bump; every id
+- **Part A — identity grammar**: everything inside an id preimage. Changing
+  any of it is an identity hard fork (context-string bump; every id
   changes). This is the freeze set proper.
-- **Part B — snapshot stream grammar**: the canonical artifact form
+- **Part B — snapshot stream grammar**: the canonical snapshot form
   (ENCODING_SPEC.md's rules made concrete). Versioned by a stream header;
   changing it re-fingerprints snapshots but never touches op identity.
-
-Rationale for contested calls is recorded inline, where each rule is
-defined.
 
 ## Primitives and canonicality meta-rules
 
 - `varint` — LEB128 unsigned, 7 bits per byte, low group first, high bit =
-  continuation. **Minimal form mandatory** (no zero-padded continuation) —
-  a non-minimal varint is malformed.
+  continuation. **Minimal form only**: a zero-padded continuation (e.g.
+  `80 00`), or a 10th byte carrying more than the top bit, is malformed.
 - `id` — 32 raw bytes (BLAKE3 output).
 - signed integers — zigzag, then varint.
 - **One value, one encoding.** Every set is sorted ascending and
   duplicate-free; every optional is a presence tag with a mandatory rule
-  for when it may appear; every length must be exact. Any violation is
-  malformed — a grammar reject, which is total, convergent, and stable
-  (bytes are the input), hence a permanent verdict.
+  for when it appears; every length is exact. A violation is malformed — a
+  grammar reject, which depends only on the bytes and so is total,
+  convergent, and permanent.
+- **No redundancy.** A length appears exactly where a boundary is
+  otherwise undecidable within one encoding, and nowhere else. A second
+  copy of a fact is a new mismatch class and frozen identity spent on
+  nothing.
 
 ## Part A: identity grammar
 
@@ -35,164 +35,147 @@ NODE_CONTEXT   = "hashweb v1 node id"
 VALUE_CONTEXT  = "hashweb v1 value id"
 OBJECT_CONTEXT = "hashweb v1 object id"
 
-id(u)              = BLAKE3::derive_key(NODE_CONTEXT,   node_bytes(u))
-value_id(a)        = len ‖ a ‖ 0^(31 − len)          if 1 ≤ len ≤ 15   -- identity form
-                   = BLAKE3::derive_key(VALUE_CONTEXT,  a)  otherwise
-                       -- a = artifact_bytes(a), len = |a| as one byte
+id(u)                = BLAKE3::derive_key(NODE_CONTEXT, node_bytes(u))
+value_id(a)          = len ‖ a ‖ 0^(31 − len)            if 1 ≤ len ≤ 15  -- identity form
+                     = BLAKE3::derive_key(VALUE_CONTEXT, a)  otherwise
+                       -- a = artifact bytes, len = |a| as one byte
 object_id(k, origin) = BLAKE3::derive_key(OBJECT_CONTEXT, k ‖ origin)
-                       -- k: the object kind tag (KIND_KV = 0x00 /
-                       --    KIND_SEQ = 0x01, one byte); origin: an
-                       --    arbitrary 32-byte value the object's creator
-                       --    chose
+                       -- k: object kind, one byte (KIND_KV = 0x00, KIND_SEQ = 0x01)
+                       -- origin: any 32-byte value the object's creator chose
 ```
 
-One node context for every op kind; one value context for every value kind;
-one object context deriving every object's store address. **Origins and
-object ids are distinct, and they live at different layers**: the origin
-(an arbitrary 32-byte value — often another op's id, by app convention)
-is the op-level anchor — what an object's ops ref and bottom out at; the
-object id, derived from
-**kind ‖ origin**, is the store-level address (routing envelope + index)
-and **never appears in any preimage**. The kind is inside the address, so
-the same origin opened as a Seq and as a Kv is two different objects, and
-kind mis-agreement is unrepresentable rather than refused. Kinds are tags
-inside the encodings. Bump a context string ⟺ identity hard fork; there
-is no other versioning at this layer.
+One context per id class; op kinds and value kinds are tags inside the
+encodings. Bumping a context string is an identity hard fork — there is no
+other versioning at this layer.
+
+**Origin vs object id.** The origin is the op-level anchor: an object's
+ops ref it and bottom out at it. The object id is the store-level address
+(routing envelope, index) and **never appears in any preimage**. Because
+the kind is inside the derivation, the same origin opened as a Seq and as
+a Kv is two different objects; kind disagreement is unrepresentable.
 
 ### Identity-form value ids
 
-A small artifact is its own value id — no hash, and inverting it is a
-parse (`identity_artifact`), so every replica reads the same value out of
-the same id while holding nothing. Why:
+An artifact of 1–15 bytes is its own value id — no hash. Inverting it is a
+parse (`identity_artifact`): check `id[0] ∈ 1..=15` and that
+`id[1+len..]` is all zero. Every replica reads the same value out of the
+same id while holding nothing.
 
-- **One stored form per node, with no store.** A payload's rendering must
-  be a function of the node set. With hashed ids only, a small value sent
-  by id renders as the value on a replica that can invert the id and as an
-  opaque atom elsewhere — the same node id, two states (the 2026-09
-  review: a non-ASCII char sent `0x01 id` rendered U+FFFC). Inverting a
-  hash needs a table over the value universe (≈ 9 MB for chars alone); the
-  identity form needs nothing.
-- **No tag bit.** Identity ids are recognized by shape: `len ∈ 1..=15` and
-  at least 16 zero bytes of padding. That set holds ≈ 2^120 ids of 2^256,
-  so landing a BLAKE3 value id on one costs ≥ 2^128 work — BLAKE3's own
-  collision bound. The bound on `len` is exactly what keeps it there; do
-  not raise it. BLAKE3 ids keep all 256 bits.
-- **Extensible.** Which form applies depends on the artifact's length
-  alone, never its kind: a new small artifact kind changes no id, and a
-  replica that does not know the kind still derives, verifies and carries
-  its id (it renders a placeholder). The length byte frames the artifact,
-  so trailing `0x00` bytes inside it are unambiguous.
-- **Short preimage fields.** A value field in a node preimage is the
-  id's unpadded prefix for identity-form ids ("Value fields" below), so
-  small values cost their size, not 32 bytes, in every node hash.
-- **Consequences.** Identity values are never held in a value store (the
-  id is the bytes; a stream `ValueStore` entry for one is non-canonical)
-  and never shipped as artifact frames. Value ids are no longer uniform:
-  an author picks small ones directly, so nothing may key an unseeded
-  hash table by value id (or by any id read raw off the wire).
+- **Why.** A payload's rendering must be a function of the node set. With
+  hashed ids only, a small value sent by id renders as the value where a
+  replica can invert the hash and as an opaque atom elsewhere — one node
+  id, two states. The identity form needs no inversion table.
+- **No tag bit.** Identity ids are recognized by shape (`len ∈ 1..=15` plus
+  ≥ 16 zero bytes). That set is ≈ 2^120 of 2^256 ids, so landing a BLAKE3
+  value id on one costs ≥ 2^128 work, BLAKE3's own collision bound. The
+  bound on `len` is what keeps it there: **do not raise it.** Hashed ids
+  keep all 256 bits.
+- **Kind-agnostic.** The form depends on artifact length alone: a new small
+  artifact kind changes no id, and a replica that does not know the kind
+  still derives, verifies and carries its id (rendering a placeholder). The
+  length byte frames the artifact, so trailing `0x00` bytes inside it are
+  unambiguous.
+- **Consequences.** Identity-form values are never held in a value store
+  and never shipped as artifact bytes; a stream carrying one in an
+  artifact section or `ValueStore` is non-canonical. Value ids are not
+  uniform — an author picks small ones directly — so nothing may key an
+  unseeded hash table by value id (or by any id read raw off the wire).
 
 ### The node grammar: envelope ‖ body
 
 ```
 node     := envelope body
-envelope := kind      : varint          -- op kind tag (table below)
+envelope := kind      : varint          -- op kind tag (Op kinds)
             ref_count : varint          -- |refs(u)|, ≥ 1
             refs      : ref_count × id  -- refs(u), sorted ascending, unique
             body_len  : varint          -- exact byte length of body
 ```
 
-The envelope is the kind-independent parse (HETEROGENEITY.md): a replica
-that does not know `kind` still reads the refs (buffering and commitment)
-and skips `body_len` bytes. Placement is **body semantics** — where an op
-sits in its container is kind-level meaning, and not every kind has a place
-(a `Put` does not); an op anchoring on a node of unknown kind orphans until
-the kind is known (Op kinds, below). The refs table doubles as the
-body's dictionary: role fields address it by index, and any entry no role
-addresses is a pure frontier pin — the named/pin split is positional, never
-flagged (there is no tips marker; the partition is semantically inert, so
-the artifact does not record it). The preimage is these bytes verbatim — the id commits
-to the envelope and body exactly as transmitted, and the streaming hasher
-is pinned by test to this layout.
+The preimage is these bytes verbatim. An implementation that streams the
+preimage into the hasher must be pinned by test to this layout
+(`id_preimage_is_the_canonical_encoding`).
 
-`ref_count ≥ 1`: every op pins at least its frontier, and a frontier is
-never empty (every object has an origin from birth). A zero-ref node is
-malformed. An object's origin is the recursion's base: an arbitrary
-32-byte value its creator chose. Choosing another op's id is the standard
-*composition convention* — it welds the new object into that op's causal
-closure (ownership-style nesting), but the store attaches no semantics to
-the choice: creation is not an op-layer concept. Object ids never appear
-among refs — they are store-level addresses, not op-level anchors; naming
-an object id in an envelope *is* naming its kind, since the kind is
-inside the derivation. There is
-no store-level anchor above root objects; each object's closure is its own
-commitment domain. An object's first op is `refs = {origin}` — causally
-empty, but never anchor-free. That is the rule's real content: no op
-floats outside a commitment chain, which is what roots routing and
-confines ops to their object (an op bottoming at object A's origin can
-never merge into object B).
+- **Kind-independent parse** (HETEROGENEITY.md). A replica that does not
+  know `kind` still reads the refs (for buffering and commitment) and skips
+  `body_len` bytes. Placement is body semantics — not every kind has a
+  place (`Put` does not).
+- **The refs table is the body's dictionary.** Role fields address it by
+  index. An entry no role addresses is a frontier pin; the named/pin split
+  is positional and never flagged (it is semantically inert).
+- **`ref_count ≥ 1`.** Every op pins at least its frontier, and a frontier
+  is never empty: every object has an origin from birth. An object's first
+  op is `refs = {origin}`. No op floats outside a commitment chain, which
+  roots routing and confines ops to their object — an op bottoming at A's
+  origin can never merge into B.
+- **Origins are the base case.** An origin is an arbitrary 32-byte value.
+  Choosing another op's id is the standard composition convention (it
+  welds the new object into that op's causal closure), but creation is not
+  an op-layer concept and the store attaches no meaning to the choice.
+  There is no store-level anchor above root objects; each object's closure
+  is its own commitment domain.
+- **Object ids never appear among refs.** They are store addresses, not
+  anchors.
 
 ### Op kinds
 
 ```
 anchor := varint( (ref_idx << 1) | side )     -- side: 0 = Before, 1 = After
+set    := count:varint ‖ count × ref_idx:varint   -- indices strictly ascending
 ```
 
-| tag | kind     | body                                                                                                                 |
-|-----|----------|----------------------------------------------------------------------------------------------------------------------|
-| 0   | `Insert` | `at: anchor`, `value` — the payload                                                                                  |
-| 1   | `Remove` | `count:varint`, then `count` × `ref_idx:varint`, ascending                                                           |
-| 2   | `Move`   | `target: ref_idx`, `to: anchor`, `count`, `count` × `ref_idx` ascending (`overwrites`)                               |
-| 3   | `Put`    | `key: value`, `val: value`, `count`, `count` × `ref_idx` ascending (`overwrites`)                                    |
-| 4   | `Mark`   | `start: anchor`, `end: anchor`, `kind_v: value`, `val: value`, `count`, `count` × `ref_idx` ascending (`overwrites`) |
-| 5   | `Place`  | `placed_at: value`, `count`, `count` × `ref_idx` ascending (`overwrites`) — containment register, valid in any object's DAG (PLACEMENT_SPEC.md; added 2026-07-04 via the extension path) |
+| tag | kind     | body                                                                  |
+|-----|----------|-----------------------------------------------------------------------|
+| 0   | `Insert` | `at: anchor` ‖ `payload: value`                                        |
+| 1   | `Remove` | `targets: set`                                                         |
+| 2   | `Move`   | `target: ref_idx` ‖ `to: anchor` ‖ `overwrites: set`                   |
+| 3   | `Put`    | `key: value` ‖ `val: value` ‖ `overwrites: set`                        |
+| 4   | `Mark`   | `start: anchor` ‖ `end: anchor` ‖ `kind_v: value` ‖ `val: value` ‖ `overwrites: set` |
+| 5   | `Place`  | `placed_at: value` ‖ `overwrites: set` — containment register, valid in any object's DAG (PLACEMENT_SPEC.md) |
 
-Unknown kind tags are **not** malformed: the node is carried opaquely
-(envelope semantics only), per the extension path; ops that reference it in
-roles orphan until the kind is known.
+`value` fields use the short form of "Value fields" below.
 
-`Insert` carries a **single** anchor by decision — Fugue-style dual
-left/right origins were rejected: a committed interval hands every
-malicious peer an inverted `(right, left)` pair (and crossing intervals
-from several peers form constraint sets with no consistent order), forcing
-per-insert interval validation and a new arbitration surface onto the
-system's hottest op, on top of a second ref in every insert preimage and
-an absent-right sentinel. Non-interleaving is convention-scoped; full
-rationale and accepted residuals: HASHSEQ_SPEC.md, Resolution.
+**Unknown kind tags are not malformed**: the node is carried opaquely
+(envelope semantics only), and ops that reference it in roles orphan until
+the kind is known.
 
-There is **no route field in the preimage** — delivery rides a **routing
-envelope**, `obj_id ‖ node`, that is pure transport metadata (never
-hashed, never part of identity). The envelope address is the derived
-object id (`object_id(k, origin)` above; a standalone document's `doc_id`
-is the same class); it disambiguates every ref for free — an op id `X`
-used as another object's origin names the element in its own object's
-envelope and the origin anchor in the other's, with no dual-role
-ambiguity because the two streams never mix. The envelope needs no trust
-and no verdict: an op enveloped to the wrong object simply never applies
-there (its refs never arrive inside that object), the same fate as any
-garbage ref — bounded and attributable. Buffering is two-level: envelopes
-naming unknown object ids orphan store-wide until the object is opened or
-adopted; ops inside a live object orphan on their first missing ref in that
-object's own buffer.
+**`Insert` has a single anchor.** Fugue-style left/right origins were
+rejected: a committed interval lets a malicious peer author an inverted
+`(right, left)` pair (and crossing intervals from several peers can admit
+no consistent order), forcing interval validation and a new arbitration
+surface onto the hottest op. Rationale and residuals: HASHSEQ_SPEC.md,
+Resolution.
+
+**No route field in the preimage.** Delivery rides a routing envelope,
+`obj_id ‖ node`, which is transport metadata — never hashed. Its address is
+the derived object id (a standalone document's `doc_id` is the same
+class). It disambiguates every ref: an op id `X` used as another object's
+origin names an element in its own object's envelope and the origin anchor
+in the other's, and the two streams never mix. The envelope needs no trust:
+an op enveloped to the wrong object never applies there (its refs never
+arrive in that object). Buffering is two-level — envelopes naming an
+unknown object id orphan store-wide until the object is opened; ops inside
+a live object orphan on their first missing ref in that object's buffer.
 
 ### Value fields: a function of the id in the preimage
 
 ```
-value := len:u8 ‖ artifact     -- the id is identity-form (len 1..=15):
-                               --   its own bytes, minus the zero padding
-       | 0x20 ‖ id             -- any other id: 32 raw bytes (a hashed
-                               --   value_id, an op-node id, an object id)
+value := len:u8 ‖ artifact     -- identity-form id (len 1..=15): id[..1+len]
+       | 0x20 ‖ id             -- any other id, 32 raw bytes (hashed value id,
+                               --   op-node id, object id, origin)
 ```
 
-A payload/key/value field is the id's **short form**: an identity-form id
-contributes `id[..1+len]`, any other id `0x20 ‖ id` — never a ref-table
-index. The form is a function of the 32-byte id alone, so identity stays
-availability-independent (no verdict depends on whether a replica holds
-the artifact bytes — the rule that forbids an inline-iff-small preimage).
-It is injective: the first byte is ≤ 15 exactly for the short form, which
-zero-pads back to the id. Why not always 32 bytes: a typing-path insert
-preimage (`kind ‖ ref_count ‖ anchor ‖ body_len ‖ anchor_ref ‖ value`) is
-then 39–42 bytes — one BLAKE3 block — instead of 68 (two); measured −6 to
-−11% on every sequential trace (2026-09-25).
+A payload/key/value field is the id's **short form** — never a ref-table
+index.
+
+- **A function of the 32-byte id alone**, so identity never depends on
+  whether a replica holds the artifact bytes (which is why an
+  inline-iff-held preimage is forbidden).
+- **Injective**: the first byte is ≤ 15 exactly for the short form, which
+  zero-pads back to the id.
+- **Why not always 32 bytes**: a typing-path insert preimage
+  (`kind ‖ ref_count ‖ anchor_id ‖ body_len ‖ anchor ‖ value`) is then
+  39–42 bytes — one BLAKE3 block instead of two (measured −6 to −11% on
+  the sequential traces).
 
 ### Value artifact grammar
 
@@ -200,53 +183,56 @@ then 39–42 bytes — one BLAKE3 block — instead of 68 (two); measured −6 t
 artifact := kind:varint ‖ payload
 ```
 
-| tag | kind        | payload                            | notes                                                                         |
-|-----|-------------|------------------------------------|-------------------------------------------------------------------------------|
-| 0   | `Tombstone` | empty                              | `TOMBSTONE = value_id(0x00)` — derived constant (identity form)               |
-| 1   | `Bool`      | 1 byte, 0x00/0x01                  |                                                                               |
-| 2   | `Int`       | zigzag varint                      | i64 range; out-of-range is app-level                                          |
-| 3   | `Char`      | minimal UTF-8, one scalar          | text payloads                                                                 |
-| 4   | `String`    | UTF-8 bytes                        |                                                                               |
-| 5   | `Bytes`     | raw bytes                          |                                                                               |
+| tag | kind        | payload                            | notes                                                                        |
+|-----|-------------|------------------------------------|------------------------------------------------------------------------------|
+| 0   | `Tombstone` | empty                              | `TOMBSTONE = value_id(0x00)` — a derived constant (identity form)            |
+| 1   | `Bool`      | 1 byte, `0x00` / `0x01`            |                                                                              |
+| 2   | `Int`       | zigzag varint                      | i64 range; out-of-range is app-level                                         |
+| 3   | `Char`      | minimal UTF-8, one scalar          | text payloads                                                                |
+| 4   | `String`    | UTF-8 bytes                        |                                                                              |
+| 5   | `Bytes`     | raw bytes                          |                                                                              |
 | 6   | `F64`       | 8 bytes, IEEE 754 LE, bit-verbatim | every bit pattern is a distinct value; NaN normalization is the app's concern |
 
-Artifact bytes are the `value_id` preimage; there is **no length prefix
-inside an artifact** — an artifact is a leaf, hashed whole, and every
-carrier already frames it (`ValueStore` entries are `len ‖ artifact`; the
-stream's inline value form carries `len`). An internal length would be
-redundant, and redundancy in canonical bytes is a liability: a second copy
-of a fact is a new mismatch class and frozen identity spent on nothing.
-The general rule: a length appears exactly where a boundary is otherwise
-undecidable *within* one encoding (op bodies count their interior lists for
-this reason), and nowhere else — so a future artifact kind with more than
-one variable-length field must self-delimit all but its final field.
-Unknown artifact tags are carried opaquely — the id verifies, renderers
-show placeholders. (An internal length is also unnecessary for the
-identity form: the id's own length byte frames the artifact.)
-`TOMBSTONE` is an ordinary derived id: a computed constant, published as
-a test vector, never magic bytes in id space.
+- Artifact bytes are the `value_id` preimage. There is **no length prefix
+  inside an artifact**: it is a leaf, hashed whole, and every carrier
+  frames it (store entries are `len ‖ artifact`; the stream's inline form
+  carries `len`; the identity form carries its own length byte). A future
+  kind with more than one variable-length field must self-delimit all but
+  its last field.
+- Unknown artifact tags are carried opaquely: the id verifies, renderers
+  show a placeholder.
+- `TOMBSTONE` is an ordinary derived id — a computed constant published as
+  a test vector, never magic bytes in id space.
 
 ### Grammar-level validation (all stable)
 
 Malformed — reject permanently and drop; anything that refs it orphans on
-the missing ref: non-
-minimal varint; unsorted/duplicated refs table or index list;
-`ref_count = 0`; `body_len` mismatch; ref index ≥ `ref_count`; trailing
-bytes. **Not**
-malformed: unknown op kinds, unknown artifact kinds (carried), and any
-semantic property of referents (those verdicts belong to the admission
-table, which runs when referents are present).
+the missing ref:
+
+- non-minimal varint;
+- unsorted or duplicated refs table or index set;
+- `ref_count = 0`;
+- `body_len` mismatch, or trailing bytes;
+- ref index ≥ `ref_count`.
+
+**Not** malformed: unknown op kinds, unknown artifact kinds (both carried),
+and any semantic property of referents — those verdicts belong to the
+admission table, which runs when the referents are present.
 
 ## Part B: snapshot stream grammar
 
-Concrete form of ENCODING_SPEC.md's block/order/ref rules. Softer freeze:
-the header carries `stream_version`; bumping it re-fingerprints snapshots
-without touching identity.
+Concrete form of ENCODING_SPEC.md's block, order and ref rules. Softer
+freeze: the header carries `stream_version`; bumping it re-fingerprints
+snapshots without touching identity.
+
+Status: Part B is the target grammar and is **not yet implemented**. The
+current encoder emits the unversioned form in ENCODING_SPEC.md "Byte
+layouts", which follows the same block/order/ref rules.
 
 ### Header
 
 ```
-stream  := magic "hwb1" ‖ stream_version:varint ‖ genesis:id ‖ block*
+stream := magic "hwb1" ‖ stream_version:varint ‖ genesis:id ‖ block*
 ```
 
 `genesis` is implicit dict entry 0 of the stream-level reference space.
@@ -257,42 +243,43 @@ stream  := magic "hwb1" ‖ stream_version:varint ‖ genesis:id ‖ block*
 block := kind:varint ‖ len:varint ‖ body        -- skippable by construction
 ```
 
-Block kinds: `Run` (insert chains, both anchor flavors, interior extra-deps
-at offsets), `RemoveChain` (one block per maximal remove chain: deps once,
-then direction-tagged segments — ranges where contiguous, singles otherwise;
-subsumes spans and singles), `Node` (any op verbatim in Part A form, with
-ref-table ids replaced by stream refs — the fallback for ops that fit no chain,
-and the carrier for unknown kinds), `ValueStore` (artifact bytes:
-`count`, then `count` × (`len` ‖ artifact); artifacts referenced by the
-stream, sorted by value_id; erased blobs simply absent). Emission order and
-cycle-breaking per ENCODING_SPEC.md (hard remove→run edges, force-emit
-smallest blocked head, dict spill).
+| block         | carries                                                                                                  |
+|---------------|----------------------------------------------------------------------------------------------------------|
+| `Run`         | an insert chain, either head anchor side; interior extra-deps at their offsets                            |
+| `RemoveChain` | one maximal remove chain: deps once, then direction-tagged segments (ranges where contiguous, singles otherwise) |
+| `Node`        | any op verbatim in Part A form with ref-table ids replaced by stream refs — the fallback for ops no chain fits, and the carrier for unknown kinds |
+| `ValueStore`  | `count ‖ count × (len ‖ artifact)`: artifacts the stream references, sorted by value id; erased blobs absent; never identity-form |
 
-**Run-split rule (adopted):** when a run's interior dep participates in a
-run↔remove 2-cycle and splitting the run at that offset evacuates the
+Emission order and cycle breaking follow ENCODING_SPEC.md.
+
+**Run-split rule.** When a run's interior dep participates in a
+run↔remove 2-cycle and splitting the run at that offset removes the
 spilled id from the dict entirely, the canonical form *is* the split
 (run-prefix, remove, run-suffix — all refs backward). The condition is a
-function of the op set; no encoder choice.
+function of the op set, not an encoder choice.
 
 ### Stream references and value elision
 
 Refs in block bodies are tagged varints with within-kind rank spaces
-(run-element `(run_rank, offset)` keeps the cheapest tag; remove rank;
-dict) — per ENCODING_SPEC.md. **Value elision**: where a Part A `value`
-field appears and the artifact is in this stream's `ValueStore` with
-artifact bytes ≤ 32, the stream form inlines `0x00 len bytes`; otherwise
-`0x01 id`. Inline is mandatory when present-and-small — no choice — and
-the decoder derives the value_id to reconstruct the Part A preimage
-exactly. Identity-form values are never in a `ValueStore`; the
-implemented encoder inlines chars and sends other identity-form values
-`0x01 id` (the id carries the bytes). Chain interiors elide tips/anchor (implicit `prev`); the decoder
+(run-element `(run_rank, offset)` has the cheapest tag; remove rank; dict),
+per ENCODING_SPEC.md.
+
+**Value elision.** Where a Part A `value` field appears:
+
+- artifact in this stream's `ValueStore` and ≤ 32 bytes → `0x00 len bytes`
+  (mandatory — no choice);
+- identity-form `Char` → `0x00 len bytes`;
+- otherwise → `0x01 id` (for any other identity-form value, the id carries
+  the bytes).
+
+The decoder derives the value id to rebuild the Part A preimage exactly.
+Chain interiors elide pins and anchor (implicitly `prev`); the decoder
 reconstructs each member's full envelope deterministically.
 
 ## Open items
 
-1. **Test vectors — generated and locked** (2026-07-02, by the first
-   implementation; regenerated 2026-09-24 for identity-form value ids and 2026-09-25 for short-form value fields — pre-release, so no context bump; mirrored in `tests/grammar_vectors.rs`, which fails on
-   any drift):
+1. **Test vectors.** Locked by `tests/grammar_vectors.rs` (printed by
+   `examples/grammar_vectors.rs`); any drift fails the test:
 
    ```
    TOMBSTONE            = 0100000000000000000000000000000000000000000000000000000000000000
@@ -311,19 +298,16 @@ reconstructs each member's full envelope deterministically.
                                                (both value-field forms)
    ```
 
-   Still owed: a small canonical snapshot vector once the Part B stream
-   encoder is normalized (block derivation from the op set).
-2. **Stream ref bit-packing.** The exact tag/rank/offset packing for
-   stream refs (Part B) — carry over the implemented `r1`/`00`/`10` scheme
-   and its measured trade-offs; pin the widths when the encoder is ported.
-3. **No `MarkChain` block in v1.** Part B has chain blocks only where
-   volume demands them (`Run` for insert chains, `RemoveChain` for delete
-   chains); each mark op travels uncompressed as its own `Node` block,
-   since mark volume is orders of magnitude below element volume —
-   compression would buy noise. The one workload that could change the
-   math is a "format painter" sweep: one gesture emitting many same-kind,
-   same-value marks chained `refs = {prev}`, which a `MarkChain` block
-   could encode as kind/value/deps once plus two anchors per entry. If
-   profiles ever show it, that is a stream-version addition — Part B is
-   header-versioned, so a new block kind re-fingerprints snapshots but
-   never touches op identity.
+   Still owed: `Mark` and `Place` vectors, and a Part B snapshot vector
+   once Part B is implemented (the current stream's bytes are locked by
+   `canonical_snapshot_vector` in `src/encoding.rs`).
+2. **Stream ref bit-packing.** Pin the exact tag/rank/offset widths for
+   Part B refs; carry over the implemented `r1` / `00` / `10` scheme
+   (ENCODING_SPEC.md "Byte layouts").
+3. **No `MarkChain` block in v1.** Chain blocks exist only where volume
+   demands (`Run`, `RemoveChain`); each mark travels as its own `Node`
+   block, since mark volume is orders of magnitude below element volume.
+   The one workload that could change this is a "format painter" sweep —
+   many same-kind, same-value marks chained `refs = {prev}`, encodable as
+   kind/value/deps once plus two anchors per entry. If profiles show it,
+   add it as a stream-version bump; op identity is untouched.
