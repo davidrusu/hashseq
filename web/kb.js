@@ -92,6 +92,30 @@ function loadStore() {
 const web = loadStore();
 const WS = web.createKv(WS_ORIGIN); // idempotent: open ≠ create
 
+/// Every store write that can change what a derived read returns goes
+/// through here — local edits and remote merges alike — so the caches below
+/// (placements, the live-atom set) never outlive the data they came from.
+/// Opens (`createSeq`/`createKv`), artifact stores and outbox drains change
+/// no structure and are not wrapped.
+const STORE_WRITES = [
+  'textInsert', 'textRemove', 'seqInsertRef', 'seqMove',
+  'markRange', 'markRangeClosed', 'unmarkRange',
+  'putString', 'putRef', 'del', 'placeAt',
+  'applyDelta', 'mergeEncoded',
+];
+for (const m of STORE_WRITES) {
+  const write = web[m].bind(web);
+  web[m] = (...args) => {
+    const r = write(...args);
+    storeChanged();
+    return r;
+  };
+}
+function storeChanged() {
+  placementMemo.clear();
+  liveAtomMemo = null;
+}
+
 // A layout node is a seq. A LEAF is a text block. A CONTAINER's first
 // element is this marker atom; its remaining elements are child-node refs.
 // Orientation alternates by depth (body=vertical, then horizontal, …), so
@@ -119,9 +143,9 @@ function currentBody0() {
 
 const TOMB_ID = WasmHashWeb.tombstoneId();
 
-// Register reads memoized per render; any local write or remote merge
-// invalidates (placeObjAt / render() clear). Keyed by OBJECT id — layout
-// nodes are seqs, pages are kvs, the register rides either.
+// Register reads, memoized until the store changes (`storeChanged`). Keyed
+// by OBJECT id — layout nodes are seqs, pages are kvs, the register rides
+// either.
 const placementMemo = new Map();
 function placementOfObj(obj) {
   let pl = placementMemo.get(obj);
@@ -139,7 +163,30 @@ function placementInfo(origin) {
 /// superseding the heads this replica sees.
 function placeObjAt(obj, elemId) {
   web.placeAt(obj, elemId);
-  placementMemo.delete(obj);
+}
+
+/// Every link atom present in the current page's layout tree (winning or
+/// ghost), memoized per page until the store changes. A register's fallback
+/// chain may name atoms that were since removed; only these can hold a node.
+let liveAtomMemo = null;
+function liveAtoms() {
+  if (liveAtomMemo?.body === currentBody0()) return liveAtomMemo.atoms;
+  const atoms = new Set();
+  const seen = new Set();
+  const walk = (origin) => {
+    if (seen.has(origin)) return;
+    seen.add(origin);
+    const obj = web.createSeq(origin);
+    for (let i = childOffset(origin); i < web.textLen(obj); i++) {
+      const o = web.payloadAt(obj, i);
+      if (!o || o === CONTAINER_MARK) continue;
+      atoms.add(web.seqIdAt(obj, i));
+      if (nodeIsContainer(o)) walk(o);
+    }
+  };
+  if (currentBody0()) walk(currentBody0());
+  liveAtomMemo = { body: currentBody0(), atoms };
+  return atoms;
 }
 function placeNodeAt(nodeOrigin, elemId) {
   placeObjAt(web.createSeq(nodeOrigin), elemId);
@@ -166,14 +213,34 @@ function setListKind(blockOrigin, kind) {
   else web.del(current, 'blockKind:' + blockOrigin);
 }
 
-/// The winning link atom for a node, per the register: chain[0] is the
-/// single head's claim, or the last-agreed placement under conflict
-/// (freeze — contenders never render). TOMB = deleted. null = legacy.
+/// The winning link atom for a node, per the register (PLACEMENT_SPEC
+/// "Freeze"): the first chain entry still present — chain[0] is the single
+/// head's claim, or the last-agreed placement under conflict (contenders
+/// never render), later entries its fallbacks. A TOMB entry = deleted.
+/// null = legacy (no register); undefined = deleted or placed nowhere.
 function winningAtomOf(origin) {
   const pl = placementInfo(origin);
   if (pl.empty) return null;
-  const w = pl.chain[0];
-  return !w || w === TOMB_ID ? undefined : w; // undefined = placed nowhere
+  const live = liveAtoms();
+  for (const w of pl.chain) {
+    if (w === TOMB_ID) return undefined;
+    if (live.has(w)) return w;
+  }
+  return undefined;
+}
+
+/// Deleted on purpose (the register's first decisive entry is a TOMB) —
+/// as opposed to placed nowhere by a conflict, which the unplaced strip
+/// surfaces.
+function isDeleted(origin) {
+  const pl = placementInfo(origin);
+  if (pl.empty) return false;
+  const live = liveAtoms();
+  for (const w of pl.chain) {
+    if (w === TOMB_ID) return true;
+    if (live.has(w)) return false;
+  }
+  return false;
 }
 
 /// Child node refs of a container (or of the body), membership-filtered:
@@ -256,53 +323,31 @@ function replaceChild(parentOrigin, oldOrigin, newOrigin) {
   const ci = childIndexOf(parentOrigin, oldOrigin);
   insertChildAt(parentOrigin, newOrigin, ci < 0 ? 1e9 : ci);
 }
-/// Depth after edits can leave empty containers or pointless single-child
-/// wrappers; a full walk from the body removes the former and unwraps the
-/// latter (trees are tiny, so a whole-tree normalize is cheap and simpler
-/// than incremental parent tracking).
-function normalizeTree(parentOrigin, seen = new Set()) {
-  const p = web.createSeq(parentOrigin);
-  // Legacy heal only: for nodes WITHOUT a register, duplicate atoms are
-  // visible — first occurrence in document order wins, later raw atoms
-  // are removed. Registered nodes cannot visibly duplicate (membership
-  // picks one atom) and their ghosts must be retained for the fallback.
-  {
-    const legacySeen = new Set();
-    let i = childOffset(parentOrigin);
-    while (i < web.textLen(p)) {
-      const o = web.payloadAt(p, i);
-      if (o && o !== CONTAINER_MARK && placementInfo(o).empty) {
-        if (legacySeen.has(o)) {
-          web.textRemove(p, i, 1);
-          continue;
-        }
-        legacySeen.add(o);
-      }
-      i++;
-    }
-  }
-  for (const c of childNodes2(parentOrigin)) {
-    if (seen.has(c.origin)) continue; // cycle guard
+/// The rendered layout: a node's children with the tree collapsed — an
+/// empty container shows as nothing, a one-child container as that child.
+/// A pure view: nothing is written, so replicas never race to rewrite the
+/// same structure (writing this cleanup as ops deleted blocks under
+/// concurrent drags). `slot` is the real child of `nodeOrigin` a shown node
+/// occupies — sibling inserts are indexed by it. A shown container carries
+/// its own `kids`. Each node shows once (duplicate / cycle guard).
+function viewKids(nodeOrigin, seen = new Set()) {
+  const out = [];
+  for (const c of childNodes2(nodeOrigin)) {
+    if (seen.has(c.origin)) continue;
     seen.add(c.origin);
-    if (!nodeIsContainer(c.origin)) continue;
-    normalizeTree(c.origin, seen);
-    const kids = childNodes2(c.origin);
-    if (kids.length === 0) {
-      removeNodeFromParent(parentOrigin, c.origin);
-    } else if (kids.length === 1) {
-      // Unwrap: hoist the child to the container's slot (a move — a fresh
-      // claim), then delete the container.
-      const ci = childIndexOf(parentOrigin, c.origin);
-      insertChildAt(parentOrigin, kids[0].origin, ci < 0 ? 1e9 : ci);
-      seen.delete(kids[0].origin);
-      removeNodeFromParent(parentOrigin, c.origin);
+    if (!nodeIsContainer(c.origin)) {
+      out.push({ origin: c.origin, slot: c.origin, conflicted: c.conflicted });
+      continue;
     }
+    const kids = viewKids(c.origin, seen);
+    if (kids.length === 1) out.push({ ...kids[0], slot: c.origin });
+    else if (kids.length > 1) out.push({ origin: c.origin, slot: c.origin, conflicted: c.conflicted, kids });
   }
+  return out;
 }
 /// Every leaf block object across the whole tree (for comments etc).
 /// Dedup across the WHOLE tree, not just per-parent: duplicate refs from
-/// concurrent edits must never surface twice (render heals visually even
-/// before normalizeTree repairs the data).
+/// concurrent edits must never surface twice.
 function allLeaves(parentOrigin, seen = new Set()) {
   const out = [];
   for (const c of childNodes2(parentOrigin)) {
@@ -810,7 +855,7 @@ const toolsEl = document.getElementById('page-tools');
 const noPageEl = document.getElementById('no-page');
 const statObjects = document.getElementById('stat-objects');
 const statBytes = document.getElementById('stat-bytes');
-const statParked = document.getElementById('stat-orphaned');
+const statParked = document.getElementById('stat-parked');
 
 let current = null; // pageObj hex
 let currentBody = null; // body seq obj id
@@ -1367,13 +1412,10 @@ function renderBody(el, bodyObj) {
 // ---- rendering ---------------------------------------------------------------
 
 function render() {
-  // A rebuild mid-drag rebuilds the rows/leaves under the pointer; the
-  // drop that follows would act on stale state — cancel the drag instead.
-  treeDrag = null;
-  dragCol = null;
+  // Drags survive a rebuild (a peer typing re-renders several times a
+  // second): both are keyed by origin, and the drop re-resolves its slot.
   // A title typed for one page must never land on the page we switch to.
   if (titlePending && titlePending.page !== current) flushTitle();
-  placementMemo.clear();
   rebuildGraph();
   if (current && !pageMeta.has(current)) current = null;
   if (!current && rootPages.length > 0) current = rootPages[0];
@@ -1450,7 +1492,7 @@ function renderTree() {
         treeDrag = { pageObj: p, origin: meta.origin };
         row.classList.add('dragging');
         e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', meta.title);
+        e.dataTransfer.setData(KB_DRAG, meta.origin);
       };
       row.ondragend = () => {
         row.classList.remove('dragging');
@@ -1602,10 +1644,9 @@ function renderEditor() {
     conflictEl.style.display = 'none';
   }
 
-  // Body: a seq of ROW refs; each row a seq of column blocks.
+  // Body: the layout tree's root container.
   currentBodyOrigin = refsOf(current, 'body').sort()[0] ?? null;
   currentBody = bodyOf(current);
-  if (currentBody) ensureTreeSchema(current, currentBody);
   renderBlocks();
   renderComments();
 }
@@ -2045,52 +2086,23 @@ function clearDropMarks() {
 // dropping a block perpendicular to its target's parent auto-creates a
 // container the other way — arbitrary subdivision from one rule.
 
-/// One-time migration into the tree model. Handles both the flat-block
-/// legacy and the intermediate rows model via the page's bodySchema flag.
-function ensureTreeSchema(page, body) {
-  const schema = stringsOf(page, 'bodySchema');
-  if (schema.includes('tree')) return;
-  const isRows = schema.includes('rows');
-  const atoms = [];
-  const n = web.textLen(body);
-  for (let i = 0; i < n; i++) {
-    const o = web.payloadAt(body, i);
-    if (o) atoms.push(o);
-  }
-  // A flat body IS already a valid tree (a list of leaf refs): flag it
-  // and touch nothing. Rewriting atoms here tombstones registered
-  // children's claimed atoms (remove-wins = deletion) — found the hard
-  // way when a delta-synced fresh page rendered on a peer before its
-  // bodySchema flag arrived and 'migrated' itself invisible. Same guard
-  // for any body that already has registered children: it cannot be
-  // pre-tree data, whatever the flag says.
-  if (!isRows || atoms.some((o) => !placementOfObj(web.createSeq(o)).empty)) {
-    web.putString(page, 'bodySchema', 'tree');
-    persistSoon();
-    return;
-  }
-  web.textRemove(body, 0, web.textLen(body));
-  for (const ao of atoms) {
-    // rows model (pre-register data, presence rule): ao is a row seq of
-    // column blocks.
-    const row = web.createSeq(ao);
-    const cols = [];
-    for (let i = 0; i < web.textLen(row); i++) {
-      const c = web.payloadAt(row, i);
-      if (c) cols.push(c);
-    }
-    if (cols.length <= 1) {
-      web.seqInsertRef(body, web.textLen(body), cols[0] ?? ao);
-    } else {
-      web.seqInsertRef(row, 0, CONTAINER_MARK); // reuse the row seq as a container
-      web.seqInsertRef(body, web.textLen(body), ao);
-    }
-  }
-  web.putString(page, 'bodySchema', 'tree');
-  persistSoon();
-}
+let dragCol = null; // { origin } — a block drag in flight (slot resolved at drop)
 
-let dragCol = null; // { origin, parentOrigin }
+/// Where each shown leaf sits in the current render: its shown parent, the
+/// slot it occupies there, and its depth (`viewKids`). Rebuilt by every
+/// render; handlers look a leaf up here by origin. Unplaced leaves have no
+/// entry — there is no slot beside them.
+let leafPlaces = new Map(); // origin -> { parentOrigin, slot, depth }
+
+/// Our drags carry only this type, never text: a drop that no handler of
+/// ours takes (say, after the source vanished) must not fall through to the
+/// browser inserting text into an editor.
+const KB_DRAG = 'application/x-kb-drag';
+const isKbDrag = (e) => [...(e.dataTransfer?.types ?? [])].includes(KB_DRAG);
+document.addEventListener('dragend', () => {
+  dragCol = null;
+  treeDrag = null;
+});
 
 /// Drop the dragged leaf beside `col` on side `dir`. Parallel to the
 /// target's parent axis → sibling insert; perpendicular → wrap target in a
@@ -2100,21 +2112,18 @@ function dropOnLeaf(col, dir) {
   dragCol = null;
   if (!src) return;
   const tOrigin = col.dataset.origin;
-  if (src.origin === tOrigin) return;
-  const tParent = col.dataset.parentOrigin;
-  const tDepth = Number(col.dataset.depth);
+  const place = leafPlaces.get(tOrigin);
+  // Not beside itself, not beside an unplaced block, and never a block a
+  // peer deleted while it was being dragged (a claim would resurrect it).
+  if (src.origin === tOrigin || !place || isDeleted(src.origin)) return render();
+  const { parentOrigin: tParent, depth: tDepth } = place;
   // A move is never a delete: the new claim supersedes the old placement,
   // and the old atom stays as a dead ghost.
   const parentAxis = (tDepth - 1) % 2 === 0 ? 'V' : 'H';
   const dirAxis = dir === 'left' || dir === 'right' ? 'H' : 'V';
   const before = dir === 'left' || dir === 'top';
-  const ti = childIndexOf(tParent, tOrigin);
-  if (ti < 0) {
-    normalizeTree(currentBodyOrigin);
-    persistSoon();
-    render();
-    return;
-  }
+  const ti = childIndexOf(tParent, place.slot);
+  if (ti < 0) return render(); // the target moved meanwhile
   if (parentAxis === dirAxis) {
     insertChildAt(tParent, src.origin, ti + (before ? 0 : 1));
   } else {
@@ -2125,7 +2134,6 @@ function dropOnLeaf(col, dir) {
     const cont = makeContainerNode(kids);
     insertChildAt(tParent, cont, ti);
   }
-  normalizeTree(currentBodyOrigin);
   persistSoon();
   render();
 }
@@ -2133,9 +2141,8 @@ function dropOnLeaf(col, dir) {
 function newLeafToNewRow(bodyIdx) {
   const src = dragCol;
   dragCol = null;
-  if (!src) return;
+  if (!src || isDeleted(src.origin)) return render();
   insertChildAt(currentBodyOrigin, src.origin, bodyIdx); // move = re-claim
-  normalizeTree(currentBodyOrigin);
   persistSoon();
   render();
 }
@@ -2180,10 +2187,10 @@ function focusLeaf(origin, offset) {
   setSelectionRangeIn(ed, offset === 'end' ? cpLen(extractText(ed)) : offset);
 }
 
+/// Delete a block from wherever it really lives (its shown parent may be
+/// a collapsed ancestor of that).
 function removeLeaf(origin) {
-  const parent = parentOfNode(origin) ?? currentBodyOrigin;
-  removeNodeFromParent(parent, origin);
-  normalizeTree(currentBodyOrigin);
+  removeNodeFromParent(parentOfNode(origin) ?? currentBodyOrigin, origin);
 }
 
 /// The caret's client rect; empty blocks fall back to the editor's box.
@@ -2293,10 +2300,10 @@ function makeColumn(obj, origin) {
   handle.title = 'drag to move, or drop beside/under another block to split';
   handle.draggable = true;
   handle.ondragstart = (e) => {
-    dragCol = { origin: col.dataset.origin, parentOrigin: col.dataset.parentOrigin };
+    dragCol = { origin: col.dataset.origin };
     col.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', 'block');
+    e.dataTransfer.setData(KB_DRAG, col.dataset.origin);
   };
   handle.ondragend = () => {
     col.classList.remove('dragging');
@@ -2305,7 +2312,7 @@ function makeColumn(obj, origin) {
   };
 
   col.ondragover = (e) => {
-    if (!dragCol) return;
+    if (!dragCol || !leafPlaces.has(col.dataset.origin)) return; // unplaced: no slot beside it
     e.preventDefault();
     e.stopPropagation();
     const rect = col.getBoundingClientRect();
@@ -2320,8 +2327,8 @@ function makeColumn(obj, origin) {
   };
   col.ondragleave = () => clearDropMarks();
   col.ondrop = (e) => {
+    if (isKbDrag(e)) e.preventDefault();
     if (!dragCol) return;
-    e.preventDefault();
     e.stopPropagation();
     clearDropMarks();
     const rect = col.getBoundingClientRect();
@@ -2453,9 +2460,10 @@ function makeColumn(obj, origin) {
       // The list continues: the new item inherits the flavor.
       setListKind(nb, listKind);
     }
-    const parent = col.dataset.parentOrigin;
-    const ci = childIndexOf(parent, col.dataset.origin);
-    insertChildAt(parent, nb, ci + 1);
+    const place = leafPlaces.get(col.dataset.origin); // unplaced: to the page's end
+    const parent = place?.parentOrigin ?? currentBodyOrigin;
+    const ci = place ? childIndexOf(parent, place.slot) : -1;
+    insertChildAt(parent, nb, ci < 0 ? 1e9 : ci + 1);
     persistSoon();
     render();
     for (const ed of blocksEl.querySelectorAll('.block-ed')) {
@@ -2635,7 +2643,7 @@ function makeColumn(obj, origin) {
     flushDeferredRender();
   });
   ta.addEventListener('drop', (e) => {
-    if (dragCol) e.preventDefault();
+    if (dragCol || isKbDrag(e)) e.preventDefault();
   });
   ta.onfocus = () => {
     focusedBlockObj = obj;
@@ -2651,8 +2659,7 @@ function makeColumn(obj, origin) {
   del.textContent = '✕';
   del.title = 'remove block';
   del.onclick = () => {
-    removeNodeFromParent(col.dataset.parentOrigin, col.dataset.origin);
-    normalizeTree(currentBodyOrigin);
+    removeLeaf(col.dataset.origin);
     persistSoon();
     render();
   };
@@ -2730,34 +2737,63 @@ function updateLeafContent(col, obj, ed) {
   }
 }
 
-function renderNodeInto(parentEl, origin, depth, parentOrigin, prevLeaves, single, seen, conflicted) {
-  if (seen.has(origin)) return; // duplicate ref — render first occurrence only
-  seen.add(origin);
-  if (nodeIsContainer(origin)) {
+/// Render one view entry (`viewKids`): a container with 2+ shown kids,
+/// or a leaf. `parentOrigin` is the shown parent — where sibling inserts
+/// beside this node go, at its `slot`.
+function renderNodeInto(parentEl, entry, depth, parentOrigin, prevLeaves, single) {
+  if (entry.kids) {
     const cont = document.createElement('div');
     cont.className = 'node-container';
     cont.style.flexDirection = depth % 2 === 0 ? 'column' : 'row';
-    for (const k of childNodes2(origin)) {
-      renderNodeInto(cont, k.origin, depth + 1, origin, prevLeaves, false, seen, k.conflicted);
-    }
+    for (const k of entry.kids) renderNodeInto(cont, k, depth + 1, entry.origin, prevLeaves, false);
     parentEl.appendChild(cont);
     return;
   }
-  const obj = web.createSeq(origin);
-  let col = prevLeaves.get(origin);
-  if (col) prevLeaves.delete(origin);
-  else col = makeColumn(obj, origin);
-  col.dataset.parentOrigin = parentOrigin;
-  col.dataset.depth = depth;
+  parentEl.appendChild(leafCol(entry, depth, parentOrigin, prevLeaves, single));
+}
+
+/// A leaf's column, reused across renders (caret survives); its place in
+/// the tree goes to `leafPlaces` (`parentOrigin` null: unplaced).
+function leafCol(entry, depth, parentOrigin, prevLeaves, single) {
+  const obj = web.createSeq(entry.origin);
+  let col = prevLeaves.get(entry.origin);
+  if (col) prevLeaves.delete(entry.origin);
+  else col = makeColumn(obj, entry.origin);
+  if (parentOrigin) leafPlaces.set(entry.origin, { parentOrigin, slot: entry.slot, depth });
   // Contested placement (two register heads): frozen at last-agreed,
   // badged; the next drag names both heads and resolves.
-  col.classList.toggle('pl-conflict', !!conflicted);
-  col.title = conflicted ? 'placement contested by a concurrent move — drag to resolve' : '';
+  col.classList.toggle('pl-conflict', !!entry.conflicted);
+  col.title = entry.conflicted ? 'placement contested by a concurrent move — drag to resolve' : '';
   const ed = col.querySelector('.block-ed');
   if (single) ed.dataset.placeholder = 'Type here…';
   else delete ed.dataset.placeholder;
   updateLeafContent(col, obj, ed);
-  parentEl.appendChild(col);
+  return col;
+}
+
+/// Leaves of this page's tree that render nowhere yet were never deleted —
+/// a conflict froze them at a removed atom, or inside a node that renders
+/// nowhere. Surfaced so they can be dragged back (the page tree's
+/// unplaced strip, block edition).
+function unplacedLeaves(shown) {
+  const out = [];
+  const seen = new Set();
+  const walk = (origin) => {
+    if (seen.has(origin)) return;
+    seen.add(origin);
+    const obj = web.createSeq(origin);
+    for (let i = childOffset(origin); i < web.textLen(obj); i++) {
+      const o = web.payloadAt(obj, i);
+      if (!o || o === CONTAINER_MARK) continue;
+      if (nodeIsContainer(o)) walk(o);
+      else if (!shown.has(o) && !seen.has(o) && !isDeleted(o)) {
+        seen.add(o);
+        out.push(o);
+      }
+    }
+  };
+  walk(currentBodyOrigin);
+  return out;
 }
 
 /// Number list items: a DOM-only pass (CSS sibling-counter shadowing is
@@ -2807,16 +2843,28 @@ function renderBlocks() {
   for (const c of blocksEl.querySelectorAll('.block-col')) prevLeaves.set(c.dataset.origin, c);
 
   const frag = document.createDocumentFragment();
-  const topKids = childNodes2(currentBodyOrigin);
-  const single = topKids.length === 1 && !nodeIsContainer(topKids[0].origin);
-  const seen = new Set();
+  leafPlaces = new Map();
+  const shown = new Set();
+  const topKids = viewKids(currentBodyOrigin, shown);
+  const single = topKids.length === 1 && !topKids[0].kids;
   for (const k of topKids) {
-    renderNodeInto(frag, k.origin, 1, currentBodyOrigin, prevLeaves, single, seen, k.conflicted);
+    renderNodeInto(frag, k, 1, currentBodyOrigin, prevLeaves, single);
+  }
+  const unplaced = unplacedLeaves(shown);
+  if (unplaced.length) {
+    const strip = document.createElement('div');
+    strip.className = 'unplaced-blocks';
+    const head = document.createElement('div');
+    head.className = 'orphan-note';
+    head.textContent = '⚠ UNPLACED — concurrent moves left these nowhere; drag them back';
+    strip.appendChild(head);
+    for (const o of unplaced) strip.appendChild(leafCol({ origin: o }, 1, null, prevLeaves, false));
+    frag.appendChild(strip);
   }
 
   for (const c of prevLeaves.values()) c.remove();
   blocksEl
-    .querySelectorAll(':scope > .node-container, :scope > .block-col')
+    .querySelectorAll(':scope > .node-container, :scope > .block-col, :scope > .unplaced-blocks')
     .forEach((e) => e.remove());
   const add = ensureAddButton();
   for (const child of [...frag.childNodes]) blocksEl.insertBefore(child, add);
@@ -2828,6 +2876,7 @@ function renderBlocks() {
     if (dragCol) e.preventDefault();
   };
   blocksEl.ondrop = (e) => {
+    if (isKbDrag(e)) e.preventDefault();
     if (dragCol && (e.target === blocksEl || e.target === add)) {
       newLeafToNewRow(childNodes2(currentBodyOrigin).length);
     }
@@ -3905,6 +3954,7 @@ window.__kb = {
   spans: (obj) => JSON.parse(web.markedSpans(obj)),
   text: (obj) => web.text(obj),
   blocks: () => allLeaves(currentBodyOrigin).map((b) => b.obj),
+  body: () => currentBody,
   persist: () => persistNow(true),
   render,
 };
