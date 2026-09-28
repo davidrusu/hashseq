@@ -13,7 +13,7 @@
 //! compared across replicas, or put on the wire; set-valued roles are
 //! `SortedIdVec`s, which keep `Id` order.
 
-use crate::hash_node::{ResolvedBody, chain_insert_id, hash_resolved};
+use crate::hash_node::{ResolvedBody, chain_insert_id, hash_resolved, single_remove_id};
 use crate::{Anchor, HashNode, Id, InternIndex, Op, Payload};
 use crate::{InternedId, SortedIdVec};
 
@@ -207,6 +207,13 @@ impl InternedHashNode {
         {
             return chain_insert_id(interns.id(at.idx()), at.side_bit(), payload);
         }
+        if let InternedOp::Remove(targets) = &self.op
+            && let [target] = targets.as_slice()
+            && self.pins.len() <= 1
+        {
+            let pin = self.pins.first().map(|p| interns.id(p));
+            return single_remove_id(interns.id(*target), pin);
+        }
 
         let mut refs: Vec<InternedId> = self.refs().collect();
         refs.sort_unstable_by(|a, b| interns.id(*a).cmp(interns.id(*b)));
@@ -335,6 +342,20 @@ mod tests {
     fn sample_nodes() -> Vec<HashNode> {
         let pins = BTreeSet::from_iter([tid(7), tid(9)]);
         vec![
+            // Backspace shapes (`single_remove_id`): no pin, a pin sorting
+            // before the target, a pin sorting after it.
+            HashNode {
+                pins: BTreeSet::new(),
+                op: Op::Remove(BTreeSet::from_iter([tid(5)])),
+            },
+            HashNode {
+                pins: BTreeSet::from_iter([tid(2)]),
+                op: Op::Remove(BTreeSet::from_iter([tid(5)])),
+            },
+            HashNode {
+                pins: BTreeSet::from_iter([tid(11)]),
+                op: Op::Remove(BTreeSet::from_iter([tid(5)])),
+            },
             HashNode {
                 pins: BTreeSet::new(),
                 op: Op::insert_after(tid(1), 'x'),

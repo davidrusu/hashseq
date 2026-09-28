@@ -363,8 +363,8 @@ pub struct HashSeq {
     /// The containment register: live heads + the last-agreed walk.
     pub(crate) placement: PlacementRegister,
 
-    /// Latest concurrent nodes
-    pub(crate) tips: BTreeSet<Id>,
+    /// The DAG's heads, as handles in `Id` order (`tips()` is the id view).
+    pub(crate) tips: SortedIdVec,
     /// Orphans (see `delivery::Delivery`). Refused here
     /// today: `Move` targets/anchors that fail the placement rows, `Put`
     /// (a map op in a seq), non-char insert payloads (the value column
@@ -372,6 +372,21 @@ pub struct HashSeq {
     /// splice points.
     pub(crate) delivery: Delivery,
     index: RunIndex,
+    /// The char `insert_batch` typed last, and its visible position: the
+    /// next keystroke's left neighbour without a seek (`typing_left`).
+    typing: Option<TypingHint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypingHint {
+    pos: usize,
+    elem: InternedId,
+}
+
+/// The DAG walk's view of a handle: the origin is an axiom, not a node.
+#[inline]
+fn walk_handle(h: InternedId) -> Option<usize> {
+    (h != ORIGIN_IDX).then_some(h.0 as usize)
 }
 
 /// The live mark set at a point, grouped by kind: `(kind, [(mark id,
@@ -401,7 +416,10 @@ pub struct StoredPlace {
 
 impl PartialEq for HashSeq {
     fn eq(&self, other: &Self) -> bool {
-        self.tips == other.tips
+        // By id: handles are replica-local.
+        self.tips
+            .iter_ids(&self.interns)
+            .eq(other.tips.iter_ids(&other.interns))
     }
 }
 
@@ -439,9 +457,10 @@ impl HashSeq {
             mark_events: FxHashMap::default(),
             place_nodes: FxHashMap::default(),
             placement: PlacementRegister::default(),
-            tips: BTreeSet::new(),
+            tips: SortedIdVec::default(),
             delivery: Delivery::default(),
             index: RunIndex::default(),
+            typing: None,
         };
         // The origin is an axiom: present (so anchoring at it always
         // satisfies the dependency check) but tombstoned (never visible, and
@@ -449,7 +468,7 @@ impl HashSeq {
         let idx = seq.intern(doc_id, Loc::Origin);
         debug_assert_eq!(idx, ORIGIN_IDX);
         seq.removed.set(ORIGIN_IDX.0 as usize);
-        seq.tips.insert(doc_id);
+        seq.tips = SortedIdVec::single(ORIGIN_IDX);
         seq
     }
 
@@ -681,36 +700,16 @@ impl HashSeq {
         }
     }
 
-    /// The visible elements at `idx - 1` and `idx`: one seek, both read
-    /// off the walk.
-    fn neighbours(&self, idx: usize) -> (Option<InternedId>, Option<InternedId>) {
-        match idx.checked_sub(1) {
-            Some(prev_idx) => {
-                let mut walk = self.elements_from(prev_idx);
-                (walk.next(), walk.next())
-            }
-            None => (None, self.element_at(0)),
-        }
-    }
-
-    /// The tips an op pins, as handles: every tip `named` does not already
-    /// reference (pins stay normalized: `refs ∖ named`). Tips are applied,
-    /// so each resolves.
+    /// The tips an op pins: every tip `named` does not already reference
+    /// (pins stay normalized: `refs ∖ named`).
     ///
     /// Fast path: sequential typing leaves `tips == {anchor}`, so the pins
     /// are empty and nothing is allocated.
-    fn tip_pins(&self, named: impl Fn(&Id) -> bool) -> SortedIdVec {
+    fn tip_pins(&self, named: impl Fn(InternedId) -> bool) -> SortedIdVec {
         if self.tips.len() == 1 && self.tips.first().is_some_and(&named) {
             return SortedIdVec::default();
         }
-        // `tips` iterates in Id order, so the handles land sorted.
-        SortedIdVec::from_id_sorted(
-            self.tips
-                .iter()
-                .filter(|t| !named(t))
-                .map(|t| self.interns.get(t).expect("tips are applied"))
-                .collect(),
-        )
+        SortedIdVec::from_id_sorted(self.tips.iter().filter(|t| !named(*t)).collect())
     }
 
     pub fn insert(&mut self, idx: usize, value: char) {
@@ -728,8 +727,9 @@ impl HashSeq {
 
         // Authored and applied in handle space: no `HashNode`, no id
         // resolution (`author`).
+        let start = idx.min(self.len());
         let (at, pins) = self
-            .insert_point(idx.min(self.len()))
+            .insert_point(start)
             .expect("insert_point is total for idx <= len");
         let (_, mut prev) = self.author(InternedHashNode {
             pins,
@@ -741,6 +741,7 @@ impl HashSeq {
 
         // After the first apply, tips == {prev}, so the chained nodes carry
         // no pins.
+        let mut prev_pos = start;
         for ch in chars {
             (_, prev) = self.author(InternedHashNode {
                 pins: SortedIdVec::default(),
@@ -749,7 +750,12 @@ impl HashSeq {
                     payload: Payload::Char(ch),
                 },
             });
+            prev_pos += 1;
         }
+        self.typing = Some(TypingHint {
+            pos: prev_pos,
+            elem: prev,
+        });
     }
 
     /// Build (without applying) an insert of a value commitment id at
@@ -799,7 +805,7 @@ impl HashSeq {
         }
         targets.sort_unstable_by(|a, b| self.interns.id(*a).cmp(self.interns.id(*b)));
         let targets = SortedIdVec::from_id_sorted(targets);
-        let pins = self.tip_pins(|t| targets.contains(t, &self.interns));
+        let pins = self.tip_pins(|t| targets.contains(self.interns.id(t), &self.interns));
         Some(InternedHashNode {
             pins,
             op: InternedOp::Remove(targets),
@@ -1323,7 +1329,9 @@ impl HashSeq {
         let mut named: BTreeSet<Id> = overwrites.clone();
         named.insert(target);
         named.insert(*to.id());
-        let pins: BTreeSet<Id> = self.tips.difference(&named).cloned().collect();
+        let pins = self
+            .tip_pins(|t| named.contains(self.interns.id(t)))
+            .to_id_set(&self.interns);
         let node = HashNode {
             pins,
             op: Op::Move {
@@ -1482,7 +1490,9 @@ impl HashSeq {
     /// heads this replica sees. Returns the applied node (re-broadcast).
     pub fn place(&mut self, placed_at: Id) -> HashNode {
         let overwrites: BTreeSet<Id> = self.placement.heads().iter().copied().collect();
-        let pins: BTreeSet<Id> = self.tips.difference(&overwrites).cloned().collect();
+        let pins = self
+            .tip_pins(|t| overwrites.contains(self.interns.id(t)))
+            .to_id_set(&self.interns);
         let node = HashNode {
             pins,
             op: Op::Place {
@@ -1752,7 +1762,9 @@ impl HashSeq {
         let mut named: BTreeSet<Id> = overwrites.clone();
         named.insert(*start.id());
         named.insert(*end.id());
-        let pins: BTreeSet<Id> = self.tips.difference(&named).cloned().collect();
+        let pins = self
+            .tip_pins(|t| named.contains(self.interns.id(t)))
+            .to_id_set(&self.interns);
         let node = HashNode {
             pins,
             op: Op::Mark {
@@ -1941,9 +1953,10 @@ impl HashSeq {
         };
 
         for r in node.refs() {
-            self.tips.remove(&*self.interns.id(r));
+            self.tips.remove(self.interns.id(r), &self.interns);
         }
-        self.tips.insert(id);
+        // The op interns first when applied; it joins the tips after.
+        let handle = self.interns.next_interned();
 
         let pins = node.pins;
         match node.op {
@@ -1967,6 +1980,8 @@ impl HashSeq {
             } => self.apply_place(id, pins, placed_at, overwrites),
             InternedOp::Put { .. } => unreachable!("refused above"),
         }
+        debug_assert_eq!(self.interns.get(&id), Some(handle));
+        self.tips.insert(handle, &self.interns);
         Ok(())
     }
 
@@ -2131,7 +2146,7 @@ impl HashSeq {
     /// everything we have holds. Sent as the hello, and kept as "last
     /// sent" for a peer after a drain.
     pub fn clock(&self) -> crate::Clock {
-        crate::Clock(self.tips().clone())
+        crate::Clock(self.tips())
     }
 
     /// The delta for the peer behind `clock`: every applied node outside
@@ -2152,11 +2167,10 @@ impl HashSeq {
     pub fn delta_for(&self, clock: &crate::Clock) -> Vec<HashNode> {
         const OURS: u8 = 1;
         const PEER: u8 = 2;
-        let ours = self.tips();
         let mut heap: BinaryHeap<usize> = BinaryHeap::new();
         let mut colour: FxHashMap<usize, u8> = FxHashMap::default();
         let mut pending_ours = 0usize;
-        for i in ours.iter().filter_map(|t| self.walk_idx(t)) {
+        for i in self.tips.iter().filter_map(walk_handle) {
             if colour.insert(i, OURS).is_none() {
                 heap.push(i);
                 pending_ours += 1;
@@ -2207,13 +2221,10 @@ impl HashSeq {
             .collect()
     }
 
-    /// The walk's view of a handle: the origin is an axiom, not a node.
+    /// The walk's view of an id: its handle, if this replica holds it.
     #[inline]
     fn walk_idx(&self, id: &Id) -> Option<usize> {
-        self.interns
-            .get(id)
-            .filter(|i| *i != ORIGIN_IDX)
-            .map(|i| i.0 as usize)
+        walk_handle(self.interns.get(id)?)
     }
 
     /// The handles a node references (the origin is an axiom, not a node).
@@ -2342,9 +2353,9 @@ impl HashSeq {
         self.index.position_of(at)
     }
 
-    /// The current causal tips (heads of the causal DAG).
-    pub fn tips(&self) -> &BTreeSet<Id> {
-        &self.tips
+    /// The current causal tips (heads of the causal DAG), as ids.
+    pub fn tips(&self) -> BTreeSet<Id> {
+        self.tips.to_id_set(&self.interns)
     }
 
     /// Build a `Cursor` for inserting at position `idx`. This is the op-choice
@@ -2382,29 +2393,53 @@ impl HashSeq {
     /// Where an insert at visible position `idx` anchors, and the tips it
     /// pins — in handle space (`cursor_at` is the id-space view).
     fn insert_point(&self, idx: usize) -> Option<(InternedAnchor, SortedIdVec)> {
-        if idx > self.len() {
+        let len = self.len();
+        if idx > len {
             return None;
         }
-        let (left, right) = self.neighbours(idx);
-        let at = match (left, right) {
-            (Some(left), Some(_)) => {
-                let left = self.render_anchor(left);
-                // Fugue rule. The Before anchor is left's traversal successor
-                // with tombstones included — not the visible right neighbor —
-                // and `region_first` guarantees it has no before-children, so
-                // the insert lands directly after left with no Id-ordered
-                // sibling race.
-                match self.afters_of(left).next() {
+        let at = match idx.checked_sub(1) {
+            // Nothing to the left: before the first element, or the empty
+            // document's origin.
+            None => match self.element_at(0) {
+                Some(right) => InternedAnchor::Before(self.render_anchor(right)),
+                None => InternedAnchor::After(ORIGIN_IDX),
+            },
+            Some(left) => {
+                // Typing on: the char just typed is the anchor, and tips are
+                // exactly it, so there is nothing to pin.
+                if let Some(typed) = self.typing_left(left) {
+                    return Some((InternedAnchor::After(typed), SortedIdVec::default()));
+                }
+                let left = self.render_anchor(self.element_at(left).expect("left < len"));
+                // Fugue rule, when anything visible lies to the right: the
+                // Before anchor is left's traversal successor with tombstones
+                // included — not the visible right neighbour — and
+                // `region_first` guarantees it has no before-children, so the
+                // insert lands directly after left with no Id-ordered sibling
+                // race.
+                let child = if idx < len {
+                    self.afters_of(left).next()
+                } else {
+                    None
+                };
+                match child {
                     Some(child) => InternedAnchor::Before(self.region_first(child)),
                     None => InternedAnchor::After(left),
                 }
             }
-            (Some(left), None) => InternedAnchor::After(self.render_anchor(left)),
-            (None, Some(right)) => InternedAnchor::Before(self.render_anchor(right)),
-            (None, None) => InternedAnchor::After(ORIGIN_IDX),
         };
-        let anchor = self.interns.id(at.idx());
-        Some((at, self.tip_pins(|t| t == anchor)))
+        Some((at, self.tip_pins(|t| t == at.idx())))
+    }
+
+    /// The typing hint's char, if it is at visible position `pos` and still
+    /// current: `tips` is exactly that char. Every applied op becomes a tip,
+    /// so nothing has been applied since it was typed — its position holds,
+    /// nothing anchors after it, it has not moved. (A refused mark can still
+    /// place zero-width splice slots; they move no position.)
+    fn typing_left(&self, pos: usize) -> Option<InternedId> {
+        let t = self.typing?;
+        let current = t.pos == pos && self.tips.as_slice() == [t.elem];
+        current.then_some(t.elem)
     }
 
     /// Apply an `EncodableOp` to the sequence. `Run` ops are decompressed into their
@@ -2618,7 +2653,8 @@ mod test {
             "Runs should be identical"
         );
         assert_eq!(
-            seq_single_batch.tips, seq_split_batch.tips,
+            seq_single_batch.tips(),
+            seq_split_batch.tips(),
             "Tips should be identical"
         );
 
@@ -2645,7 +2681,7 @@ mod test {
 
         // Verify internal structures are identical
         assert_eq!(seq1.runs, seq2.runs, "Runs should be identical");
-        assert_eq!(seq1.tips, seq2.tips, "Tips should be identical");
+        assert_eq!(seq1.tips(), seq2.tips(), "Tips should be identical");
     }
 
     #[test]
@@ -2664,7 +2700,8 @@ mod test {
             "Runs should be identical after merge"
         );
         assert_eq!(
-            seq_with_abcd.tips, empty_seq.tips,
+            seq_with_abcd.tips(),
+            empty_seq.tips(),
             "tips should be identical after merge"
         );
 
@@ -2747,7 +2784,7 @@ mod test {
         assert_eq!(seq1.runs, seq2.runs);
         assert_eq!(seq1.befores_by_anchor, seq2.befores_by_anchor);
         assert_eq!(seq1.remove_nodes, seq2.remove_nodes);
-        assert_eq!(seq1.tips, seq2.tips);
+        assert_eq!(seq1.tips(), seq2.tips());
 
         true
     }
@@ -4403,6 +4440,66 @@ mod test {
         check_index_matches_iter(&seq);
     }
 
+    /// The typing hint (the char just typed as the next keystroke's left
+    /// neighbour) is used only while it is current (tips == {that char}):
+    /// remote ops, removes, typing elsewhere, and orphans the keystroke
+    /// wakes all fall back to a seek.
+    #[test]
+    fn typing_hint_is_used_only_while_current() {
+        fn same(seq: &HashSeq, model: &[char]) {
+            assert_eq!(
+                seq.iter().collect::<String>(),
+                model.iter().collect::<String>()
+            );
+            check_index_matches_iter(seq);
+        }
+        fn type_at(seq: &mut HashSeq, model: &mut Vec<char>, idx: usize, text: &str) {
+            seq.insert_batch(idx, text.chars());
+            model.splice(idx..idx, text.chars());
+            same(seq, model);
+        }
+        let (mut seq, mut model) = (HashSeq::default(), Vec::new());
+
+        type_at(&mut seq, &mut model, 0, "abc");
+        type_at(&mut seq, &mut model, 3, "d"); // typing on: the hint
+        type_at(&mut seq, &mut model, 4, "e");
+
+        // A remote insert at the front shifts every position.
+        let mut remote = HashSeq::default();
+        remote.merge(seq.clone());
+        remote.insert_batch(0, "XY".chars());
+        seq.merge(remote);
+        model.splice(0..0, ['X', 'Y']);
+        type_at(&mut seq, &mut model, 5, "f"); // wrong if the hint were trusted
+        type_at(&mut seq, &mut model, 8, "g");
+
+        // A remove between keystrokes.
+        seq.remove_batch(8, 1);
+        model.remove(8);
+        same(&seq, &model);
+        type_at(&mut seq, &mut model, 8, "h");
+
+        // Typing elsewhere, then back.
+        type_at(&mut seq, &mut model, 1, "i");
+        type_at(&mut seq, &mut model, 10, "j");
+        type_at(&mut seq, &mut model, 2, "k");
+
+        // An orphan woken by the keystroke itself: a peer's insert anchored
+        // Before the next char (its id is deterministic) waits for it, then
+        // lands in front of it inside `insert_batch`.
+        let end = model.len();
+        let next = seq.cursor_at(end).unwrap().first_node('l'); // what typing authors
+        let waiting = HashNode {
+            pins: BTreeSet::new(),
+            op: Op::insert_before(next.id(), 'Z'),
+        };
+        assert_eq!(seq.apply(waiting), Ok(Outcome::Orphaned));
+        seq.insert_batch(end, "l".chars());
+        model.extend(['Z', 'l']);
+        same(&seq, &model);
+        type_at(&mut seq, &mut model, end + 2, "m");
+    }
+
     /// Ops authored in handle space (`author`) have the ids their wire
     /// forms hash to, and replay to the same document on a fresh replica.
     #[test]
@@ -4828,7 +4925,7 @@ mod test {
         assert!(seq.delta_for(&peer).is_empty(), "nothing shipped");
         assert_eq!(
             seq.tips(),
-            &frontier,
+            frontier,
             "a refused op never enters the frontier"
         );
 
@@ -4836,7 +4933,7 @@ mod test {
         let err = seq.move_element(c, Anchor::After(c)).unwrap_err();
         assert_eq!(err, Refused::SelfMove);
         assert!(seq.delta_for(&peer).is_empty());
-        assert_eq!(seq.tips(), &frontier);
+        assert_eq!(seq.tips(), frontier);
     }
 
     /// A delta is the DAG diff against the peer's clock: an empty clock
@@ -5155,7 +5252,7 @@ mod test {
         }
 
         assert_eq!(seq.orphans().count(), 0);
-        assert_eq!(seq.tips(), &tips);
+        assert_eq!(seq.tips(), tips);
         assert!(seq.delta_for(&peer).is_empty());
         // Still authors normally.
         seq.mark_range(Anchor::Before(a), Anchor::After(b), bold(), yes())
@@ -5682,7 +5779,7 @@ mod test {
         );
         assert!(!seq.contains_node(&id));
         assert_eq!(seq.orphans().count(), 0);
-        assert_eq!(seq.tips(), &frontier);
+        assert_eq!(seq.tips(), frontier);
         assert_eq!(crate::encoding::encode_hashseq(&seq), before);
         assert_eq!(seq.delta_for(&Clock::default()).len(), history);
         // Merging a replica that saw the refused op carries nothing over.

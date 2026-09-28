@@ -216,7 +216,7 @@ impl HashWeb {
         let mut out: Vec<(Id, FrontierGroup)> = self
             .seqs
             .iter()
-            .map(|(obj, s)| (*obj, (KIND_SEQ, s.origin(), s.tips().clone())))
+            .map(|(obj, s)| (*obj, (KIND_SEQ, s.origin(), s.tips())))
             .chain(
                 self.kvs
                     .iter()

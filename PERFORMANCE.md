@@ -31,6 +31,20 @@ the stack, one hasher update — recovered roughly half of the initial
 regression). A same-conditions A/B against the pre-Move commit confirmed the
 Move/HashKv additions cost nothing on text traces.
 
+**Update 2026-09-29: keystrokes skip the seek; tips are handles.** Every
+trace is past 3M char edits/s. Three changes for single-char patches:
+`insert_point` looks up only the left neighbour (the right one only ever
+mattered as "exists"); a typing hint — the char just typed and its position,
+valid while `tips` is exactly that char — makes the next keystroke's anchor
+known without a seek; backspaces (one target, ≤ 1 pin) get a stack-built id
+(`single_remove_id`). Load-gated A/B vs 0a3a8c3, min: automerge −23.2%,
+friendsforever −22.1%, clownschool −21.3%, json-crdt −13.5%, seph −11.3%,
+svelte −3.0%, rustcode −1.5%. Then `tips` as a `SortedIdVec` of handles
+(no id ↔ handle conversions on apply or authoring), vs that state: −4.3% to
+−5.9% min on every trace — automerge ≈ 3.9–4.0M, everything else > 4M
+char edits/s. (An inline-singleton `SortedIdVec` was tried on top: ≤ 1.7%,
+reverted.)
+
 **Update 2026-09-28: local ops author in handle space.** `insert_batch` /
 `remove_batch` build `InternedHashNode`s straight from handles, hash them
 there (`InternedHashNode::id`, sharing `hash_resolved` with `HashNode::id`)

@@ -293,6 +293,14 @@ impl HashNode {
         {
             return chain_insert_id(at.id(), at.side_bit(), payload);
         }
+        // Fast path — a backspace: one target, at most one pin.
+        if let Op::Remove(targets) = &self.op
+            && targets.len() == 1
+            && self.pins.len() <= 1
+        {
+            let target = targets.first().expect("one target");
+            return single_remove_id(target, self.pins.first());
+        }
 
         let refs = self.refs_table();
         let ref_idx = |id: &Id| -> usize {
@@ -368,6 +376,38 @@ pub(crate) fn chain_insert_id(anchor: &Id, side_bit: usize, payload: &Payload) -
     pre[35] = side_bit as u8;
     let mut hasher = node_hasher();
     hasher.update(&pre[..36 + n]);
+    Id(*hasher.finalize().as_bytes())
+}
+
+/// The id of the backspace shape: a remove of one target with at most one
+/// pin (the previous op of a delete chain). Stack-assembled like
+/// `chain_insert_id`: `kind ‖ ref_count ‖ refs (sorted) ‖ body_len = 2 ‖
+/// count = 1 ‖ target's ref index` — 37 bytes, or 69 with the pin.
+#[inline]
+pub(crate) fn single_remove_id(target: &Id, pin: Option<&Id>) -> Id {
+    let mut pre = [0u8; 2 + 64 + 3];
+    pre[0] = KIND_REMOVE;
+    let (refs_end, target_idx) = match pin {
+        None => {
+            pre[1] = 1;
+            pre[2..34].copy_from_slice(&target.0);
+            (34, 0)
+        }
+        Some(pin) => {
+            pre[1] = 2;
+            let (lo, hi, target_idx) = if pin < target {
+                (pin, target, 1)
+            } else {
+                (target, pin, 0)
+            };
+            pre[2..34].copy_from_slice(&lo.0);
+            pre[34..66].copy_from_slice(&hi.0);
+            (66, target_idx)
+        }
+    };
+    pre[refs_end..refs_end + 3].copy_from_slice(&[2, 1, target_idx]);
+    let mut hasher = node_hasher();
+    hasher.update(&pre[..refs_end + 3]);
     Id(*hasher.finalize().as_bytes())
 }
 
@@ -543,6 +583,20 @@ mod tests {
         let b = tid(0xBB);
         let pins = BTreeSet::from_iter([a, tid(0x07)]);
         let nodes = [
+            // Backspace shapes (`single_remove_id`): no pin, a pin sorting
+            // before the target, a pin sorting after it.
+            HashNode {
+                pins: BTreeSet::new(),
+                op: Op::Remove(BTreeSet::from_iter([b])),
+            },
+            HashNode {
+                pins: BTreeSet::from_iter([a]),
+                op: Op::Remove(BTreeSet::from_iter([b])),
+            },
+            HashNode {
+                pins: BTreeSet::from_iter([tid(0xCC)]),
+                op: Op::Remove(BTreeSet::from_iter([b])),
+            },
             HashNode {
                 pins: BTreeSet::new(),
                 op: Op::insert_after(a, 'x'),
